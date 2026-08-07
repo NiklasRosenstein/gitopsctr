@@ -134,7 +134,6 @@ runs:
       shell: bash
       env:
         GITHUB_ACTION_PATH: ${{ github.action_path }}
-        GITHUB_PATH: ${{ github.path }}
         PACKAGE_REPOSITORY: ${{ inputs.package-repository }}
         PACKAGE_REVISION: ${{ inputs.package-revision }}
         PACKAGE_SOURCE: ${{ inputs.package-source }}
