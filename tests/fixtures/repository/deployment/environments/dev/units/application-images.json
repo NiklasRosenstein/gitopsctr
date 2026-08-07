@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "name": "application-images",
+  "driver": "oci-images",
+  "source": {
+    "path": ".",
+    "inputs": ["pyproject.toml"]
+  },
+  "build": {
+    "dockerfile": "Dockerfile",
+    "platform": "linux/amd64"
+  },
+  "publish": {
+    "repositories": {
+      "application": "registry.example/example/application"
+    }
+  },
+  "artifacts": ["containers.json"]
+}

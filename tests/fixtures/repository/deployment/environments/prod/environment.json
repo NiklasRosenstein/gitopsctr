@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "name": "prod",
+  "changeGate": "pullRequest",
+  "promotion": {"allowedSources": ["staging"]}
+}

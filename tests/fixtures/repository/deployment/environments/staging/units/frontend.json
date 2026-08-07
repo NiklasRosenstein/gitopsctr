@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "name": "frontend",
+  "driver": "frontend-s3-cloudfront",
+  "source": {"path": "web"},
+  "inputs": {
+    "bundle": {"fromPromotion": "units/frontend.json", "pointer": "/inputs/bundle"}
+  }
+}

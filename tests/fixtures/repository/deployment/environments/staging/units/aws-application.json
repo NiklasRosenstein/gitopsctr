@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "name": "aws-application",
+  "driver": "terraform",
+  "source": {"path": "infrastructure"},
+  "terraform": {
+    "backend": {"key": "example/staging.tfstate"},
+    "variables": {"environment": "staging"},
+    "observeOutputs": [],
+    "checks": []
+  }
+}

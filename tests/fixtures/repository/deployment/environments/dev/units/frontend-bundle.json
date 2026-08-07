@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "name": "frontend-bundle",
+  "driver": "vite-oci-bundle",
+  "source": {"path": "web", "inputs": ["."]},
+  "build": {"nodeVersion": "24"},
+  "publish": {"repository": "registry.example/example/frontend"},
+  "artifacts": ["frontend.json"]
+}

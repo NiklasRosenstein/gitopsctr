@@ -1,0 +1,210 @@
+"""Forge-neutral change-request behavior without network access."""
+
+import json
+import subprocess
+from pathlib import Path
+
+from gitopsctr import forges as deployment_forges
+
+
+def _completed(
+    command: tuple[str, ...] = (),
+    returncode: int = 0,
+    stdout: str = "",
+    stderr: str = "",
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+
+class FakeRunner:
+    def __init__(self, *responses: subprocess.CompletedProcess[str] | BaseException):
+        self.responses = iter(responses)
+        self.calls: list[tuple[tuple[str, ...], Path | None]] = []
+
+    def __call__(self, command: tuple[str, ...], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        self.calls.append((tuple(command), cwd))
+        response = next(self.responses)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+def _spec() -> deployment_forges.ChangeRequestSpec:
+    return deployment_forges.ChangeRequestSpec(
+        head="promotion/prod/abc123",
+        base="deploy/prod",
+        title="Promote staging to prod",
+        body="Promotes the reviewed staging release.",
+    )
+
+
+def test_configured_github_remote_finds_exact_existing_change_request(tmp_path):
+    runner = FakeRunner(
+        _completed(stdout="git@github.com:example-org/example-deployment.git\n"),
+        _completed(stdout='[{"url":"https://github.com/example-org/example-deployment/pull/17"}]\n'),
+    )
+
+    result = deployment_forges.ensure_change_request(_spec(), runner=runner, cwd=tmp_path)
+
+    assert result == deployment_forges.ChangeRequestResult(
+        status="existing",
+        url="https://github.com/example-org/example-deployment/pull/17",
+    )
+    assert runner.calls == [
+        (("git", "remote", "get-url", "origin"), tmp_path),
+        (
+            (
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                "example-org/example-deployment",
+                "--head",
+                "promotion/prod/abc123",
+                "--base",
+                "deploy/prod",
+                "--state",
+                "open",
+                "--json",
+                "url",
+                "--limit",
+                "1",
+            ),
+            tmp_path,
+        ),
+    ]
+
+
+def test_github_adapter_creates_change_request_when_none_is_open(tmp_path):
+    runner = FakeRunner(
+        _completed(stdout="[]\n"),
+        _completed(stdout="https://github.com/example-org/example-deployment/pull/18\n"),
+    )
+
+    result = deployment_forges.ensure_change_request(
+        _spec(),
+        remote_url="https://github.com/example-org/example-deployment.git",
+        runner=runner,
+        cwd=tmp_path,
+    )
+
+    assert result == deployment_forges.ChangeRequestResult(
+        status="created",
+        url="https://github.com/example-org/example-deployment/pull/18",
+    )
+    assert runner.calls[1] == (
+        (
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            "example-org/example-deployment",
+            "--head",
+            _spec().head,
+            "--base",
+            _spec().base,
+            "--title",
+            _spec().title,
+            "--body",
+            _spec().body,
+        ),
+        tmp_path,
+    )
+
+
+def test_concurrent_creation_reuses_change_request_found_after_create_failure():
+    url = "https://github.com/example-org/example-deployment/pull/19"
+    runner = FakeRunner(
+        _completed(stdout="[]"),
+        _completed(returncode=1, stderr="a pull request already exists"),
+        _completed(stdout=json.dumps([{"url": url}])),
+    )
+
+    result = deployment_forges.ensure_change_request(
+        _spec(),
+        remote_url="https://github.com/example-org/example-deployment.git",
+        runner=runner,
+    )
+
+    assert result == deployment_forges.ChangeRequestResult(status="existing", url=url)
+    assert [call[0][2] for call in runner.calls] == ["list", "create", "list"]
+
+
+def test_missing_remote_returns_exact_manual_change_request_instructions(tmp_path):
+    spec = _spec()
+    runner = FakeRunner(_completed(returncode=2, stderr="No such remote 'origin'"))
+
+    result = deployment_forges.ensure_change_request(spec, runner=runner, cwd=tmp_path)
+
+    assert isinstance(result, deployment_forges.ManualChangeRequest)
+    assert result.status == "manual"
+    assert result.head == spec.head
+    assert result.base == spec.base
+    assert result.title == spec.title
+    assert result.body == spec.body
+    assert result.remote_url is None
+    assert "No such remote 'origin'" in result.reason
+    assert "Head: promotion/prod/abc123" in result.instructions()
+    assert "Base: deploy/prod" in result.instructions()
+
+
+def test_unknown_forge_returns_manual_fallback_without_invoking_a_cli():
+    runner = FakeRunner()
+
+    result = deployment_forges.ensure_change_request(
+        _spec(),
+        remote_url="git@gitlab.com:example-org/example-deployment.git",
+        runner=runner,
+    )
+
+    assert isinstance(result, deployment_forges.ManualChangeRequest)
+    assert result.remote_url == "git@gitlab.com:example-org/example-deployment.git"
+    assert "no change-request adapter" in result.reason
+    assert runner.calls == []
+
+
+def test_unavailable_or_unauthenticated_github_cli_returns_manual_fallback():
+    missing_runner = FakeRunner(FileNotFoundError("gh"))
+    missing = deployment_forges.ensure_change_request(
+        _spec(),
+        remote_url="git@github.com:example-org/example-deployment.git",
+        runner=missing_runner,
+    )
+    assert isinstance(missing, deployment_forges.ManualChangeRequest)
+    assert "gh" in missing.reason
+
+    unauthenticated_runner = FakeRunner(
+        _completed(returncode=4, stderr="To get started with GitHub CLI, run: gh auth login")
+    )
+    unauthenticated = deployment_forges.ensure_change_request(
+        _spec(),
+        remote_url="git@github.com:example-org/example-deployment.git",
+        runner=unauthenticated_runner,
+    )
+    assert isinstance(unauthenticated, deployment_forges.ManualChangeRequest)
+    assert "gh auth login" in unauthenticated.reason
+
+
+def test_explicit_adapter_is_the_plugin_seam_for_other_forges():
+    expected = deployment_forges.ChangeRequestResult(
+        status="created", url="https://gitlab.example/group/project/-/merge_requests/3"
+    )
+
+    class GitLabAdapter:
+        def __init__(self):
+            self.received = None
+
+        def ensure_change_request(self, spec):
+            self.received = spec
+            return expected
+
+    adapter = GitLabAdapter()
+
+    result = deployment_forges.ensure_change_request(
+        _spec(),
+        remote_url="git@gitlab.example:group/project.git",
+        adapter=adapter,
+    )
+
+    assert result == expected
+    assert adapter.received == _spec()

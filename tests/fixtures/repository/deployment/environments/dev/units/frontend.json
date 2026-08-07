@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "name": "frontend",
+  "driver": "frontend-s3-cloudfront",
+  "source": {"path": "web"},
+  "inputs": {
+    "bundle": "registry.example/example/frontend@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "runtimeConfig": {},
+    "bucket": "example-bucket",
+    "distributionId": "EXAMPLE",
+    "url": "https://example.invalid"
+  }
+}
