@@ -1,0 +1,169 @@
+name: gitopsctr
+description: Reconcile, advance, or promote Git-backed deployment state
+
+inputs:
+  operation:
+    description: Operation to run (reconcile, advance, or promote)
+    required: true
+  package-source:
+    description: Install from pypi, this action revision, or an explicit git repository
+    required: false
+    default: pypi
+  package-version:
+    description: Exact PyPI version; empty installs the latest version
+    required: false
+    default: ""
+  package-repository:
+    description: Git repository URL or GitHub owner/repository, required when package-source is git
+    required: false
+    default: ""
+  package-revision:
+    description: Git commit, tag, or ref, required when package-source is git
+    required: false
+    default: ""
+  working-directory:
+    description: Directory inside the deployment repository
+    required: false
+    default: .
+  environment:
+    description: Deployment environment for reconcile or advance
+    required: false
+    default: ""
+  unit:
+    description: Deployment unit for reconcile
+    required: false
+    default: ""
+  from-environment:
+    description: Source environment for promote
+    required: false
+    default: ""
+  to-environment:
+    description: Target environment for promote
+    required: false
+    default: ""
+  desired-ref:
+    description: Optional desired-state ref override
+    required: false
+    default: ""
+  observed-ref:
+    description: Optional observed-state ref override
+    required: false
+    default: ""
+  desired-revision:
+    description: Exact desired-state revision for reconcile
+    required: false
+    default: ""
+  source-revision:
+    description: Source revision for reconcile, advance, or promotion source desired state
+    required: false
+    default: ""
+  specification-revision:
+    description: Specification revision for promote; defaults to the workflow revision
+    required: false
+    default: ""
+  require-source-ref:
+    description: Require source revision to remain the head of this ref
+    required: false
+    default: ""
+  candidate-ref:
+    description: Optional candidate ref for a gated promotion
+    required: false
+    default: ""
+  advance:
+    description: Advance desired state as part of reconcile
+    required: false
+    default: "false"
+  dry:
+    description: Resolve or reconcile without publishing state
+    required: false
+    default: "false"
+  reapply:
+    description: Run the reconcile driver even when its receipt is clean
+    required: false
+    default: "false"
+  report:
+    description: Optional driver report directory for reconcile
+    required: false
+    default: ""
+  github-token:
+    description: Token used by the GitHub forge adapter
+    required: false
+    default: ""
+  git-author-name:
+    description: Author name for desired and observed state commits
+    required: false
+    default: gitopsctr GitHub Action
+  git-author-email:
+    description: Author email for desired and observed state commits
+    required: false
+    default: 41898282+github-actions[bot]@users.noreply.github.com
+
+outputs:
+  reconciled:
+    description: Whether reconcile published a receipt
+    value: ${{ steps.run.outputs.reconciled }}
+  desired-changed:
+    description: Whether desired state advanced
+    value: ${{ steps.run.outputs.desired_changed }}
+  desired-revision:
+    description: Resulting desired revision
+    value: ${{ steps.run.outputs.desired_revision }}
+  change-revision:
+    description: Published change or candidate revision
+    value: ${{ steps.run.outputs.change_revision }}
+  change-status:
+    description: published, created, existing, or manual
+    value: ${{ steps.run.outputs.change_status }}
+  change-url:
+    description: Forge change-request URL when available
+    value: ${{ steps.run.outputs.change_url }}
+  candidate-ref:
+    description: Candidate ref for a gated change
+    value: ${{ steps.run.outputs.candidate_ref }}
+  target-ref:
+    description: Target desired-state ref
+    value: ${{ steps.run.outputs.target_ref }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v9.0.0
+
+    - name: Install gitopsctr
+      shell: bash
+      env:
+        GITHUB_ACTION_PATH: ${{ github.action_path }}
+        GITHUB_PATH: ${{ github.path }}
+        PACKAGE_REPOSITORY: ${{ inputs.package-repository }}
+        PACKAGE_REVISION: ${{ inputs.package-revision }}
+        PACKAGE_SOURCE: ${{ inputs.package-source }}
+        PACKAGE_VERSION: ${{ inputs.package-version }}
+      run: bash "${GITHUB_ACTION_PATH}/action/install.sh"
+
+    - name: Run ${{ inputs.operation }}
+      id: run
+      shell: bash
+      env:
+        ADVANCE: ${{ inputs.advance }}
+        CANDIDATE_REF: ${{ inputs.candidate-ref }}
+        DESIRED_REF: ${{ inputs.desired-ref }}
+        DESIRED_REVISION: ${{ inputs.desired-revision }}
+        DRY: ${{ inputs.dry }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        FROM_ENVIRONMENT: ${{ inputs.from-environment }}
+        GH_TOKEN: ${{ inputs.github-token || github.token }}
+        GITOPSCTR_GIT_AUTHOR_EMAIL: ${{ inputs.git-author-email }}
+        GITOPSCTR_GIT_AUTHOR_NAME: ${{ inputs.git-author-name }}
+        OBSERVED_REF: ${{ inputs.observed-ref }}
+        OPERATION: ${{ inputs.operation }}
+        REAPPLY: ${{ inputs.reapply }}
+        REPORT: ${{ inputs.report }}
+        REQUIRE_SOURCE_REF: ${{ inputs.require-source-ref }}
+        SOURCE_REVISION: ${{ inputs.source-revision }}
+        SPECIFICATION_REVISION: ${{ inputs.specification-revision }}
+        TO_ENVIRONMENT: ${{ inputs.to-environment }}
+        UNIT: ${{ inputs.unit }}
+        WORKFLOW_REVISION: ${{ github.sha }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+      run: bash "${GITHUB_ACTION_PATH}/action/run.sh"

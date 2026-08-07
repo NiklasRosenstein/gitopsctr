@@ -1,4 +1,5 @@
 [tools]
+actionlint = "latest"
 oras = "latest"
 python = "3.12"
 uv = "latest"
@@ -18,8 +19,11 @@ run = "uv run ruff format ."
 [tasks.typecheck]
 run = "uv run ty check src"
 
+[tasks.actionlint]
+run = "actionlint"
+
 [tasks.check]
-depends = ["lint", "typecheck", "test"]
+depends = ["actionlint", "lint", "typecheck", "test"]
 
 [tasks.build]
 run = "uv build"

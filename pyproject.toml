@@ -33,6 +33,7 @@ vite-oci-bundle = "gitopsctr.contrib.driver.implementations:VITE_OCI_BUNDLE"
 [dependency-groups]
 dev = [
   "pytest>=8",
+  "pyyaml>=6",
   "ruff>=0.12",
   "ty>=0.0.1a16",
 ]

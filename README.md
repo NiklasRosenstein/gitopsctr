@@ -47,6 +47,50 @@ install the CLI from PyPI, from the checked-out action revision, or from an expl
 and revision. Caller workflows retain responsibility for credentials, deployment tools, permissions,
 concurrency, and follow-up scheduling.
 
+Install the package bundled with the exact action revision while testing an unreleased change:
+
+```yaml
+- uses: NiklasRosenstein/gitopsctr@<commit-or-ref>
+  with:
+    operation: reconcile
+    package-source: action
+    environment: dev
+    unit: application
+```
+
+Install the latest PyPI release (the default):
+
+```yaml
+- uses: NiklasRosenstein/gitopsctr@v1
+  with:
+    operation: advance
+    environment: dev
+    source-revision: ${{ github.sha }}
+```
+
+Install from a separate Git revision:
+
+```yaml
+- uses: NiklasRosenstein/gitopsctr@v1
+  with:
+    operation: promote
+    package-source: git
+    package-repository: NiklasRosenstein/gitopsctr
+    package-revision: <commit-or-ref>
+    from-environment: dev
+    to-environment: staging
+```
+
+The caller must check out its deployment repository before invoking the action. For gated changes,
+grant `contents: write` and `pull-requests: write`; for reconciliation receipts, grant
+`contents: write`. Pass any cloud credentials and required external tools in the caller workflow.
+
+## Releases
+
+CI runs the mocked suite on Python 3.12, 3.13, and 3.14. Tags matching `v*` are accepted only when
+the tag equals `v` plus the package version. After verification and an isolated package build, the
+release workflow publishes through PyPI Trusted Publishing using the protected `pypi` environment.
+
 ## License
 
 MIT
