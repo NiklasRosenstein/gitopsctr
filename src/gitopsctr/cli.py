@@ -88,7 +88,6 @@ class PromotionContext:
     def document(self) -> dict[str, Any]:
         return with_schema(
             {
-                "schema": 1,
                 "source": {
                     "environment": self.source_environment,
                     "desiredRef": self.desired_ref,
@@ -319,10 +318,16 @@ CORE_API_VERSION = "gitopsctr.io/v1"
 UNIT_API_VERSION = "unit.gitopsctr.io/v1"
 
 
+def without_legacy_schema(document: dict[str, Any]) -> dict[str, Any]:
+    if document.get("schema") == 1:
+        return {key: value for key, value in document.items() if key != "schema"}
+    return document
+
+
 def normalize_environment_document(document: dict[str, Any], expected_name: str | None = None) -> dict[str, Any]:
     """Convert a resource envelope to the controller's internal environment shape."""
     if document.get("apiVersion") is None:
-        return document
+        return without_legacy_schema(document)
     if document.get("apiVersion") != CORE_API_VERSION or document.get("kind") != "Environment":
         raise OperationError("environment must use apiVersion gitopsctr.io/v1 and kind Environment")
     metadata = document.get("metadata")
@@ -332,24 +337,24 @@ def normalize_environment_document(document: dict[str, Any], expected_name: str 
     name = metadata["name"]
     if expected_name is not None and name != expected_name:
         raise OperationError(f"environment metadata.name must be {expected_name!r}")
-    return {"schema": 1, "name": name, **specification}
+    return {"name": name, **specification}
 
 
 def normalize_promotion_document(document: dict[str, Any]) -> dict[str, Any]:
     if document.get("apiVersion") is None:
-        return document
+        return without_legacy_schema(document)
     if document.get("apiVersion") != CORE_API_VERSION or document.get("kind") != "Promotion":
         raise OperationError("promotion must use apiVersion gitopsctr.io/v1 and kind Promotion")
     specification = document.get("spec")
     if not isinstance(specification, dict):
         raise OperationError("promotion envelope requires a spec mapping")
-    return {"schema": 1, **specification}
+    return dict(specification)
 
 
 def normalize_unit_document(document: dict[str, Any], expected_name: str | None = None) -> dict[str, Any]:
     """Convert a unit resource envelope to the controller's internal shape."""
     if document.get("apiVersion") is None:
-        return document
+        return without_legacy_schema(document)
     api_version = document.get("apiVersion")
     kind = document.get("kind")
     metadata = document.get("metadata")
@@ -366,7 +371,7 @@ def normalize_unit_document(document: dict[str, Any], expected_name: str | None 
         raise OperationError(f"unit metadata.name must be {expected_name or 'a non-empty name'!r}")
     if not isinstance(specification, dict):
         raise OperationError(f"unit {name} requires a spec mapping")
-    return {"schema": 1, "name": name, "driver": driver, **specification}
+    return {"name": name, "driver": driver, **specification}
 
 
 def serialize_environment_document(environment: dict[str, Any]) -> dict[str, Any]:
@@ -419,7 +424,7 @@ def serialize_unit_document(
 
 def normalize_receipt_document(document: dict[str, Any], expected_unit: str | None = None) -> dict[str, Any]:
     if document.get("apiVersion") is None:
-        return document
+        return without_legacy_schema(document)
     if document.get("apiVersion") != CORE_API_VERSION or document.get("kind") != "Receipt":
         raise OperationError("receipt must use apiVersion gitopsctr.io/v1 and kind Receipt")
     metadata = document.get("metadata")
@@ -442,7 +447,6 @@ def normalize_receipt_document(document: dict[str, Any], expected_unit: str | No
     if not isinstance(result, dict):
         raise OperationError("receipt status.result must be a mapping")
     return {
-        "schema": 1,
         "unit": name,
         "driver": driver,
         "desired": specification.get("desired", {}),
@@ -744,11 +748,7 @@ def require_unit_specification(
     name = specification.get("name")
     driver = specification.get("driver")
     source = specification.get("source")
-    if (
-        specification.get("schema") != 1
-        or not isinstance(name, str)
-        or (expected_name is not None and name != expected_name)
-    ):
+    if not isinstance(name, str) or (expected_name is not None and name != expected_name):
         raise OperationError(f"invalid unit specification: {expected_name or name!r}")
     if driver not in UNIT_DRIVERS:
         raise OperationError(f"{name} uses an unknown driver: {driver!r}")
@@ -942,7 +942,7 @@ def load_environment(source_root: Path, environment_name: str) -> dict[str, Any]
     if resource_documents_enabled(source_root) and environment_document.get("apiVersion") is None:
         raise OperationError(f"legacy environment document is not valid in a migrated project: {environment_paths[0]}")
     environment = normalize_environment_document(environment_document, environment_name)
-    if environment.get("schema") != 1 or environment.get("name") != environment_name:
+    if environment.get("name") != environment_name:
         raise OperationError(f"invalid environment specification: {environment_name}")
     change_gate = environment.get("changeGate", "none")
     if change_gate not in {"none", "pullRequest"}:
@@ -1679,8 +1679,7 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
     driver = unit.get("driver")
     desired_evidence = receipt.get("desired")
     if (
-        receipt.get("schema") != 1
-        or receipt.get("unit") != unit_name
+        receipt.get("unit") != unit_name
         or not isinstance(driver, str)
         or receipt.get("driver") != driver
         or not isinstance(desired_evidence, dict)
@@ -2018,7 +2017,6 @@ def command_promote(args: argparse.Namespace) -> None:
         if target_revision is None and gate == "pullRequest":
             baseline = temporary / "target-baseline"
             baseline_environment = {
-                "schema": 1,
                 "name": args.to_environment,
                 "state": "unpromoted",
             }
@@ -2463,7 +2461,7 @@ def command_facts(args: argparse.Namespace) -> None:
             receipt = load_receipt(path, path.stem)
             unit_name = path.stem
             validate_receipt_document(receipt, f"observation receipt units/{path.name}")
-            if receipt.get("schema") != 1 or receipt.get("unit") != unit_name:
+            if receipt.get("unit") != unit_name:
                 raise OperationError(f"invalid observation receipt: units/{path.name}")
             units[unit_name] = {key: value for key, value in receipt.items() if key not in metadata}
 
@@ -2556,7 +2554,7 @@ def command_verify(args: argparse.Namespace) -> None:
 
 
 def require_unit(unit: dict[str, Any], unit_name: str) -> tuple[str, dict[str, str]]:
-    if unit.get("schema") != 1 or unit.get("name") != unit_name:
+    if unit.get("name") != unit_name:
         raise OperationError(f"invalid desired unit: {unit_name}")
     driver = unit.get("driver")
     if driver not in UNIT_DRIVERS:
@@ -3009,7 +3007,6 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             raise OperationError(f"driver returned reserved observation fields: {sorted(overlap)}")
         receipt = with_schema(
             {
-                "schema": 1,
                 "unit": args.unit,
                 "driver": driver_name,
                 "desired": {"revision": desired_revision, "unitBlob": unit_blob},

@@ -45,6 +45,10 @@ class MashumaroContract(DocumentContract):
         candidate = dict(document)
         # $schema is only a transport hint. Its value never selects a validator or triggers IO.
         schema = self.json_schema()
+        # Flat documents from before the resource API carried ``schema: 1``.
+        # It is discarded at the boundary and is not part of any current contract.
+        if "schema" not in cast(dict[str, Any], schema.get("properties", {})) and candidate.get("schema") == 1:
+            candidate.pop("schema", None)
         if "$schema" in cast(dict[str, Any], schema.get("properties", {})):
             candidate["$schema"] = None
         else:
@@ -83,8 +87,11 @@ class MashumaroUnionContract(DocumentContract):
     def validate(self, document: object) -> JsonObject:
         if not isinstance(document, dict) or not all(isinstance(key, str) for key in document):
             raise ContractError("expected a JSON object")
+        candidate = dict(document)
+        if candidate.get("schema") == 1:
+            candidate.pop("schema", None)
         try:
-            Draft202012Validator(self.json_schema()).validate(document)
+            Draft202012Validator(self.json_schema()).validate(candidate)
         except ValidationError as exc:
             raise ContractError(exc.message) from exc
         return cast(JsonObject, document)
@@ -108,7 +115,6 @@ class PromotionPolicy(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class EnvironmentDocument(SchemaDocument):
-    schema: Literal[1]
     name: str
     changeGate: Literal["pullRequest", "none"] = "none"
     refs: EnvironmentRefs | None = None
@@ -127,7 +133,6 @@ class PromotionSource(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class PromotionDocument(SchemaDocument):
-    schema: Literal[1]
     source: PromotionSource
     specificationRevision: str
 
@@ -157,7 +162,6 @@ class DesiredSource(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class DesiredUnitDocument(SchemaDocument):
-    schema: Literal[1]
     name: str
     driver: str
     source: DesiredSource
@@ -179,7 +183,6 @@ class ReceiptDesired(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class ReceiptDocument(SchemaDocument):
-    schema: Literal[1]
     unit: str
     driver: str
     desired: ReceiptDesired

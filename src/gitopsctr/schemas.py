@@ -34,9 +34,9 @@ def _specification_schema(contract: DocumentContract) -> JsonObject:
     required = [
         value
         for value in cast(list[str], schema.get("required", []))
-        if value not in {"$schema", "schema", "name", "driver"}
+        if value not in {"$schema", "name", "driver"}
     ]
-    for key in ("$schema", "schema", "name", "driver"):
+    for key in ("$schema", "name", "driver"):
         properties.pop(key, None)
     schema["properties"] = properties
     schema["required"] = cast(Any, required)

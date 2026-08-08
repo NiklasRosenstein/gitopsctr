@@ -67,7 +67,6 @@ class OciPublication(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class OciImagesUnit(SchemaDocument):
-    schema: Literal[1]
     name: str
     driver: Literal["oci-images"]
     source: AuthoredSource
@@ -79,7 +78,6 @@ class OciImagesUnit(SchemaDocument):
 
 @dataclass(frozen=True, kw_only=True)
 class OciImagesDesiredUnit(SchemaDocument):
-    schema: Literal[1]
     name: str
     driver: Literal["oci-images"]
     source: DesiredSource

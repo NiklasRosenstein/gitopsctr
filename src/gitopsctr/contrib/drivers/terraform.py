@@ -64,7 +64,6 @@ class TerraformConfiguration(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class TerraformUnit(SchemaDocument):
-    schema: Literal[1]
     name: str
     driver: Literal["terraform"]
     source: AuthoredSource
@@ -74,7 +73,6 @@ class TerraformUnit(SchemaDocument):
 
 @dataclass(frozen=True, kw_only=True)
 class TerraformDesiredUnit(SchemaDocument):
-    schema: Literal[1]
     name: str
     driver: Literal["terraform"]
     source: DesiredSource

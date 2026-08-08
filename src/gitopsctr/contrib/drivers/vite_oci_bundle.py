@@ -80,7 +80,6 @@ class VitePublication(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class ViteOciBundleUnit(SchemaDocument):
-    schema: Literal[1]
     name: str
     driver: Literal["vite-oci-bundle"]
     source: AuthoredSource
@@ -91,7 +90,6 @@ class ViteOciBundleUnit(SchemaDocument):
 
 @dataclass(frozen=True, kw_only=True)
 class ViteOciBundleDesiredUnit(SchemaDocument):
-    schema: Literal[1]
     name: str
     driver: Literal["vite-oci-bundle"]
     source: DesiredSource

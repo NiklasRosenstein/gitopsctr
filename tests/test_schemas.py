@@ -21,11 +21,12 @@ DIGEST = "sha256:" + "1" * 64
 
 def authored_examples() -> list[dict]:
     paths = sorted((ROOT / "tests/fixtures").rglob("units/*.json")) + sorted((ROOT / "demo").rglob("units/*.json"))
-    return [json.loads(path.read_text()) for path in paths]
+    return [{key: value for key, value in json.loads(path.read_text()).items() if key != "schema"} for path in paths]
 
 
 def desired_example(unit: dict) -> dict:
     desired = deepcopy(unit)
+    desired.pop("schema", None)
     driver = desired["driver"]
     desired["$schema"] = schemas.driver_schema(driver, "desired-unit")["$id"]
     desired["source"] |= {
@@ -70,6 +71,14 @@ def test_schema_hint_is_ignored_for_runtime_validation():
         if hint is not None:
             candidate["$schema"] = hint
         assert contract.validate(candidate) == candidate
+
+
+def test_resource_contracts_use_api_version_instead_of_envelope_schema_field():
+    for driver in UNIT_DRIVERS.values():
+        for contract in (driver.unit_contract, driver.desired_unit_contract):
+            assert "schema" not in contract.json_schema().get("properties", {})
+    for contract in CORE_CONTRACTS.values():
+        assert "schema" not in contract.json_schema().get("properties", {})
 
 
 RESULTS = {
@@ -131,7 +140,6 @@ def test_result_and_composed_receipt_schemas(driver):
     plugin.result_contract.validate(result)
     receipt = {
         "$schema": schemas.driver_schema(driver, "receipt")["$id"],
-        "schema": 1,
         "unit": "example",
         "driver": driver,
         "desired": {"revision": REVISION, "unitBlob": "f" * 40},
@@ -172,7 +180,7 @@ def test_generated_schemas_and_examples_validate_from_the_local_catalog():
         desired = desired_example(authored)
         Draft202012Validator(by_id[desired["$schema"]], registry=registry).validate(desired)
     for path in sorted((ROOT / "tests/fixtures").rglob("environment.json")):
-        environment = json.loads(path.read_text())
+        environment = {key: value for key, value in json.loads(path.read_text()).items() if key != "schema"}
         Draft202012Validator(by_id[environment["$schema"]], registry=registry).validate(environment)
 
 

@@ -117,7 +117,6 @@ class FrontendDesiredInputs(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class FrontendUnit(SchemaDocument):
-    schema: Literal[1]
     name: str
     driver: Literal["frontend-s3-cloudfront"]
     source: AuthoredSource
@@ -127,7 +126,6 @@ class FrontendUnit(SchemaDocument):
 
 @dataclass(frozen=True, kw_only=True)
 class FrontendDesiredUnit(SchemaDocument):
-    schema: Literal[1]
     name: str
     driver: Literal["frontend-s3-cloudfront"]
     source: DesiredSource

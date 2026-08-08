@@ -131,7 +131,6 @@ class ExternalDelivery(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class KubernetesUnit(SchemaDocument):
-    schema: Literal[1]
     name: str
     driver: Literal["kubernetes-manifests"]
     source: AuthoredSource
@@ -166,7 +165,6 @@ class KubernetesMaterializationDescriptor(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class KubernetesDesiredUnit(SchemaDocument):
-    schema: Literal[1]
     name: str
     driver: Literal["kubernetes-manifests"]
     source: DesiredSource
