@@ -15,21 +15,23 @@ wheels = [
 name = "gitopsctr"
 version = "0.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "pyyaml" },
+]
 
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
-    { name = "pyyaml" },
     { name = "ruff" },
     { name = "ty" },
 ]
 
 [package.metadata]
+requires-dist = [{ name = "pyyaml", specifier = ">=6" }]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=8" },
-    { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", specifier = ">=0.12" },
     { name = "ty", specifier = ">=0.0.1a16" },
 ]

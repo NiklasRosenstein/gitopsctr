@@ -9,7 +9,14 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import driver as driver_registry
-from gitopsctr.contrib.driver import _oci, frontend_s3_cloudfront, oci_images, terraform, vite_oci_bundle
+from gitopsctr.contrib.driver import (
+    _oci,
+    frontend_s3_cloudfront,
+    kubernetes_manifests,
+    oci_images,
+    terraform,
+    vite_oci_bundle,
+)
 from gitopsctr.driver import (
     DriverError,
     ReconciliationCapability,
@@ -31,12 +38,14 @@ def test_contributed_driver_entry_points_load_one_module_per_driver():
 
     assert entry_points == {
         "frontend-s3-cloudfront": "gitopsctr.contrib.driver.frontend_s3_cloudfront:PLUGIN",
+        "kubernetes-manifests": "gitopsctr.contrib.driver.kubernetes_manifests:PLUGIN",
         "oci-images": "gitopsctr.contrib.driver.oci_images:PLUGIN",
         "terraform": "gitopsctr.contrib.driver.terraform:PLUGIN",
         "vite-oci-bundle": "gitopsctr.contrib.driver.vite_oci_bundle:PLUGIN",
     }
     assert {plugin.reconcile.__module__ for plugin in driver_registry.RECONCILIATION_PLUGINS.values()} == {
         "gitopsctr.contrib.driver.frontend_s3_cloudfront",
+        "gitopsctr.contrib.driver.kubernetes_manifests",
         "gitopsctr.contrib.driver.oci_images",
         "gitopsctr.contrib.driver.terraform",
         "gitopsctr.contrib.driver.vite_oci_bundle",
@@ -46,10 +55,14 @@ def test_contributed_driver_entry_points_load_one_module_per_driver():
 
 def test_driver_capabilities_are_independent_and_explicit():
     assert isinstance(terraform.PLUGIN, VerificationCapability)
+    assert isinstance(kubernetes_manifests.PLUGIN, VerificationCapability)
     assert not isinstance(oci_images.PLUGIN, VerificationCapability)
     assert not isinstance(vite_oci_bundle.PLUGIN, VerificationCapability)
     assert not isinstance(frontend_s3_cloudfront.PLUGIN, VerificationCapability)
-    assert driver_registry.VERIFICATION_PLUGINS == {"terraform": terraform.PLUGIN}
+    assert driver_registry.VERIFICATION_PLUGINS == {
+        "kubernetes-manifests": kubernetes_manifests.PLUGIN,
+        "terraform": terraform.PLUGIN,
+    }
 
 
 def test_reconciliation_capability_requires_core_operations():

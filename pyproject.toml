@@ -16,7 +16,7 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Build Tools",
 ]
-dependencies = []
+dependencies = ["PyYAML>=6"]
 
 [project.urls]
 Repository = "https://github.com/NiklasRosenstein/gitopsctr"
@@ -29,11 +29,11 @@ frontend-s3-cloudfront = "gitopsctr.contrib.driver.frontend_s3_cloudfront:PLUGIN
 oci-images = "gitopsctr.contrib.driver.oci_images:PLUGIN"
 terraform = "gitopsctr.contrib.driver.terraform:PLUGIN"
 vite-oci-bundle = "gitopsctr.contrib.driver.vite_oci_bundle:PLUGIN"
+kubernetes-manifests = "gitopsctr.contrib.driver.kubernetes_manifests:PLUGIN"
 
 [dependency-groups]
 dev = [
   "pytest>=8",
-  "pyyaml>=6",
   "ruff>=0.12",
   "ty>=0.0.1a16",
 ]
