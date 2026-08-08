@@ -4,6 +4,14 @@
   "additionalProperties": false,
   "properties": {
     "$schema": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
       "default": null
     },
     "apiVersion": {

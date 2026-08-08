@@ -11,11 +11,121 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from mashumaro.config import BaseConfig
 from mashumaro.jsonschema import build_json_schema
+from mashumaro.jsonschema.models import Context, JSONSchema, JSONSchemaInstanceType
+from mashumaro.jsonschema.plugins import BasePlugin
+from mashumaro.jsonschema.schema import Instance
 from mashumaro.mixins.dict import DataClassDictMixin
 
-from gitopsctr.document import ContractError, DocumentContract, JsonObject, TypedDocumentContract
+from gitopsctr.document import (
+    ContractError,
+    DocumentContract,
+    JsonObject,
+    JsonObjectValue,
+    JsonValue,
+    TypedDocumentContract,
+)
+from gitopsctr.templates import REFERENCE_KEYS, TemplateObject
 
 SCHEMA_ROOT = "https://niklasrosenstein.github.io/gitopsctr/schemas"
+
+
+class _ContractSchemaPlugin(BasePlugin):
+    """Mark pass-through types for expansion after Mashumaro builds the enclosing schema."""
+
+    def get_schema(
+        self,
+        instance: Instance,
+        ctx: Context,
+        schema: JSONSchema | None = None,
+    ) -> JSONSchema | None:
+        if instance.type is TemplateObject:
+            return JSONSchema(title="__gitopsctr_template_object__")
+        if instance.type is JsonObjectValue:
+            return JSONSchema(type=JSONSchemaInstanceType.OBJECT)
+        return None
+
+
+def _reference_target_schema(*, artifact: bool = False) -> JsonObject:
+    properties: JsonObject = {
+        "unit": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+        "pointer": {"type": "string", "pattern": "^(?:$|/(?:[^~]|~[01])*)$", "default": ""},
+    }
+    required = ["unit"]
+    if artifact:
+        properties.update(
+            {
+                "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+                "apiVersion": {"type": "string", "pattern": "^[^/]+/[^/]+$"},
+                "kind": {"type": "string", "pattern": "^[A-Z][A-Za-z0-9]*$"},
+            }
+        )
+        required.extend(("name", "apiVersion", "kind"))
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
+    }
+
+
+def _template_definitions() -> JsonObject:
+    variants: list[JsonObject] = []
+    for key in sorted(REFERENCE_KEYS):
+        variants.append(
+            {
+                "type": "object",
+                "properties": {key: _reference_target_schema(artifact=key == "fromArtifact")},
+                "required": [key],
+                "additionalProperties": False,
+            }
+        )
+    variants.extend(
+        cast(
+            list[JsonObject],
+            [
+                {"type": "null"},
+                {"type": "boolean"},
+                {"type": "integer"},
+                {"type": "number"},
+                {"type": "string"},
+                {"type": "array", "items": {"$ref": "#/$defs/TemplateValue"}},
+                {
+                    "type": "object",
+                    "propertyNames": {"not": {"enum": sorted(REFERENCE_KEYS)}},
+                    "additionalProperties": {"$ref": "#/$defs/TemplateValue"},
+                },
+            ],
+        )
+    )
+    return cast(JsonObject, {"TemplateValue": {"oneOf": variants}})
+
+
+def _expand_special_schemas(schema: JsonObject) -> JsonObject:
+    used_template = False
+
+    def visit(value: JsonValue) -> JsonValue:
+        nonlocal used_template
+        if isinstance(value, list):
+            return [visit(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        if value.get("title") == "__gitopsctr_template_object__":
+            used_template = True
+            return cast(
+                JsonObject,
+                {
+                    "type": "object",
+                    "propertyNames": {"not": {"enum": sorted(REFERENCE_KEYS)}},
+                    "additionalProperties": {"$ref": "#/$defs/TemplateValue"},
+                },
+            )
+        return {name: visit(item) for name, item in value.items()}
+
+    expanded = cast(JsonObject, visit(schema))
+    if used_template:
+        definitions = cast(JsonObject, expanded.setdefault("$defs", {}))
+        definitions.update(_template_definitions())
+    return expanded
 
 
 class StrictModel(DataClassDictMixin):
@@ -27,7 +137,7 @@ class StrictModel(DataClassDictMixin):
 
 @dataclass(frozen=True, kw_only=True)
 class SchemaDocument(StrictModel):
-    schema_hint: Any = field(default=None, metadata={"alias": "$schema"})
+    schema_hint: str | None = field(default=None, metadata={"alias": "$schema"})
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -41,7 +151,15 @@ class MashumaroContract[ModelT: StrictModel](TypedDocumentContract[ModelT]):
     schema_id: str
 
     def json_schema(self) -> JsonObject:
-        schema = cast(JsonObject, build_json_schema(self.model, with_dialect_uri=True).to_dict())
+        schema = cast(
+            JsonObject,
+            build_json_schema(
+                self.model,
+                with_dialect_uri=True,
+                plugins=(_ContractSchemaPlugin(),),
+            ).to_dict(),
+        )
+        schema = _expand_special_schemas(schema)
         schema["$id"] = self.schema_id
         return schema
 
@@ -82,8 +200,8 @@ class MashumaroContract[ModelT: StrictModel](TypedDocumentContract[ModelT]):
 
 
 @dataclass(frozen=True)
-class MashumaroUnionContract(DocumentContract):
-    models: tuple[type[StrictModel], ...]
+class MashumaroUnionContract[ModelT: StrictModel](TypedDocumentContract[ModelT]):
+    models: tuple[type[ModelT], ...]
     schema_id: str
     title: str
 
@@ -103,7 +221,7 @@ class MashumaroUnionContract(DocumentContract):
             },
         )
 
-    def validate(self, document: object) -> JsonObject:
+    def parse(self, document: object) -> ModelT:
         if not isinstance(document, dict) or not all(isinstance(key, str) for key in document):
             raise ContractError("expected a JSON object")
         candidate = dict(document)
@@ -113,6 +231,22 @@ class MashumaroUnionContract(DocumentContract):
             Draft202012Validator(self.json_schema()).validate(candidate)
         except ValidationError as exc:
             raise ContractError(exc.message) from exc
+        errors: list[Exception] = []
+        for model in self.models:
+            try:
+                return model.from_dict(candidate)
+            except (LookupError, TypeError, ValueError) as exc:
+                errors.append(exc)
+        raise ContractError(str(errors[-1]) if errors else "document does not match a union variant")
+
+    def dump(self, value: ModelT) -> JsonObject:
+        document = cast(JsonObject, value.to_dict())
+        if document.get("$schema") is None:
+            document.pop("$schema", None)
+        return document
+
+    def validate(self, document: object) -> JsonObject:
+        self.parse(document)
         return cast(JsonObject, document)
 
 
@@ -161,7 +295,14 @@ class MaterializationDocument(SchemaDocument):
     path: str
     mediaType: str
     digest: str
-    metadata: dict[str, Any]
+    metadata: JsonObjectValue
+
+
+@dataclass(frozen=True, kw_only=True)
+class ResolvedInputs(StrictModel):
+    promotions: dict[str, str] | None = None
+    receipts: dict[str, str] | None = None
+    artifacts: dict[str, str] | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -190,16 +331,6 @@ class DesiredSource(StrictModel):
 
 
 @dataclass(frozen=True, kw_only=True)
-class DesiredUnitDocument(SchemaDocument):
-    name: str
-    driver: str
-    source: DesiredSource
-    inputs: dict[str, Any] | None = None
-    resolvedInputs: dict[str, dict[str, str]] | None = None
-    materialization: MaterializationDocument | None = None
-
-
-@dataclass(frozen=True, kw_only=True)
 class AwsEcrCredentialProvider(StrictModel):
     type: Literal["aws-ecr"]
 
@@ -215,10 +346,10 @@ class ReceiptDocument(SchemaDocument):
     unit: str
     driver: str
     desired: ReceiptDesired
-    resolvedInputs: dict[str, dict[str, str]] | None = None
-    controller: dict[str, Any] | None = None
+    resolvedInputs: ResolvedInputs | None = None
+    controller: JsonObjectValue | None = None
     artifacts: dict[str, ArtifactDescriptor] | None = None
-    planEvidence: dict[str, Any] | None = None
+    planEvidence: JsonObjectValue | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -239,10 +370,6 @@ CORE_CONTRACTS: dict[str, DocumentContract] = {
     "materialization": MashumaroContract(
         MaterializationDocument,
         f"{SCHEMA_ROOT}/core/v1/materialization.schema.json",
-    ),
-    "desired-unit": MashumaroContract(
-        DesiredUnitDocument,
-        f"{SCHEMA_ROOT}/core/v1/desired-unit.schema.json",
     ),
     "receipt": MashumaroContract(ReceiptDocument, f"{SCHEMA_ROOT}/core/v1/receipt.schema.json"),
 }

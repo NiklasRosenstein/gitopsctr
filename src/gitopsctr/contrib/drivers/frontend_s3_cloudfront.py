@@ -8,15 +8,14 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 
 from gitopsctr.contracts import (
     AuthoredSource,
     AwsEcrCredentialProvider,
     DesiredSource,
     MashumaroContract,
-    MaterializationDocument,
-    SchemaDocument,
+    ResolvedInputs,
     StrictModel,
     schema_url,
 )
@@ -31,9 +30,13 @@ from gitopsctr.driver import (
     ReconciliationResult,
     UnitDriver,
     UnitExecutionContext,
+    UnitResolution,
+    UnitResolutionContext,
+    reference_fingerprints,
     unit_driver_api,
 )
 from gitopsctr.execution import CommandOutput
+from gitopsctr.templates import AuthoredValue
 
 from ._common import require_strings, select_result_fields
 from ._oci import (
@@ -86,12 +89,26 @@ class FrontendPull(StrictModel):
 
 
 @dataclass(frozen=True, kw_only=True)
+class AuthoredRuntimeAuth(StrictModel):
+    mode: AuthoredValue[str]
+    issuer: AuthoredValue[str]
+    clientId: AuthoredValue[str]
+
+
+@dataclass(frozen=True, kw_only=True)
+class AuthoredRuntimeConfiguration(StrictModel):
+    schema: AuthoredValue[int]
+    apiBase: AuthoredValue[str]
+    auth: AuthoredValue[AuthoredRuntimeAuth]
+
+
+@dataclass(frozen=True, kw_only=True)
 class FrontendAuthoredInputs(StrictModel):
-    bundle: Any = None
-    bucket: Any = None
-    distributionId: Any = None
-    url: Any = None
-    runtimeConfig: Any = None
+    bundle: AuthoredValue[str] | None = None
+    bucket: AuthoredValue[str] | None = None
+    distributionId: AuthoredValue[str] | None = None
+    url: AuthoredValue[str] | None = None
+    runtimeConfig: AuthoredValue[AuthoredRuntimeConfiguration] | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -118,23 +135,18 @@ class FrontendDesiredInputs(StrictModel):
 
 
 @dataclass(frozen=True, kw_only=True)
-class FrontendUnit(SchemaDocument):
-    name: str
-    driver: Literal["frontend-s3-cloudfront"]
+class FrontendUnit(StrictModel):
     source: AuthoredSource
     inputs: FrontendAuthoredInputs | None = None
     pull: FrontendPull | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
-class FrontendDesiredUnit(SchemaDocument):
-    name: str
-    driver: Literal["frontend-s3-cloudfront"]
+class FrontendDesiredUnit(StrictModel):
     source: DesiredSource
-    inputs: FrontendDesiredInputs | FrontendAuthoredInputs | None = None
+    inputs: FrontendDesiredInputs | None = None
     pull: FrontendPull | None = None
-    resolvedInputs: dict[str, dict[str, str]] | None = None
-    materialization: MaterializationDocument | None = None
+    resolvedInputs: ResolvedInputs | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -154,7 +166,7 @@ class FrontendResultModel(StrictModel):
 
 @dataclass(frozen=True)
 class FrontendRuntime:
-    inputs: FrontendInputs
+    inputs: FrontendDesiredInputs
     repository: str
     artifact_digest: str
     credential_provider: ResolvedCredentialProvider | None
@@ -193,7 +205,11 @@ def runtime_configuration(inputs: JsonObject) -> RuntimeConfiguration:
     return cast(RuntimeConfiguration, configuration)
 
 
-class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
+class FrontendS3CloudfrontDriver(
+    UnitDriver[FrontendUnit, FrontendDesiredUnit, FrontendDesiredUnit, FrontendResultModel],
+    PlanningCapability[FrontendDesiredUnit],
+    ReconciliationCapability[FrontendDesiredUnit, FrontendResultModel],
+):
     api_version = "unit.gitopsctr.io/v1"
     kind = "FrontendS3Cloudfront"
     driver_name = "frontend-s3-cloudfront"
@@ -202,6 +218,10 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
     unit_contract = MashumaroContract(
         FrontendUnit,
         schema_url("drivers/frontend-s3-cloudfront", version, "unit"),
+    )
+    resolved_unit_contract = MashumaroContract(
+        FrontendDesiredUnit,
+        schema_url("drivers/frontend-s3-cloudfront", version, "resolved-unit"),
     )
     desired_unit_contract = MashumaroContract(
         FrontendDesiredUnit,
@@ -216,22 +236,45 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
     def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject:
         return {"source": {"path": source_path}}
 
-    @staticmethod
-    def _runtime(context: UnitExecutionContext) -> FrontendRuntime:
-        require_strings(
-            context.inputs,
-            ("bundle", "bucket", "distributionId", "url"),
-            "frontend-s3-cloudfront inputs",
+    def resolve_unit(self, unit: FrontendUnit, context: UnitResolutionContext) -> UnitResolution[FrontendDesiredUnit]:
+        resolutions = []
+        inputs = None
+        if unit.inputs is not None:
+            input_resolution = context.resolve_template(unit.inputs.to_dict())
+            if not isinstance(input_resolution.value, dict):
+                raise DriverError("resolved frontend inputs must be an object")
+            try:
+                inputs = FrontendDesiredInputs.from_dict(input_resolution.value)
+            except (TypeError, ValueError) as exc:
+                raise DriverError(f"resolved frontend inputs are invalid: {exc}") from exc
+            resolutions.append(input_resolution)
+        fingerprints = reference_fingerprints(*resolutions)
+        return UnitResolution(
+            FrontendDesiredUnit(
+                source=context.source,
+                inputs=inputs,
+                pull=unit.pull,
+                resolvedInputs=fingerprints,
+            ),
+            fingerprints,
         )
-        configuration = runtime_configuration(context.inputs)
-        inputs = cast(FrontendInputs, context.inputs)
-        repository, artifact_digest = parse_oci_uri(inputs["bundle"])
-        publication = context.unit.get("pull", {})
-        if not isinstance(publication, dict):
-            raise DriverError("frontend-s3-cloudfront pull must be an object")
+
+    @staticmethod
+    def _runtime(context: UnitExecutionContext[FrontendDesiredUnit]) -> FrontendRuntime:
+        inputs = context.unit.inputs
+        if inputs is None:
+            raise DriverError("frontend-s3-cloudfront requires resolved inputs")
+        configuration = inputs.runtimeConfig
+        repository, artifact_digest = parse_oci_uri(inputs.bundle)
+        publication = context.unit.pull
         registry = repository_registry(repository)
-        credential_provider = resolve_credential_provider(publication.get("credentialProvider"), {registry})
-        runtime_bytes = json.dumps(configuration, indent=2, sort_keys=True).encode() + b"\n"
+        credential_provider = resolve_credential_provider(
+            publication.credentialProvider.to_dict()
+            if publication is not None and publication.credentialProvider is not None
+            else None,
+            {registry},
+        )
+        runtime_bytes = json.dumps(configuration.to_dict(), indent=2, sort_keys=True).encode() + b"\n"
         return FrontendRuntime(
             inputs=inputs,
             repository=repository,
@@ -241,10 +284,13 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
             runtime_digest=f"sha256:{hashlib.sha256(runtime_bytes).hexdigest()}",
         )
 
-    def plan(self, context: PlanningContext) -> None:
+    def plan(self, context: PlanningContext[FrontendDesiredUnit]) -> None:
         self._runtime(context)
 
-    def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
+    def reconcile(
+        self,
+        context: ReconciliationContext[FrontendDesiredUnit],
+    ) -> ReconciliationOutput[FrontendResultModel]:
         runtime = self._runtime(context)
         inputs = runtime.inputs
 
@@ -265,7 +311,7 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
                     *oras_registry_args(registry_config),
                     "--output",
                     str(pulled),
-                    inputs["bundle"],
+                    inputs.bundle,
                 )
             archive = pulled / FRONTEND_ARCHIVE
             if not archive.is_file():
@@ -277,7 +323,7 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
             if not index_path.is_file():
                 raise DriverError("frontend OCI artifact did not contain index.html")
             index_text = index_path.read_text()
-            context.execution.run("aws", "s3", "sync", str(distribution), f"s3://{inputs['bucket']}", "--delete")
+            context.execution.run("aws", "s3", "sync", str(distribution), f"s3://{inputs.bucket}", "--delete")
             # Deterministic bundles give index.html a fixed timestamp, while hashed assets can
             # change without changing its byte length. Always replace the entry point.
             context.execution.run(
@@ -285,7 +331,7 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
                 "s3",
                 "cp",
                 str(index_path),
-                f"s3://{inputs['bucket']}/index.html",
+                f"s3://{inputs.bucket}/index.html",
                 "--cache-control",
                 "no-cache",
                 "--content-type",
@@ -296,7 +342,7 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
                 "s3",
                 "cp",
                 str(runtime_path),
-                f"s3://{inputs['bucket']}/runtime-config.json",
+                f"s3://{inputs.bucket}/runtime-config.json",
                 "--cache-control",
                 "no-store",
                 "--content-type",
@@ -307,7 +353,7 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
             "cloudfront",
             "create-invalidation",
             "--distribution-id",
-            inputs["distributionId"],
+            inputs.distributionId,
             "--paths",
             "/*",
             "--query",
@@ -324,7 +370,7 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
             "wait",
             "invalidation-completed",
             "--distribution-id",
-            inputs["distributionId"],
+            inputs.distributionId,
             "--id",
             invalidation,
         )
@@ -341,26 +387,26 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
         )
         served_index = context.execution.run(
             *curl_args,
-            inputs["url"],
+            inputs.url,
             output=CommandOutput.CAPTURE,
         ).stdout
         if served_index != index_text:
             raise DriverError("CloudFront did not serve the frontend index from this deployment")
         context.execution.run(
             *curl_args,
-            f"{inputs['url']}/runtime-config.json",
+            f"{inputs.url}/runtime-config.json",
         )
         return ReconciliationOutput(
-            result={
-                "published": {
-                    "sourceRevision": context.source_revision,
-                    "path": context.source_path,
-                    "bundle": inputs["bundle"],
-                    "artifactDigest": runtime.artifact_digest,
-                    "runtimeConfigHash": runtime.runtime_digest,
-                    "url": inputs["url"],
-                }
-            }
+            result=FrontendResultModel(
+                published=PublishedFrontendModel(
+                    sourceRevision=context.source_revision,
+                    path=context.source_path,
+                    bundle=inputs.bundle,
+                    artifactDigest=runtime.artifact_digest,
+                    runtimeConfigHash=runtime.runtime_digest,
+                    url=inputs.url,
+                )
+            )
         )
 
     def semantic_result(self, result: object) -> ReconciliationResult:

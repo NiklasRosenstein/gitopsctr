@@ -35,11 +35,12 @@ def test_kubernetes_controller_preserves_terminal_color_when_capturing(monkeypat
 def test_demo_repository_exercises_observation_driven_convergence():
     specifications = cli.load_environment_specifications(demo.TEMPLATE, "dev")
 
-    targets, scope = cli.convergence_scope(specifications, ["demo-service"])
+    selection = cli.convergence_scope(specifications, ["demo-service"])
+    targets, scope = selection.targets, selection.scope
 
-    assert targets == ["demo-service"]
-    assert scope == ["demo-image", "demo-service"]
-    assert cli.convergence_order(specifications, scope) == ["demo-image", "demo-service"]
+    assert targets == ("demo-service",)
+    assert scope == ("demo-image", "demo-service")
+    assert cli.convergence_order(specifications, scope) == ("demo-image", "demo-service")
 
 
 def test_demo_runner_materializes_local_runtime_configuration(tmp_path, monkeypatch):
@@ -106,17 +107,17 @@ def test_kubernetes_demo_is_a_real_image_and_helm_delivery(tmp_path, monkeypatch
     specifications = cli.load_environment_specifications(worktree, "dev")
     specification = specifications["web"]
 
-    assert cli.convergence_order(specifications, ["demo-image", "web"]) == ["demo-image", "web"]
-    assert specification["source"]["inputs"] == ["**/*"]
-    assert specification["materialize"]["type"] == "helm"
-    assert specification["materialize"]["values"]["image"]["fromArtifact"] == {
+    assert cli.convergence_order(specifications, ["demo-image", "web"]) == ("demo-image", "web")
+    assert specification.spec.source.inputs == ["**/*"]
+    assert specification.spec.materialize.type == "helm"
+    assert specification.spec.materialize.values._serialize()["image"]["fromArtifact"] == {
         "unit": "demo-image",
         "name": "containers",
         "apiVersion": "artifact.gitopsctr.io/v1",
         "kind": "ContainerImages",
         "pointer": "/images/application/uri",
     }
-    assert specification["delivery"] == {
+    assert specification.driver.unit_contract.dump(specification.spec)["delivery"] == {
         "mode": "direct",
         "kubeContext": kubernetes_demo.kube_context(provider),
         "prune": False,
@@ -129,11 +130,9 @@ def test_kubernetes_demo_is_a_real_image_and_helm_delivery(tmp_path, monkeypatch
             }
         ],
     }
-    image_target = specifications["demo-image"]["publish"]["targets"]["application"]
-    assert image_target == {
-        "type": provider,
-        "cluster" if provider == "kind" else "profile": kubernetes_demo.CLUSTER_NAME,
-    }
+    image_target = specifications["demo-image"].spec.publish.targets["application"]
+    assert image_target.type == provider
+    assert getattr(image_target, "cluster" if provider == "kind" else "profile") == kubernetes_demo.CLUSTER_NAME
 
 
 def test_kubernetes_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):

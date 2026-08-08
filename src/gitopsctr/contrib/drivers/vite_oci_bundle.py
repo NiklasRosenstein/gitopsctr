@@ -9,7 +9,6 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
 
 from gitopsctr.artifacts import (
     ARTIFACT_API_VERSION,
@@ -25,12 +24,11 @@ from gitopsctr.contracts import (
     DesiredSource,
     EmptyResultModel,
     MashumaroContract,
-    MaterializationDocument,
-    SchemaDocument,
+    ResolvedInputs,
     StrictModel,
     schema_url,
 )
-from gitopsctr.document import JsonObject
+from gitopsctr.document import JsonObject, JsonObjectValue
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -41,6 +39,8 @@ from gitopsctr.driver import (
     ReconciliationResult,
     UnitDriver,
     UnitExecutionContext,
+    UnitResolution,
+    UnitResolutionContext,
     unit_driver_api,
 )
 from gitopsctr.execution import CommandOutput, DriverExecution
@@ -73,24 +73,19 @@ class VitePublication(StrictModel):
 
 
 @dataclass(frozen=True, kw_only=True)
-class ViteOciBundleUnit(SchemaDocument):
-    name: str
-    driver: Literal["vite-oci-bundle"]
+class ViteOciBundleUnit(StrictModel):
     source: AuthoredSource
     build: ViteBuild | None = None
     publish: VitePublication | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
-class ViteOciBundleDesiredUnit(SchemaDocument):
-    name: str
-    driver: Literal["vite-oci-bundle"]
+class ViteOciBundleDesiredUnit(StrictModel):
     source: DesiredSource
     build: ViteBuild | None = None
     publish: VitePublication | None = None
-    inputs: dict[str, Any] | None = None
-    resolvedInputs: dict[str, dict[str, str]] | None = None
-    materialization: MaterializationDocument | None = None
+    inputs: JsonObjectValue | None = None
+    resolvedInputs: ResolvedInputs | None = None
 
 
 @dataclass(frozen=True)
@@ -138,13 +133,21 @@ def deterministic_archive(source: Path, destination: Path) -> None:
                         raise DriverError(f"frontend bundle contains an unsupported file: {path}")
 
 
-class ViteOciBundleDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
+class ViteOciBundleDriver(
+    UnitDriver[ViteOciBundleUnit, ViteOciBundleDesiredUnit, ViteOciBundleDesiredUnit, EmptyResultModel],
+    PlanningCapability[ViteOciBundleDesiredUnit],
+    ReconciliationCapability[ViteOciBundleDesiredUnit, EmptyResultModel],
+):
     api_version = "unit.gitopsctr.io/v1"
     kind = "ViteOciBundle"
     driver_name = "vite-oci-bundle"
     version = 1
     schema_base_uri = schema_url("drivers/vite-oci-bundle", version, "").removesuffix(".schema.json")
     unit_contract = MashumaroContract(ViteOciBundleUnit, schema_url("drivers/vite-oci-bundle", version, "unit"))
+    resolved_unit_contract = MashumaroContract(
+        ViteOciBundleDesiredUnit,
+        schema_url("drivers/vite-oci-bundle", version, "resolved-unit"),
+    )
     desired_unit_contract = MashumaroContract(
         ViteOciBundleDesiredUnit,
         schema_url("drivers/vite-oci-bundle", version, "desired-unit"),
@@ -155,22 +158,35 @@ class ViteOciBundleDriver(UnitDriver, PlanningCapability, ReconciliationCapabili
     def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject:
         return {"source": {"path": source_path}}
 
+    def resolve_unit(
+        self,
+        unit: ViteOciBundleUnit,
+        context: UnitResolutionContext,
+    ) -> UnitResolution[ViteOciBundleDesiredUnit]:
+        return UnitResolution(
+            ViteOciBundleDesiredUnit(
+                source=context.source,
+                build=unit.build,
+                publish=unit.publish,
+            )
+        )
+
     @staticmethod
-    def _runtime(context: UnitExecutionContext) -> ViteRuntime:
+    def _runtime(context: UnitExecutionContext[ViteOciBundleDesiredUnit]) -> ViteRuntime:
         specification = context.unit
-        build = specification.get("build")
-        publication = specification.get("publish")
-        if not isinstance(build, dict) or not isinstance(publication, dict):
+        build = specification.build
+        publication = specification.publish
+        if build is None or publication is None:
             raise DriverError("vite-oci-bundle requires build and publish objects")
-        if build != {"nodeVersion": "24"}:
+        if build.nodeVersion != "24":
             raise DriverError("vite-oci-bundle requires nodeVersion 24")
-        repository = publication.get("repository")
-        if not isinstance(repository, str):
-            raise DriverError("vite-oci-bundle requires a repository")
+        repository = publication.repository
         registry = repository_registry(repository)
-        credential_provider = resolve_credential_provider(publication.get("credentialProvider"), {registry})
-        source = specification.get("source")
-        input_hash = source.get("inputHash") if isinstance(source, dict) else None
+        credential_provider = resolve_credential_provider(
+            publication.credentialProvider.to_dict() if publication.credentialProvider is not None else None,
+            {registry},
+        )
+        input_hash = specification.source.inputHash
         if not isinstance(input_hash, str) or not OCI_DIGEST_RE.fullmatch(input_hash):
             raise DriverError("vite-oci-bundle requires a resolved source inputHash")
         producer = artifact_producer_identity(
@@ -193,18 +209,25 @@ class ViteOciBundleDriver(UnitDriver, PlanningCapability, ReconciliationCapabili
         )
 
     @staticmethod
-    def _build_archive(context: UnitExecutionContext, runtime: ViteRuntime, archive: Path) -> None:
+    def _build_archive(
+        context: UnitExecutionContext[ViteOciBundleDesiredUnit],
+        runtime: ViteRuntime,
+        archive: Path,
+    ) -> None:
         require_node_24(context.execution)
         context.execution.run("npm", "ci", cwd=runtime.frontend_root, env=runtime.build_environment)
         context.execution.run("npm", "run", "build", cwd=runtime.frontend_root, env=runtime.build_environment)
         deterministic_archive(runtime.frontend_root / "dist", archive)
 
-    def plan(self, context: PlanningContext) -> None:
+    def plan(self, context: PlanningContext[ViteOciBundleDesiredUnit]) -> None:
         runtime = self._runtime(context)
         with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-") as directory:
             self._build_archive(context, runtime, Path(directory) / FRONTEND_ARCHIVE)
 
-    def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
+    def reconcile(
+        self,
+        context: ReconciliationContext[ViteOciBundleDesiredUnit],
+    ) -> ReconciliationOutput[EmptyResultModel]:
         runtime = self._runtime(context)
 
         with oras_authentication(context.execution, runtime.credential_provider, {runtime.registry}) as registry_config:
@@ -241,7 +264,10 @@ class ViteOciBundleDriver(UnitDriver, PlanningCapability, ReconciliationCapabili
                 uri=f"{runtime.repository}@{digest}",
             ),
         )
-        return ReconciliationOutput(artifacts={"frontend": FRONTEND_BUNDLE.spec.dump(resource)})
+        return ReconciliationOutput(
+            result=EmptyResultModel(),
+            artifacts={"frontend": FRONTEND_BUNDLE.spec.dump(resource)},
+        )
 
     def semantic_result(self, result: object) -> ReconciliationResult:
         if result == {}:

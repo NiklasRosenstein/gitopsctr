@@ -14,6 +14,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -134,17 +135,17 @@ def convert_environment(tree: Path, environment_name: str) -> None:
     write_yaml(root / "environment.yaml", cli.serialize_environment_document(environment))
     units = root / "units"
     for path in sorted(path for path in units.glob("*") if path.suffix in {".json", ".yaml", ".yml"}):
-        unit = cli.normalize_unit_document(load_document(path), path.stem)
+        unit = cli.parse_authored_unit_document(load_document(path), path.stem)
         write_yaml(units / f"{path.stem}.yaml", cli.serialize_unit_document(unit, profile="authored"))
 
 
 def convert_desired(tree: Path, source_revision: str) -> None:
     units = tree / "units"
     for path in sorted(path for path in units.glob("*") if path.suffix in {".json", ".yaml", ".yml"}):
-        unit = cli.normalize_unit_document(load_document(path), path.stem)
-        source = unit.get("source")
-        if isinstance(source, dict) and isinstance(source.get("revision"), str):
-            unit = {**unit, "source": {**source, "revision": source_revision}}
+        unit = cli.parse_desired_unit_document(load_document(path), path.stem)
+        source = getattr(unit.spec, "source", None)
+        if source is not None and isinstance(source.revision, str):
+            unit = unit.with_spec(replace(unit.spec, source=replace(source, revision=source_revision)))
         write_yaml(units / f"{path.stem}.yaml", cli.serialize_unit_document(unit, profile="desired"))
     promotion_paths = document_candidates(tree, "promotion")
     if promotion_paths:

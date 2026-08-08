@@ -63,11 +63,8 @@ def unit(
     renderer: dict | None = None,
     delivery: dict | None = None,
     inventory: list[dict[str, str]] | None = None,
-) -> dict:
-    return {
-        "schema": 1,
-        "name": "web",
-        "driver": "kubernetes-manifests",
+) -> kubernetes.KubernetesDesiredUnit:
+    return kubernetes.KubernetesDesiredUnit.from_dict({
         "source": {"path": "charts/web", "revision": REVISION},
         "materialize": renderer or {"type": "plain", "paths": ["*.yaml"]},
         "delivery": delivery or {"mode": "external"},
@@ -88,10 +85,12 @@ def unit(
                 ],
             },
         },
-    }
+    })
 
 
-def materialization_context(tmp_path: Path, desired_unit: dict, runner=None) -> MaterializationContext:
+def materialization_context(
+    tmp_path: Path, desired_unit: kubernetes.KubernetesDesiredUnit, runner=None
+) -> MaterializationContext:
     output = tmp_path / "output"
     output.mkdir()
     context = MaterializationContext(
@@ -99,7 +98,8 @@ def materialization_context(tmp_path: Path, desired_unit: dict, runner=None) -> 
         source_root=tmp_path / "source",
         source_revision=REVISION,
         source_path="charts/web",
-        unit=desired_unit,
+        unit_name="web",
+        unit=kubernetes.DRIVER.resolved_from_desired(desired_unit),
         output_root=output,
     )
     return replace(context, execution=execution_for(runner)) if runner is not None else context
@@ -107,7 +107,7 @@ def materialization_context(tmp_path: Path, desired_unit: dict, runner=None) -> 
 
 def reconciliation_context(
     tmp_path: Path,
-    desired_unit: dict,
+    desired_unit: kubernetes.KubernetesDesiredUnit,
     previous_receipt: dict | None = None,
     runner=None,
 ) -> ReconciliationContext:
@@ -121,14 +121,14 @@ def reconciliation_context(
         source_root=tmp_path / "source",
         source_revision=REVISION,
         source_path="charts/web",
+        unit_name="web",
         unit=desired_unit,
-        inputs={},
         previous_receipt=previous_receipt,
     )
     return replace(context, execution=execution_for(runner)) if runner is not None else context
 
 
-def planning_context(tmp_path: Path, desired_unit: dict, runner=None) -> PlanningContext:
+def planning_context(tmp_path: Path, desired_unit: kubernetes.KubernetesDesiredUnit, runner=None) -> PlanningContext:
     reconcile = reconciliation_context(tmp_path, desired_unit, runner=runner)
     return PlanningContext(
         environment=reconcile.environment,
@@ -137,13 +137,15 @@ def planning_context(tmp_path: Path, desired_unit: dict, runner=None) -> Plannin
         source_root=reconcile.source_root,
         source_revision=reconcile.source_revision,
         source_path=reconcile.source_path,
+        unit_name="web",
         unit=reconcile.unit,
-        inputs=reconcile.inputs,
         execution=reconcile.execution,
     )
 
 
-def verification_context(tmp_path: Path, desired_unit: dict, runner=None) -> VerificationContext:
+def verification_context(
+    tmp_path: Path, desired_unit: kubernetes.KubernetesDesiredUnit, runner=None
+) -> VerificationContext:
     reconcile = reconciliation_context(tmp_path, desired_unit, runner=runner)
     return VerificationContext(
         environment=reconcile.environment,
@@ -152,8 +154,8 @@ def verification_context(tmp_path: Path, desired_unit: dict, runner=None) -> Ver
         source_root=reconcile.source_root,
         source_revision=reconcile.source_revision,
         source_path=reconcile.source_path,
+        unit_name="web",
         unit=reconcile.unit,
-        inputs={},
         execution=reconcile.execution,
     )
 
@@ -266,7 +268,8 @@ def test_direct_delivery_applies_waits_then_prunes_previous_inventory(tmp_path, 
 
     result = kubernetes.DRIVER.reconcile(reconciliation_context(tmp_path, desired_unit, previous, runner))
 
-    assert result.result["applied"]["manifestDigest"] == DIGEST
+    assert isinstance(result.result, kubernetes.KubernetesResultModel)
+    assert result.result.applied.manifestDigest == DIGEST
     assert [call[0][3] for call in calls] == ["apply", "--namespace", "delete"]
     assert calls[0][0] == (
         "kubectl",
@@ -351,14 +354,13 @@ def test_argo_observation_supports_both_read_only_transports(access, tmp_path, m
 
     result = kubernetes.DRIVER.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
 
-    assert result.result == {
-        "observed": {
-            "application": "web",
-            "desiredRevision": REVISION,
-            "syncStatus": "Synced",
-            "healthStatus": "Healthy",
-        }
-    }
+    assert isinstance(result.result, kubernetes.ArgoResultModel)
+    assert result.result.observed == kubernetes.ObservedApplicationModel(
+        application="web",
+        desiredRevision=REVISION,
+        syncStatus="Synced",
+        healthStatus="Healthy",
+    )
     command = calls[0][0]
     assert command[0] == ("argocd" if access == "api" else "kubectl")
     assert "sync" not in command

@@ -9,11 +9,26 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import cli as deploy_release
+from gitopsctr.contracts import DesiredSource, ResolvedInputs
+from gitopsctr.contrib.drivers.frontend_s3_cloudfront import FrontendDesiredUnit
+from gitopsctr.driver import UnitResolution
 from tests.conftest import write_test_document
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
     write_test_document(path, value)
+
+
+def _terraform_desired_resource(name: str = "aws-application"):
+    return deploy_release.RESOURCE_CATALOG.parse_unit(
+        {
+            "name": name,
+            "driver": "terraform",
+            "source": {"path": ".", "revision": "a" * 40},
+        },
+        profile="desired",
+        expected_name=name,
+    )
 
 
 def test_desired_resolution_logs_unit_and_observation_decision(tmp_path, monkeypatch, capsys):
@@ -34,7 +49,7 @@ def test_desired_resolution_logs_unit_and_observation_decision(tmp_path, monkeyp
     _write_json(source / "deployment/environments/dev/units/frontend.json", unit)
     _write_json(
         current / "units/frontend.json",
-        {**unit, "resolvedInputs": {"observed": {"units/aws-application.json": "old"}}},
+        {**unit, "resolvedInputs": {"receipts": {"units/aws-application.json": "old"}}},
     )
     observed.mkdir()
 
@@ -42,22 +57,23 @@ def test_desired_resolution_logs_unit_and_observation_decision(tmp_path, monkeyp
         deploy_release,
         "resolved_unit_source",
         lambda *_args: (
-            {
-                "path": "scripts/deployment_drivers.py",
-                "revision": "a" * 40,
-                "inputHash": "sha256:value",
-            },
+            DesiredSource(
+                path="scripts/deployment_drivers.py",
+                revision="a" * 40,
+                inputHash="sha256:value",
+            ),
             False,
         ),
     )
     monkeypatch.setattr(
-        deploy_release,
-        "resolve_template",
-        lambda value, *_args: deploy_release.TemplateResolution(
-            value=value,
-            promotions={},
-            receipts={"aws-application": "new"},
-            artifacts={},
+        deploy_release.UNIT_DRIVERS["frontend-s3-cloudfront"],
+        "resolve_unit",
+        lambda _unit, context: UnitResolution(
+            FrontendDesiredUnit(
+                source=context.source,
+                resolvedInputs=ResolvedInputs(receipts={"aws-application": "new"}),
+            ),
+            ResolvedInputs(receipts={"aws-application": "new"}),
         ),
     )
 
@@ -101,7 +117,7 @@ def test_desired_candidate_drops_legacy_artifact_catalogue(tmp_path, monkeypatch
         deploy_release,
         "resolved_unit_source",
         lambda *_args: (
-            {"path": ".", "revision": "a" * 40, "inputHash": "sha256:value"},
+            DesiredSource(path=".", revision="a" * 40, inputHash="sha256:value"),
             False,
         ),
     )
@@ -121,7 +137,7 @@ def test_show_receipt_reports_receipt_and_artifacts(monkeypatch, capsys):
                 "unit": "aws-application",
                 "driver": "terraform",
                 "desired": {"revision": "b" * 40, "unitBlob": "blob"},
-                "resolvedInputs": {"observed": {}},
+                "resolvedInputs": {},
                 "controller": {"observed_at": "2026-08-07T00:00:00Z"},
                 "applied": {"sourceRevision": "c" * 40},
                 "outputs": {"api_url": "https://api.example"},
@@ -142,7 +158,7 @@ def test_show_receipt_reports_receipt_and_artifacts(monkeypatch, capsys):
         "unit": "aws-application",
         "driver": "terraform",
         "desired": {"revision": "b" * 40, "unitBlob": "blob"},
-        "resolvedInputs": {"observed": {}},
+        "resolvedInputs": {},
         "controller": {"observed_at": "2026-08-07T00:00:00Z"},
         "applied": {"sourceRevision": "c" * 40},
         "outputs": {"api_url": "https://api.example"},
@@ -199,11 +215,11 @@ def test_blocked_driver_transition_omits_previous_unit_and_reports_wait(tmp_path
         deploy_release,
         "resolved_unit_source",
         lambda *_args: (
-            {
-                "path": "scripts/deployment_drivers.py",
-                "revision": "b" * 40,
-                "inputHash": "sha256:value",
-            },
+            DesiredSource(
+                path="scripts/deployment_drivers.py",
+                revision="b" * 40,
+                inputHash="sha256:value",
+            ),
             True,
         ),
     )
@@ -247,17 +263,29 @@ def test_blocked_unit_with_same_driver_retains_previous_desired_state(tmp_path, 
     )
     _write_json(source / "deployment/environments/dev/units/frontend.json", specification)
     previous = current / "units/frontend.json"
-    _write_json(previous, {**specification, "source": {"path": "frontend"}})
+    _write_json(
+        previous,
+        {
+            "name": "frontend",
+            "driver": "frontend-s3-cloudfront",
+            "source": {
+                "path": "frontend",
+                "revision": "a" * 40,
+                "inputHash": "sha256:previous",
+                "driverVersion": 2,
+            },
+        },
+    )
     observed.mkdir()
     monkeypatch.setattr(
         deploy_release,
         "resolved_unit_source",
         lambda *_args: (
-            {
-                "path": "scripts/deployment_drivers.py",
-                "revision": "b" * 40,
-                "inputHash": "sha256:value",
-            },
+            DesiredSource(
+                path="scripts/deployment_drivers.py",
+                revision="b" * 40,
+                inputHash="sha256:value",
+            ),
             True,
         ),
     )
@@ -281,7 +309,9 @@ def test_removing_producer_environment_preserves_existing_input_hash(tmp_path):
         "publish": {"targets": {"control": {"type": "registry", "repository": "registry.example.com/control"}}},
     }
     legacy_specification = {**specification, "environment": "dev"}
-    legacy_hash = deploy_release.unit_input_hash(legacy_specification, source)
+    legacy_resource = deploy_release.parse_authored_unit_document(legacy_specification, "application-images")
+    specification_resource = deploy_release.parse_authored_unit_document(specification, "application-images")
+    legacy_hash = deploy_release.unit_input_hash(legacy_resource, source)
     _write_json(
         current / "units/application-images.json",
         {
@@ -294,10 +324,10 @@ def test_removing_producer_environment_preserves_existing_input_hash(tmp_path):
         },
     )
 
-    resolved, changed = deploy_release.resolved_unit_source(specification, source, "b" * 40, current, None)
+    resolved, changed = deploy_release.resolved_unit_source(specification_resource, source, "b" * 40, current, None)
 
-    assert resolved["inputHash"] == legacy_hash
-    assert resolved["revision"] == "a" * 40
+    assert resolved.inputHash == legacy_hash
+    assert resolved.revision == "a" * 40
     assert changed is False
 
 
@@ -367,7 +397,12 @@ def test_promotion_reference_materializes_from_source_desired_unit(tmp_path):
     source_unit = promotion / "units/aws-application.json"
     _write_json(
         source_unit,
-        {"terraform": {"variables": {"control_image_uri": "registry.example/control@sha256:" + "1" * 64}}},
+        {
+            "name": "aws-application",
+            "driver": "terraform",
+            "source": {"path": ".", "revision": "a" * 40},
+            "terraform": {"variables": {"control_image_uri": "registry.example/control@sha256:" + "1" * 64}},
+        },
     )
 
     resolution = deploy_release.resolve_template(
@@ -428,7 +463,12 @@ def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path
     promoted_unit = promoted / "units/aws-application.json"
     _write_json(
         promoted_unit,
-        {"terraform": {"variables": {"control_image_uri": "registry.example/control@sha256:" + "1" * 64}}},
+        {
+            "name": "aws-application",
+            "driver": "terraform",
+            "source": {"path": "infra/deploy", "revision": "a" * 40},
+            "terraform": {"variables": {"control_image_uri": "registry.example/control@sha256:" + "1" * 64}},
+        },
     )
     current.mkdir()
     observed.mkdir()
@@ -436,11 +476,7 @@ def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path
         deploy_release,
         "resolved_unit_source",
         lambda *_args: (
-            {
-                "path": "infra/deploy",
-                "revision": "a" * 40,
-                "inputHash": "sha256:value",
-            },
+            DesiredSource(path="infra/deploy", revision="a" * 40, inputHash="sha256:value"),
             True,
         ),
     )
@@ -471,9 +507,9 @@ def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path
         "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/"
         "unit.gitopsctr.io/v1/Terraform/desired.schema.json\n"
     )
-    unit = deploy_release.load_unit(unit_path, "aws-application")
-    assert unit["terraform"]["variables"]["control_image_uri"].endswith("1" * 64)
-    assert unit["resolvedInputs"]["promotions"] == {"aws-application": deploy_release.file_blob(promoted_unit)}
+    unit = deploy_release.load_desired_unit(unit_path, "aws-application")
+    assert unit.spec.terraform.variables["control_image_uri"].endswith("1" * 64)
+    assert unit.spec.resolvedInputs.promotions == {"aws-application": deploy_release.file_blob(promoted_unit)}
     promotion_path = deploy_release.document_candidates(candidate, "promotion")[0]
     assert promotion_path.read_text().startswith(
         "# yaml-language-server: $schema="
@@ -853,9 +889,12 @@ def test_desired_unit_rejects_an_incompatible_running_driver_version():
             "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"] + 1,
         },
     }
+    resource = deploy_release.RESOURCE_CATALOG.parse_unit(
+        unit, profile="desired", expected_name="aws-application"
+    )
 
     with pytest.raises(deploy_release.OperationError, match="driver version"):
-        deploy_release.require_unit(unit, "aws-application")
+        deploy_release.require_unit(resource, "aws-application")
 
 
 def test_duplicate_receipt_reuses_identical_semantic_result_without_writing(tmp_path, monkeypatch):
@@ -890,7 +929,7 @@ def test_duplicate_receipt_reuses_identical_semantic_result_without_writing(tmp_
             "observed/dev",
             "aws-application",
             candidate,
-            {"name": "aws-application", "driver": "terraform"},
+            _terraform_desired_resource(),
             {},
             "c" * 40,
         )
@@ -923,7 +962,7 @@ def test_duplicate_receipt_rejects_a_different_semantic_result(tmp_path, monkeyp
             "observed/dev",
             "aws-application",
             candidate,
-            {"name": "aws-application", "driver": "terraform"},
+            _terraform_desired_resource(),
             {},
             "c" * 40,
         )
@@ -961,7 +1000,13 @@ def test_unit_change_explanation_classifies_causal_changes(monkeypatch):
         ),
     )
 
-    explanation = deploy_release.classify_unit_change(previous, current, "c" * 40)
+    previous_resource = deploy_release.RESOURCE_CATALOG.parse_unit(
+        {"name": "aws-application", **previous}, profile="desired", expected_name="aws-application"
+    )
+    current_resource = deploy_release.RESOURCE_CATALOG.parse_unit(
+        {"name": "aws-application", **current}, profile="desired", expected_name="aws-application"
+    )
+    explanation = deploy_release.classify_unit_change(previous_resource, current_resource, "c" * 40)
 
     assert explanation.causes == (
         "reconciliation driver changed",
@@ -1030,7 +1075,14 @@ def test_convergence_plan_distinguishes_next_later_wait_and_clean():
 def test_compact_approval_card_shows_driver_change_evidence_and_write_boundary(tmp_path, monkeypatch, capsys):
     desired = tmp_path / "desired"
     observed = tmp_path / "observed"
-    _write_json(desired / "units/aws-application.json", {"driver": "terraform"})
+    _write_json(
+        desired / "units/aws-application.json",
+        {
+            "name": "aws-application",
+            "driver": "terraform",
+            "source": {"path": "infra/deploy", "revision": "a" * 40},
+        },
+    )
     explanation = deploy_release.UnitChangeExplanation(
         previous_desired_revision="a" * 40,
         previous_source_revision="b" * 40,
@@ -1204,10 +1256,14 @@ def _unit(name: str, inputs: dict | None = None) -> dict:
     }
 
 
+def _unit_resource(name: str, inputs: dict | None = None):
+    return deploy_release.parse_authored_unit_document(_unit(name, inputs), name)
+
+
 def test_convergence_scope_includes_only_transitive_observation_dependencies():
     specifications = {
-        "application-images": _unit("application-images"),
-        "aws-application": _unit(
+        "application-images": _unit_resource("application-images"),
+        "aws-application": _unit_resource(
             "aws-application",
             {
                 "image": {
@@ -1215,8 +1271,8 @@ def test_convergence_scope_includes_only_transitive_observation_dependencies():
                 }
             },
         ),
-        "frontend-bundle": _unit("frontend-bundle"),
-        "frontend": _unit(
+        "frontend-bundle": _unit_resource("frontend-bundle"),
+        "frontend": _unit_resource(
             "frontend",
             {
                 "bundle": {
@@ -1227,28 +1283,29 @@ def test_convergence_scope_includes_only_transitive_observation_dependencies():
                 },
             },
         ),
-        "unrelated": _unit("unrelated"),
+        "unrelated": _unit_resource("unrelated"),
     }
 
-    targets, scope = deploy_release.convergence_scope(specifications, ["frontend"])
+    selection = deploy_release.convergence_scope(specifications, ["frontend"])
+    targets, scope = selection.targets, selection.scope
 
-    assert targets == ["frontend"]
-    assert scope == [
+    assert targets == ("frontend",)
+    assert scope == (
         "application-images",
         "aws-application",
         "frontend",
         "frontend-bundle",
-    ]
+    )
     assert deploy_release.convergence_order(specifications, scope).index(
         "application-images"
     ) < deploy_release.convergence_order(specifications, scope).index("aws-application")
-    graph = deploy_release.observation_dependency_graph(specifications, scope)
-    assert deploy_release.render_dependency_tree("frontend", graph) == [
+    graph = deploy_release.dependency_graph(specifications, scope)
+    assert graph.render_tree("frontend") == (
         "frontend",
         "├── aws-application",
         "│   └── application-images",
         "└── frontend-bundle",
-    ]
+    )
 
 
 def test_dependencies_parser_defaults_to_head_and_accepts_repeated_units():
@@ -1284,7 +1341,7 @@ def test_dependencies_parser_defaults_to_head_and_accepts_repeated_units():
         )
 
     with pytest.raises(deploy_release.OperationError, match="--depth"):
-        deploy_release.convergence_scope({"frontend": _unit("frontend")}, ["frontend"], max_depth=-1)
+        deploy_release.convergence_scope({"frontend": _unit_resource("frontend")}, ["frontend"], max_depth=-1)
 
 
 def test_dependencies_command_prints_the_resolved_tree(monkeypatch, capsys):

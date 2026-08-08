@@ -1,34 +1,64 @@
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from gitopsctr import cli
-from gitopsctr.document import DocumentContract, JsonObject
-from gitopsctr.driver import MaterializationCapability, MaterializationContext, MaterializationResult, UnitDriver
+from gitopsctr.contracts import (
+    AuthoredSource,
+    DesiredSource,
+    EmptyResultModel,
+    MashumaroContract,
+    MaterializationDocument,
+    ResolvedInputs,
+    StrictModel,
+)
+from gitopsctr.driver import (
+    MaterializationCapability,
+    MaterializationContext,
+    MaterializationResult,
+    UnitDriver,
+    UnitResolution,
+    UnitResolutionContext,
+)
 from tests.conftest import write_test_document
 
 
-class RenderOnlyContract(DocumentContract):
-    def validate(self, document: object) -> JsonObject:
-        assert isinstance(document, dict)
-        return document
-
-    def json_schema(self) -> JsonObject:
-        return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object"}
+@dataclass(frozen=True, kw_only=True)
+class RenderOnlyUnit(StrictModel):
+    source: AuthoredSource
 
 
-class RenderOnlyPlugin(UnitDriver, MaterializationCapability):
+@dataclass(frozen=True, kw_only=True)
+class RenderOnlyResolvedUnit(StrictModel):
+    source: DesiredSource
+    resolvedInputs: ResolvedInputs | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class RenderOnlyDesiredUnit(RenderOnlyResolvedUnit):
+    materialization: MaterializationDocument
+
+
+class RenderOnlyPlugin(
+    UnitDriver[RenderOnlyUnit, RenderOnlyResolvedUnit, RenderOnlyDesiredUnit, EmptyResultModel],
+    MaterializationCapability[RenderOnlyResolvedUnit, RenderOnlyDesiredUnit],
+):
     driver_name = "render-only"
     kind = "RenderOnly"
     version = 1
-    unit_contract = RenderOnlyContract()
-    desired_unit_contract = RenderOnlyContract()
-    result_contract = RenderOnlyContract()
+    unit_contract = MashumaroContract(RenderOnlyUnit, "urn:gitopsctr:test:render-only:authored")
+    resolved_unit_contract = MashumaroContract(RenderOnlyResolvedUnit, "urn:gitopsctr:test:render-only:resolved")
+    desired_unit_contract = MashumaroContract(RenderOnlyDesiredUnit, "urn:gitopsctr:test:render-only:desired")
+    result_contract = MashumaroContract(EmptyResultModel, "urn:gitopsctr:test:render-only:result")
 
     def __init__(self) -> None:
         self.calls = 0
 
-    def materialize(self, context: MaterializationContext) -> MaterializationResult:
+    def resolve_unit(self, unit: RenderOnlyUnit, context: UnitResolutionContext) -> UnitResolution[RenderOnlyResolvedUnit]:
+        return UnitResolution(RenderOnlyResolvedUnit(source=context.source))
+
+    def materialize(self, context: MaterializationContext[RenderOnlyResolvedUnit]) -> MaterializationResult:
         self.calls += 1
         output = context.output_root / "rendered.yaml"
         output.write_text(f"environment: {context.environment}\nrevision: {context.source_revision}\n")
@@ -36,6 +66,18 @@ class RenderOnlyPlugin(UnitDriver, MaterializationCapability):
             media_type="application/yaml",
             metadata={"renderer": "test"},
         )
+
+    def finalize_materialization(
+        self, unit: RenderOnlyResolvedUnit, descriptor: MaterializationDocument
+    ) -> RenderOnlyDesiredUnit:
+        return RenderOnlyDesiredUnit(
+            source=unit.source,
+            resolvedInputs=unit.resolvedInputs,
+            materialization=descriptor,
+        )
+
+    def resolved_from_desired(self, unit: RenderOnlyDesiredUnit) -> RenderOnlyResolvedUnit:
+        return RenderOnlyResolvedUnit(source=unit.source, resolvedInputs=unit.resolvedInputs)
 
 
 def write_json(path: Path, value: object) -> None:
@@ -113,18 +155,18 @@ def test_advancement_materializes_and_reuses_an_unchanged_payload(tmp_path, monk
     source_tree(source)
 
     first = materialize_candidate(tmp_path, source, tmp_path / "empty", "first")
-    first_unit = cli.load_unit(first / "units/rendered.json", "rendered")
+    first_unit = cli.load_desired_unit(first / "units/rendered.json", "rendered")
 
     assert plugin.calls == 1
     assert (first / "materialized/rendered/rendered.yaml").read_text() == (
         "environment: dev\nrevision: " + "a" * 40 + "\n"
     )
-    assert first_unit["materialization"] == {
-        "path": "materialized/rendered",
-        "digest": cli.materialization_tree_digest(first / "materialized/rendered"),
-        "mediaType": "application/yaml",
-        "metadata": {"renderer": "test"},
-    }
+    assert first_unit.spec.materialization == MaterializationDocument(
+        path="materialized/rendered",
+        digest=cli.materialization_tree_digest(first / "materialized/rendered"),
+        mediaType="application/yaml",
+        metadata={"renderer": "test"},
+    )
     assert cli.reconciliation_statuses(["rendered"], first, tmp_path / "first-observed") == [
         ("rendered", "MATERIALIZED", "desired payload is published for external delivery")
     ]
@@ -133,7 +175,10 @@ def test_advancement_materializes_and_reuses_an_unchanged_payload(tmp_path, monk
 
     assert plugin.calls == 1
     assert cli.directory_files(second / "materialized/rendered") == cli.directory_files(first / "materialized/rendered")
-    assert cli.load_unit(second / "units/rendered.json", "rendered")["materialization"] == first_unit["materialization"]
+    assert (
+        cli.load_desired_unit(second / "units/rendered.json", "rendered").spec.materialization
+        == first_unit.spec.materialization
+    )
 
 
 def test_materialized_payload_tampering_fails_before_status_or_promotion(tmp_path, monkeypatch):

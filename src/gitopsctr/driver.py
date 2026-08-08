@@ -15,8 +15,10 @@ from typing import Any, ClassVar
 
 from gitopsctr.api import GVK, ApiKind, api_kinds
 from gitopsctr.artifacts import ArtifactApi, require_artifact_api
-from gitopsctr.document import DocumentContract, JsonObject
+from gitopsctr.contracts import DesiredSource, MaterializationDocument, ResolvedInputs, StrictModel
+from gitopsctr.document import DocumentContract, JsonObject, TypedDocumentContract
 from gitopsctr.execution import DriverExecution, default_driver_execution
+from gitopsctr.resolution import TemplateResolution
 
 type ReconciliationResult = Mapping[str, object]
 
@@ -26,14 +28,54 @@ class DriverError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class ReconciliationOutput:
+class ReconciliationOutput[ResultT: StrictModel]:
     """Validated observation facts and artifact resources returned by reconciliation."""
 
-    result: ReconciliationResult = field(default_factory=dict)
+    result: ResultT
     artifacts: Mapping[str, JsonObject] = field(default_factory=dict)
 
 
-class UnitDriver:
+@dataclass(frozen=True)
+class UnitResolutionContext:
+    """Controller-owned facts and the intentionally open template boundary."""
+
+    source: DesiredSource
+    resolve_template: Callable[[object], TemplateResolution]
+
+
+@dataclass(frozen=True)
+class UnitResolution[ResolvedT: StrictModel]:
+    """A typed pre-materialization model and its reference fingerprints."""
+
+    unit: ResolvedT
+    resolved_inputs: ResolvedInputs | None = None
+
+
+def reference_fingerprints(*resolutions: TemplateResolution) -> ResolvedInputs | None:
+    """Merge fingerprints collected while resolving typed template-bearing fields."""
+
+    promotions: dict[str, str] = {}
+    receipts: dict[str, str] = {}
+    artifacts: dict[str, str] = {}
+    for resolution in resolutions:
+        promotions.update(resolution.promotions)
+        receipts.update(resolution.receipts)
+        artifacts.update(resolution.artifacts)
+    if not (promotions or receipts or artifacts):
+        return None
+    return ResolvedInputs(
+        promotions=promotions or None,
+        receipts=receipts or None,
+        artifacts=artifacts or None,
+    )
+
+
+class UnitDriver[
+    AuthoredT: StrictModel,
+    ResolvedT: StrictModel,
+    DesiredT: StrictModel,
+    ResultT: StrictModel,
+]:
     """A versioned implementation of one unit API kind."""
 
     api_version: ClassVar[str] = "unit.gitopsctr.io/v1"
@@ -41,10 +83,20 @@ class UnitDriver:
     driver_name: ClassVar[str]
     version: ClassVar[int] = 0
     schema_base_uri: ClassVar[str | None] = None
-    unit_contract: ClassVar[DocumentContract]
-    desired_unit_contract: ClassVar[DocumentContract]
-    result_contract: ClassVar[DocumentContract]
+    unit_contract: TypedDocumentContract[AuthoredT]
+    resolved_unit_contract: TypedDocumentContract[ResolvedT]
+    desired_unit_contract: TypedDocumentContract[DesiredT]
+    result_contract: TypedDocumentContract[ResultT]
     artifact_outputs: ClassVar[Mapping[str, ApiKind[ArtifactApi[Any]]]] = {}
+
+    def authored_reconciliation_required(self, unit: AuthoredT) -> bool:
+        """Return whether an authored unit can produce observation receipts."""
+
+        return isinstance(self, ReconciliationCapability)
+
+    @abstractmethod
+    def resolve_unit(self, unit: AuthoredT, context: UnitResolutionContext) -> UnitResolution[ResolvedT]:
+        """Resolve an authored specification into its typed pre-materialization model."""
 
     def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject | None:
         """Return an authored unit spec body, or ``None`` when scaffolding is unsupported.
@@ -57,19 +109,23 @@ class UnitDriver:
         return None
 
 
-def unit_driver_api(driver: UnitDriver) -> ApiKind[UnitDriver]:
+type InstalledUnitDriver = UnitDriver[Any, Any, Any, Any]
+
+
+def unit_driver_api(driver: InstalledUnitDriver) -> ApiKind[InstalledUnitDriver]:
     """Expose a unit driver through the generic API-kind entry-point interface."""
 
     return ApiKind(GVK(driver.api_version, driver.kind), driver)
 
 
 @dataclass(frozen=True)
-class MaterializationContext:
+class MaterializationContext[ResolvedT: StrictModel]:
     environment: str
     source_root: Path
     source_revision: str
     source_path: str
-    unit: JsonObject
+    unit_name: str
+    unit: ResolvedT
     output_root: Path
     execution: DriverExecution = field(default_factory=default_driver_execution)
 
@@ -81,67 +137,79 @@ class MaterializationResult:
 
 
 @dataclass(frozen=True)
-class UnitExecutionContext:
+class UnitExecutionContext[DesiredT: StrictModel]:
     environment: str
     desired_root: Path
     desired_revision: str
     source_root: Path
     source_revision: str
     source_path: str
-    unit: JsonObject
-    inputs: JsonObject
+    unit_name: str
+    unit: DesiredT
     report: Path | None = None
     execution: DriverExecution = field(default_factory=default_driver_execution)
 
 
 @dataclass(frozen=True)
-class PlanningContext(UnitExecutionContext):
+class PlanningContext[DesiredT: StrictModel](UnitExecutionContext[DesiredT]):
     pass
 
 
 @dataclass(frozen=True)
-class ReconciliationContext(UnitExecutionContext):
+class ReconciliationContext[DesiredT: StrictModel](UnitExecutionContext[DesiredT]):
     previous_receipt: JsonObject | None = None
 
 
 @dataclass(frozen=True)
-class VerificationContext:
+class VerificationContext[DesiredT: StrictModel]:
     environment: str
     desired_root: Path
     desired_revision: str
     source_root: Path
     source_revision: str
     source_path: str
-    unit: JsonObject
-    inputs: JsonObject
+    unit_name: str
+    unit: DesiredT
     report: Path | None = None
     execution: DriverExecution = field(default_factory=default_driver_execution)
 
 
-class MaterializationCapability(ABC):
+class MaterializationCapability[ResolvedT: StrictModel, DesiredT: StrictModel](ABC):
     """Produce immutable files while desired state is advanced."""
 
     @abstractmethod
-    def materialize(self, context: MaterializationContext) -> MaterializationResult:
+    def materialize(self, context: MaterializationContext[ResolvedT]) -> MaterializationResult:
         """Write materialized files below ``output_root`` and describe them."""
 
+    @abstractmethod
+    def finalize_materialization(
+        self,
+        unit: ResolvedT,
+        descriptor: MaterializationDocument,
+    ) -> DesiredT:
+        """Construct the final typed desired model after its payload is materialized."""
 
-class PlanningCapability(ABC):
+    @abstractmethod
+    def resolved_from_desired(self, unit: DesiredT) -> ResolvedT:
+        """Recover the typed materialization input for deterministic payload reuse."""
+
+
+class PlanningCapability[DesiredT: StrictModel](ABC):
     """Perform speculative, non-publishing work for a deployment unit."""
 
     @abstractmethod
-    def plan(self, context: PlanningContext) -> None:
+    def plan(self, context: PlanningContext[DesiredT]) -> None:
         """Validate and plan the unit without changing remote deployment state."""
 
 
-class ReconciliationCapability(ABC):
+class ReconciliationCapability[DesiredT: StrictModel, ResultT: StrictModel](ABC):
     """Converge external state for a fully materialized unit."""
 
-    def reconciliation_required(self, unit: JsonObject) -> bool:
+    def reconciliation_required(self, unit: DesiredT) -> bool:
         return True
 
     @abstractmethod
-    def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
+    def reconcile(self, context: ReconciliationContext[DesiredT]) -> ReconciliationOutput[ResultT]:
         """Converge one unit and return its observation facts and artifact resources."""
 
     @abstractmethod
@@ -159,14 +227,14 @@ class VerificationResult:
     status: VerificationStatus
 
 
-class VerificationCapability(ABC):
+class VerificationCapability[DesiredT: StrictModel](ABC):
     """Compare external state with desired state without writing a receipt."""
 
-    def verification_supported(self, unit: JsonObject) -> bool:
+    def verification_supported(self, unit: DesiredT) -> bool:
         return True
 
     @abstractmethod
-    def verify(self, context: VerificationContext) -> VerificationResult:
+    def verify(self, context: VerificationContext[DesiredT]) -> VerificationResult:
         """Return whether external state matches the fully materialized unit."""
 
 
@@ -175,8 +243,8 @@ SemanticResultSelector = Callable[[object], ReconciliationResult]
 
 def load_unit_drivers(
     installed_api_kinds: Mapping[GVK, ApiKind[object]] | None = None,
-) -> dict[str, UnitDriver]:
-    drivers: dict[str, UnitDriver] = {}
+) -> dict[str, InstalledUnitDriver]:
+    drivers: dict[str, InstalledUnitDriver] = {}
     installed = api_kinds() if installed_api_kinds is None else installed_api_kinds
     for api_kind in installed.values():
         if isinstance(api_kind.spec, ArtifactApi):
@@ -196,7 +264,7 @@ def load_unit_drivers(
             raise DriverError(f"unit driver API {api_kind.gvk!s} has no driver_name")
         if driver.driver_name in drivers:
             raise DriverError(f"duplicate unit driver entry point: {driver.driver_name}")
-        for kind in ("unit", "desired_unit", "result"):
+        for kind in ("unit", "resolved_unit", "desired_unit", "result"):
             contract = getattr(driver, f"{kind}_contract", None)
             if not isinstance(contract, DocumentContract):
                 raise DriverError(f"unit driver API {api_kind.gvk!s} has no {kind.replace('_', '-')} contract")

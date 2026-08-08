@@ -10,7 +10,15 @@
       "bucket": "example-bucket",
       "bundle": "registry.example/example/frontend@sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "distributionId": "EXAMPLE",
-      "runtimeConfig": {},
+      "runtimeConfig": {
+        "schema": 1,
+        "apiBase": "https://api.example.invalid",
+        "auth": {
+          "mode": "cognito",
+          "issuer": "https://issuer.example.invalid",
+          "clientId": "example-client"
+        }
+      },
       "url": "https://example.invalid"
     },
     "source": {

@@ -126,7 +126,7 @@ spec:
     assert list(cli.load_environment_specifications(tmp_path, "dev")) == ["infrastructure"]
 
 
-def test_new_yaml_resource_envelopes_are_loaded_and_normalized(tmp_path: Path):
+def test_new_yaml_resource_envelopes_are_loaded_as_typed_resources(tmp_path: Path):
     environment_root = tmp_path / "deployment/environments/dev"
     units_root = environment_root / "units"
     units_root.mkdir(parents=True)
@@ -161,8 +161,9 @@ spec:
     specifications = cli.load_environment_specifications(tmp_path, "dev")
 
     assert environment["name"] == "dev"
-    assert specifications["infrastructure"]["driver"] == "terraform"
-    assert specifications["infrastructure"]["name"] == "infrastructure"
+    assert specifications["infrastructure"].driver_name == "terraform"
+    assert specifications["infrastructure"].name == "infrastructure"
+    assert specifications["infrastructure"].spec.source.path == "infrastructure"
 
 
 def test_yaml_demo_documents_validate_against_published_resource_schemas():

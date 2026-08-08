@@ -17,7 +17,8 @@ from gitopsctr import cli
 from gitopsctr import registry as driver_registry
 from gitopsctr.api import GVK, ApiError, ApiKind
 from gitopsctr.artifacts import CONTAINER_IMAGES, ArtifactApi, ContainerImagesResource, require_artifact_api
-from gitopsctr.contracts import MashumaroContract
+from gitopsctr.contracts import DesiredSource, MashumaroContract
+from gitopsctr.contrib.drivers.oci_images import OciImagesDesiredUnit
 from gitopsctr.driver import (
     DriverError,
     ReconciliationCapability,
@@ -27,6 +28,7 @@ from gitopsctr.driver import (
     UnitDriver,
     unit_driver_api,
 )
+from gitopsctr.resources import ResourceMetadata, UnitResource
 
 
 def project(root: Path, write_format: str) -> None:
@@ -59,6 +61,23 @@ def container_images() -> dict[str, object]:
         },
         "images": {"application": {"uri": "registry.example/application@sha256:" + "c" * 64}},
     }
+
+
+def desired_images_unit() -> UnitResource[OciImagesDesiredUnit]:
+    driver = cli.UNIT_DRIVERS["oci-images"]
+    return UnitResource(
+        GVK(driver.api_version, driver.kind),
+        ResourceMetadata(name="images"),
+        driver,
+        OciImagesDesiredUnit(
+            source=DesiredSource(
+                path=".",
+                revision="a" * 40,
+                inputHash="sha256:" + "b" * 64,
+                driverVersion=driver.version,
+            )
+        ),
+    )
 
 
 @pytest.mark.parametrize(("write_format", "suffix"), (("yaml", ".yaml"), ("json", ".json")))
@@ -128,13 +147,7 @@ def test_artifact_resource_name_mismatch_warns_without_rejecting(
 
     cli.validate_artifact_output_identity(
         "oci-images",
-        {
-            "name": "images",
-            "source": {
-                "revision": "a" * 40,
-                "inputHash": "sha256:" + "b" * 64,
-            },
-        },
+        desired_images_unit(),
         {"containers": document},
     )
 
@@ -184,6 +197,7 @@ def test_multiple_drivers_share_one_authoritative_artifact_api() -> None:
     class SharedArtifactDriver(UnitDriver, ReconciliationCapability):
         version = 1
         unit_contract = contracts.unit_contract
+        resolved_unit_contract = contracts.resolved_unit_contract
         desired_unit_contract = contracts.desired_unit_contract
         result_contract = contracts.result_contract
         artifact_outputs = {"images": CONTAINER_IMAGES}
@@ -229,6 +243,7 @@ def test_driver_rejects_non_authoritative_artifact_api_handle() -> None:
         driver_name = "invalid"
         version = 1
         unit_contract = contracts.unit_contract
+        resolved_unit_contract = contracts.resolved_unit_contract
         desired_unit_contract = contracts.desired_unit_contract
         result_contract = contracts.result_contract
         artifact_outputs = {"images": duplicate}
@@ -299,14 +314,7 @@ def test_artifact_validation_rejects_tampering_and_extra_files(
     project(tmp_path, "json")
     monkeypatch.setattr(cli, "REPOSITORY_ROOT", tmp_path)
     observed = tmp_path / "observed"
-    unit = {
-        "name": "images",
-        "driver": "oci-images",
-        "source": {
-            "revision": "a" * 40,
-            "inputHash": "sha256:" + "b" * 64,
-        },
-    }
+    unit = desired_images_unit()
     descriptors = cli.write_artifact_documents(
         observed,
         "images",
@@ -416,14 +424,7 @@ def test_observation_publication_writes_receipt_and_artifact_atomically(
             "desired": {"revision": "e" * 40, "unitBlob": "unit-blob"},
             "controller": {},
         },
-        {
-            "name": "images",
-            "driver": "oci-images",
-            "source": {
-                "revision": "a" * 40,
-                "inputHash": "sha256:" + "b" * 64,
-            },
-        },
+        desired_images_unit(),
         {"containers": container_images()},
         "e" * 40,
     )
@@ -479,14 +480,7 @@ def test_observation_publication_retries_without_losing_concurrent_state(
             "desired": {"revision": "e" * 40, "unitBlob": "unit-blob"},
             "controller": {},
         },
-        {
-            "name": "images",
-            "driver": "oci-images",
-            "source": {
-                "revision": "a" * 40,
-                "inputHash": "sha256:" + "b" * 64,
-            },
-        },
+        desired_images_unit(),
         {"containers": container_images()},
         "e" * 40,
     )

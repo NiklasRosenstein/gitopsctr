@@ -16,8 +16,6 @@ from gitopsctr.document import JsonObject
 from gitopsctr.driver import DriverError, UnitExecutionContext
 from gitopsctr.execution import CommandOutput, DriverExecution
 
-from ._common import require_strings
-
 OCI_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 FRONTEND_ARCHIVE = "frontend-bundle.tar.gz"
 OCI_REPOSITORY_RE = re.compile(
@@ -44,11 +42,10 @@ def artifact_producer_identity(
     kind: str,
     driver_version: int,
 ) -> ArtifactProducer:
-    require_strings(context.unit, ("name", "driver"), contract)
     return ArtifactProducer(
         apiVersion="unit.gitopsctr.io/v1",
         kind=kind,
-        name=cast(str, context.unit["name"]),
+        name=context.unit_name,
         driverVersion=driver_version,
         inputHashVersion=1,
         inputHash=input_hash,

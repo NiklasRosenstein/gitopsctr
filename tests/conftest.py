@@ -39,7 +39,7 @@ def write_test_document(path: Path, value: object) -> None:
             value = cli.serialize_environment_document(cli.normalize_environment_document(value, path.parent.name))
         elif path.parent.name == "units":
             value = cli.serialize_unit_document(
-                cli.normalize_unit_document(value, path.stem),
+                cli.parse_authored_unit_document(value, path.stem),
                 profile="authored",
             )
     path.parent.mkdir(parents=True, exist_ok=True)

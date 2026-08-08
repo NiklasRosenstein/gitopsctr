@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from gitopsctr import cli as deploy_release
+from gitopsctr.contrib.drivers.terraform import AppliedTerraformModel, TerraformResultModel
 from gitopsctr.driver import ReconciliationOutput
 from tests.conftest import write_test_document
 
@@ -26,7 +27,7 @@ def test_reconcile_parser_exposes_plan_without_a_dry_alias():
         parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--dry"])
 
 
-def test_observation_reference_uses_fallback_only_during_dry_resolution(tmp_path):
+def test_reference_rejects_removed_dry_fallback(tmp_path):
     template = {
         "image": {
             "fromArtifact": {
@@ -42,25 +43,8 @@ def test_observation_reference_uses_fallback_only_during_dry_resolution(tmp_path
     candidate = tmp_path / "candidate"
     observed = tmp_path / "observed"
 
-    resolution = deploy_release.resolve_template(
-        template,
-        candidate,
-        observed,
-        None,
-        dry=True,
-    )
-
-    assert resolution.value == {"image": "preview.invalid/control@sha256:" + "0" * 64}
-    assert resolution.promotions == {}
-    assert resolution.receipts == {}
-    assert resolution.artifacts == {}
-
-    try:
+    with pytest.raises(deploy_release.OperationError, match="dryFallback"):
         deploy_release.resolve_template(template, candidate, observed, None)
-    except deploy_release.ReferenceUnavailable:
-        pass
-    else:
-        raise AssertionError("non-dry resolution accepted a dry fallback")
 
 
 def test_observation_reference_materializes_artifact_into_consumer(tmp_path):
@@ -198,19 +182,24 @@ def test_receipt_reference_normalizes_resource_receipt_before_applying_pointer(t
     assert resolution.artifacts == {}
 
 
-def test_promotion_reference_normalizes_resource_unit_before_applying_pointer(tmp_path):
+def test_promotion_reference_reads_typed_resource_spec_before_applying_pointer(tmp_path):
     promotion = tmp_path / "promotion"
     source_unit = promotion / "units/aws-application.yaml"
     source_unit.parent.mkdir(parents=True)
     source_unit.write_text(
         json.dumps(
             deploy_release.serialize_unit_document(
-                {
-                    "name": "aws-application",
-                    "driver": "terraform",
-                    "source": {"path": "infra"},
-                    "terraform": {"variables": {"control_image_uri": "registry.example/control@sha256:" + "1" * 64}},
-                }
+                deploy_release.parse_desired_unit_document(
+                    {
+                        "name": "aws-application",
+                        "driver": "terraform",
+                        "source": {"path": "infra"},
+                        "terraform": {
+                            "variables": {"control_image_uri": "registry.example/control@sha256:" + "1" * 64}
+                        },
+                    },
+                    "aws-application",
+                )
             )
         )
     )
@@ -484,7 +473,12 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
 
     def fake_driver(context):
         events.append(("driver", context.source_revision))
-        return ReconciliationOutput(result={"applied": {"sourceRevision": context.source_revision}, "outputs": {}})
+        return ReconciliationOutput(
+            result=TerraformResultModel(
+                applied=AppliedTerraformModel(sourceRevision=context.source_revision),
+                outputs={},
+            )
+        )
 
     def fake_publish(*_args):
         events.append(("receipt",))

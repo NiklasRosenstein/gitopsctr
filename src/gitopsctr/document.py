@@ -3,10 +3,39 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import cast
+
+from mashumaro.types import SerializableType
 
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
+
+
+def require_json_value(value: object) -> JsonValue:
+    """Validate an arbitrary Python value as JSON without coercing it."""
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, list):
+        return [require_json_value(item) for item in value]
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return {cast(str, key): require_json_value(item) for key, item in value.items()}
+    raise ValueError(f"expected a JSON value, got {type(value).__name__}")
+
+
+class JsonObjectValue(dict[str, JsonValue], SerializableType):
+    """Mashumaro-compatible, recursively typed arbitrary JSON object."""
+
+    def _serialize(self) -> JsonObject:
+        return dict(self)
+
+    @classmethod
+    def _deserialize(cls, value: object) -> JsonObjectValue:
+        parsed = require_json_value(value)
+        if not isinstance(parsed, dict):
+            raise ValueError("expected a JSON object")
+        return cls(parsed)
 
 
 class ContractError(ValueError):

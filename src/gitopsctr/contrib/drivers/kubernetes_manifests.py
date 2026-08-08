@@ -18,11 +18,12 @@ from gitopsctr.contracts import (
     DesiredSource,
     MashumaroContract,
     MashumaroUnionContract,
-    SchemaDocument,
+    MaterializationDocument,
+    ResolvedInputs,
     StrictModel,
     schema_url,
 )
-from gitopsctr.document import JsonObject
+from gitopsctr.document import JsonObject, JsonObjectValue
 from gitopsctr.driver import (
     DriverError,
     MaterializationCapability,
@@ -35,13 +36,17 @@ from gitopsctr.driver import (
     ReconciliationOutput,
     ReconciliationResult,
     UnitDriver,
+    UnitResolution,
+    UnitResolutionContext,
     VerificationCapability,
     VerificationContext,
     VerificationResult,
     VerificationStatus,
+    reference_fingerprints,
     unit_driver_api,
 )
 from gitopsctr.execution import CommandOutput, DriverExecution
+from gitopsctr.templates import TemplateObject
 
 from ._common import select_result_fields
 
@@ -74,11 +79,20 @@ class ArgoResult(TypedDict):
 
 
 @dataclass(frozen=True, kw_only=True)
+class AuthoredHelmMaterialization(StrictModel):
+    type: Literal["helm"]
+    releaseName: str
+    namespace: str
+    values: TemplateObject
+    allowSecrets: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
 class HelmMaterialization(StrictModel):
     type: Literal["helm"]
     releaseName: str
     namespace: str
-    values: dict[str, Any]
+    values: JsonObjectValue
     allowSecrets: bool = False
 
 
@@ -132,11 +146,9 @@ class ExternalDelivery(StrictModel):
 
 
 @dataclass(frozen=True, kw_only=True)
-class KubernetesUnit(SchemaDocument):
-    name: str
-    driver: Literal["kubernetes-manifests"]
+class KubernetesUnit(StrictModel):
     source: AuthoredSource
-    materialize: HelmMaterialization | PlainMaterialization
+    materialize: AuthoredHelmMaterialization | PlainMaterialization
     delivery: DirectDelivery | ExternalDelivery
 
 
@@ -166,15 +178,17 @@ class KubernetesMaterializationDescriptor(StrictModel):
 
 
 @dataclass(frozen=True, kw_only=True)
-class KubernetesDesiredUnit(SchemaDocument):
-    name: str
-    driver: Literal["kubernetes-manifests"]
+class KubernetesResolvedUnit(StrictModel):
     source: DesiredSource
     materialize: HelmMaterialization | PlainMaterialization
     delivery: DirectDelivery | ExternalDelivery
+    inputs: JsonObjectValue | None = None
+    resolvedInputs: ResolvedInputs | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class KubernetesDesiredUnit(KubernetesResolvedUnit):
     materialization: KubernetesMaterializationDescriptor
-    inputs: dict[str, Any] | None = None
-    resolvedInputs: dict[str, dict[str, str]] | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -199,6 +213,9 @@ class ObservedApplicationModel(StrictModel):
 @dataclass(frozen=True, kw_only=True)
 class ArgoResultModel(StrictModel):
     observed: ObservedApplicationModel
+
+
+type KubernetesDriverResult = KubernetesResultModel | ArgoResultModel
 
 
 def require_object(value: object, description: str) -> dict[str, Any]:
@@ -231,9 +248,7 @@ def _argo_observer_configuration(value: object) -> ArgoApiObserver | ArgoKuberne
     if set(observer) - (common_fields | {access_field}):
         raise DriverError("kubernetes-manifests argocd observer has unsupported fields")
     application = require_string(observer.get("application"), "argocd observer application")
-    application_namespace = require_string(
-        observer.get("applicationNamespace"), "argocd observer applicationNamespace"
-    )
+    application_namespace = require_string(observer.get("applicationNamespace"), "argocd observer applicationNamespace")
     timeout = observer.get("timeoutSeconds", 600)
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
         raise DriverError("argocd observer timeoutSeconds must be a positive integer")
@@ -258,58 +273,16 @@ def _argo_observer_configuration(value: object) -> ArgoApiObserver | ArgoKuberne
     )
 
 
-def delivery_configuration(unit: JsonObject) -> DirectDelivery | ExternalDelivery:
-    delivery = require_object(unit.get("delivery"), "kubernetes-manifests delivery")
-    mode = delivery.get("mode")
-    if mode not in {"direct", "external"}:
-        raise DriverError("kubernetes-manifests delivery.mode must be 'direct' or 'external'")
-    if mode == "direct" and "observer" in delivery:
-        raise DriverError("kubernetes-manifests direct delivery cannot configure an observer")
-    if mode == "direct" and set(delivery) - {"mode", "kubeContext", "prune", "wait"}:
-        raise DriverError("kubernetes-manifests direct delivery has unsupported fields")
-    if mode == "direct":
-        kube_context = require_string(delivery.get("kubeContext"), "direct delivery kubeContext")
-        prune = delivery.get("prune", False)
-        if not isinstance(prune, bool):
-            raise DriverError("direct delivery prune must be a boolean")
-        waits = delivery.get("wait", [])
-        if not isinstance(waits, list):
-            raise DriverError("direct delivery wait must be a list")
-        readiness_waits: list[ReadinessWait] = []
-        for item in waits:
-            wait = require_object(item, "Kubernetes readiness wait")
-            if set(wait) != {"resource", "namespace", "condition", "timeoutSeconds"}:
-                raise DriverError("Kubernetes readiness wait has unsupported or missing fields")
-            require_string(wait["resource"], "Kubernetes readiness wait resource")
-            require_string(wait["namespace"], "Kubernetes readiness wait namespace")
-            require_string(wait["condition"], "Kubernetes readiness wait condition")
-            timeout = wait["timeoutSeconds"]
-            if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
-                raise DriverError("Kubernetes readiness wait timeoutSeconds must be a positive integer")
-            readiness_waits.append(
-                ReadinessWait(
-                    resource=cast(str, wait["resource"]),
-                    namespace=cast(str, wait["namespace"]),
-                    condition=cast(str, wait["condition"]),
-                    timeoutSeconds=timeout,
-                )
-            )
-        return DirectDelivery(mode="direct", kubeContext=kube_context, prune=prune, wait=readiness_waits)
-    if mode == "external" and set(delivery) - {"mode", "observer"}:
-        raise DriverError("kubernetes-manifests external delivery has unsupported fields")
-    observer = delivery.get("observer")
-    return ExternalDelivery(
-        mode="external",
-        observer=None if observer is None else _argo_observer_configuration(observer),
-    )
+def delivery_configuration(
+    unit: KubernetesUnit | KubernetesResolvedUnit | KubernetesDesiredUnit,
+) -> DirectDelivery | ExternalDelivery:
+    return unit.delivery
 
 
-def materialization_configuration(unit: JsonObject) -> dict[str, Any]:
-    configuration = require_object(unit.get("materialize"), "kubernetes-manifests materialize")
-    renderer = configuration.get("type")
-    if renderer not in {"helm", "plain"}:
-        raise DriverError("kubernetes-manifests materialize.type must be 'helm' or 'plain'")
-    return configuration
+def materialization_configuration(
+    unit: KubernetesUnit | KubernetesResolvedUnit | KubernetesDesiredUnit,
+) -> AuthoredHelmMaterialization | HelmMaterialization | PlainMaterialization:
+    return unit.materialize
 
 
 @dataclass(frozen=True)
@@ -319,22 +292,13 @@ class ResolvedMaterialization:
     inventory: list[ResourceIdentity]
 
 
-def materialization_descriptor(unit: JsonObject) -> ResolvedMaterialization:
-    descriptor = require_object(unit.get("materialization"), "kubernetes-manifests materialization descriptor")
-    path = require_string(descriptor.get("path"), "kubernetes-manifests materialization path")
-    digest = require_string(descriptor.get("digest"), "kubernetes-manifests materialization digest")
-    metadata = require_object(descriptor.get("metadata"), "kubernetes-manifests materialization metadata")
-    raw_inventory = metadata.get("inventory")
-    if not isinstance(raw_inventory, list):
-        raise DriverError("kubernetes-manifests materialization inventory must be a list")
-    inventory: list[ResourceIdentity] = []
-    for item in raw_inventory:
-        if not isinstance(item, dict) or set(item) != {"apiVersion", "kind", "namespace", "name"}:
-            raise DriverError("kubernetes-manifests materialization inventory is invalid")
-        if not all(isinstance(item[field], str) for field in item):
-            raise DriverError("kubernetes-manifests materialization inventory is invalid")
-        inventory.append(cast(ResourceIdentity, item))
-    return ResolvedMaterialization(path, digest, inventory)
+def materialization_descriptor(unit: KubernetesDesiredUnit) -> ResolvedMaterialization:
+    descriptor = unit.materialization
+    return ResolvedMaterialization(
+        descriptor.path,
+        descriptor.digest,
+        [cast(ResourceIdentity, item.to_dict()) for item in descriptor.metadata.inventory],
+    )
 
 
 def manifest_inventory(root: Path, allow_secrets: bool) -> list[ResourceIdentity]:
@@ -473,11 +437,11 @@ def argo_application_status(document: dict[str, Any]) -> tuple[str, str, str]:
 
 
 class KubernetesManifestsDriver(
-    UnitDriver,
-    MaterializationCapability,
-    PlanningCapability,
-    ReconciliationCapability,
-    VerificationCapability,
+    UnitDriver[KubernetesUnit, KubernetesResolvedUnit, KubernetesDesiredUnit, KubernetesDriverResult],
+    MaterializationCapability[KubernetesResolvedUnit, KubernetesDesiredUnit],
+    PlanningCapability[KubernetesDesiredUnit],
+    ReconciliationCapability[KubernetesDesiredUnit, KubernetesDriverResult],
+    VerificationCapability[KubernetesDesiredUnit],
 ):
     api_version = "unit.gitopsctr.io/v1"
     kind = "KubernetesManifests"
@@ -488,6 +452,10 @@ class KubernetesManifestsDriver(
         KubernetesUnit,
         schema_url("drivers/kubernetes-manifests", version, "unit"),
     )
+    resolved_unit_contract = MashumaroContract(
+        KubernetesResolvedUnit,
+        schema_url("drivers/kubernetes-manifests", version, "resolved-unit"),
+    )
     desired_unit_contract = MashumaroContract(
         KubernetesDesiredUnit,
         schema_url("drivers/kubernetes-manifests", version, "desired-unit"),
@@ -497,6 +465,11 @@ class KubernetesManifestsDriver(
         schema_url("drivers/kubernetes-manifests", version, "result"),
         "kubernetes-manifests result v1",
     )
+
+    def authored_reconciliation_required(self, unit: KubernetesUnit) -> bool:
+        delivery = unit.delivery
+        return isinstance(delivery, DirectDelivery) or argo_observer(delivery) is not None
+
     _select_direct_result = staticmethod(select_result_fields("applied"))
     _select_argo_result = staticmethod(select_result_fields("observed"))
 
@@ -511,32 +484,56 @@ class KubernetesManifestsDriver(
             "delivery": {"mode": "external"},
         }
 
-    def materialize(self, context: MaterializationContext) -> MaterializationResult:
+    def resolve_unit(self, unit: KubernetesUnit, context: UnitResolutionContext) -> UnitResolution[KubernetesResolvedUnit]:
+        resolved = ()
+        materialize: HelmMaterialization | PlainMaterialization
+        if isinstance(unit.materialize, AuthoredHelmMaterialization):
+            values = context.resolve_template(unit.materialize.values._serialize())
+            if not isinstance(values.value, dict):
+                raise DriverError("resolved Helm values must be an object")
+            materialize = HelmMaterialization(
+                type="helm",
+                releaseName=unit.materialize.releaseName,
+                namespace=unit.materialize.namespace,
+                values=JsonObjectValue(values.value),
+                allowSecrets=unit.materialize.allowSecrets,
+            )
+            resolved = (values,)
+        else:
+            materialize = unit.materialize
+        fingerprints = reference_fingerprints(*resolved)
+        return UnitResolution(
+            KubernetesResolvedUnit(
+                source=context.source,
+                materialize=materialize,
+                delivery=unit.delivery,
+                resolvedInputs=fingerprints,
+            ),
+            fingerprints,
+        )
+
+    def materialize(self, context: MaterializationContext[KubernetesResolvedUnit]) -> MaterializationResult:
         configuration = materialization_configuration(context.unit)
         delivery = delivery_configuration(context.unit)
         if isinstance(delivery, ExternalDelivery):
             argo_observer(delivery)
-        renderer = cast(str, configuration["type"])
-        allow_secrets = configuration.get("allowSecrets", False)
-        if not isinstance(allow_secrets, bool):
-            raise DriverError("kubernetes-manifests allowSecrets must be a boolean")
+        renderer = configuration.type
+        allow_secrets = configuration.allowSecrets
         source = context.source_root / context.source_path
         if not source.is_dir():
             raise DriverError(f"kubernetes-manifests source path is not a directory: {context.source_path}")
 
         metadata: JsonObject
         if renderer == "helm":
-            allowed = {"type", "releaseName", "namespace", "values", "allowSecrets"}
-            if set(configuration) - allowed:
-                raise DriverError("kubernetes-manifests Helm materialization has unsupported fields")
-            release_name = require_string(configuration.get("releaseName"), "Helm releaseName")
-            namespace = require_string(configuration.get("namespace"), "Helm namespace")
-            values = require_object(configuration.get("values", {}), "Helm values")
+            assert isinstance(configuration, HelmMaterialization)
+            release_name = configuration.releaseName
+            namespace = configuration.namespace
+            values = configuration.values
             version = context.execution.run("helm", "version", "--short", output=CommandOutput.CAPTURE).stdout.strip()
             if not version:
                 raise DriverError("Helm did not report its version")
             with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as values_file:
-                yaml.safe_dump(values, values_file, sort_keys=True)
+                yaml.safe_dump(dict(values), values_file, sort_keys=True)
                 values_file.flush()
                 rendered = context.execution.run(
                     "helm",
@@ -555,17 +552,9 @@ class KubernetesManifestsDriver(
             (context.output_root / "manifest.yaml").write_text(rendered)
             metadata = {"renderer": "helm", "version": version}
         else:
-            allowed = {"type", "paths", "allowSecrets"}
-            if set(configuration) - allowed:
-                raise DriverError("kubernetes-manifests plain materialization has unsupported fields")
-            raw_patterns = configuration.get("paths", ["**/*.yaml", "**/*.yml"])
-            if (
-                not isinstance(raw_patterns, list)
-                or not raw_patterns
-                or not all(isinstance(pattern, str) and pattern for pattern in raw_patterns)
-            ):
-                raise DriverError("kubernetes-manifests plain paths must be a non-empty list of globs")
-            copy_plain_manifests(source, context.output_root, cast(list[str], raw_patterns))
+            assert isinstance(configuration, PlainMaterialization)
+            raw_patterns = configuration.paths or ["**/*.yaml", "**/*.yml"]
+            copy_plain_manifests(source, context.output_root, raw_patterns)
             metadata = {"renderer": "plain"}
 
         inventory = manifest_inventory(context.output_root, allow_secrets)
@@ -574,11 +563,40 @@ class KubernetesManifestsDriver(
         metadata["inventory"] = cast(Any, inventory)
         return MaterializationResult("application/vnd.gitopsctr.kubernetes-manifests.v1", metadata)
 
-    def reconciliation_required(self, unit: JsonObject) -> bool:
+    def finalize_materialization(
+        self,
+        unit: KubernetesResolvedUnit,
+        descriptor: MaterializationDocument,
+    ) -> KubernetesDesiredUnit:
+        metadata = KubernetesMaterializationMetadata.from_dict(descriptor.metadata)
+        return KubernetesDesiredUnit(
+            source=unit.source,
+            materialize=unit.materialize,
+            delivery=unit.delivery,
+            inputs=unit.inputs,
+            resolvedInputs=unit.resolvedInputs,
+            materialization=KubernetesMaterializationDescriptor(
+                path=descriptor.path,
+                digest=descriptor.digest,
+                mediaType=descriptor.mediaType,
+                metadata=metadata,
+            ),
+        )
+
+    def resolved_from_desired(self, unit: KubernetesDesiredUnit) -> KubernetesResolvedUnit:
+        return KubernetesResolvedUnit(
+            source=unit.source,
+            materialize=unit.materialize,
+            delivery=unit.delivery,
+            inputs=unit.inputs,
+            resolvedInputs=unit.resolvedInputs,
+        )
+
+    def reconciliation_required(self, unit: KubernetesDesiredUnit) -> bool:
         delivery = delivery_configuration(unit)
         return isinstance(delivery, DirectDelivery) or argo_observer(delivery) is not None
 
-    def plan(self, context: PlanningContext) -> None:
+    def plan(self, context: PlanningContext[KubernetesDesiredUnit]) -> None:
         delivery = delivery_configuration(context.unit)
         observer = argo_observer(delivery)
         if observer is not None:
@@ -588,7 +606,10 @@ class KubernetesManifestsDriver(
             raise DriverError("external Kubernetes delivery without an observer does not support planning")
         materialization_descriptor(context.unit)
 
-    def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
+    def reconcile(
+        self,
+        context: ReconciliationContext[KubernetesDesiredUnit],
+    ) -> ReconciliationOutput[KubernetesDriverResult]:
         delivery = delivery_configuration(context.unit)
         observer = argo_observer(delivery)
         if observer is not None:
@@ -602,7 +623,7 @@ class KubernetesManifestsDriver(
         context_name = delivery.kubeContext
         prune = delivery.prune
         waits = delivery.wait or []
-        manager = field_manager(context.environment, context.unit.get("name"))
+        manager = field_manager(context.environment, context.unit_name)
         context.execution.run(
             *kubectl_prefix(context_name),
             "apply",
@@ -623,11 +644,18 @@ class KubernetesManifestsDriver(
             )
         if prune:
             self._prune_previous(context, context_name, inventory)
-        return ReconciliationOutput(result={"applied": {"manifestDigest": digest, "inventory": inventory}})
+        return ReconciliationOutput(
+            result=KubernetesResultModel(
+                applied=AppliedManifestsModel(
+                    manifestDigest=digest,
+                    inventory=[ResourceIdentityModel(**item) for item in inventory],
+                )
+            )
+        )
 
     @staticmethod
     def _prune_previous(
-        context: ReconciliationContext,
+        context: ReconciliationContext[KubernetesDesiredUnit],
         context_name: str,
         inventory: list[ResourceIdentity],
     ) -> None:
@@ -667,11 +695,11 @@ class KubernetesManifestsDriver(
                 input_text=resource,
             )
 
-    def verification_supported(self, unit: JsonObject) -> bool:
+    def verification_supported(self, unit: KubernetesDesiredUnit) -> bool:
         delivery = delivery_configuration(unit)
         return isinstance(delivery, DirectDelivery) or argo_observer(delivery) is not None
 
-    def verify(self, context: VerificationContext) -> VerificationResult:
+    def verify(self, context: VerificationContext[KubernetesDesiredUnit]) -> VerificationResult:
         delivery = delivery_configuration(context.unit)
         observer = argo_observer(delivery)
         if observer is not None:
@@ -691,7 +719,7 @@ class KubernetesManifestsDriver(
             *kubectl_prefix(context_name),
             "diff",
             "--server-side",
-            f"--field-manager={field_manager(context.environment, context.unit.get('name'))}",
+            f"--field-manager={field_manager(context.environment, context.unit_name)}",
             "--filename",
             str(context.desired_root / materialization.path),
             output=CommandOutput.CAPTURE,
@@ -706,25 +734,29 @@ class KubernetesManifestsDriver(
 
     @staticmethod
     def _observe_argo(
-        context: PlanningContext | ReconciliationContext | VerificationContext,
+        context: (
+            PlanningContext[KubernetesDesiredUnit]
+            | ReconciliationContext[KubernetesDesiredUnit]
+            | VerificationContext[KubernetesDesiredUnit]
+        ),
         observer: ArgoApiObserver | ArgoKubernetesObserver,
         *,
         wait: bool,
-    ) -> ArgoResult:
+    ) -> ArgoResultModel:
         deadline = time.monotonic() + observer.timeoutSeconds
         while True:
             document = read_argo_application(context.execution, observer)
             revision, sync_status, health_status = argo_application_status(document)
             ready = revision == context.desired_revision and sync_status == "Synced" and health_status == "Healthy"
             if ready:
-                return {
-                    "observed": {
-                        "application": observer.application,
-                        "desiredRevision": revision,
-                        "syncStatus": sync_status,
-                        "healthStatus": health_status,
-                    }
-                }
+                return ArgoResultModel(
+                    observed=ObservedApplicationModel(
+                        application=observer.application,
+                        desiredRevision=revision,
+                        syncStatus="Synced",
+                        healthStatus="Healthy",
+                    )
+                )
             if not wait:
                 raise DriverError(
                     f"Argo CD Application is revision {revision!r}, {sync_status}, {health_status}; "

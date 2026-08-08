@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -11,67 +10,100 @@ from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 
 from gitopsctr import cli, schemas
-from gitopsctr.contracts import CORE_CONTRACTS, ContractError
+from gitopsctr.contracts import CORE_CONTRACTS, ContractError, DesiredSource, MaterializationDocument
+from gitopsctr.document import JsonObjectValue
+from gitopsctr.driver import DriverError, MaterializationCapability, UnitResolutionContext
 from gitopsctr.registry import UNIT_DRIVERS
+from gitopsctr.resolution import FingerprintedValue, ResolutionContext, resolve_template
+from gitopsctr.resources import UnitResource
 
 ROOT = Path(__file__).parents[1]
 REVISION = "a" * 40
 DIGEST = "sha256:" + "1" * 64
 
 
-def authored_examples() -> list[dict]:
+def authored_examples() -> list[UnitResource]:
     paths = sorted((ROOT / "tests/fixtures").rglob("units/*.json")) + sorted((ROOT / "demo").rglob("units/*.json"))
-    return [cli.normalize_unit_document(json.loads(path.read_text()), path.stem) for path in paths]
+    return [cli.parse_authored_unit_document(json.loads(path.read_text()), path.stem) for path in paths]
 
 
-def desired_example(unit: dict) -> dict:
-    desired = deepcopy(unit)
-    desired.pop("schema", None)
-    driver = desired["driver"]
-    desired["$schema"] = schemas.resource_schema_url(
-        UNIT_DRIVERS[driver].api_version,
-        UNIT_DRIVERS[driver].kind,
-        "desired",
+def desired_example(unit: UnitResource) -> UnitResource:
+    authored_source = unit.spec.source
+    source = DesiredSource(
+        path=authored_source.path,
+        inputs=authored_source.inputs,
+        revision=REVISION,
+        inputHash=DIGEST,
+        driverVersion=unit.driver.version,
     )
-    desired["source"] |= {
-        "revision": REVISION,
-        "inputHash": DIGEST,
-        "driverVersion": UNIT_DRIVERS[driver].version,
-    }
-    if driver == "kubernetes-manifests":
-        desired["materialization"] = {
-            "path": f"materialized/{desired['name']}",
-            "digest": DIGEST,
-            "mediaType": "application/vnd.gitopsctr.kubernetes-manifests.v1",
-            "metadata": {
-                "renderer": "helm",
+    resolved = unit.driver.resolve_unit(
+        unit.spec,
+        UnitResolutionContext(
+            source=source,
+            resolve_template=lambda value: resolve_template(
+                value,
+                ResolutionContext(
+                    receipt=lambda _target: FingerprintedValue("resolved", DIGEST),
+                    artifact=lambda _target: FingerprintedValue("resolved", DIGEST),
+                    promotion=lambda _target: FingerprintedValue("resolved", DIGEST),
+                ),
+            ),
+        ),
+    )
+    unit.driver.resolved_unit_contract.validate(unit.driver.resolved_unit_contract.dump(resolved.unit))
+    desired = resolved.unit
+    if isinstance(unit.driver, MaterializationCapability):
+        renderer = desired.materialize.type
+        metadata = {"renderer": renderer, "inventory": []}
+        if renderer == "helm":
+            metadata |= {
                 "version": "v3.17.1",
-                "releaseName": "web",
-                "namespace": "default",
-                "inventory": [{"apiVersion": "v1", "kind": "ConfigMap", "namespace": "default", "name": "web"}],
-            },
-        }
-    return desired
+                "releaseName": desired.materialize.releaseName,
+                "namespace": desired.materialize.namespace,
+            }
+        desired = unit.driver.finalize_materialization(
+            desired,
+            MaterializationDocument(
+                path=f"materialized/{unit.name}",
+                digest=DIGEST,
+                mediaType="application/vnd.gitopsctr.kubernetes-manifests.v1",
+                metadata=JsonObjectValue(metadata),
+            ),
+        )
+    return unit.with_spec(desired)
 
 
-@pytest.mark.parametrize("unit", authored_examples(), ids=lambda unit: f"{unit['driver']}-{unit['name']}")
-def test_builtin_contracts_validate_authored_and_desired_examples(unit):
-    plugin = UNIT_DRIVERS[unit["driver"]]
+def has_incomplete_frontend_inputs(unit: UnitResource) -> bool:
+    return unit.driver_name == "frontend-s3-cloudfront" and any(
+        value is None for value in unit.spec.inputs.to_dict().values()
+    )
 
-    plugin.unit_contract.validate(unit)
-    plugin.desired_unit_contract.validate(desired_example(unit))
 
-    invalid = {**unit, "unexpected": True}
+@pytest.mark.parametrize("unit", authored_examples(), ids=lambda unit: f"{unit.driver_name}-{unit.name}")
+def test_builtin_contracts_validate_the_full_typed_unit_pipeline(unit):
+    plugin = unit.driver
+    authored = plugin.unit_contract.dump(unit.spec)
+
+    plugin.unit_contract.validate(authored)
+    if has_incomplete_frontend_inputs(unit):
+        with pytest.raises(DriverError, match="resolved frontend inputs are invalid"):
+            desired_example(unit)
+        return
+    desired = desired_example(unit)
+    plugin.desired_unit_contract.validate(plugin.desired_unit_contract.dump(desired.spec))
+
+    invalid = {**authored, "unexpected": True}
     with pytest.raises(ContractError, match="Additional properties"):
         plugin.unit_contract.validate(invalid)
 
 
 def test_schema_hint_is_ignored_for_runtime_validation():
     unit = authored_examples()[0]
-    contract = UNIT_DRIVERS[unit["driver"]].unit_contract
+    contract = unit.driver.unit_contract
+    authored = contract.dump(unit.spec)
 
     for hint in (None, "https://example.invalid/schema.json", 42):
-        candidate = {key: value for key, value in unit.items() if key != "$schema"}
+        candidate = dict(authored)
         if hint is not None:
             candidate["$schema"] = hint
         assert contract.validate(candidate) == candidate
@@ -158,9 +190,12 @@ def test_generated_schemas_and_examples_validate_from_the_local_catalog():
     for authored in authored_examples():
         authored_resource = cli.serialize_unit_document(authored, profile="authored")
         Draft202012Validator(by_id[authored_resource["$schema"]], registry=registry).validate(authored_resource)
+        if has_incomplete_frontend_inputs(authored):
+            continue
         desired = desired_example(authored)
         desired_resource = cli.serialize_unit_document(desired, profile="desired")
-        Draft202012Validator(by_id[desired_resource["$schema"]], registry=registry).validate(desired_resource)
+        validator = Draft202012Validator(by_id[desired_resource["$schema"]], registry=registry)
+        validator.validate(desired_resource)
     for path in sorted((ROOT / "tests/fixtures").rglob("environment.json")):
         environment = {key: value for key, value in json.loads(path.read_text()).items() if key != "schema"}
         Draft202012Validator(by_id[environment["$schema"]], registry=registry).validate(environment)

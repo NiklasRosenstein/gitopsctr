@@ -152,10 +152,10 @@ def test_create_unit_generates_a_valid_builtin_scaffold(tmp_path: Path, driver_n
     path = tmp_path / f"deployment/environments/dev/units/{driver_name}.yaml"
     text = path.read_text()
     document = yaml.safe_load(text)
-    unit = cli.normalize_unit_document(document, driver_name)
-    UNIT_DRIVERS[driver_name].unit_contract.validate(unit)
-    assert unit["source"]["path"] == f"services/{driver_name}"
-    assert "artifacts" not in unit
+    unit = cli.parse_authored_unit_document(document, driver_name)
+    UNIT_DRIVERS[driver_name].unit_contract.validate(unit.driver.unit_contract.dump(unit.spec))
+    assert unit.spec.source.path == f"services/{driver_name}"
+    assert not hasattr(unit.spec, "artifacts")
     assert text.startswith(
         f"# yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/"
         f"unit.gitopsctr.io/v1/{UNIT_DRIVERS[driver_name].kind}/authored.schema.json\n"
@@ -271,7 +271,10 @@ def test_validate_rejects_duplicate_unit_representations(tmp_path: Path):
     create_environment(tmp_path)
     units = tmp_path / "deployment/environments/dev/units"
     document = cli.serialize_unit_document(
-        {"name": "infra", "driver": "terraform", **UNIT_DRIVERS["terraform"].scaffold_unit_spec("infra", ".")},
+        cli.parse_authored_unit_document(
+            {"name": "infra", "driver": "terraform", **UNIT_DRIVERS["terraform"].scaffold_unit_spec("infra", ".")},
+            "infra",
+        ),
         profile="authored",
     )
     write_yaml(units / "infra.yaml", document)
@@ -298,8 +301,14 @@ def test_validate_applies_cross_unit_observation_rules(tmp_path: Path, capsys: p
         **UNIT_DRIVERS["terraform"].scaffold_unit_spec("consumer", "terraform"),
         "inputs": {"value": {"fromReceipt": {"unit": "manifests"}}},
     }
-    write_yaml(units / "manifests.yaml", cli.serialize_unit_document(producer, profile="authored"))
-    write_yaml(units / "consumer.yaml", cli.serialize_unit_document(consumer, profile="authored"))
+    write_yaml(
+        units / "manifests.yaml",
+        cli.serialize_unit_document(cli.parse_authored_unit_document(producer, "manifests"), profile="authored"),
+    )
+    write_yaml(
+        units / "consumer.yaml",
+        cli.serialize_unit_document(cli.parse_authored_unit_document(consumer, "consumer"), profile="authored"),
+    )
     capsys.readouterr()
 
     with pytest.raises(cli.OperationError, match="1 error"):

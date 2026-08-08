@@ -13,12 +13,11 @@ from gitopsctr.contracts import (
     AuthoredSource,
     DesiredSource,
     MashumaroContract,
-    MaterializationDocument,
-    SchemaDocument,
+    ResolvedInputs,
     StrictModel,
     schema_url,
 )
-from gitopsctr.document import JsonObject, JsonValue
+from gitopsctr.document import JsonObject, JsonObjectValue, JsonValue
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -28,13 +27,17 @@ from gitopsctr.driver import (
     ReconciliationOutput,
     ReconciliationResult,
     UnitDriver,
+    UnitResolution,
+    UnitResolutionContext,
     VerificationCapability,
     VerificationContext,
     VerificationResult,
     VerificationStatus,
+    reference_fingerprints,
     unit_driver_api,
 )
 from gitopsctr.execution import CommandOutput, CommandResult
+from gitopsctr.templates import TemplateObject
 
 from ._common import select_result_fields
 
@@ -57,31 +60,34 @@ class TerraformHttpCheck(StrictModel):
 
 
 @dataclass(frozen=True, kw_only=True)
-class TerraformConfiguration(StrictModel):
+class TerraformAuthoredConfiguration(StrictModel):
     backend: dict[str, str | int | float | bool] | None = None
-    variables: dict[str, Any] | None = None
+    variables: TemplateObject | None = None
     observeOutputs: list[str] | None = None
     checks: list[TerraformHttpCheck] | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
-class TerraformUnit(SchemaDocument):
-    name: str
-    driver: Literal["terraform"]
-    source: AuthoredSource
-    terraform: TerraformConfiguration | None = None
-    inputs: dict[str, Any] | None = None
+class TerraformConfiguration(StrictModel):
+    backend: dict[str, str | int | float | bool] | None = None
+    variables: JsonObjectValue | None = None
+    observeOutputs: list[str] | None = None
+    checks: list[TerraformHttpCheck] | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
-class TerraformDesiredUnit(SchemaDocument):
-    name: str
-    driver: Literal["terraform"]
+class TerraformUnit(StrictModel):
+    source: AuthoredSource
+    terraform: TerraformAuthoredConfiguration | None = None
+    inputs: TemplateObject | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class TerraformDesiredUnit(StrictModel):
     source: DesiredSource
     terraform: TerraformConfiguration | None = None
-    inputs: dict[str, Any] | None = None
-    resolvedInputs: dict[str, dict[str, str]] | None = None
-    materialization: MaterializationDocument | None = None
+    inputs: JsonObjectValue | None = None
+    resolvedInputs: ResolvedInputs | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -108,19 +114,23 @@ class TerraformRuntime:
     environment: dict[str, str]
     init_args: list[str]
     observed_output_names: list[str]
-    checks: list[object]
+    checks: list[TerraformHttpCheck]
 
 
 def terraform_runtime(
-    context: PlanningContext | ReconciliationContext | VerificationContext,
+    context: (
+        PlanningContext[TerraformDesiredUnit]
+        | ReconciliationContext[TerraformDesiredUnit]
+        | VerificationContext[TerraformDesiredUnit]
+    ),
 ) -> TerraformRuntime:
-    configuration = context.unit.get("terraform")
-    if not isinstance(configuration, dict):
+    configuration = context.unit.terraform
+    if configuration is None:
         raise DriverError("terraform driver requires a terraform configuration")
-    backend = configuration.get("backend")
-    variables = configuration.get("variables")
-    output_names = configuration.get("observeOutputs")
-    checks = configuration.get("checks", [])
+    backend = configuration.backend
+    variables = configuration.variables
+    output_names = configuration.observeOutputs
+    checks = configuration.checks or []
     if not isinstance(backend, dict) or not isinstance(variables, dict):
         raise DriverError("terraform driver requires backend and variables objects")
     invalid_backend_fields = [
@@ -134,11 +144,8 @@ def terraform_runtime(
         f"-backend-config={name}={value if isinstance(value, str) else json.dumps(value)}"
         for name, value in backend.items()
     ]
-    if not isinstance(output_names, list) or not all(isinstance(name, str) for name in output_names):
+    if output_names is None:
         raise DriverError("terraform observeOutputs must be a list of names")
-    output_names = cast(list[str], output_names)
-    if not isinstance(checks, list):
-        raise DriverError("terraform checks must be a list")
 
     terraform_root = context.source_root / context.source_path
     terraform_environment = os.environ | {
@@ -149,17 +156,26 @@ def terraform_runtime(
         environment=terraform_environment,
         init_args=backend_args,
         observed_output_names=output_names,
-        checks=cast(list[object], checks),
+        checks=checks,
     )
 
 
-class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, VerificationCapability):
+class TerraformDriver(
+    UnitDriver[TerraformUnit, TerraformDesiredUnit, TerraformDesiredUnit, TerraformResultModel],
+    PlanningCapability[TerraformDesiredUnit],
+    ReconciliationCapability[TerraformDesiredUnit, TerraformResultModel],
+    VerificationCapability[TerraformDesiredUnit],
+):
     api_version = "unit.gitopsctr.io/v1"
     kind = "Terraform"
     driver_name = "terraform"
     version = 2
     schema_base_uri = schema_url("drivers/terraform", version, "").removesuffix(".schema.json")
     unit_contract = MashumaroContract(TerraformUnit, schema_url("drivers/terraform", version, "unit"))
+    resolved_unit_contract = MashumaroContract(
+        TerraformDesiredUnit,
+        schema_url("drivers/terraform", version, "resolved-unit"),
+    )
     desired_unit_contract = MashumaroContract(
         TerraformDesiredUnit,
         schema_url("drivers/terraform", version, "desired-unit"),
@@ -173,9 +189,48 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
             "terraform": {"backend": {}, "variables": {}, "observeOutputs": [], "checks": []},
         }
 
+    def resolve_unit(self, unit: TerraformUnit, context: UnitResolutionContext) -> UnitResolution[TerraformDesiredUnit]:
+        resolutions = []
+        configuration: TerraformConfiguration | None = None
+        if unit.terraform is not None:
+            variables = None
+            if unit.terraform.variables is not None:
+                variable_resolution = context.resolve_template(unit.terraform.variables._serialize())
+                if not isinstance(variable_resolution.value, dict):
+                    raise DriverError("resolved Terraform variables must be an object")
+                variables = JsonObjectValue(variable_resolution.value)
+                resolutions.append(variable_resolution)
+            configuration = TerraformConfiguration(
+                backend=unit.terraform.backend,
+                variables=variables,
+                observeOutputs=unit.terraform.observeOutputs,
+                checks=unit.terraform.checks,
+            )
+        inputs = None
+        if unit.inputs is not None:
+            input_resolution = context.resolve_template(unit.inputs._serialize())
+            if not isinstance(input_resolution.value, dict):
+                raise DriverError("resolved Terraform inputs must be an object")
+            inputs = JsonObjectValue(input_resolution.value)
+            resolutions.append(input_resolution)
+        fingerprints = reference_fingerprints(*resolutions)
+        return UnitResolution(
+            TerraformDesiredUnit(
+                source=context.source,
+                terraform=configuration,
+                inputs=inputs,
+                resolvedInputs=fingerprints,
+            ),
+            fingerprints,
+        )
+
     @staticmethod
     def _prepare_plan_artifacts(
-        context: PlanningContext | ReconciliationContext | VerificationContext,
+        context: (
+            PlanningContext[TerraformDesiredUnit]
+            | ReconciliationContext[TerraformDesiredUnit]
+            | VerificationContext[TerraformDesiredUnit]
+        ),
         plan_name: str,
         report_name: str,
         local_plan_name: str,
@@ -190,7 +245,7 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
                 previous.unlink()
         return plan, report
 
-    def plan(self, context: PlanningContext) -> None:
+    def plan(self, context: PlanningContext[TerraformDesiredUnit]) -> None:
         runtime = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,
@@ -231,7 +286,10 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
         if report_text is not None:
             terraform("show", "-no-color", str(plan), reported=True)
 
-    def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
+    def reconcile(
+        self,
+        context: ReconciliationContext[TerraformDesiredUnit],
+    ) -> ReconciliationOutput[TerraformResultModel]:
         runtime = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,
@@ -290,11 +348,11 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
             raise DriverError(f"Terraform did not return the expected outputs: {exc}") from exc
 
         for check in runtime.checks:
-            if not isinstance(check, dict) or check.get("type") != "http":
+            if check.type != "http":
                 raise DriverError("terraform currently supports only HTTP checks")
-            output_name = check.get("urlOutput")
-            path = check.get("path", "")
-            if output_name not in outputs or not isinstance(path, str):
+            output_name = check.urlOutput
+            path = check.path
+            if output_name not in outputs:
                 raise DriverError("terraform HTTP check has invalid urlOutput or path")
             context.execution.run(
                 "curl",
@@ -310,13 +368,16 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
             )
 
         return ReconciliationOutput(
-            result={
-                "applied": {"sourceRevision": context.source_revision, "path": context.source_path},
-                "outputs": outputs,
-            }
+            result=TerraformResultModel(
+                applied=AppliedTerraformModel(
+                    sourceRevision=context.source_revision,
+                    path=context.source_path,
+                ),
+                outputs=dict(outputs),
+            )
         )
 
-    def verify(self, context: VerificationContext) -> VerificationResult:
+    def verify(self, context: VerificationContext[TerraformDesiredUnit]) -> VerificationResult:
         runtime = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,

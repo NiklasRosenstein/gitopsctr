@@ -51,7 +51,8 @@ def _resource_schema(
     kind: str,
     spec: JsonObject,
 ) -> JsonObject:
-    return {
+    definitions = spec.pop("$defs", None)
+    resource: JsonObject = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": schema_id,
         "title": f"{kind} ({api_version})",
@@ -71,6 +72,9 @@ def _resource_schema(
         "required": ["apiVersion", "kind", "metadata", "spec"],
         "additionalProperties": False,
     }
+    if definitions is not None:
+        resource["$defs"] = definitions
+    return resource
 
 
 def unit_resource_schema(driver: str, profile: str = "authored") -> JsonObject:

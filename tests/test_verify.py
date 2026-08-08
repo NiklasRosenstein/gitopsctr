@@ -2,13 +2,17 @@
 
 import json
 from argparse import Namespace
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from gitopsctr import cli as deploy_release
+from gitopsctr.contrib.drivers.terraform import AppliedTerraformModel, TerraformResultModel
+from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import ReconciliationOutput, VerificationContext, VerificationResult, VerificationStatus
+from gitopsctr.resources import UnitResource
 
 DESIRED_REVISION = "d" * 40
 
@@ -18,21 +22,24 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
     path.write_text(json.dumps(value))
 
 
-def _unit(name: str, driver: str, revision: str) -> dict[str, object]:
-    return {
-        "schema": 1,
-        "name": name,
-        "driver": driver,
-        "source": {
-            "path": f"deployment/{name}",
-            "revision": revision,
-            "driverVersion": deploy_release.DRIVER_VERSIONS[driver],
+def _unit(name: str, driver: str, revision: str) -> UnitResource:
+    return deploy_release.parse_desired_unit_document(
+        {
+            "schema": 1,
+            "name": name,
+            "driver": driver,
+            "source": {
+                "path": f"deployment/{name}",
+                "revision": revision,
+                "driverVersion": deploy_release.DRIVER_VERSIONS[driver],
+            },
+            "inputs": {"environment": "prod"},
         },
-        "inputs": {"environment": "prod"},
-    }
+        name,
+    )
 
 
-def _install_desired_state(monkeypatch, units: list[dict[str, object]]) -> list[str]:
+def _install_desired_state(monkeypatch, units: list[UnitResource]) -> list[str]:
     materialized: list[str] = []
 
     def deployment_refs(source_root, environment, desired=None, observed=None):
@@ -53,7 +60,7 @@ def _install_desired_state(monkeypatch, units: list[dict[str, object]]) -> list[
         if revision == DESIRED_REVISION:
             for unit in units:
                 _write_json(
-                    output / "units" / f"{unit['name']}.json",
+                    output / "units" / f"{unit.name}.json",
                     deploy_release.serialize_unit_document(unit),
                 )
 
@@ -77,7 +84,7 @@ def test_verify_runs_every_selected_driver_and_reports_drift_after_all_units(mon
 
     def verifier(status):
         def verify(context):
-            calls.append((context.unit["name"], context))
+            calls.append((context.unit_name, context))
             return VerificationResult(status)
 
         return verify
@@ -100,7 +107,7 @@ def test_verify_runs_every_selected_driver_and_reports_drift_after_all_units(mon
     assert materialized == [DESIRED_REVISION, "a" * 40, "b" * 40]
     assert calls[0][1].source_revision == "a" * 40
     assert calls[0][1].source_path == "deployment/images"
-    assert calls[0][1].inputs == {"environment": "prod"}
+    assert calls[0][1].unit.inputs == {"environment": "prod"}
     output = capsys.readouterr().err
     assert "DRIFT    images" in output
     assert "CLEAN    infrastructure" in output
@@ -118,7 +125,7 @@ def test_verify_deduplicates_selected_units_and_reports_clean(monkeypatch, capsy
         deploy_release.VERIFICATION_DRIVERS,
         "terraform",
         SimpleNamespace(
-            verify=lambda context: calls.append(context.unit["name"]) or VerificationResult(VerificationStatus.CLEAN)
+            verify=lambda context: calls.append(context.unit_name) or VerificationResult(VerificationStatus.CLEAN)
         ),
     )
 
@@ -152,11 +159,18 @@ def test_verify_preflights_unsupported_drivers_before_running_any_unit(monkeypat
 
 def test_verify_rejects_unmaterialized_desired_units_before_running_driver(monkeypatch):
     unit = _unit("infrastructure", "terraform", "a" * 40)
-    unit["inputs"] = {
-        "image": {
-            "fromReceipt": {"unit": "images", "pointer": "/image"},
-        }
-    }
+    unit = unit.with_spec(
+        replace(
+            unit.spec,
+            inputs=JsonObjectValue(
+                {
+                    "image": {
+                        "fromReceipt": {"unit": "images", "pointer": "/image"},
+                    }
+                }
+            ),
+        )
+    )
     materialized = _install_desired_state(monkeypatch, [unit])
     monkeypatch.setitem(
         deploy_release.VERIFICATION_DRIVERS,
@@ -204,11 +218,19 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
     def materialize(revision: str, output: Path):
         output.mkdir(parents=True, exist_ok=True)
         if revision == DESIRED_REVISION:
-            _write_json(output / "units/infrastructure.json", unit)
+            _write_json(
+                output / "units/infrastructure.json",
+                deploy_release.serialize_unit_document(unit),
+            )
 
     def driver(context):
-        calls.append(context.unit["name"])
-        return ReconciliationOutput(result={"applied": {"sourceRevision": context.source_revision}, "outputs": {}})
+        calls.append(context.unit_name)
+        return ReconciliationOutput(
+            result=TerraformResultModel(
+                applied=AppliedTerraformModel(sourceRevision=context.source_revision),
+                outputs={},
+            )
+        )
 
     monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
     monkeypatch.setattr(deploy_release, "materialize_revision", materialize)

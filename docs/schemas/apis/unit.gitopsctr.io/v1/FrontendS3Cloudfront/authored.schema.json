@@ -34,18 +34,1284 @@
               "additionalProperties": false,
               "properties": {
                 "bucket": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromReceipt": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit"
+                              ],
+                              "title": "ReceiptReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromReceipt"
+                          ],
+                          "title": "ReceiptReference",
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromArtifact": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "apiVersion": {
+                                  "pattern": "^[^/]+/[^/]+$",
+                                  "type": "string"
+                                },
+                                "kind": {
+                                  "pattern": "^[A-Z][A-Za-z0-9]*$",
+                                  "type": "string"
+                                },
+                                "name": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                },
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit",
+                                "name",
+                                "apiVersion",
+                                "kind"
+                              ],
+                              "title": "ArtifactReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromArtifact"
+                          ],
+                          "title": "ArtifactReference",
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromPromotion": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit"
+                              ],
+                              "title": "PromotionReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromPromotion"
+                          ],
+                          "title": "PromotionReference",
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
                   "default": null
                 },
                 "bundle": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromReceipt": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit"
+                              ],
+                              "title": "ReceiptReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromReceipt"
+                          ],
+                          "title": "ReceiptReference",
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromArtifact": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "apiVersion": {
+                                  "pattern": "^[^/]+/[^/]+$",
+                                  "type": "string"
+                                },
+                                "kind": {
+                                  "pattern": "^[A-Z][A-Za-z0-9]*$",
+                                  "type": "string"
+                                },
+                                "name": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                },
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit",
+                                "name",
+                                "apiVersion",
+                                "kind"
+                              ],
+                              "title": "ArtifactReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromArtifact"
+                          ],
+                          "title": "ArtifactReference",
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromPromotion": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit"
+                              ],
+                              "title": "PromotionReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromPromotion"
+                          ],
+                          "title": "PromotionReference",
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
                   "default": null
                 },
                 "distributionId": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromReceipt": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit"
+                              ],
+                              "title": "ReceiptReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromReceipt"
+                          ],
+                          "title": "ReceiptReference",
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromArtifact": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "apiVersion": {
+                                  "pattern": "^[^/]+/[^/]+$",
+                                  "type": "string"
+                                },
+                                "kind": {
+                                  "pattern": "^[A-Z][A-Za-z0-9]*$",
+                                  "type": "string"
+                                },
+                                "name": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                },
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit",
+                                "name",
+                                "apiVersion",
+                                "kind"
+                              ],
+                              "title": "ArtifactReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromArtifact"
+                          ],
+                          "title": "ArtifactReference",
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromPromotion": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit"
+                              ],
+                              "title": "PromotionReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromPromotion"
+                          ],
+                          "title": "PromotionReference",
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
                   "default": null
                 },
                 "runtimeConfig": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "apiBase": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "anyOf": [
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "fromReceipt": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "pointer": {
+                                          "default": "",
+                                          "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "unit"
+                                      ],
+                                      "title": "ReceiptReferenceTarget",
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "fromReceipt"
+                                  ],
+                                  "title": "ReceiptReference",
+                                  "type": "object"
+                                },
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "fromArtifact": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "apiVersion": {
+                                          "pattern": "^[^/]+/[^/]+$",
+                                          "type": "string"
+                                        },
+                                        "kind": {
+                                          "pattern": "^[A-Z][A-Za-z0-9]*$",
+                                          "type": "string"
+                                        },
+                                        "name": {
+                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "type": "string"
+                                        },
+                                        "pointer": {
+                                          "default": "",
+                                          "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "unit",
+                                        "name",
+                                        "apiVersion",
+                                        "kind"
+                                      ],
+                                      "title": "ArtifactReferenceTarget",
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "fromArtifact"
+                                  ],
+                                  "title": "ArtifactReference",
+                                  "type": "object"
+                                },
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "fromPromotion": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "pointer": {
+                                          "default": "",
+                                          "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "unit"
+                                      ],
+                                      "title": "PromotionReferenceTarget",
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "fromPromotion"
+                                  ],
+                                  "title": "PromotionReference",
+                                  "type": "object"
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        "auth": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "clientId": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "fromReceipt": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "pointer": {
+                                                  "default": "",
+                                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                                  "type": "string"
+                                                },
+                                                "unit": {
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "unit"
+                                              ],
+                                              "title": "ReceiptReferenceTarget",
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "fromReceipt"
+                                          ],
+                                          "title": "ReceiptReference",
+                                          "type": "object"
+                                        },
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "fromArtifact": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "apiVersion": {
+                                                  "pattern": "^[^/]+/[^/]+$",
+                                                  "type": "string"
+                                                },
+                                                "kind": {
+                                                  "pattern": "^[A-Z][A-Za-z0-9]*$",
+                                                  "type": "string"
+                                                },
+                                                "name": {
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "type": "string"
+                                                },
+                                                "pointer": {
+                                                  "default": "",
+                                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                                  "type": "string"
+                                                },
+                                                "unit": {
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "unit",
+                                                "name",
+                                                "apiVersion",
+                                                "kind"
+                                              ],
+                                              "title": "ArtifactReferenceTarget",
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "fromArtifact"
+                                          ],
+                                          "title": "ArtifactReference",
+                                          "type": "object"
+                                        },
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "fromPromotion": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "pointer": {
+                                                  "default": "",
+                                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                                  "type": "string"
+                                                },
+                                                "unit": {
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "unit"
+                                              ],
+                                              "title": "PromotionReferenceTarget",
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "fromPromotion"
+                                          ],
+                                          "title": "PromotionReference",
+                                          "type": "object"
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "issuer": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "fromReceipt": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "pointer": {
+                                                  "default": "",
+                                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                                  "type": "string"
+                                                },
+                                                "unit": {
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "unit"
+                                              ],
+                                              "title": "ReceiptReferenceTarget",
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "fromReceipt"
+                                          ],
+                                          "title": "ReceiptReference",
+                                          "type": "object"
+                                        },
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "fromArtifact": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "apiVersion": {
+                                                  "pattern": "^[^/]+/[^/]+$",
+                                                  "type": "string"
+                                                },
+                                                "kind": {
+                                                  "pattern": "^[A-Z][A-Za-z0-9]*$",
+                                                  "type": "string"
+                                                },
+                                                "name": {
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "type": "string"
+                                                },
+                                                "pointer": {
+                                                  "default": "",
+                                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                                  "type": "string"
+                                                },
+                                                "unit": {
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "unit",
+                                                "name",
+                                                "apiVersion",
+                                                "kind"
+                                              ],
+                                              "title": "ArtifactReferenceTarget",
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "fromArtifact"
+                                          ],
+                                          "title": "ArtifactReference",
+                                          "type": "object"
+                                        },
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "fromPromotion": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "pointer": {
+                                                  "default": "",
+                                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                                  "type": "string"
+                                                },
+                                                "unit": {
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "unit"
+                                              ],
+                                              "title": "PromotionReferenceTarget",
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "fromPromotion"
+                                          ],
+                                          "title": "PromotionReference",
+                                          "type": "object"
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "mode": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "fromReceipt": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "pointer": {
+                                                  "default": "",
+                                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                                  "type": "string"
+                                                },
+                                                "unit": {
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "unit"
+                                              ],
+                                              "title": "ReceiptReferenceTarget",
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "fromReceipt"
+                                          ],
+                                          "title": "ReceiptReference",
+                                          "type": "object"
+                                        },
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "fromArtifact": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "apiVersion": {
+                                                  "pattern": "^[^/]+/[^/]+$",
+                                                  "type": "string"
+                                                },
+                                                "kind": {
+                                                  "pattern": "^[A-Z][A-Za-z0-9]*$",
+                                                  "type": "string"
+                                                },
+                                                "name": {
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "type": "string"
+                                                },
+                                                "pointer": {
+                                                  "default": "",
+                                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                                  "type": "string"
+                                                },
+                                                "unit": {
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "unit",
+                                                "name",
+                                                "apiVersion",
+                                                "kind"
+                                              ],
+                                              "title": "ArtifactReferenceTarget",
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "fromArtifact"
+                                          ],
+                                          "title": "ArtifactReference",
+                                          "type": "object"
+                                        },
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "fromPromotion": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "pointer": {
+                                                  "default": "",
+                                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                                  "type": "string"
+                                                },
+                                                "unit": {
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "unit"
+                                              ],
+                                              "title": "PromotionReferenceTarget",
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "fromPromotion"
+                                          ],
+                                          "title": "PromotionReference",
+                                          "type": "object"
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "mode",
+                                "issuer",
+                                "clientId"
+                              ],
+                              "title": "AuthoredRuntimeAuth",
+                              "type": "object"
+                            },
+                            {
+                              "anyOf": [
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "fromReceipt": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "pointer": {
+                                          "default": "",
+                                          "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "unit"
+                                      ],
+                                      "title": "ReceiptReferenceTarget",
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "fromReceipt"
+                                  ],
+                                  "title": "ReceiptReference",
+                                  "type": "object"
+                                },
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "fromArtifact": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "apiVersion": {
+                                          "pattern": "^[^/]+/[^/]+$",
+                                          "type": "string"
+                                        },
+                                        "kind": {
+                                          "pattern": "^[A-Z][A-Za-z0-9]*$",
+                                          "type": "string"
+                                        },
+                                        "name": {
+                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "type": "string"
+                                        },
+                                        "pointer": {
+                                          "default": "",
+                                          "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "unit",
+                                        "name",
+                                        "apiVersion",
+                                        "kind"
+                                      ],
+                                      "title": "ArtifactReferenceTarget",
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "fromArtifact"
+                                  ],
+                                  "title": "ArtifactReference",
+                                  "type": "object"
+                                },
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "fromPromotion": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "pointer": {
+                                          "default": "",
+                                          "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "unit"
+                                      ],
+                                      "title": "PromotionReferenceTarget",
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "fromPromotion"
+                                  ],
+                                  "title": "PromotionReference",
+                                  "type": "object"
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        "schema": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "anyOf": [
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "fromReceipt": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "pointer": {
+                                          "default": "",
+                                          "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "unit"
+                                      ],
+                                      "title": "ReceiptReferenceTarget",
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "fromReceipt"
+                                  ],
+                                  "title": "ReceiptReference",
+                                  "type": "object"
+                                },
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "fromArtifact": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "apiVersion": {
+                                          "pattern": "^[^/]+/[^/]+$",
+                                          "type": "string"
+                                        },
+                                        "kind": {
+                                          "pattern": "^[A-Z][A-Za-z0-9]*$",
+                                          "type": "string"
+                                        },
+                                        "name": {
+                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "type": "string"
+                                        },
+                                        "pointer": {
+                                          "default": "",
+                                          "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "unit",
+                                        "name",
+                                        "apiVersion",
+                                        "kind"
+                                      ],
+                                      "title": "ArtifactReferenceTarget",
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "fromArtifact"
+                                  ],
+                                  "title": "ArtifactReference",
+                                  "type": "object"
+                                },
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "fromPromotion": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "pointer": {
+                                          "default": "",
+                                          "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "unit"
+                                      ],
+                                      "title": "PromotionReferenceTarget",
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "fromPromotion"
+                                  ],
+                                  "title": "PromotionReference",
+                                  "type": "object"
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "schema",
+                        "apiBase",
+                        "auth"
+                      ],
+                      "title": "AuthoredRuntimeConfiguration",
+                      "type": "object"
+                    },
+                    {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromReceipt": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit"
+                              ],
+                              "title": "ReceiptReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromReceipt"
+                          ],
+                          "title": "ReceiptReference",
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromArtifact": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "apiVersion": {
+                                  "pattern": "^[^/]+/[^/]+$",
+                                  "type": "string"
+                                },
+                                "kind": {
+                                  "pattern": "^[A-Z][A-Za-z0-9]*$",
+                                  "type": "string"
+                                },
+                                "name": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                },
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit",
+                                "name",
+                                "apiVersion",
+                                "kind"
+                              ],
+                              "title": "ArtifactReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromArtifact"
+                          ],
+                          "title": "ArtifactReference",
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromPromotion": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit"
+                              ],
+                              "title": "PromotionReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromPromotion"
+                          ],
+                          "title": "PromotionReference",
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
                   "default": null
                 },
                 "url": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromReceipt": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit"
+                              ],
+                              "title": "ReceiptReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromReceipt"
+                          ],
+                          "title": "ReceiptReference",
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromArtifact": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "apiVersion": {
+                                  "pattern": "^[^/]+/[^/]+$",
+                                  "type": "string"
+                                },
+                                "kind": {
+                                  "pattern": "^[A-Z][A-Za-z0-9]*$",
+                                  "type": "string"
+                                },
+                                "name": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                },
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit",
+                                "name",
+                                "apiVersion",
+                                "kind"
+                              ],
+                              "title": "ArtifactReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromArtifact"
+                          ],
+                          "title": "ArtifactReference",
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fromPromotion": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "pointer": {
+                                  "default": "",
+                                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "unit"
+                              ],
+                              "title": "PromotionReferenceTarget",
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "fromPromotion"
+                          ],
+                          "title": "PromotionReference",
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
                   "default": null
                 }
               },

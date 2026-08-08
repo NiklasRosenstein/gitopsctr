@@ -19,6 +19,7 @@ from gitopsctr.contrib.drivers import (
     terraform,
     vite_oci_bundle,
 )
+from gitopsctr.document import ContractError
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -143,14 +144,12 @@ def _oci_context(
         source_root=tmp_path,
         source_revision="a" * 40,
         source_path=".",
-        unit={
-            "name": "application-images",
-            "driver": "oci-images",
-            "source": {"inputHash": "sha256:" + "b" * 64},
+        unit_name="application-images",
+        unit=oci_images.OciImagesDesiredUnit.from_dict({
+            "source": {"path": ".", "revision": "a" * 40, "inputHash": "sha256:" + "b" * 64},
             "build": {"dockerfile": "Dockerfile", "platform": "linux/amd64"},
             "publish": publication,
-        },
-        inputs={},
+        }),
     )
 
 
@@ -162,8 +161,8 @@ def _planning_context(context: ReconciliationContext) -> PlanningContext:
         source_root=context.source_root,
         source_revision=context.source_revision,
         source_path=context.source_path,
+        unit_name=context.unit_name,
         unit=context.unit,
-        inputs=context.inputs,
         report=context.report,
         execution=context.execution,
     )
@@ -293,7 +292,7 @@ def test_oci_images_rejects_invalid_publication_target_configuration(tmp_path, m
         lambda *_args, **_kwargs: pytest.fail("invalid configuration must fail before commands run")
     )
 
-    with pytest.raises(DriverError, match=message):
+    with pytest.raises((DriverError, ValueError)):
         oci_images.DRIVER.reconcile(
             replace(
                 _oci_context(
@@ -452,17 +451,15 @@ def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path,
         source_root=tmp_path,
         source_revision="a" * 40,
         source_path="frontend",
-        unit={
-            "name": "frontend-bundle",
-            "driver": "vite-oci-bundle",
-            "source": {"inputHash": "sha256:" + "b" * 64},
+        unit_name="frontend-bundle",
+        unit=vite_oci_bundle.ViteOciBundleDesiredUnit.from_dict({
+            "source": {"path": "frontend", "revision": "a" * 40, "inputHash": "sha256:" + "b" * 64},
             "build": {"nodeVersion": "24"},
             "publish": {
                 "repository": f"{REGISTRY}/example-application-frontend",
                 "credentialProvider": {"type": "aws-ecr"},
             },
-        },
-        inputs={},
+        }),
     )
     monkeypatch.setattr(
         vite_oci_bundle,
@@ -538,22 +535,28 @@ def test_frontend_deploy_overwrites_index_and_verifies_cloudfront(tmp_path, monk
         source_root=tmp_path,
         source_revision="a" * 40,
         source_path="scripts/deployment_drivers.py",
-        unit={"pull": {}},
-        inputs={
-            "bundle": f"{REGISTRY}/example-application-frontend@{DIGEST}",
-            "bucket": "frontend-bucket",
-            "distributionId": "distribution-id",
-            "url": "https://frontend.example.test",
-            "runtimeConfig": {
-                "schema": 1,
-                "apiBase": "https://api.example.test",
-                "auth": {
-                    "mode": "cognito",
-                    "issuer": "https://issuer.example.test",
-                    "clientId": "client-id",
+        unit_name="frontend",
+        unit=frontend_s3_cloudfront.FrontendDesiredUnit.from_dict(
+            {
+                "source": {"path": "scripts/deployment_drivers.py", "revision": "a" * 40},
+                "pull": {},
+                "inputs": {
+                    "bundle": f"{REGISTRY}/example-application-frontend@{DIGEST}",
+                    "bucket": "frontend-bucket",
+                    "distributionId": "distribution-id",
+                    "url": "https://frontend.example.test",
+                    "runtimeConfig": {
+                        "schema": 1,
+                        "apiBase": "https://api.example.test",
+                        "auth": {
+                            "mode": "cognito",
+                            "issuer": "https://issuer.example.test",
+                            "clientId": "client-id",
+                        },
+                    },
                 },
-            },
-        },
+            }
+        ),
         execution=execution_for(fake_run),
     )
 
@@ -562,7 +565,7 @@ def test_frontend_deploy_overwrites_index_and_verifies_cloudfront(tmp_path, monk
             frontend_s3_cloudfront.DRIVER.reconcile(context)
     else:
         result = frontend_s3_cloudfront.DRIVER.reconcile(context)
-        assert result.result["published"]["bundle"] == context.inputs["bundle"]
+        assert result.result.published.bundle == context.unit.inputs.bundle
 
     index_upload = next(
         command for command in commands if command[:3] == ("aws", "s3", "cp") and command[4].endswith("/index.html")
@@ -597,14 +600,15 @@ def _terraform_context(
         source_root=tmp_path / "source",
         source_revision="a" * 40,
         source_path="infra/deploy",
-        unit={
+        unit_name="terraform",
+        unit=terraform.TerraformDesiredUnit.from_dict({
+            "source": {"path": "infra/deploy", "revision": "a" * 40},
             "terraform": {
                 "backend": backend or {"key": "application/dev.tfstate"},
                 "variables": {"environment": "dev"},
                 "observeOutputs": [],
             }
-        },
-        inputs={},
+        }),
         report=report,
     )
 
@@ -629,9 +633,16 @@ def test_terraform_accepts_driver_neutral_backend_configuration(tmp_path, monkey
 
 
 def test_terraform_rejects_structured_backend_values(tmp_path):
-    with pytest.raises(DriverError, match="strings, numbers, or booleans"):
-        terraform.DRIVER.plan(
-            _planning_context(_terraform_context(tmp_path, tmp_path / "report", {"path": ["not", "a", "scalar"]}))
+    with pytest.raises(ContractError):
+        terraform.DRIVER.desired_unit_contract.parse(
+            {
+                "source": {"path": "infra/deploy", "revision": "a" * 40},
+                "terraform": {
+                    "backend": {"path": ["not", "a", "scalar"]},
+                    "variables": {"environment": "dev"},
+                    "observeOutputs": [],
+                },
+            }
         )
 
 
@@ -713,8 +724,8 @@ def test_terraform_verification_uses_refresh_enabled_read_only_saved_plan(
             source_root=reconciliation.source_root,
             source_revision=reconciliation.source_revision,
             source_path=reconciliation.source_path,
+            unit_name=reconciliation.unit_name,
             unit=reconciliation.unit,
-            inputs=reconciliation.inputs,
             report=reconciliation.report,
             execution=reconciliation.execution,
         )

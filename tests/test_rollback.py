@@ -44,6 +44,48 @@ def _desired_unit(name: str, revision: str, value: str) -> dict:
     }
 
 
+def _materialized_specification(name: str, producer: str | None = None) -> dict:
+    values = {}
+    if producer:
+        values["value"] = {
+            "fromReceipt": {"unit": producer, "pointer": "/outputs/value"},
+        }
+    return {
+        "schema": 1,
+        "name": name,
+        "driver": "kubernetes-manifests",
+        "source": {"path": "manifests"},
+        "materialize": {
+            "type": "helm",
+            "releaseName": name,
+            "namespace": "default",
+            "values": values,
+        },
+        "delivery": {"mode": "direct", "kubeContext": "test"},
+    }
+
+
+def _materialized_desired_unit(name: str, revision: str, value: str) -> dict:
+    return {
+        "schema": 1,
+        "name": name,
+        "driver": "kubernetes-manifests",
+        "source": {
+            "path": "manifests",
+            "revision": revision,
+            "inputHash": f"sha256:{value}",
+            "driverVersion": deploy_release.DRIVER_VERSIONS["kubernetes-manifests"],
+        },
+        "materialize": {
+            "type": "helm",
+            "releaseName": name,
+            "namespace": "default",
+            "values": {"value": value},
+        },
+        "delivery": {"mode": "direct", "kubeContext": "test"},
+    }
+
+
 def _receipt(unit_path: Path, unit_name: str, revision: str) -> dict:
     return {
         "schema": 1,
@@ -73,18 +115,21 @@ def _promotion_document(revision: str) -> dict:
 
 
 def test_downstream_unit_closure_is_transitive_and_excludes_selected_units():
-    specifications = {
+    documents = {
         "base": _specification("base"),
         "application": _specification("application", "base"),
         "frontend": _specification("frontend", "application"),
         "unrelated": _specification("unrelated"),
     }
+    specifications = {
+        name: deploy_release.parse_authored_unit_document(document, name) for name, document in documents.items()
+    }
 
-    assert deploy_release.downstream_unit_closure(specifications, ["base"]) == [
+    assert deploy_release.downstream_unit_closure(specifications, ["base"]) == (
         "application",
         "frontend",
-    ]
-    assert deploy_release.downstream_unit_closure(specifications, ["application"]) == ["frontend"]
+    )
+    assert deploy_release.downstream_unit_closure(specifications, ["application"]) == ("frontend",)
 
 
 def test_clean_rollback_target_requires_one_matching_observed_snapshot(tmp_path, monkeypatch):
@@ -204,10 +249,11 @@ def _install_rollback_simulation(
         "published": "f" * 40,
     }
     publications = []
+    specification = _materialized_specification if materialized_payloads else _specification
     specifications = {
-        "base": _specification("base"),
-        "consumer": _specification("consumer", "base"),
-        "unrelated": _specification("unrelated"),
+        "base": specification("base"),
+        "consumer": specification("consumer", "base"),
+        "unrelated": specification("unrelated"),
     }
 
     def write_source(output, promoted):
@@ -223,7 +269,11 @@ def _install_rollback_simulation(
 
     def write_desired(output, revision, value, promoted):
         for name in specifications:
-            unit = _desired_unit(name, revision, value)
+            unit = (
+                _materialized_desired_unit(name, revision, value)
+                if materialized_payloads
+                else _desired_unit(name, revision, value)
+            )
             if materialized_payloads:
                 payload = output / f"materialized/{name}"
                 payload.mkdir(parents=True, exist_ok=True)
@@ -234,7 +284,12 @@ def _install_rollback_simulation(
                     "path": f"materialized/{name}",
                     "digest": deploy_release.materialization_tree_digest(payload),
                     "mediaType": "application/yaml",
-                    "metadata": {"renderer": "test"},
+                    "metadata": {
+                        "renderer": "helm",
+                        "releaseName": name,
+                        "namespace": "default",
+                        "inventory": [],
+                    },
                 }
             _write_json(output / f"units/{name}.json", unit)
         if promoted:
@@ -305,12 +360,6 @@ def _install_rollback_simulation(
     )
     monkeypatch.setattr(deploy_release, "change_gate", lambda *_args: gate)
     monkeypatch.setattr(deploy_release, "publish_tree", publish)
-    if materialized_payloads:
-        monkeypatch.setitem(
-            deploy_release.MATERIALIZATION_DRIVERS,
-            "terraform",
-            deploy_release.UNIT_DRIVERS["terraform"],
-        )
     return revisions, publications
 
 

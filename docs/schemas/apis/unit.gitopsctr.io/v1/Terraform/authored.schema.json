@@ -1,4 +1,142 @@
 {
+  "$defs": {
+    "TemplateValue": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fromArtifact": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "pattern": "^[^/]+/[^/]+$",
+                  "type": "string"
+                },
+                "kind": {
+                  "pattern": "^[A-Z][A-Za-z0-9]*$",
+                  "type": "string"
+                },
+                "name": {
+                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "type": "string"
+                },
+                "pointer": {
+                  "default": "",
+                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                  "type": "string"
+                },
+                "unit": {
+                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "unit",
+                "name",
+                "apiVersion",
+                "kind"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "fromArtifact"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fromPromotion": {
+              "additionalProperties": false,
+              "properties": {
+                "pointer": {
+                  "default": "",
+                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                  "type": "string"
+                },
+                "unit": {
+                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "unit"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "fromPromotion"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fromReceipt": {
+              "additionalProperties": false,
+              "properties": {
+                "pointer": {
+                  "default": "",
+                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                  "type": "string"
+                },
+                "unit": {
+                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "unit"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "fromReceipt"
+          ],
+          "type": "object"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/TemplateValue"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/TemplateValue"
+          },
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "fromArtifact",
+                "fromPromotion",
+                "fromReceipt"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      ]
+    }
+  },
   "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
@@ -31,8 +169,17 @@
         "inputs": {
           "anyOf": [
             {
+              "additionalProperties": {
+                "$ref": "#/$defs/TemplateValue"
+              },
               "propertyNames": {
-                "type": "string"
+                "not": {
+                  "enum": [
+                    "fromArtifact",
+                    "fromPromotion",
+                    "fromReceipt"
+                  ]
+                }
               },
               "type": "object"
             },
@@ -155,8 +302,17 @@
                 "variables": {
                   "anyOf": [
                     {
+                      "additionalProperties": {
+                        "$ref": "#/$defs/TemplateValue"
+                      },
                       "propertyNames": {
-                        "type": "string"
+                        "not": {
+                          "enum": [
+                            "fromArtifact",
+                            "fromPromotion",
+                            "fromReceipt"
+                          ]
+                        }
                       },
                       "type": "object"
                     },
@@ -167,7 +323,7 @@
                   "default": null
                 }
               },
-              "title": "TerraformConfiguration",
+              "title": "TerraformAuthoredConfiguration",
               "type": "object"
             },
             {

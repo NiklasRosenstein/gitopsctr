@@ -102,8 +102,9 @@ promotedValue:
 the producer driver's declared output, the receipt descriptor, and the registered API kind before parsing the complete
 artifact resource and applying the pointer. The resolved consumer resource is then validated by its desired-unit type.
 
-Each reference may include `dryFallback`. A receipt or artifact is usable only while it matches the producer's current
-desired unit; artifacts are additionally checked against their descriptor, digest, identity, and registered contract.
+A receipt or artifact is usable only while it matches the producer's current desired unit; artifacts are additionally
+checked against their descriptor, digest, identity, and registered contract. If referenced evidence is unavailable or
+stale, the consumer remains waiting, including during speculative planning.
 
 The generic receipt points back to the unit kind:
 

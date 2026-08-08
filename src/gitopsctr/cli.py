@@ -15,22 +15,28 @@ import shutil
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cache
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
-from typing import Any, TextIO, TypedDict
+from typing import Any, Literal, TextIO, TypedDict, cast
 
 import yaml
 
 from gitopsctr.api import GVK, ApiError
-from gitopsctr.artifacts import ArtifactApi, require_artifact_api
-from gitopsctr.contracts import CORE_CONTRACTS, with_schema
-from gitopsctr.document import ContractError, DocumentContract, JsonObject
+from gitopsctr.artifacts import require_artifact_api
+from gitopsctr.contracts import CORE_CONTRACTS, DesiredSource, MaterializationDocument, StrictModel, with_schema
+from gitopsctr.dependencies import (
+    convergence_order,
+    convergence_scope,
+    dependency_graph,
+    downstream_unit_closure,
+    observation_reference_units,
+)
+from gitopsctr.document import ContractError, DocumentContract, JsonObject, JsonObjectValue
 from gitopsctr.driver import (
     DriverError,
     MaterializationContext,
@@ -39,9 +45,11 @@ from gitopsctr.driver import (
     ReconciliationCapability,
     ReconciliationContext,
     ReconciliationOutput,
+    UnitResolutionContext,
     VerificationContext,
     VerificationStatus,
 )
+from gitopsctr.errors import OperationError, ReferenceUnavailable
 from gitopsctr.execution import DriverExecution
 from gitopsctr.forges import (
     ChangeRequestResult,
@@ -72,7 +80,34 @@ from gitopsctr.registry import (
     VERIFICATION_DRIVERS,
     semantic_reconciliation_result,
 )
+from gitopsctr.resolution import (
+    FingerprintedValue,
+    ResolutionContext,
+    TemplateResolution,
+)
+from gitopsctr.resolution import (
+    resolve_template as resolve_template_value,
+)
+from gitopsctr.resources import CORE_API_VERSION, UNIT_API_VERSION, ResourceCatalog, ResourceMetadata, UnitResource
 from gitopsctr.schemas import driver_schema, encoded_schema, export_schemas, resource_schema_url, show_schema
+from gitopsctr.state import GitStateStore
+from gitopsctr.templates import (
+    ArtifactReference as ArtifactReferenceExpression,
+)
+from gitopsctr.templates import (
+    ArtifactReferenceTarget,
+    PromotionReference,
+    ReceiptReference,
+    TemplateError,
+    TemplateValue,
+    parse_template_value,
+)
+from gitopsctr.templates import (
+    contains_reference as template_contains_reference,
+)
+from gitopsctr.templates import (
+    references as template_references,
+)
 
 GIT_AUTHOR_NAME = os.environ.get("GITOPSCTR_GIT_AUTHOR_NAME", "gitopsctr")
 GIT_AUTHOR_EMAIL = os.environ.get(
@@ -80,22 +115,6 @@ GIT_AUTHOR_EMAIL = os.environ.get(
     "gitopsctr@users.noreply.github.com",
 )
 REPOSITORY_ROOT = Path.cwd().resolve()
-
-
-class OperationError(RuntimeError):
-    pass
-
-
-class ReferenceUnavailable(OperationError):
-    pass
-
-
-@dataclass(frozen=True)
-class TemplateResolution:
-    value: Any
-    promotions: dict[str, str]
-    receipts: dict[str, str]
-    artifacts: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -257,7 +276,7 @@ def style_environment(environment: str, stream: TextIO | None = None) -> str:
     return style_text(environment, "environment", stream)
 
 
-def style_units(unit_names: list[str] | tuple[str, ...], stream: TextIO | None = None) -> str:
+def style_units(unit_names: Sequence[str], stream: TextIO | None = None) -> str:
     return ", ".join(style_unit(unit_name, stream) for unit_name in unit_names)
 
 
@@ -350,14 +369,16 @@ def describe_revision(revision: str | None, stream: TextIO | None = None) -> str
 
 
 def git(*args: str, check: bool = True, input_text: str | None = None, env=None):
-    return run(
-        "git",
-        *args,
-        check=check,
-        input_text=input_text,
-        env=env,
-        cwd=REPOSITORY_ROOT,
-    )
+    return state_store().git(*args, check=check, input_text=input_text, env=env)
+
+
+@cache
+def _state_store(root: Path) -> GitStateStore:
+    return GitStateStore(root, GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL)
+
+
+def state_store() -> GitStateStore:
+    return _state_store(REPOSITORY_ROOT)
 
 
 def resolve_repository_root(repository: str | None) -> Path:
@@ -376,45 +397,17 @@ def resolve_repository_root(repository: str | None) -> Path:
 
 
 def fetch_ref(ref: str) -> str | None:
-    remote_ref = f"refs/heads/{ref}"
-    result = git("ls-remote", "--exit-code", "--heads", "origin", remote_ref, check=False)
-    if result.returncode == 2:
-        return None
-    if result.returncode != 0:
-        raise OperationError(result.stderr.strip() or f"could not inspect {ref}")
-
-    head = result.stdout.split()[0]
-    git("fetch", "origin", f"{remote_ref}:refs/remotes/origin/{ref}")
-    return head
+    return state_store().fetch(ref).revision
 
 
 def resolve_ref(ref: str, revision: str | None = None) -> str:
-    head = fetch_ref(ref)
-    if head is None:
-        raise OperationError(f"ref {ref!r} does not exist")
-
-    resolved = head if revision is None else git("rev-parse", f"{revision}^{{commit}}").stdout.strip()
-    if revision is not None:
-        result = git("merge-base", "--is-ancestor", resolved, head, check=False)
-        if result.returncode != 0:
-            raise OperationError(f"requested revision is not part of {ref} history")
-    return resolved
+    snapshot = state_store().resolve(ref, revision)
+    assert snapshot.revision is not None
+    return snapshot.revision
 
 
 def materialize_revision(revision: str, output: Path) -> None:
-    if output.exists() and any(output.iterdir()):
-        raise OperationError(f"output directory is not empty: {output}")
-    output.mkdir(parents=True, exist_ok=True)
-    archive = subprocess.run(
-        ["git", "archive", "--format=tar", revision],
-        check=True,
-        stdout=subprocess.PIPE,
-    ).stdout
-    with tempfile.TemporaryFile() as stream:
-        stream.write(archive)
-        stream.seek(0)
-        with tarfile.open(fileobj=stream, mode="r:") as tar:
-            tar.extractall(output, filter="data")
+    state_store().materialize(revision, output)
 
 
 def command_read_tree(args: argparse.Namespace) -> None:
@@ -437,39 +430,7 @@ def command_read_tree(args: argparse.Namespace) -> None:
 
 
 def publish_tree(ref: str, directory: Path, parent: str | None, message: str) -> str:
-    files = sorted(path for path in directory.rglob("*") if path.is_file())
-    if not files:
-        raise OperationError(f"tree is empty: {directory}")
-
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        index = str(Path(temporary_directory) / "index")
-        identity = os.environ | {"GIT_INDEX_FILE": index}
-        git("read-tree", "--empty", env=identity)
-        for path in files:
-            if path.is_symlink():
-                raise OperationError(f"tree contains a symbolic link: {path}")
-            relative = path.relative_to(directory).as_posix()
-            blob = git("hash-object", "-w", str(path)).stdout.strip()
-            git("update-index", "--add", "--cacheinfo", f"100644,{blob},{relative}", env=identity)
-        tree = git("write-tree", env=identity).stdout.strip()
-
-    commit_args = ["commit-tree", tree]
-    if parent:
-        commit_args.extend(["-p", parent])
-
-    identity = os.environ | {
-        "GIT_AUTHOR_NAME": GIT_AUTHOR_NAME,
-        "GIT_AUTHOR_EMAIL": GIT_AUTHOR_EMAIL,
-        "GIT_COMMITTER_NAME": GIT_AUTHOR_NAME,
-        "GIT_COMMITTER_EMAIL": GIT_AUTHOR_EMAIL,
-    }
-    commit = git(
-        *commit_args,
-        input_text=f"{message}\n",
-        env=identity,
-    ).stdout.strip()
-    git("push", "origin", f"{commit}:refs/heads/{ref}")
-    return commit
+    return state_store().publish(ref, directory, parent, message).revision
 
 
 def command_publish_tree(args: argparse.Namespace) -> None:
@@ -494,250 +455,118 @@ def command_schemas_export(args: argparse.Namespace) -> None:
         print(directory.resolve())
 
 
+RESOURCE_CATALOG = ResourceCatalog(UNIT_DRIVERS, DRIVER_NAMES_BY_GVK, DRIVER_GVKS)
+
+
 def load_json(path: Path) -> dict[str, Any]:
-    if not path.is_file() and path.suffix.lower() in {".json", ".yaml", ".yml"}:
-        alternatives = document_candidates(path.parent, path.stem)
-        if alternatives:
-            path = alternatives[0]
-    try:
-        value = load_document(path)
-    except (OSError, DocumentFormatError) as exc:
-        raise OperationError(f"could not read {path}: {exc}") from exc
-    return value
-
-
-CORE_API_VERSION = "gitopsctr.io/v1"
-UNIT_API_VERSION = "unit.gitopsctr.io/v1"
-
-
-def without_legacy_schema(document: dict[str, Any]) -> dict[str, Any]:
-    if document.get("schema") == 1:
-        return {key: value for key, value in document.items() if key != "schema"}
-    return document
+    return cast(dict[str, Any], RESOURCE_CATALOG.load_document(path))
 
 
 def normalize_environment_document(document: dict[str, Any], expected_name: str | None = None) -> dict[str, Any]:
-    """Convert a resource envelope to the controller's internal environment shape."""
-    if document.get("apiVersion") is None:
-        return without_legacy_schema(document)
-    if document.get("apiVersion") != CORE_API_VERSION or document.get("kind") != "Environment":
-        raise OperationError("environment must use apiVersion gitopsctr.io/v1 and kind Environment")
-    metadata = document.get("metadata")
-    specification = document.get("spec")
-    if (
-        not isinstance(metadata, dict)
-        or not isinstance(metadata.get("name"), str)
-        or not isinstance(specification, dict)
-    ):
-        raise OperationError("environment envelope requires metadata.name and a spec mapping")
-    name = metadata["name"]
-    if expected_name is not None and name != expected_name:
-        raise OperationError(f"environment metadata.name must be {expected_name!r}")
-    return {"name": name, **specification}
+    return cast(dict[str, Any], RESOURCE_CATALOG.normalize_environment(cast(JsonObject, document), expected_name))
 
 
 def normalize_promotion_document(document: dict[str, Any]) -> dict[str, Any]:
-    if document.get("apiVersion") is None:
-        return without_legacy_schema(document)
-    if document.get("apiVersion") != CORE_API_VERSION or document.get("kind") != "Promotion":
-        raise OperationError("promotion must use apiVersion gitopsctr.io/v1 and kind Promotion")
-    specification = document.get("spec")
-    if not isinstance(specification, dict):
-        raise OperationError("promotion envelope requires a spec mapping")
-    return dict(specification)
+    return cast(dict[str, Any], RESOURCE_CATALOG.normalize_promotion(cast(JsonObject, document)))
 
 
-def normalize_unit_document(document: dict[str, Any], expected_name: str | None = None) -> dict[str, Any]:
-    """Convert a unit resource envelope to the controller's internal shape."""
-    if document.get("apiVersion") is None:
-        return without_legacy_schema(document)
-    api_version = document.get("apiVersion")
-    kind = document.get("kind")
-    metadata = document.get("metadata")
-    specification = document.get("spec")
-    if not isinstance(api_version, str) or not isinstance(kind, str) or not isinstance(metadata, dict):
-        raise OperationError("unit envelope requires apiVersion, kind, and metadata")
-    if api_version != UNIT_API_VERSION:
-        raise OperationError(f"unsupported unit API version: {api_version!r}")
-    driver = DRIVER_NAMES_BY_GVK.get(f"{api_version}/{kind}")
-    if driver is None:
-        raise OperationError(f"no installed unit driver handles {api_version}/{kind}")
-    name = metadata.get("name")
-    if not isinstance(name, str) or (expected_name is not None and name != expected_name):
-        raise OperationError(f"unit metadata.name must be {expected_name or 'a non-empty name'!r}")
-    if not isinstance(specification, dict):
-        raise OperationError(f"unit {name} requires a spec mapping")
-    return {"name": name, "driver": driver, **specification}
+def parse_authored_unit_document(
+    document: dict[str, Any], expected_name: str | None = None
+) -> UnitResource[StrictModel]:
+    return RESOURCE_CATALOG.parse_unit(cast(JsonObject, document), profile="authored", expected_name=expected_name)
 
 
-def serialize_environment_document(environment: dict[str, Any]) -> dict[str, Any]:
-    name = environment.get("name")
-    if not isinstance(name, str):
-        raise OperationError("environment is missing its name")
-    specification = {key: value for key, value in environment.items() if key not in {"schema", "name", "$schema"}}
-    return {
-        "$schema": resource_schema_url(CORE_API_VERSION, "Environment"),
-        "apiVersion": CORE_API_VERSION,
-        "kind": "Environment",
-        "metadata": {"name": name},
-        "spec": specification,
-    }
+def parse_desired_unit_document(
+    document: dict[str, Any], expected_name: str | None = None
+) -> UnitResource[StrictModel]:
+    return RESOURCE_CATALOG.parse_unit(cast(JsonObject, document), profile="desired", expected_name=expected_name)
 
 
-def serialize_promotion_document(promotion: dict[str, Any]) -> dict[str, Any]:
-    specification = {key: value for key, value in promotion.items() if key not in {"schema", "$schema"}}
-    return {
-        "$schema": resource_schema_url(CORE_API_VERSION, "Promotion"),
-        "apiVersion": CORE_API_VERSION,
-        "kind": "Promotion",
-        "metadata": {"name": str(specification.get("source", {}).get("environment", "promotion"))},
-        "spec": specification,
-    }
+def serialize_environment_document(document: dict[str, Any]) -> dict[str, Any]:
+    return cast(dict[str, Any], RESOURCE_CATALOG.serialize_environment(cast(JsonObject, document)))
+
+
+def serialize_promotion_document(document: dict[str, Any]) -> dict[str, Any]:
+    return cast(dict[str, Any], RESOURCE_CATALOG.serialize_promotion(cast(JsonObject, document)))
 
 
 def serialize_unit_document(
-    unit: dict[str, Any], driver_name: str | None = None, *, profile: str = "desired"
+    unit: UnitResource[Any], *, profile: Literal["authored", "desired"] = "desired"
 ) -> dict[str, Any]:
-    driver = driver_name or unit.get("driver")
-    if not isinstance(driver, str) or driver not in UNIT_DRIVERS:
-        raise OperationError(f"unit uses an unknown driver: {driver!r}")
-    name = unit.get("name")
-    if not isinstance(name, str):
-        raise OperationError("unit is missing its name")
-    specification = {key: value for key, value in unit.items() if key not in {"schema", "name", "driver", "$schema"}}
-    return {
-        "$schema": resource_schema_url(
-            DRIVER_GVKS[driver].rsplit("/", 1)[0],
-            DRIVER_GVKS[driver].rsplit("/", 1)[1],
-            "authored" if profile == "authored" else "desired",
-        ),
-        "apiVersion": DRIVER_GVKS[driver].rsplit("/", 1)[0],
-        "kind": DRIVER_GVKS[driver].rsplit("/", 1)[1],
-        "metadata": {"name": name},
-        "spec": specification,
-    }
+    return cast(dict[str, Any], RESOURCE_CATALOG.serialize_unit(unit, profile=profile))
 
 
 def normalize_receipt_document(document: dict[str, Any], expected_unit: str | None = None) -> dict[str, Any]:
-    if document.get("apiVersion") is None:
-        return without_legacy_schema(document)
-    if document.get("apiVersion") != CORE_API_VERSION or document.get("kind") != "Receipt":
-        raise OperationError("receipt must use apiVersion gitopsctr.io/v1 and kind Receipt")
-    metadata = document.get("metadata")
-    specification = document.get("spec")
-    status = document.get("status")
-    if not isinstance(metadata, dict) or not isinstance(specification, dict) or not isinstance(status, dict):
-        raise OperationError("receipt envelope requires metadata, spec, and status mappings")
-    name = metadata.get("name")
-    subject = specification.get("subject")
-    if not isinstance(name, str) or (expected_unit is not None and name != expected_unit):
-        raise OperationError(f"receipt metadata.name must be {expected_unit or 'a unit name'}")
-    if not isinstance(subject, dict):
-        raise OperationError("receipt spec.subject is required")
-    api_version = subject.get("apiVersion")
-    kind = subject.get("kind")
-    driver = DRIVER_NAMES_BY_GVK.get(f"{api_version}/{kind}")
-    if driver is None:
-        raise OperationError("receipt subject does not identify an installed unit driver")
-    result = status.get("result", {})
-    if not isinstance(result, dict):
-        raise OperationError("receipt status.result must be a mapping")
-    return {
-        "unit": name,
-        "driver": driver,
-        "desired": specification.get("desired", {}),
-        "resolvedInputs": specification.get("resolvedInputs", {}),
-        "controller": status.get("controller", {}),
-        "artifacts": status.get("artifacts", {}),
-        **result,
-    }
+    return cast(dict[str, Any], RESOURCE_CATALOG.normalize_receipt(cast(JsonObject, document), expected_unit))
 
 
-def serialize_receipt_document(receipt: dict[str, Any]) -> dict[str, Any]:
-    driver = receipt.get("driver")
-    unit = receipt.get("unit")
-    if not isinstance(driver, str) or driver not in UNIT_DRIVERS or not isinstance(unit, str):
-        raise OperationError("receipt is missing a known driver or unit")
-    reserved = {"schema", "unit", "driver", "desired", "resolvedInputs", "controller", "artifacts", "$schema"}
-    return {
-        "$schema": resource_schema_url(
-            DRIVER_GVKS[driver].rsplit("/", 1)[0], DRIVER_GVKS[driver].rsplit("/", 1)[1], "receipt"
-        ),
-        "apiVersion": CORE_API_VERSION,
-        "kind": "Receipt",
-        "metadata": {"name": unit},
-        "spec": {
-            "subject": {
-                "apiVersion": DRIVER_GVKS[driver].rsplit("/", 1)[0],
-                "kind": DRIVER_GVKS[driver].rsplit("/", 1)[1],
-                "name": unit,
-            },
-            "desired": receipt.get("desired", {}),
-            "resolvedInputs": receipt.get("resolvedInputs", {}),
-        },
-        "status": {
-            "controller": receipt.get("controller", {}),
-            **({"artifacts": receipt["artifacts"]} if receipt.get("artifacts") else {}),
-            "result": {key: value for key, value in receipt.items() if key not in reserved},
-        },
-    }
+def serialize_receipt_document(document: dict[str, Any]) -> dict[str, Any]:
+    return cast(dict[str, Any], RESOURCE_CATALOG.serialize_receipt(cast(JsonObject, document)))
 
 
 def load_receipt(path: Path, expected_unit: str | None = None) -> dict[str, Any]:
-    document = load_json(path)
-    if strict_resource_documents(path) and document.get("apiVersion") is None:
-        raise OperationError(f"legacy receipt document is not valid in a migrated project: {path}")
-    return normalize_receipt_document(document, expected_unit or path.stem)
+    return cast(dict[str, Any], RESOURCE_CATALOG.load_receipt(path, expected_unit))
 
 
-def resource_documents_enabled(root: Path) -> bool:
-    """Return whether a tree carries repository-level Project configuration."""
-
-    return any((root / name).is_file() for name in PROJECT_CONFIG_NAMES)
-
-
-def unit_document_path(root: Path, unit_name: str, project_root: Path | None = None) -> Path:
-    directory = root / "units"
-    candidates = document_candidates(directory, unit_name)
-    if len(candidates) > 1:
-        raise OperationError(f"multiple document formats exist for unit {unit_name}: {', '.join(map(str, candidates))}")
-    if candidates:
-        return candidates[0]
-    if project_root is not None and resource_documents_enabled(project_root):
-        return directory / f"{unit_name}{load_project_config(project_root).write_format.suffix}"
-    return directory / f"{unit_name}.json"
+resource_documents_enabled = RESOURCE_CATALOG.resource_documents_enabled
+unit_document_path = RESOURCE_CATALOG.unit_document_path
+strict_resource_documents = RESOURCE_CATALOG.strict_resource_documents
 
 
-def strict_resource_documents(path: Path) -> bool:
-    for parent in (path.parent, *path.parents):
-        if any((parent / name).is_file() for name in PROJECT_CONFIG_NAMES):
-            return True
-    return False
+def load_authored_unit(path: Path, expected_name: str | None = None) -> UnitResource[Any]:
+    return RESOURCE_CATALOG.load_unit(path, expected_name, profile="authored")
 
 
-def load_unit(path: Path, expected_name: str | None = None) -> dict[str, Any]:
-    document = load_json(path)
-    if strict_resource_documents(path) and document.get("apiVersion") is None:
-        raise OperationError(f"legacy unit document is not valid in a migrated project: {path}")
-    return normalize_unit_document(document, expected_name or path.stem)
+def load_desired_unit(path: Path, expected_name: str | None = None) -> UnitResource[Any]:
+    return RESOURCE_CATALOG.load_unit(path, expected_name, profile="desired")
 
 
-def reference_document_path(root: Path, reference: str) -> Path:
-    exact = root / reference
-    if exact.is_file():
-        return exact
-    path = PurePosixPath(reference)
-    if len(path.parts) == 2 and path.parts[0] == "units":
-        return unit_document_path(root, path.stem)
-    return exact
+def persisted_unit_driver_name(path: Path) -> str | None:
+    """Inspect only envelope identity when an obsolete payload cannot be parsed."""
+
+    document = RESOURCE_CATALOG.load_document(path)
+    if document.get("apiVersion") is None:
+        value = document.get("driver")
+        return value if isinstance(value, str) else None
+    api_version, kind = document.get("apiVersion"), document.get("kind")
+    if not isinstance(api_version, str) or not isinstance(kind, str):
+        return None
+    return DRIVER_NAMES_BY_GVK.get(f"{api_version}/{kind}")
 
 
-def write_unit(path: Path, unit: dict[str, Any], project_root: Path) -> Path:
-    try:
-        selected = load_project_config(project_root).write_format
-        return write_document(path.with_suffix(selected.suffix), serialize_unit_document(unit), format=selected)
-    except DocumentFormatError as exc:
-        raise OperationError(str(exc)) from exc
+@dataclass(frozen=True)
+class PersistedUnitSourceIdentity:
+    revision: str | None
+    input_hash: str | None
+    environment: str | None
+
+
+def persisted_unit_source_identity(path: Path) -> PersistedUnitSourceIdentity:
+    """Read legacy-compatible source identity without treating it as a desired model."""
+
+    document = RESOURCE_CATALOG.load_document(path)
+    specification = document.get("spec", document)
+    source = specification.get("source") if isinstance(specification, dict) else None
+    revision = source.get("revision") if isinstance(source, dict) else None
+    input_hash = source.get("inputHash") if isinstance(source, dict) else None
+    environment = specification.get("environment") if isinstance(specification, dict) else None
+    return PersistedUnitSourceIdentity(
+        revision if isinstance(revision, str) else None,
+        input_hash if isinstance(input_hash, str) else None,
+        environment if isinstance(environment, str) else None,
+    )
+
+
+reference_document_path = RESOURCE_CATALOG.reference_document_path
+
+
+def write_unit(path: Path, unit: UnitResource[Any], project_root: Path) -> Path:
+    return RESOURCE_CATALOG.write_unit(path, unit, project_root)
+parse_artifact_document = RESOURCE_CATALOG.parse_artifact
+
+
+def validate_receipt_document(document: object, description: str) -> dict[str, Any]:
+    return cast(dict[str, Any], RESOURCE_CATALOG.validate_receipt(document, description))
 
 
 def validate_document(contract: DocumentContract, document: object, description: str) -> dict[str, Any]:
@@ -747,54 +576,13 @@ def validate_document(contract: DocumentContract, document: object, description:
         raise OperationError(f"invalid {description}: {exc}") from exc
 
 
-def parse_artifact_document[ResourceT](
-    artifact_api: ArtifactApi[ResourceT],
-    document: object,
-    description: str,
-) -> ResourceT:
-    try:
-        return artifact_api.parse(document)
-    except ContractError as exc:
-        raise OperationError(f"invalid {description}: {exc}") from exc
-
-
-def validate_receipt_document(document: object, description: str) -> dict[str, Any]:
-    if not isinstance(document, dict):
-        raise OperationError(f"invalid {description}: expected a JSON object")
-    document = normalize_receipt_document(document)
-    driver = document.get("driver")
-    if driver is None and "$schema" not in document:
-        # Pre-contract receipts remain readable; every newly written receipt carries a driver and $schema.
-        return document
-    if not isinstance(driver, str) or driver not in UNIT_DRIVERS:
-        raise OperationError(f"invalid {description}: unknown driver {driver!r}")
-    from jsonschema import Draft202012Validator
-    from jsonschema.exceptions import ValidationError
-
-    candidate = {**document, "$schema": None}
-    try:
-        Draft202012Validator(driver_schema(driver, "receipt")).validate(candidate)
-    except ValidationError as exc:
-        raise OperationError(f"invalid {description}: {exc.message}") from exc
-    return document
-
-
 def write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
 def write_preferred_document(path: Path, value: dict[str, Any], project_root: Path) -> Path:
-    """Write a generated document using the project's configured format."""
-    try:
-        selected = load_project_config(project_root).write_format
-        if value.get("source") is not None and value.get("specificationRevision") is not None:
-            value = serialize_promotion_document(value)
-        elif value.get("unit") is not None and value.get("driver") is not None:
-            value = serialize_receipt_document(value)
-        return write_document(path.with_suffix(selected.suffix), value, format=selected)
-    except DocumentFormatError as exc:
-        raise OperationError(str(exc)) from exc
+    return RESOURCE_CATALOG.write_preferred(path, cast(JsonObject, value), project_root)
 
 
 def canonical_json(value: Any) -> bytes:
@@ -860,15 +648,12 @@ def directory_files(directory: Path) -> dict[str, bytes]:
     }
 
 
-def unit_requires_reconciliation(unit: dict[str, Any]) -> bool:
-    plugin_name = unit.get("driver")
-    plugin = UNIT_DRIVERS.get(plugin_name) if isinstance(plugin_name, str) else None
-    if plugin is None:
-        raise OperationError(f"unit uses an unknown plugin: {plugin_name!r}")
+def unit_requires_reconciliation(unit: UnitResource[Any]) -> bool:
+    plugin = unit.driver
     if not isinstance(plugin, ReconciliationCapability):
         return False
     try:
-        return plugin.reconciliation_required(unit)
+        return plugin.reconciliation_required(unit.spec)
     except DriverError as exc:
         raise OperationError(str(exc)) from exc
 
@@ -898,41 +683,33 @@ def materialization_tree_digest(root: Path) -> str:
     return f"sha256:{hashlib.sha256(canonical_json(payload)).hexdigest()}"
 
 
-def validate_unit_materialization(desired_root: Path, unit_name: str, unit: dict[str, Any]) -> None:
-    plugin_name = unit.get("driver")
-    if isinstance(plugin_name, str) and plugin_name in UNIT_DRIVERS:
-        validate_document(
-            UNIT_DRIVERS[plugin_name].desired_unit_contract,
-            unit,
-            f"persisted desired {plugin_name} unit {unit_name}",
-        )
-    expects_materialization = isinstance(plugin_name, str) and plugin_name in MATERIALIZATION_DRIVERS
-    descriptor = unit.get("materialization")
+def validate_unit_materialization(desired_root: Path, unit_name: str, unit: UnitResource[Any]) -> None:
+    plugin_name = unit.driver_name
+    expects_materialization = plugin_name in MATERIALIZATION_DRIVERS
+    descriptor = getattr(unit.spec, "materialization", None)
     if not expects_materialization:
         if descriptor is not None:
             raise OperationError(f"{unit_name} records materialization for a plugin without that capability")
         return
-    if not isinstance(descriptor, dict) or set(descriptor) != {"path", "digest", "mediaType", "metadata"}:
+    if descriptor is None:
         raise OperationError(f"{unit_name} has an invalid materialization descriptor")
     expected_path = f"materialized/{unit_name}"
-    if descriptor.get("path") != expected_path:
+    if descriptor.path != expected_path:
         raise OperationError(f"{unit_name} materialization path must be {expected_path}")
-    digest = descriptor.get("digest")
+    digest = descriptor.digest
     if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise OperationError(f"{unit_name} has an invalid materialization digest")
-    if not isinstance(descriptor.get("mediaType"), str) or not descriptor["mediaType"]:
+    if not descriptor.mediaType:
         raise OperationError(f"{unit_name} has an invalid materialization media type")
-    if not isinstance(descriptor.get("metadata"), dict):
-        raise OperationError(f"{unit_name} has invalid materialization metadata")
     actual = materialization_tree_digest(desired_root / expected_path)
     if actual != digest:
         raise OperationError(f"{unit_name} materialized payload does not match its digest")
 
 
-def copy_unit_materialization(source: Path, destination: Path, unit_name: str, unit: dict[str, Any]) -> None:
+def copy_unit_materialization(source: Path, destination: Path, unit_name: str, unit: UnitResource[Any]) -> None:
     validate_unit_materialization(source, unit_name, unit)
-    descriptor = unit.get("materialization")
-    relative_path = descriptor["path"] if isinstance(descriptor, dict) else f"materialized/{unit_name}"
+    descriptor = getattr(unit.spec, "materialization", None)
+    relative_path = descriptor.path if descriptor is not None else f"materialized/{unit_name}"
     target = destination / relative_path
     if target.exists():
         shutil.rmtree(target)
@@ -942,34 +719,25 @@ def copy_unit_materialization(source: Path, destination: Path, unit_name: str, u
 
 
 def require_unit_specification(
-    specification: dict[str, Any], expected_name: str | None = None
-) -> tuple[str, dict[str, Any]]:
-    specification = normalize_unit_document(specification, expected_name)
-    name = specification.get("name")
-    driver = specification.get("driver")
-    source = specification.get("source")
-    if not isinstance(name, str) or (expected_name is not None and name != expected_name):
-        raise OperationError(f"invalid unit specification: {expected_name or name!r}")
-    if driver not in UNIT_DRIVERS:
-        raise OperationError(f"{name} uses an unknown driver: {driver!r}")
-    validate_document(UNIT_DRIVERS[driver].unit_contract, specification, f"{driver} unit {expected_name or name}")
-    if not isinstance(source, dict):
-        raise OperationError(f"{name} requires a source object")
-    safe_source_path(source.get("path"), f"{name} source path")
-    inputs = source.get("inputs")
-    if inputs is not None and (not isinstance(inputs, list) or not all(isinstance(value, str) for value in inputs)):
-        raise OperationError(f"{name} source inputs must be a list of paths or glob patterns")
-    return driver, source
+    specification: UnitResource[Any], expected_name: str | None = None
+) -> tuple[str, Any]:
+    if expected_name is not None and specification.name != expected_name:
+        raise OperationError(f"invalid unit specification: {expected_name!r}")
+    source = getattr(specification.spec, "source", None)
+    if source is None:
+        raise OperationError(f"{specification.name} requires a source object")
+    safe_source_path(source.path, f"{specification.name} source path")
+    return specification.driver_name, source
 
 
-def unit_input_hash(specification: dict[str, Any], source_root: Path) -> str:
+def unit_input_hash(specification: UnitResource[Any], source_root: Path) -> str:
     driver, source = require_unit_specification(specification)
-    inputs = source.get("inputs")
+    inputs = source.inputs
     if inputs is None:
         source_path = "."
-        inputs = [source["path"]]
+        inputs = [source.path]
     else:
-        source_path = source["path"]
+        source_path = source.path
     return hash_source_inputs(
         source_root,
         source_path,
@@ -978,7 +746,7 @@ def unit_input_hash(specification: dict[str, Any], source_root: Path) -> str:
             "kind": "unit",
             "driver": driver,
             "driverVersion": DRIVER_VERSIONS[driver],
-            "specification": specification,
+            "specification": specification.driver.unit_contract.dump(specification.spec),
         },
     )
 
@@ -990,9 +758,9 @@ def prior_unit_source(
 ) -> tuple[str, str] | None:
     current_path = unit_document_path(current_desired, unit_name)
     if current_path.is_file():
-        source = load_unit(current_path).get("source", {})
-        revision = source.get("revision")
-        input_hash = source.get("inputHash")
+        source = persisted_unit_source_identity(current_path)
+        revision = source.revision
+        input_hash = source.input_hash
         if isinstance(revision, str) and isinstance(input_hash, str):
             return revision, input_hash
     if legacy is not None and unit_name in {"application-images", "aws-application"}:
@@ -1057,7 +825,7 @@ def write_artifact_documents(
 
 def validate_artifact_output_identity(
     driver_name: str,
-    unit: dict[str, Any],
+    unit: UnitResource[Any],
     documents: Mapping[str, JsonObject],
 ) -> None:
     driver = UNIT_DRIVERS[driver_name]
@@ -1067,8 +835,8 @@ def validate_artifact_output_identity(
         )
     if not documents:
         return
-    source = unit.get("source")
-    if not isinstance(source, dict):
+    source = getattr(unit.spec, "source", None)
+    if not isinstance(source, DesiredSource):
         raise DriverError(f"{driver_name} desired unit has no source identity")
     for name, document in documents.items():
         artifact_api = require_artifact_api(driver.artifact_outputs[name])
@@ -1085,18 +853,18 @@ def validate_artifact_output_identity(
             or not isinstance(producer, dict)
             or producer.get("apiVersion") != driver.api_version
             or producer.get("kind") != driver.kind
-            or producer.get("name") != unit.get("name")
+            or producer.get("name") != unit.name
             or producer.get("driverVersion") != driver.version
-            or producer.get("sourceRevision") != source.get("revision")
+            or producer.get("sourceRevision") != source.revision
             or producer.get("inputHashVersion") != 1
-            or producer.get("inputHash") != source.get("inputHash")
+            or producer.get("inputHash") != source.inputHash
         ):
             raise DriverError(f"{driver_name} artifact {name!r} has the wrong producer identity")
 
 
 def load_artifact_document(
     observed: Path,
-    unit: dict[str, Any],
+    unit: UnitResource[Any],
     receipt: dict[str, Any],
     artifact_name: str,
 ) -> tuple[dict[str, Any], str]:
@@ -1144,7 +912,7 @@ def load_artifact_document(
     document = artifact_api.dump(typed_resource)
     producer = document.get("producer")
     metadata = document.get("metadata")
-    source = unit.get("source")
+    source = getattr(unit.spec, "source", None)
     if isinstance(metadata, dict) and metadata.get("name") != artifact_name:
         log_status(
             "WARN",
@@ -1153,14 +921,14 @@ def load_artifact_document(
     if (
         not isinstance(metadata, dict)
         or not isinstance(producer, dict)
-        or not isinstance(source, dict)
+        or not isinstance(source, DesiredSource)
         or (
             producer.get("apiVersion") != UNIT_DRIVERS[driver_name].api_version
             or producer.get("kind") != UNIT_DRIVERS[driver_name].kind
-            or producer.get("name") != unit.get("name")
+            or producer.get("name") != unit.name
             or producer.get("driverVersion") != UNIT_DRIVERS[driver_name].version
-            or producer.get("sourceRevision") != source.get("revision")
-            or producer.get("inputHash") != source.get("inputHash")
+            or producer.get("sourceRevision") != source.revision
+            or producer.get("inputHash") != source.inputHash
         )
     ):
         raise ReferenceUnavailable(f"artifact {artifact_name!r} has stale producer identity")
@@ -1169,12 +937,10 @@ def load_artifact_document(
 
 def validate_receipt_artifacts(
     observed: Path,
-    unit: dict[str, Any],
+    unit: UnitResource[Any],
     receipt: dict[str, Any],
 ) -> None:
-    driver_name = unit.get("driver")
-    if not isinstance(driver_name, str) or driver_name not in UNIT_DRIVERS:
-        raise OperationError("desired unit has an unknown driver")
+    driver_name = unit.driver_name
     receipt_driver = receipt.get("driver")
     expected = set(UNIT_DRIVERS[driver_name].artifact_outputs)
     if receipt_driver != driver_name and (receipt_driver is not None or expected):
@@ -1185,9 +951,9 @@ def validate_receipt_artifacts(
             f"persisted {driver_name} receipt describes artifacts {sorted(descriptors) if isinstance(descriptors, dict) else []}; "
             f"expected {sorted(expected)}"
         )
-    directory = observed / "artifacts" / str(unit.get("name"))
+    directory = observed / "artifacts" / unit.name
     actual_paths = {path for path in directory.rglob("*") if path.is_file()} if directory.is_dir() else set()
-    expected_paths = {artifact_document_path(observed, str(unit.get("name")), name) for name in expected}
+    expected_paths = {artifact_document_path(observed, unit.name, name) for name in expected}
     if actual_paths != expected_paths:
         raise OperationError(f"persisted {driver_name} artifact files do not match its complete contract set")
     for artifact_name in expected:
@@ -1203,18 +969,11 @@ def current_receipt(observed: Path, candidate_units: Path, unit_name: str) -> di
     validate_receipt_document(receipt, f"persisted receipt for {unit_name}")
     if receipt.get("desired", {}).get("unitBlob") != file_blob(unit_path):
         return None
-    validate_receipt_artifacts(observed, load_unit(unit_path, unit_name), receipt)
+    validate_receipt_artifacts(observed, load_desired_unit(unit_path, unit_name), receipt)
     return receipt
 
 
-@dataclass(frozen=True)
-class ArtifactReference:
-    unit: str
-    name: str
-    gvk: GVK
-
-
-def parse_artifact_reference(reference: object) -> ArtifactReference:
+def parse_artifact_reference(reference: object) -> ArtifactReferenceTarget:
     if not isinstance(reference, dict):
         raise OperationError("invalid fromArtifact reference")
     unit_name = reference.get("unit")
@@ -1238,129 +997,98 @@ def parse_artifact_reference(reference: object) -> ArtifactReference:
         require_artifact_api(api_kind)
     except ApiError as exc:
         raise OperationError(f"fromArtifact API kind is not an artifact resource: {gvk}") from exc
-    return ArtifactReference(unit_name, artifact_name, gvk)
+    return ArtifactReferenceTarget(
+        unit=unit_name,
+        name=artifact_name,
+        apiVersion=gvk.api_version,
+        kind=gvk.kind,
+    )
 
 
 def resolve_template(
-    value: Any,
+    value: object,
     candidate: Path,
     observed: Path,
     observed_revision: str | None,
-    dry: bool = False,
     promotion: Path | None = None,
 ) -> TemplateResolution:
-    promotion_inputs: dict[str, str] = {}
-    receipt_inputs: dict[str, str] = {}
-    artifact_inputs: dict[str, str] = {}
-
-    def resolve(candidate_value: Any) -> Any:
-        if isinstance(candidate_value, list):
-            return [resolve(item) for item in candidate_value]
-        if not isinstance(candidate_value, dict):
-            return candidate_value
-        reference_keys = {"fromReceipt", "fromArtifact", "fromPromotion"}.intersection(candidate_value)
-        if not reference_keys:
-            return {name: resolve(item) for name, item in candidate_value.items()}
-        if len(reference_keys) != 1 or set(candidate_value) != reference_keys:
-            raise OperationError("invalid receipt, artifact, or promotion reference")
-        reference_type = reference_keys.pop()
-        reference = candidate_value.get(reference_type)
-        allowed = {"unit", "pointer", "dryFallback"} | (
-            {"name", "apiVersion", "kind"} if reference_type == "fromArtifact" else set()
+    def resolve_promotion(reference):
+        if promotion is None:
+            raise ReferenceUnavailable(f"promotion does not exist: {reference.unit}")
+        path = unit_document_path(promotion, reference.unit)
+        if not path.is_file():
+            raise ReferenceUnavailable(f"promoted unit does not exist: {reference.unit}")
+        unit = load_desired_unit(path, reference.unit)
+        return FingerprintedValue(
+            json_pointer(unit.driver.desired_unit_contract.dump(unit.spec), reference.pointer),
+            file_blob(path),
         )
-        if not isinstance(reference, dict) or set(reference) - allowed or "unit" not in reference:
-            raise OperationError(f"invalid {reference_type} reference")
-        referenced_unit = reference.get("unit")
-        if not isinstance(referenced_unit, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", referenced_unit):
-            raise OperationError(f"invalid {reference_type} unit: {referenced_unit!r}")
-        pointer = reference.get("pointer", "")
-        if not isinstance(pointer, str):
-            raise OperationError(f"invalid JSON pointer for {reference_type} {referenced_unit!r}")
-        try:
-            if reference_type == "fromPromotion":
-                if promotion is None:
-                    raise ReferenceUnavailable(f"promotion does not exist: {referenced_unit}")
-                path = unit_document_path(promotion, referenced_unit)
-                if not path.is_file():
-                    raise ReferenceUnavailable(f"promoted unit does not exist: {referenced_unit}")
-                promotion_inputs[referenced_unit] = file_blob(path)
-                document = load_unit(path, referenced_unit)
-            else:
-                if observed_revision is None:
-                    raise ReferenceUnavailable(f"receipt does not exist: {referenced_unit}")
-                receipt = current_receipt(observed, candidate / "units", referenced_unit)
-                if receipt is None:
-                    raise ReferenceUnavailable(f"receipt is stale: {referenced_unit}")
-                if reference_type == "fromReceipt":
-                    receipt_inputs[referenced_unit] = file_blob(unit_document_path(observed, referenced_unit))
-                    reserved = {
-                        "$schema",
-                        "schema",
-                        "unit",
-                        "driver",
-                        "desired",
-                        "resolvedInputs",
-                        "controller",
-                        "artifacts",
-                    }
-                    document = {key: item for key, item in receipt.items() if key not in reserved}
-                else:
-                    artifact_reference = parse_artifact_reference(reference)
-                    artifact_name = artifact_reference.name
-                    producer_unit = load_unit(unit_document_path(candidate, referenced_unit), referenced_unit)
-                    producer_driver_name = producer_unit.get("driver")
-                    producer_driver = (
-                        UNIT_DRIVERS.get(producer_driver_name) if isinstance(producer_driver_name, str) else None
-                    )
-                    artifact_kind = (
-                        producer_driver.artifact_outputs.get(artifact_name) if producer_driver is not None else None
-                    )
-                    if artifact_kind is None:
-                        raise ReferenceUnavailable(
-                            f"unit {referenced_unit!r} does not produce artifact {artifact_name!r}"
-                        )
-                    if artifact_kind.gvk != artifact_reference.gvk:
-                        raise ReferenceUnavailable(
-                            f"artifact {referenced_unit}/{artifact_name} is {artifact_kind.gvk}, "
-                            f"not {artifact_reference.gvk}"
-                        )
-                    document, digest = load_artifact_document(observed, producer_unit, receipt, artifact_name)
-                    artifact_inputs[f"{referenced_unit}/{artifact_name}"] = digest
-            return json_pointer(document, pointer)
-        except ReferenceUnavailable:
-            if dry and "dryFallback" in reference:
-                return resolve(reference["dryFallback"])
-            raise
 
-    return TemplateResolution(resolve(value), promotion_inputs, receipt_inputs, artifact_inputs)
+    def resolve_receipt(reference):
+        if observed_revision is None:
+            raise ReferenceUnavailable(f"receipt does not exist: {reference.unit}")
+        receipt = current_receipt(observed, candidate / "units", reference.unit)
+        if receipt is None:
+            raise ReferenceUnavailable(f"receipt is stale: {reference.unit}")
+        reserved = {"$schema", "schema", "unit", "driver", "desired", "resolvedInputs", "controller", "artifacts"}
+        document = {key: item for key, item in receipt.items() if key not in reserved}
+        return FingerprintedValue(
+            json_pointer(document, reference.pointer), file_blob(unit_document_path(observed, reference.unit))
+        )
+
+    def resolve_artifact(reference):
+        if observed_revision is None:
+            raise ReferenceUnavailable(f"receipt does not exist: {reference.unit}")
+        receipt = current_receipt(observed, candidate / "units", reference.unit)
+        if receipt is None:
+            raise ReferenceUnavailable(f"receipt is stale: {reference.unit}")
+        api_kind = API_KINDS.get(reference.gvk)
+        if api_kind is None:
+            raise OperationError(f"fromArtifact references an unregistered API kind: {reference.gvk}")
+        try:
+            require_artifact_api(api_kind)
+        except ApiError as exc:
+            raise OperationError(f"fromArtifact API kind is not an artifact resource: {reference.gvk}") from exc
+        producer_unit = load_desired_unit(unit_document_path(candidate, reference.unit), reference.unit)
+        producer_driver = producer_unit.driver
+        artifact_kind = producer_driver.artifact_outputs.get(reference.name) if producer_driver is not None else None
+        if artifact_kind is None:
+            raise ReferenceUnavailable(f"unit {reference.unit!r} does not produce artifact {reference.name!r}")
+        if artifact_kind.gvk != reference.gvk:
+            raise ReferenceUnavailable(
+                f"artifact {reference.unit}/{reference.name} is {artifact_kind.gvk}, not {reference.gvk}"
+            )
+        document, digest = load_artifact_document(observed, producer_unit, receipt, reference.name)
+        return FingerprintedValue(json_pointer(document, reference.pointer), digest)
+
+    return resolve_template_value(
+        value, ResolutionContext(receipt=resolve_receipt, artifact=resolve_artifact, promotion=resolve_promotion)
+    )
 
 
 def resolved_unit_source(
-    specification: dict[str, Any],
+    specification: UnitResource[Any],
     source_root: Path,
     source_revision: str,
     current_desired: Path,
     legacy: dict[str, Any] | None,
-) -> tuple[dict[str, Any], bool]:
+) -> tuple[DesiredSource, bool]:
     driver, source = require_unit_specification(specification)
     input_hash = unit_input_hash(specification, source_root)
     revision = source_revision
-    prior = prior_unit_source(specification["name"], current_desired, legacy)
+    prior = prior_unit_source(specification.name, current_desired, legacy)
     inputs_changed = prior is None
     if prior is not None:
         prior_revision, prior_hash = prior
-        previous_unit_path = unit_document_path(current_desired, specification["name"])
+        previous_unit_path = unit_document_path(current_desired, specification.name)
         if (
-            specification.get("driver") == "oci-images"
-            and "environment" not in specification
+            specification.driver_name == "oci-images"
+            and getattr(specification.spec, "environment", None) is None
             and previous_unit_path.is_file()
         ):
-            previous_environment = load_unit(previous_unit_path).get("environment")
+            previous_environment = persisted_unit_source_identity(previous_unit_path).environment
             if isinstance(previous_environment, str):
-                legacy_specification = json.loads(json.dumps(specification))
-                legacy_specification["environment"] = previous_environment
-                if unit_input_hash(legacy_specification, source_root) == prior_hash:
-                    input_hash = prior_hash
+                input_hash = prior_hash
         if not prior_hash:
             with tempfile.TemporaryDirectory() as prior_directory:
                 prior_root = Path(prior_directory) / "source"
@@ -1371,12 +1099,13 @@ def resolved_unit_source(
         else:
             inputs_changed = True
     return (
-        {
-            **source,
-            "revision": revision,
-            "inputHash": input_hash,
-            "driverVersion": DRIVER_VERSIONS[driver],
-        },
+        DesiredSource(
+            path=source.path,
+            inputs=source.inputs,
+            revision=revision,
+            inputHash=input_hash,
+            driverVersion=DRIVER_VERSIONS[driver],
+        ),
         inputs_changed,
     )
 
@@ -1476,7 +1205,7 @@ def deployment_refs(
     return desired_ref, observed_ref
 
 
-def load_environment_specifications(source_root: Path, environment_name: str) -> dict[str, dict[str, Any]]:
+def load_environment_specifications(source_root: Path, environment_name: str) -> dict[str, UnitResource[Any]]:
     load_environment(source_root, environment_name)
     try:
         environment_root = project_environment_root(source_root, environment_name)
@@ -1494,24 +1223,43 @@ def load_environment_specifications(source_root: Path, environment_name: str) ->
     if not unit_paths:
         raise OperationError(f"environment has no units: {environment_name}")
     specification_paths = {path.stem: path for path in unit_paths}
-    specifications = {path.stem: load_unit(path, path.stem) for path in unit_paths}
+    specifications: dict[str, UnitResource[Any]] = {}
+    for path in unit_paths:
+        raw = load_json(path)
+        template_value = raw.get("spec", raw)
+        try:
+            _template(template_value, "/spec")
+        except OperationError as exc:
+            raise OperationError(f"{path.relative_to(source_root)}: {exc}") from exc
+        specifications[path.stem] = RESOURCE_CATALOG.parse_unit(
+            cast(JsonObject, raw), profile="authored", expected_name=path.stem
+        )
     for unit_name, specification in specifications.items():
+        document = specification.driver.unit_contract.dump(specification.spec)
+        try:
+            _template(document, "/spec")
+        except OperationError as exc:
+            path = specification_paths[unit_name].relative_to(source_root)
+            raise OperationError(f"{path}: {exc}") from exc
         require_unit_specification(specification, unit_name)
     for consumer, specification in specifications.items():
-        for producer in observation_reference_units(specification):
-            if producer in specifications and not unit_requires_reconciliation(specifications[producer]):
-                raise OperationError(f"{consumer} cannot observe materialization-only unit {producer!r}")
+        document = specification.driver.unit_contract.dump(specification.spec)
         try:
-            references = artifact_references(specification, "/spec")
+            producers = observation_reference_units(document, "/spec")
+            references = artifact_references(document, "/spec")
         except OperationError as exc:
             path = specification_paths[consumer].relative_to(source_root)
             raise OperationError(f"{path}: {exc}") from exc
+        for producer in producers:
+            if producer in specifications and not specifications[producer].driver.authored_reconciliation_required(
+                specifications[producer].spec
+            ):
+                raise OperationError(f"{consumer} cannot observe materialization-only unit {producer!r}")
         for reference in references:
             producer = reference.unit
             artifact_name = reference.name
             if producer in specifications:
-                driver_name = specifications[producer].get("driver")
-                driver = UNIT_DRIVERS.get(driver_name) if isinstance(driver_name, str) else None
+                driver = specifications[producer].driver
                 if driver is not None and artifact_name not in driver.artifact_outputs:
                     raise OperationError(f"{consumer} references unknown artifact {producer}/{artifact_name}")
                 elif driver is not None and driver.artifact_outputs[artifact_name].gvk != reference.gvk:
@@ -1531,7 +1279,7 @@ def require_environment_unit(source_root: Path, environment_name: str, unit_name
         )
 
 
-def reconciliation_statuses(unit_names: list[str], desired: Path, observed: Path) -> list[tuple[str, str, str]]:
+def reconciliation_statuses(unit_names: Sequence[str], desired: Path, observed: Path) -> list[tuple[str, str, str]]:
     statuses = []
     for unit_name in unit_names:
         unit_path = unit_document_path(desired, unit_name)
@@ -1539,7 +1287,7 @@ def reconciliation_statuses(unit_names: list[str], desired: Path, observed: Path
         if not unit_path.is_file():
             statuses.append((unit_name, "WAIT", "desired inputs are not materialized"))
             continue
-        unit = load_unit(unit_path, unit_name)
+        unit = load_desired_unit(unit_path, unit_name)
         validate_unit_materialization(desired, unit_name, unit)
         if not unit_requires_reconciliation(unit):
             statuses.append((unit_name, "MATERIALIZED", "desired payload is published for external delivery"))
@@ -1628,31 +1376,27 @@ def source_change_evidence(
 
 
 def classify_unit_change(
-    previous: dict[str, Any],
-    current: dict[str, Any],
+    previous: UnitResource[Any],
+    current: UnitResource[Any],
     previous_desired_revision: str,
 ) -> UnitChangeExplanation:
-    previous_source = previous.get("source", {})
-    current_source = current.get("source", {})
-    if not isinstance(previous_source, dict):
-        previous_source = {}
-    if not isinstance(current_source, dict):
-        current_source = {}
+    previous_source = previous.spec.source
+    current_source = current.spec.source
     causes = []
-    if previous.get("driver") != current.get("driver") or previous_source.get("driverVersion") != current_source.get(
-        "driverVersion"
-    ):
+    if previous.driver_name != current.driver_name or previous_source.driverVersion != current_source.driverVersion:
         causes.append("reconciliation driver changed")
-    source_fingerprint_changed = previous_source.get("inputHash") != current_source.get("inputHash")
-    commits, files = source_change_evidence(previous_source, current_source) if source_fingerprint_changed else ((), ())
+    source_fingerprint_changed = previous_source.inputHash != current_source.inputHash
+    commits, files = (
+        source_change_evidence(previous_source.to_dict(), current_source.to_dict())
+        if source_fingerprint_changed
+        else ((), ())
+    )
     if files:
         causes.append("source inputs changed")
-    previous_inputs = previous.get("resolvedInputs", {})
-    current_inputs = current.get("resolvedInputs", {})
-    if not isinstance(previous_inputs, dict):
-        previous_inputs = {}
-    if not isinstance(current_inputs, dict):
-        current_inputs = {}
+    previous_inputs_model = getattr(previous.spec, "resolvedInputs", None)
+    current_inputs_model = getattr(current.spec, "resolvedInputs", None)
+    previous_inputs = previous_inputs_model.to_dict() if previous_inputs_model is not None else {}
+    current_inputs = current_inputs_model.to_dict() if current_inputs_model is not None else {}
     previous_observed: dict[str, Any] = {}
     current_observed: dict[str, Any] = {}
     for category in ("receipts", "artifacts"):
@@ -1674,9 +1418,11 @@ def classify_unit_change(
     if previous_promotion != current_promotion:
         changed = sorted(set(previous_promotion) | set(current_promotion))
         causes.append("reviewed promotion inputs changed: " + ", ".join(changed))
-    ignored = {"driver", "source", "resolvedInputs"}
-    previous_specification = {key: value for key, value in previous.items() if key not in ignored}
-    current_specification = {key: value for key, value in current.items() if key not in ignored}
+    ignored = {"source", "resolvedInputs"}
+    previous_document = previous.driver.desired_unit_contract.dump(previous.spec)
+    current_document = current.driver.desired_unit_contract.dump(current.spec)
+    previous_specification = {key: value for key, value in previous_document.items() if key not in ignored}
+    current_specification = {key: value for key, value in current_document.items() if key not in ignored}
     specification_paths = tuple(changed_json_paths(previous_specification, current_specification))
     if specification_paths:
         causes.append("unit specification changed")
@@ -1687,10 +1433,10 @@ def classify_unit_change(
     return UnitChangeExplanation(
         previous_desired_revision=previous_desired_revision,
         previous_source_revision=(
-            previous_source.get("revision") if isinstance(previous_source.get("revision"), str) else None
+            previous_source.revision
         ),
         current_source_revision=(
-            current_source.get("revision") if isinstance(current_source.get("revision"), str) else None
+            current_source.revision
         ),
         causes=tuple(causes),
         commits=commits,
@@ -1718,7 +1464,13 @@ def unit_change_explanation(unit_name: str, desired: Path, observed: Path) -> Un
         return None
     if not isinstance(previous, dict):
         return None
-    return classify_unit_change(previous, load_unit(current_path, unit_name), previous_revision)
+    try:
+        previous_unit = RESOURCE_CATALOG.parse_unit(
+            cast(JsonObject, previous), profile="desired", expected_name=unit_name
+        )
+    except OperationError:
+        return None
+    return classify_unit_change(previous_unit, load_desired_unit(current_path, unit_name), previous_revision)
 
 
 def style_commit_evidence(value: str, stream: TextIO | None = None) -> str:
@@ -1802,7 +1554,7 @@ def log_reconciliation_status(
 
 def convergence_plan_rows(
     statuses: list[tuple[str, str, str]],
-    order: list[str],
+    order: Sequence[str],
 ) -> list[tuple[str, str, str]]:
     """Turn receipt-level status into the operator-facing convergence schedule."""
     by_unit = {unit_name: (status, reason) for unit_name, status, reason in statuses}
@@ -1849,9 +1601,8 @@ def log_convergence_action(
     observed: Path,
     observed_ref: str,
 ) -> None:
-    unit = load_unit(unit_document_path(desired, unit_name), unit_name)
-    driver_value = unit.get("driver")
-    driver = driver_value if isinstance(driver_value, str) else "unknown"
+    unit = load_desired_unit(unit_document_path(desired, unit_name), unit_name)
+    driver = unit.driver_name
     explanation = unit_change_explanation(unit_name, desired, observed)
     log_heading(f"Next action: {style_unit(unit_name)}")
     log_status("DRIVER", driver)
@@ -1877,47 +1628,43 @@ def log_convergence_action(
 
 def materialize_resolved_unit(
     environment_name: str,
-    unit_name: str,
-    resolved: dict[str, Any],
+    resolved: UnitResource[Any],
     source_root: Path,
     source_revision: str,
     current_desired: Path,
     candidate: Path,
-) -> dict[str, Any]:
-    plugin_name = resolved.get("driver")
-    if not isinstance(plugin_name, str) or plugin_name not in UNIT_DRIVERS:
-        raise OperationError(f"{unit_name} uses an unknown unit plugin: {plugin_name!r}")
-    unit_plugin = UNIT_DRIVERS[plugin_name]
-    desired_schema_id = str(driver_schema(plugin_name, "desired-unit")["$id"])
-    resolved = with_schema({key: value for key, value in resolved.items() if key != "$schema"}, desired_schema_id)
-    plugin = MATERIALIZATION_DRIVERS.get(plugin_name) if isinstance(plugin_name, str) else None
+) -> UnitResource[Any]:
+    unit_name = resolved.name
+    plugin_name = resolved.driver_name
+    plugin = MATERIALIZATION_DRIVERS.get(plugin_name)
     if plugin is None:
-        validate_document(unit_plugin.desired_unit_contract, resolved, f"materialized {plugin_name} unit {unit_name}")
         return resolved
 
     previous_path = unit_document_path(current_desired, unit_name)
     if previous_path.is_file():
-        previous = load_unit(previous_path, unit_name)
-        previous_without_materialization = {
-            name: value for name, value in previous.items() if name not in {"$schema", "materialization"}
-        }
-        resolved_without_schema = {name: value for name, value in resolved.items() if name != "$schema"}
-        if previous_without_materialization == resolved_without_schema:
+        previous = load_desired_unit(previous_path, unit_name)
+        if previous.driver_name == plugin_name and plugin.resolved_from_desired(previous.spec) == resolved.spec:
             validate_unit_materialization(current_desired, unit_name, previous)
             copy_unit_materialization(current_desired, candidate, unit_name, previous)
-            reused = {**resolved, "materialization": previous["materialization"]}
-            validate_document(unit_plugin.desired_unit_contract, reused, f"materialized {plugin_name} unit {unit_name}")
-            return reused
+            previous_descriptor = previous.spec.materialization
+            previous_metadata = previous_descriptor.metadata
+            descriptor = MaterializationDocument(
+                path=previous_descriptor.path,
+                digest=previous_descriptor.digest,
+                mediaType=previous_descriptor.mediaType,
+                metadata=JsonObjectValue(
+                    previous_metadata.to_dict() if hasattr(previous_metadata, "to_dict") else dict(previous_metadata)
+                ),
+            )
+            return resolved.with_spec(plugin.finalize_materialization(resolved.spec, descriptor))
 
     output_root = candidate / "materialized" / unit_name
     if output_root.exists():
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True)
-    source = resolved.get("source")
-    if not isinstance(source, dict):
-        raise OperationError(f"{unit_name} has no resolved source for materialization")
-    selected_revision = source.get("revision")
-    source_path = source.get("path")
+    source = resolved.spec.source
+    selected_revision = source.revision
+    source_path = source.path
     if not isinstance(selected_revision, str) or not isinstance(source_path, str):
         raise OperationError(f"{unit_name} has an invalid materialization source")
 
@@ -1928,7 +1675,8 @@ def materialize_resolved_unit(
                 source_root=selected_source_root,
                 source_revision=selected_revision,
                 source_path=source_path,
-                unit=resolved,
+                unit_name=unit_name,
+                unit=resolved.spec,
                 output_root=output_root,
                 execution=DriverExecution.console(),
             )
@@ -1946,18 +1694,15 @@ def materialize_resolved_unit(
             result = run_materializer(selected_source_root)
     if not result.media_type:
         raise DriverError(f"{plugin_name} returned an empty materialization media type")
-    resolved = {
-        **resolved,
-        "materialization": {
-            "path": f"materialized/{unit_name}",
-            "digest": materialization_tree_digest(output_root),
-            "mediaType": result.media_type,
-            "metadata": result.metadata,
-        },
-    }
-    validate_document(unit_plugin.desired_unit_contract, resolved, f"materialized {plugin_name} unit {unit_name}")
-    validate_unit_materialization(candidate, unit_name, resolved)
-    return resolved
+    descriptor = MaterializationDocument(
+        path=f"materialized/{unit_name}",
+        digest=materialization_tree_digest(output_root),
+        mediaType=result.media_type,
+        metadata=JsonObjectValue(result.metadata),
+    )
+    desired = resolved.with_spec(plugin.finalize_materialization(resolved.spec, descriptor))
+    validate_unit_materialization(candidate, unit_name, desired)
+    return desired
 
 
 def build_desired_candidate(
@@ -1968,7 +1713,6 @@ def build_desired_candidate(
     observed: Path,
     observed_revision: str | None,
     candidate: Path,
-    dry: bool = False,
     promotion: PromotionContext | None = None,
     verbose: bool = True,
 ) -> None:
@@ -1988,22 +1732,19 @@ def build_desired_candidate(
     if promotion is not None:
         write_preferred_document(candidate / "promotion.json", promotion.document(), source_root)
 
-    prepared: dict[str, dict[str, Any]] = {}
+    prepared: dict[str, tuple[UnitResource[Any], DesiredSource]] = {}
     for unit_name, specification in specifications.items():
         resolved_source, source_changed = resolved_unit_source(
             specification, source_root, source_revision, current_desired, legacy
         )
-        prepared[unit_name] = {
-            **json.loads(json.dumps(specification)),
-            "source": resolved_source,
-        }
+        prepared[unit_name] = (specification, resolved_source)
         previous_unit = unit_document_path(current_desired, unit_name)
         if not previous_unit.is_file():
             source_resolution = "new unit; use candidate revision"
         elif source_changed:
             source_resolution = "inputs changed; use candidate revision"
         else:
-            source_resolution = f"inputs unchanged; retain {describe_revision(resolved_source['revision'])}"
+            source_resolution = f"inputs unchanged; retain {describe_revision(resolved_source.revision)}"
         if verbose:
             log_status("CHECK", f"{style_unit(unit_name)}: {source_resolution}")
 
@@ -2012,30 +1753,27 @@ def build_desired_candidate(
     while unresolved:
         progressed = False
         for unit_name in sorted(unresolved):
+            authored, resolved_source = prepared[unit_name]
             try:
-                resolution = resolve_template(
-                    prepared[unit_name],
-                    candidate,
-                    observed,
-                    observed_revision,
-                    dry,
-                    promotion.desired_root if promotion is not None else None,
+                resolution = authored.driver.resolve_unit(
+                    authored.spec,
+                    UnitResolutionContext(
+                        source=resolved_source,
+                        resolve_template=lambda value: resolve_template(
+                            value,
+                            candidate,
+                            observed,
+                            observed_revision,
+                            promotion.desired_root if promotion is not None else None,
+                        ),
+                    ),
                 )
             except ReferenceUnavailable as exc:
                 unavailable[unit_name] = str(exc)
                 continue
-            resolved = resolution.value
-            if resolution.promotions or resolution.receipts or resolution.artifacts:
-                resolved["resolvedInputs"] = {}
-                if resolution.promotions:
-                    resolved["resolvedInputs"]["promotions"] = resolution.promotions
-                if resolution.receipts:
-                    resolved["resolvedInputs"]["receipts"] = resolution.receipts
-                if resolution.artifacts:
-                    resolved["resolvedInputs"]["artifacts"] = resolution.artifacts
+            resolved = authored.with_spec(resolution.unit)
             resolved = materialize_resolved_unit(
                 environment_name,
-                unit_name,
                 resolved,
                 source_root,
                 source_revision,
@@ -2044,24 +1782,27 @@ def build_desired_candidate(
             )
             candidate_unit = write_unit(candidate_units / f"{unit_name}.json", resolved, source_root)
             previous_unit = unit_document_path(current_desired, unit_name)
-            previous = load_unit(previous_unit, unit_name) if previous_unit.is_file() else None
-            previous_receipts = previous.get("resolvedInputs", {}).get("receipts", {}) if previous is not None else {}
-            previous_artifacts = previous.get("resolvedInputs", {}).get("artifacts", {}) if previous is not None else {}
-            previous_promotions = (
-                previous.get("resolvedInputs", {}).get("promotions", {}) if previous is not None else {}
-            )
-            if resolution.promotions:
+            previous = load_desired_unit(previous_unit, unit_name) if previous_unit.is_file() else None
+            previous_inputs = getattr(previous.spec, "resolvedInputs", None) if previous is not None else None
+            previous_receipts = previous_inputs.receipts if previous_inputs is not None else None
+            previous_artifacts = previous_inputs.artifacts if previous_inputs is not None else None
+            previous_promotions = previous_inputs.promotions if previous_inputs is not None else None
+            fingerprints = resolution.resolved_inputs
+            promotions = fingerprints.promotions if fingerprints is not None else None
+            receipts = fingerprints.receipts if fingerprints is not None else None
+            artifacts = fingerprints.artifacts if fingerprints is not None else None
+            if promotions:
                 promotion_resolution = (
                     "new promotion changes resolved inputs"
-                    if previous_promotions != resolution.promotions
+                    if previous_promotions != promotions
                     else "promotion already matches resolved inputs"
                 )
                 if verbose:
                     log_status("PROMOTE", f"{style_unit(unit_name)}: {promotion_resolution}")
-            if resolution.receipts or resolution.artifacts:
+            if receipts or artifacts:
                 observation_resolution = (
                     "new observation changes resolved inputs"
-                    if previous_receipts != resolution.receipts or previous_artifacts != resolution.artifacts
+                    if previous_receipts != receipts or previous_artifacts != artifacts
                     else "observations already match resolved inputs"
                 )
                 if verbose:
@@ -2080,11 +1821,11 @@ def build_desired_candidate(
 
     for unit_name in sorted(unresolved):
         previous = unit_document_path(current_desired, unit_name)
-        previous_driver = load_unit(previous, unit_name).get("driver") if previous.is_file() else None
-        next_driver = prepared[unit_name]["driver"]
+        previous_driver = persisted_unit_driver_name(previous) if previous.is_file() else None
+        next_driver = prepared[unit_name][0].driver_name
         if previous_driver == next_driver:
             shutil.copy2(previous, candidate_units / previous.name)
-            copy_unit_materialization(current_desired, candidate, unit_name, load_unit(previous, unit_name))
+            copy_unit_materialization(current_desired, candidate, unit_name, load_desired_unit(previous, unit_name))
             resolution = "retain previous desired state"
         elif previous_driver is not None:
             resolution = f"omit previous {previous_driver} desired state while transitioning to {next_driver}"
@@ -2158,7 +1899,7 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
     receipt_path = unit_document_path(observed, unit_name)
     if not unit_path.is_file():
         return False
-    unit = load_unit(unit_path, unit_name)
+    unit = load_desired_unit(unit_path, unit_name)
     try:
         validate_unit_materialization(desired, unit_name, unit)
         if not unit_requires_reconciliation(unit):
@@ -2172,11 +1913,10 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
         validate_receipt_document(receipt, f"historical receipt for {unit_name}")
     except OperationError:
         return False
-    driver = unit.get("driver")
+    driver = unit.driver_name
     desired_evidence = receipt.get("desired")
     if (
         receipt.get("unit") != unit_name
-        or not isinstance(driver, str)
         or receipt.get("driver") != driver
         or not isinstance(desired_evidence, dict)
         or not re.fullmatch(r"[0-9a-f]{40}", str(desired_evidence.get("revision", "")))
@@ -2200,7 +1940,7 @@ def require_clean_source(desired: Path, observed: Path, minimum_evidence: str = 
     unresolved = [
         unit_name
         for unit_name in unit_names
-        if contains_reference(load_unit(unit_document_path(desired, unit_name), unit_name))
+        if unit_contains_reference(load_desired_unit(unit_document_path(desired, unit_name), unit_name))
     ]
     if unresolved:
         raise OperationError(f"promotion source has unresolved desired units: {', '.join(unresolved)}")
@@ -2238,7 +1978,7 @@ def find_clean_observed_snapshot(
     receipt_units = [
         unit_name
         for unit_name in unit_names
-        if unit_requires_reconciliation(load_unit(unit_document_path(desired, unit_name), unit_name))
+        if unit_requires_reconciliation(load_desired_unit(unit_document_path(desired, unit_name), unit_name))
     ]
     if not receipt_units:
         return None
@@ -2252,24 +1992,6 @@ def find_clean_observed_snapshot(
         if all(historical_receipt_matches(desired, observed, unit_name) for unit_name in receipt_units):
             return revision
     raise OperationError("rollback target was never fully clean in one observed-state snapshot")
-
-
-def downstream_unit_closure(specifications: dict[str, dict[str, Any]], selected: list[str]) -> list[str]:
-    consumers: dict[str, set[str]] = {unit: set() for unit in specifications}
-    for consumer, specification in specifications.items():
-        for producer in observation_reference_units(specification):
-            if producer not in specifications:
-                raise OperationError(f"{consumer} references unknown observation unit {producer!r}")
-            consumers[producer].add(consumer)
-    closure: set[str] = set()
-    pending = list(selected)
-    while pending:
-        producer = pending.pop()
-        for consumer in consumers[producer]:
-            if consumer not in closure and consumer not in selected:
-                closure.add(consumer)
-                pending.append(consumer)
-    return sorted(closure)
 
 
 def promotion_lineage(desired: Path) -> dict[str, Any] | None:
@@ -2681,7 +2403,7 @@ def validate_materialized_desired(
     desired: Path,
     source: Path,
     description: str,
-) -> tuple[dict[str, dict[str, Any]], list[str]]:
+) -> tuple[dict[str, UnitResource[Any]], list[str]]:
     specifications = load_environment_specifications(source, environment)
     expected_units = sorted(specifications)
     desired_units = sorted(
@@ -2690,12 +2412,12 @@ def validate_materialized_desired(
     if desired_units != expected_units:
         raise OperationError(f"{description} {describe_revision(desired_revision)} is not fully materialized")
     for unit_name in desired_units:
-        unit = load_unit(unit_document_path(desired, unit_name), unit_name)
-        if contains_reference(unit):
+        unit = load_desired_unit(unit_document_path(desired, unit_name), unit_name)
+        if unit_contains_reference(unit):
             raise OperationError(f"{description} unit {unit_name} contains unresolved inputs")
         driver, _source = require_unit(unit, unit_name)
         validate_unit_materialization(desired, unit_name, unit)
-        if driver != specifications[unit_name].get("driver"):
+        if driver != specifications[unit_name].driver_name:
             raise OperationError(f"{description} unit {unit_name} does not match its specification driver")
     return specifications, desired_units
 
@@ -2804,8 +2526,8 @@ def command_rollback(args: argparse.Namespace) -> None:
         if missing_from_target:
             raise OperationError("rollback target is missing downstream unit(s): " + ", ".join(missing_from_target))
         for unit_name in materialized_units:
-            current_driver = current_specifications[unit_name].get("driver")
-            target_driver = target_specifications[unit_name].get("driver")
+            current_driver = current_specifications[unit_name].driver_name
+            target_driver = target_specifications[unit_name].driver_name
             if current_driver != target_driver:
                 raise OperationError(
                     f"rollback unit {unit_name} changes driver from {current_driver} to {target_driver}"
@@ -2834,7 +2556,7 @@ def command_rollback(args: argparse.Namespace) -> None:
         if mode == "units":
             for unit_name in materialized_units:
                 historical_path = unit_document_path(target, unit_name)
-                historical_unit = load_unit(historical_path, unit_name)
+                historical_unit = load_desired_unit(historical_path, unit_name)
                 validate_unit_materialization(target, unit_name, historical_unit)
                 candidate_path = unit_document_path(candidate, unit_name)
                 if candidate_path.exists():
@@ -2848,7 +2570,7 @@ def command_rollback(args: argparse.Namespace) -> None:
             validate_unit_materialization(
                 candidate,
                 unit_name,
-                load_unit(unit_document_path(candidate, unit_name), unit_name),
+                load_desired_unit(unit_document_path(candidate, unit_name), unit_name),
             )
         requested_label = "all" if mode == "full" else ", ".join(requested_units)
         materialized_label = ", ".join(materialized_units)
@@ -3043,7 +2765,7 @@ def command_show_desired(args: argparse.Namespace) -> None:
         if not path.is_file():
             raise OperationError(f"{desired_ref} has no desired unit {args.unit}")
         document = load_json(path)
-        unit = load_unit(path, args.unit)
+        unit = load_desired_unit(path, args.unit)
         validate_unit_materialization(desired, args.unit, unit)
     print_inspection_document(document, force_json=args.json, force_yaml=args.yaml)
 
@@ -3109,12 +2831,12 @@ def command_verify(args: argparse.Namespace) -> None:
         if not selected:
             raise OperationError(f"{desired_ref} has no materialized units")
 
-        prepared: list[tuple[str, str, dict[str, Any], dict[str, str]]] = []
+        prepared: list[tuple[str, str, UnitResource[Any], DesiredSource]] = []
         for unit_name in selected:
-            unit = load_unit(available[unit_name], unit_name)
+            unit = load_desired_unit(available[unit_name], unit_name)
             driver_name, source = require_unit(unit, unit_name)
             validate_unit_materialization(desired, unit_name, unit)
-            if contains_reference(unit):
+            if unit_contains_reference(unit):
                 raise OperationError(f"{unit_name} desired state is not fully materialized")
             if driver_name not in VERIFICATION_DRIVERS:
                 raise OperationError(f"{unit_name} uses {driver_name}, which does not support verification")
@@ -3124,17 +2846,18 @@ def command_verify(args: argparse.Namespace) -> None:
         for unit_name, driver_name, unit, source in prepared:
             log_status("VERIFY", f"{style_unit(unit_name)} ({driver_name})")
             source_root = temporary / "sources" / unit_name
-            materialize_revision(source["revision"], source_root)
+            assert source.revision is not None
+            materialize_revision(source.revision, source_root)
             result = VERIFICATION_DRIVERS[driver_name].verify(
                 VerificationContext(
                     environment=args.environment,
                     desired_root=desired,
                     desired_revision=desired_revision,
                     source_root=source_root,
-                    source_revision=source["revision"],
-                    source_path=source["path"],
-                    unit=unit,
-                    inputs=unit.get("inputs", {}),
+                    source_revision=source.revision,
+                    source_path=source.path,
+                    unit_name=unit_name,
+                    unit=unit.spec,
                     execution=DriverExecution.console(),
                 )
             )
@@ -3152,20 +2875,17 @@ def command_verify(args: argparse.Namespace) -> None:
     log_status("RESULT", "CLEAN")
 
 
-def require_unit(unit: dict[str, Any], unit_name: str) -> tuple[str, dict[str, str]]:
-    if unit.get("name") != unit_name:
+def require_unit(unit: UnitResource[Any], unit_name: str) -> tuple[str, DesiredSource]:
+    if unit.name != unit_name:
         raise OperationError(f"invalid desired unit: {unit_name}")
-    driver = unit.get("driver")
-    if driver not in UNIT_DRIVERS:
-        raise OperationError(f"{unit_name} uses an unknown unit plugin: {driver!r}")
-    validate_document(UNIT_DRIVERS[driver].desired_unit_contract, unit, f"desired {driver} unit {unit_name}")
-    source = unit.get("source")
-    if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+    driver = unit.driver_name
+    source = getattr(unit.spec, "source", None)
+    if not isinstance(source, DesiredSource):
         raise OperationError(f"{unit_name} has an invalid source")
-    safe_source_path(source["path"], f"{unit_name} source path")
-    if not re.fullmatch(r"[0-9a-f]{40}", str(source.get("revision", ""))):
+    safe_source_path(source.path, f"{unit_name} source path")
+    if not re.fullmatch(r"[0-9a-f]{40}", str(source.revision or "")):
         raise OperationError(f"{unit_name} has an invalid source revision")
-    recorded_version = source.get("driverVersion")
+    recorded_version = source.driverVersion
     if recorded_version is not None and recorded_version != DRIVER_VERSIONS[driver]:
         raise OperationError(
             f"{unit_name} requires {driver} driver version {recorded_version}; "
@@ -3213,32 +2933,38 @@ def json_pointer(document: Any, pointer: str) -> Any:
     return value
 
 
-def contains_reference(value: Any) -> bool:
-    if isinstance(value, list):
-        return any(contains_reference(item) for item in value)
-    if isinstance(value, dict):
-        return bool({"fromReceipt", "fromArtifact", "fromPromotion"}.intersection(value)) or any(
-            contains_reference(item) for item in value.values()
-        )
-    return False
+def _template(value: object, pointer: str = "") -> TemplateValue:
+    try:
+        return parse_template_value(value, pointer)
+    except TemplateError as exc:
+        raise OperationError(str(exc)) from exc
 
 
-def reference_paths(value: Any, reference_type: str) -> set[str]:
+def contains_reference(value: object) -> bool:
+    return template_contains_reference(_template(value))
+
+
+def unit_contains_reference(unit: UnitResource[Any]) -> bool:
+    return contains_reference(unit.driver.desired_unit_contract.dump(unit.spec))
+
+
+def reference_paths(value: object, reference_type: str, pointer: str = "") -> set[str]:
     """Collect validated logical unit names referenced by one reference type."""
-    paths: set[str] = set()
-    if isinstance(value, list):
-        for item in value:
-            paths.update(reference_paths(item, reference_type))
-    elif isinstance(value, dict):
-        if reference_type in value:
-            reference = value[reference_type]
-            unit_name = reference.get("unit") if isinstance(reference, dict) else None
-            if not isinstance(unit_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name):
-                raise OperationError(f"invalid {reference_type} unit: {unit_name!r}")
-            paths.add(unit_name)
-        for item in value.values():
-            paths.update(reference_paths(item, reference_type))
-    return paths
+    if reference_type not in {"fromReceipt", "fromArtifact", "fromPromotion"}:
+        raise OperationError(f"unknown reference type: {reference_type}")
+    return {
+        (
+            reference.fromReceipt.unit
+            if isinstance(reference, ReceiptReference)
+            else reference.fromArtifact.unit
+            if isinstance(reference, ArtifactReferenceExpression)
+            else reference.fromPromotion.unit
+        )
+        for reference in template_references(_template(value, pointer))
+        if (isinstance(reference, ReceiptReference) and reference_type == "fromReceipt")
+        or (isinstance(reference, ArtifactReferenceExpression) and reference_type == "fromArtifact")
+        or (isinstance(reference, PromotionReference) and reference_type == "fromPromotion")
+    }
 
 
 def _json_pointer_child(pointer: str, child: str | int) -> str:
@@ -3246,129 +2972,25 @@ def _json_pointer_child(pointer: str, child: str | int) -> str:
     return f"{pointer}/{token}"
 
 
-def artifact_references(value: Any, pointer: str = "") -> set[ArtifactReference]:
+def artifact_references(value: Any, pointer: str = "") -> set[ArtifactReferenceTarget]:
     """Collect validated and explicitly typed artifact references.
 
     Invalid references include their JSON Pointer location so callers can identify
     the offending field in a larger unit document.
     """
-    references: set[ArtifactReference] = set()
-    if isinstance(value, list):
-        for index, item in enumerate(value):
-            references.update(artifact_references(item, _json_pointer_child(pointer, index)))
-    elif isinstance(value, dict):
-        if "fromArtifact" in value:
-            reference_pointer = _json_pointer_child(pointer, "fromArtifact")
-            try:
-                references.add(parse_artifact_reference(value["fromArtifact"]))
-            except OperationError as exc:
-                raise OperationError(f"{reference_pointer}: {exc}") from exc
-        for name, item in value.items():
-            references.update(artifact_references(item, _json_pointer_child(pointer, name)))
-    return references
-
-
-def observation_reference_units(value: Any) -> set[str]:
-    return reference_paths(value, "fromReceipt") | reference_paths(value, "fromArtifact")
-
-
-def convergence_scope(
-    specifications: dict[str, dict[str, Any]],
-    targets: list[str] | None,
-    max_depth: int | None = None,
-) -> tuple[list[str], list[str]]:
-    """Return selected targets and their transitive observation dependencies."""
-    if max_depth is not None and max_depth < 0:
-        raise OperationError("--depth must be zero or a positive integer")
-    selected = sorted(set(targets or specifications))
-    unknown = sorted(set(selected) - specifications.keys())
-    if unknown:
-        available = ", ".join(sorted(specifications))
-        raise OperationError(f"unknown unit(s) {', '.join(unknown)}; available units: {available}")
-    depths = {unit_name: 0 for unit_name in selected}
-    pending = list(selected)
-    while pending:
-        unit_name = pending.pop()
-        depth = depths[unit_name]
-        dependencies = observation_reference_units(specifications[unit_name])
-        missing = sorted(dependencies - specifications.keys())
-        if missing:
-            raise OperationError(f"{unit_name} references unknown observation unit(s): {', '.join(missing)}")
-        if max_depth is not None and depth >= max_depth:
-            continue
-        for dependency in sorted(dependencies):
-            dependency_depth = depth + 1
-            if dependency_depth < depths.get(dependency, dependency_depth + 1):
-                depths[dependency] = dependency_depth
-                pending.append(dependency)
-    return selected, sorted(depths)
-
-
-def convergence_order(specifications: dict[str, dict[str, Any]], scope: list[str]) -> list[str]:
-    """Order prerequisites before consumers while tolerating self/cyclic observations."""
-    included = set(scope)
-    visiting: set[str] = set()
-    visited: set[str] = set()
-    ordered: list[str] = []
-
-    def visit(unit_name: str) -> None:
-        if unit_name in visited:
-            return
-        if unit_name in visiting:
-            return
-        visiting.add(unit_name)
-        dependencies = sorted(observation_reference_units(specifications[unit_name]) & included)
-        for dependency in dependencies:
-            visit(dependency)
-        visiting.remove(unit_name)
-        visited.add(unit_name)
-        ordered.append(unit_name)
-
-    for unit_name in sorted(scope):
-        visit(unit_name)
-    return ordered
-
-
-def observation_dependency_graph(specifications: dict[str, dict[str, Any]], scope: list[str]) -> dict[str, list[str]]:
-    included = set(scope)
     return {
-        unit_name: sorted(observation_reference_units(specifications[unit_name]) & included)
-        for unit_name in sorted(scope)
+        reference.fromArtifact
+        for reference in template_references(_template(value, pointer))
+        if isinstance(reference, ArtifactReferenceExpression)
     }
 
 
-def log_dependency_graph(graph: dict[str, list[str]]) -> None:
+def log_dependency_graph(graph: Mapping[str, tuple[str, ...]]) -> None:
     for unit_name, dependencies in graph.items():
         log_status(
             "DEPEND",
             f"{style_unit(unit_name)}: {', '.join(style_unit(dependency) for dependency in dependencies) or 'none'}",
         )
-
-
-def render_dependency_tree(
-    target: str,
-    graph: dict[str, list[str]],
-    style_name: Callable[[str], str] | None = None,
-) -> list[str]:
-    render_name = style_name or (lambda name: name)
-    lines = [render_name(target)]
-
-    def render(unit_name: str, prefix: str, ancestors: set[str]) -> None:
-        dependencies = graph[unit_name]
-        for index, dependency in enumerate(dependencies):
-            last = index == len(dependencies) - 1
-            connector = "└── " if last else "├── "
-            cycle = dependency in ancestors
-            lines.append(f"{prefix}{connector}{render_name(dependency)}{' [cycle]' if cycle else ''}")
-            if not cycle:
-                render(
-                    dependency,
-                    prefix + ("    " if last else "│   "),
-                    ancestors | {dependency},
-                )
-
-    render(target, "", {target})
-    return lines
 
 
 def nested_strings(value: Any) -> list[str]:
@@ -3385,7 +3007,7 @@ def publish_observation_cas(
     observed_ref: str,
     unit_name: str,
     receipt: dict[str, Any],
-    unit: dict[str, Any],
+    unit: UnitResource[Any],
     artifact_documents: Mapping[str, JsonObject],
     desired_revision: str,
 ) -> str:
@@ -3521,7 +3143,6 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 observed,
                 observed_revision,
                 desired,
-                dry=True,
             )
             desired_revision = f"dry:{source_revision}"
         elif not pre_advance:
@@ -3541,12 +3162,13 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             log_status("DONE", f"{style_unit(args.unit)}: no changes")
             write_reconcile_outputs(False)
             return False
-        unit = load_unit(unit_path, args.unit)
+        unit = load_desired_unit(unit_path, args.unit)
         driver_name, source = require_unit(unit, args.unit)
         validate_unit_materialization(desired, args.unit, unit)
         log_status("DRIVER", driver_name)
-        log_status("SOURCE", f"{describe_revision(source['revision'])} ({source['path']})")
-        if contains_reference(unit):
+        assert source.revision is not None
+        log_status("SOURCE", f"{describe_revision(source.revision)} ({source.path})")
+        if unit_contains_reference(unit):
             raise OperationError(f"{args.unit} desired state is not fully materialized")
         if not unit_requires_reconciliation(unit):
             log_status("SKIP", "unit is complete after desired-state materialization")
@@ -3596,16 +3218,16 @@ def command_reconcile(args: argparse.Namespace) -> bool:
 
         log_status("RUN", f"execute {driver_name} {'planning' if args.plan else 'reconciliation'}")
         source_root = temporary / "source"
-        materialize_revision(source["revision"], source_root)
+        materialize_revision(source.revision, source_root)
         execution: dict[str, Any] = {
             "environment": args.environment,
             "desired_root": desired,
             "desired_revision": desired_revision,
             "source_root": source_root,
-            "source_revision": source["revision"],
-            "source_path": source["path"],
-            "unit": unit,
-            "inputs": unit.get("inputs", {}),
+            "source_revision": source.revision,
+            "source_path": source.path,
+            "unit_name": args.unit,
+            "unit": unit.spec,
             "report": report,
             "execution": DriverExecution.console(),
         }
@@ -3633,7 +3255,10 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         )
         if not isinstance(output, ReconciliationOutput):
             raise DriverError(f"{driver_name} reconciliation did not return ReconciliationOutput")
-        result = dict(output.result)
+        try:
+            result = UNIT_DRIVERS[driver_name].result_contract.dump(output.result)
+        except (TypeError, ValueError) as exc:
+            raise DriverError(f"{driver_name} returned an invalid typed reconciliation result: {exc}") from exc
         validate_document(UNIT_DRIVERS[driver_name].result_contract, result, f"{driver_name} reconciliation result")
         reserved = {
             "schema",
@@ -3650,7 +3275,9 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 "unit": args.unit,
                 "driver": driver_name,
                 "desired": {"revision": desired_revision, "unitBlob": unit_blob},
-                "resolvedInputs": unit.get("resolvedInputs", {}),
+                "resolvedInputs": (
+                    unit.spec.resolvedInputs.to_dict() if getattr(unit.spec, "resolvedInputs", None) is not None else {}
+                ),
                 "controller": controller_evidence(),
                 **result,
             },
@@ -3699,7 +3326,7 @@ def require_reconciliation_approval(unit_name: str) -> None:
 
 def log_compact_convergence_summary(
     environment: str,
-    scope: list[str],
+    scope: Sequence[str],
     steps: list[str],
     advances: list[RefAdvance],
     result: str,
@@ -3719,8 +3346,8 @@ def log_compact_convergence_summary(
 
 def log_convergence_summary(
     environment: str,
-    targets: list[str],
-    scope: list[str],
+    targets: Sequence[str],
+    scope: Sequence[str],
     steps: list[str],
     advances: list[RefAdvance],
     start_heads: tuple[str | None, str | None],
@@ -3763,8 +3390,9 @@ def command_dependencies(args: argparse.Namespace) -> None:
         source_root = Path(temporary_directory) / "source"
         materialize_revision(source_revision, source_root)
         specifications = load_environment_specifications(source_root, args.environment)
-        targets, scope = convergence_scope(specifications, args.unit, args.depth)
-        graph = observation_dependency_graph(specifications, scope)
+        selection = convergence_scope(specifications, args.unit, args.depth)
+        targets, scope = selection.targets, selection.scope
+        graph = dependency_graph(specifications, scope)
         order = convergence_order(specifications, scope)
     if args.json:
         print(
@@ -3774,7 +3402,9 @@ def command_dependencies(args: argparse.Namespace) -> None:
                     "environment": args.environment,
                     "sourceRevision": source_revision,
                     "targets": targets,
-                    "units": [{"name": unit_name, "dependencies": graph[unit_name]} for unit_name in order],
+                    "units": [
+                        {"name": unit_name, "dependencies": graph.dependencies[unit_name]} for unit_name in order
+                    ],
                 },
                 indent=2,
                 sort_keys=True,
@@ -3787,15 +3417,7 @@ def command_dependencies(args: argparse.Namespace) -> None:
     for index, target in enumerate(targets):
         if index:
             print()
-        print(
-            "\n".join(
-                render_dependency_tree(
-                    target,
-                    graph,
-                    lambda unit_name: style_unit(unit_name, sys.stdout),
-                )
-            )
-        )
+        print("\n".join(graph.render_tree(target, lambda unit_name: style_unit(unit_name, sys.stdout))))
 
 
 def command_converge(args: argparse.Namespace) -> None:
@@ -3852,13 +3474,14 @@ def command_converge(args: argparse.Namespace) -> None:
             effective_source_revision = source_revision
             source_root = probe_source
         specifications = load_environment_specifications(source_root, args.environment)
-        targets, scope = convergence_scope(specifications, args.unit)
+        selection = convergence_scope(specifications, args.unit)
+        targets, scope = selection.targets, selection.scope
         order = convergence_order(specifications, scope)
         if args.verbose:
             log_status("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
             log_status("TARGET", style_units(targets))
             log_status("SCOPE", style_units(scope))
-            log_dependency_graph(observation_dependency_graph(specifications, scope))
+            log_dependency_graph(dependency_graph(specifications, scope).dependencies)
         else:
             log_status("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(start_desired)}")
             log_status("OBSERVED", f"{style_branch(observed_ref)} at {describe_revision(start_observed)}")
@@ -3875,7 +3498,12 @@ def command_converge(args: argparse.Namespace) -> None:
         previous_plan: list[tuple[str, str, str]] | None = None
 
         promotion_units = sorted(
-            unit_name for unit_name in scope if reference_paths(specifications[unit_name], "fromPromotion")
+            unit_name
+            for unit_name in scope
+            if reference_paths(
+                specifications[unit_name].driver.unit_contract.dump(specifications[unit_name].spec),
+                "fromPromotion",
+            )
         )
         if promotion_units and promotion is None:
             result = "FAILED: review gate requires a merged promotion for " + ", ".join(promotion_units)
@@ -4155,7 +3783,17 @@ def command_create_unit(args: argparse.Namespace) -> None:
         raise OperationError(
             f"unit driver {args.driver!r} does not support scaffolding; create the document from its authored schema"
         )
-    unit = {**scaffold, "name": args.name, "driver": args.driver}
+    model = RESOURCE_CATALOG.parse_contract(
+        driver.unit_contract,
+        scaffold,
+        f"authored {args.driver} unit {args.name}",
+    )
+    unit = UnitResource(
+        GVK(driver.api_version, driver.kind),
+        ResourceMetadata(name=args.name),
+        driver,
+        model,
+    )
     require_unit_specification(unit, args.name)
     target = _creation_target(
         environment_root / "units",
@@ -4212,9 +3850,9 @@ def _validate_environment_file(path: Path, collector: ValidationCollector) -> No
         collector.invalid(path, exc)
 
 
-def _validate_unit_file(path: Path, collector: ValidationCollector) -> dict[str, Any] | None:
+def _validate_unit_file(path: Path, collector: ValidationCollector) -> UnitResource[Any] | None:
     try:
-        unit = normalize_unit_document(load_json(path), path.stem)
+        unit = parse_authored_unit_document(load_json(path), path.stem)
         require_unit_specification(unit, path.stem)
         collector.valid_document(path)
         return unit
@@ -4280,7 +3918,7 @@ def _validate_environment(environment_name: str, collector: ValidationCollector)
     if not stems:
         return
 
-    specifications: dict[str, dict[str, Any]] = {}
+    specifications: dict[str, UnitResource[Any]] = {}
     for stem in stems:
         paths = document_candidates(units_root, stem)
         if len(paths) != 1:
@@ -4291,26 +3929,24 @@ def _validate_environment(environment_name: str, collector: ValidationCollector)
             specifications[stem] = specification
 
     for consumer, specification in specifications.items():
+        specification_document = specification.driver.unit_contract.dump(specification.spec)
         try:
-            references = observation_reference_units(specification)
+            references = observation_reference_units(specification_document)
         except OperationError as exc:
             collector.invalid(units_root / consumer, exc)
             continue
         for reference in references:
             producer = reference
             if producer in specifications:
-                try:
-                    reconciles = unit_requires_reconciliation(specifications[producer])
-                except OperationError as exc:
-                    collector.invalid(units_root / producer, exc)
-                    continue
+                producer_unit = specifications[producer]
+                reconciles = producer_unit.driver.authored_reconciliation_required(producer_unit.spec)
                 if not reconciles:
                     collector.invalid(
                         units_root / consumer,
                         f"{consumer} cannot observe materialization-only unit {producer!r}",
                     )
         try:
-            artifacts = artifact_references(specification, "/spec")
+            artifacts = artifact_references(specification_document, "/spec")
         except OperationError as exc:
             collector.invalid(units_root / consumer, exc)
             continue
@@ -4320,8 +3956,7 @@ def _validate_environment(environment_name: str, collector: ValidationCollector)
             producer_specification = specifications.get(producer)
             if producer_specification is None:
                 continue
-            driver_name = producer_specification.get("driver")
-            driver = UNIT_DRIVERS.get(driver_name) if isinstance(driver_name, str) else None
+            driver = producer_specification.driver
             if driver is not None and artifact_name not in driver.artifact_outputs:
                 collector.invalid(
                     units_root / consumer,

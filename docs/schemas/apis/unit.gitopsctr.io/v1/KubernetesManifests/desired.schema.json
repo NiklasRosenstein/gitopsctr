@@ -179,9 +179,6 @@
         "inputs": {
           "anyOf": [
             {
-              "propertyNames": {
-                "type": "string"
-              },
               "type": "object"
             },
             {
@@ -309,9 +306,6 @@
                   "const": "helm"
                 },
                 "values": {
-                  "propertyNames": {
-                    "type": "string"
-                  },
                   "type": "object"
                 }
               },
@@ -360,18 +354,61 @@
         "resolvedInputs": {
           "anyOf": [
             {
-              "additionalProperties": {
-                "additionalProperties": {
-                  "type": "string"
+              "additionalProperties": false,
+              "properties": {
+                "artifacts": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
                 },
-                "propertyNames": {
-                  "type": "string"
+                "promotions": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
                 },
-                "type": "object"
+                "receipts": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                }
               },
-              "propertyNames": {
-                "type": "string"
-              },
+              "title": "ResolvedInputs",
               "type": "object"
             },
             {

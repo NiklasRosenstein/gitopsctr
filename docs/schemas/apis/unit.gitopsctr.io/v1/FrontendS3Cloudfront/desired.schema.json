@@ -96,67 +96,6 @@
               "type": "object"
             },
             {
-              "additionalProperties": false,
-              "properties": {
-                "bucket": {
-                  "default": null
-                },
-                "bundle": {
-                  "default": null
-                },
-                "distributionId": {
-                  "default": null
-                },
-                "runtimeConfig": {
-                  "default": null
-                },
-                "url": {
-                  "default": null
-                }
-              },
-              "title": "FrontendAuthoredInputs",
-              "type": "object"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "materialization": {
-          "anyOf": [
-            {
-              "additionalProperties": false,
-              "properties": {
-                "$schema": {
-                  "default": null
-                },
-                "digest": {
-                  "type": "string"
-                },
-                "mediaType": {
-                  "type": "string"
-                },
-                "metadata": {
-                  "propertyNames": {
-                    "type": "string"
-                  },
-                  "type": "object"
-                },
-                "path": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "path",
-                "mediaType",
-                "digest",
-                "metadata"
-              ],
-              "title": "MaterializationDocument",
-              "type": "object"
-            },
-            {
               "type": "null"
             }
           ],
@@ -201,18 +140,61 @@
         "resolvedInputs": {
           "anyOf": [
             {
-              "additionalProperties": {
-                "additionalProperties": {
-                  "type": "string"
+              "additionalProperties": false,
+              "properties": {
+                "artifacts": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
                 },
-                "propertyNames": {
-                  "type": "string"
+                "promotions": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
                 },
-                "type": "object"
+                "receipts": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                }
               },
-              "propertyNames": {
-                "type": "string"
-              },
+              "title": "ResolvedInputs",
               "type": "object"
             },
             {
