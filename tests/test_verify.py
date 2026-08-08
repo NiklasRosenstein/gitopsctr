@@ -3,11 +3,12 @@
 import json
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from gitopsctr import cli as deploy_release
-from gitopsctr.driver import DriverContext, VerificationResult, VerificationStatus
+from gitopsctr.driver import VerificationContext, VerificationResult, VerificationStatus
 
 DESIRED_REVISION = "d" * 40
 
@@ -25,7 +26,7 @@ def _unit(name: str, driver: str, revision: str) -> dict[str, object]:
         "source": {
             "path": f"deployment/{name}",
             "revision": revision,
-            "driverVersion": deploy_release.DRIVER_VERSIONS[driver],
+            "driverVersion": deploy_release.PLUGIN_VERSIONS[driver],
         },
         "inputs": {"environment": "prod"},
     }
@@ -69,7 +70,7 @@ def test_verify_runs_every_selected_driver_and_reports_drift_after_all_units(mon
         _unit("infrastructure", "terraform", "b" * 40),
     ]
     materialized = _install_desired_state(monkeypatch, units)
-    calls: list[tuple[str, DriverContext]] = []
+    calls: list[tuple[str, VerificationContext]] = []
 
     def verifier(status):
         def verify(context):
@@ -79,14 +80,14 @@ def test_verify_runs_every_selected_driver_and_reports_drift_after_all_units(mon
         return verify
 
     monkeypatch.setitem(
-        deploy_release.VERIFICATION_DRIVERS,
+        deploy_release.VERIFICATION_PLUGINS,
         "oci-images",
-        verifier(VerificationStatus.DRIFT),
+        SimpleNamespace(verify=verifier(VerificationStatus.DRIFT)),
     )
     monkeypatch.setitem(
-        deploy_release.VERIFICATION_DRIVERS,
+        deploy_release.VERIFICATION_PLUGINS,
         "terraform",
-        verifier(VerificationStatus.CLEAN),
+        SimpleNamespace(verify=verifier(VerificationStatus.CLEAN)),
     )
 
     with pytest.raises(deploy_release.OperationError, match="detected drift in: images"):
@@ -111,9 +112,11 @@ def test_verify_deduplicates_selected_units_and_reports_clean(monkeypatch, capsy
     materialized = _install_desired_state(monkeypatch, units)
     calls: list[str] = []
     monkeypatch.setitem(
-        deploy_release.VERIFICATION_DRIVERS,
+        deploy_release.VERIFICATION_PLUGINS,
         "terraform",
-        lambda context: calls.append(context.unit["name"]) or VerificationResult(VerificationStatus.CLEAN),
+        SimpleNamespace(
+            verify=lambda context: calls.append(context.unit["name"]) or VerificationResult(VerificationStatus.CLEAN)
+        ),
     )
 
     deploy_release.command_verify(Namespace(environment="prod", unit=["infrastructure", "infrastructure"]))
@@ -130,9 +133,9 @@ def test_verify_preflights_unsupported_drivers_before_running_any_unit(monkeypat
     ]
     materialized = _install_desired_state(monkeypatch, units)
     monkeypatch.setitem(
-        deploy_release.VERIFICATION_DRIVERS,
+        deploy_release.VERIFICATION_PLUGINS,
         "terraform",
-        lambda _context: pytest.fail("preflight must finish before verification starts"),
+        SimpleNamespace(verify=lambda _context: pytest.fail("preflight must finish before verification starts")),
     )
 
     with pytest.raises(
@@ -154,9 +157,9 @@ def test_verify_rejects_unmaterialized_desired_units_before_running_driver(monke
     }
     materialized = _install_desired_state(monkeypatch, [unit])
     monkeypatch.setitem(
-        deploy_release.VERIFICATION_DRIVERS,
+        deploy_release.VERIFICATION_PLUGINS,
         "terraform",
-        lambda _context: pytest.fail("unmaterialized unit ran verification"),
+        SimpleNamespace(verify=lambda _context: pytest.fail("unmaterialized unit ran verification")),
     )
 
     with pytest.raises(deploy_release.OperationError, match="not fully materialized"):
@@ -210,7 +213,7 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
         "write_reconcile_outputs",
         lambda changed, desired="": outputs.append((changed, desired)),
     )
-    monkeypatch.setitem(deploy_release.RECONCILIATION_DRIVERS, "terraform", driver)
+    monkeypatch.setitem(deploy_release.RECONCILIATION_PLUGINS, "terraform", SimpleNamespace(reconcile=driver))
 
     changed = deploy_release.command_reconcile(
         Namespace(

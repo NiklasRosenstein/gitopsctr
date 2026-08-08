@@ -10,12 +10,14 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 from gitopsctr.driver import (
-    Driver,
-    DriverContext,
     DriverError,
-    DriverResult,
     JsonValue,
+    ReconciliationCapability,
+    ReconciliationContext,
+    ReconciliationResult,
+    UnitPlugin,
     VerificationCapability,
+    VerificationContext,
     VerificationResult,
     VerificationStatus,
 )
@@ -42,7 +44,7 @@ class TerraformResult(TypedDict):
 
 
 def terraform_runtime(
-    context: DriverContext,
+    context: ReconciliationContext | VerificationContext,
 ) -> tuple[Path, dict[str, str], list[str], list[str], list[object]]:
     configuration = context.unit.get("terraform")
     if not isinstance(configuration, dict):
@@ -77,13 +79,13 @@ def terraform_runtime(
     return terraform_root, terraform_environment, backend_args, output_names, cast(list[object], checks)
 
 
-class TerraformDriver(Driver, VerificationCapability):
+class TerraformPlugin(UnitPlugin, ReconciliationCapability, VerificationCapability):
     version = 2
     _select_semantic_result = staticmethod(select_result_fields("applied", "outputs"))
 
     @staticmethod
     def _prepare_plan_artifacts(
-        context: DriverContext,
+        context: ReconciliationContext | VerificationContext,
         plan_name: str,
         report_name: str,
         local_plan_name: str,
@@ -98,7 +100,7 @@ class TerraformDriver(Driver, VerificationCapability):
                 previous.unlink()
         return plan, report
 
-    def reconcile(self, context: DriverContext) -> TerraformPlanResult | TerraformResult:
+    def reconcile(self, context: ReconciliationContext) -> TerraformPlanResult | TerraformResult:
         terraform_root, terraform_environment, backend_args, output_names, checks = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,
@@ -172,7 +174,7 @@ class TerraformDriver(Driver, VerificationCapability):
             "outputs": outputs,
         }
 
-    def verify(self, context: DriverContext) -> VerificationResult:
+    def verify(self, context: VerificationContext) -> VerificationResult:
         terraform_root, terraform_environment, backend_args, _, _ = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,
@@ -206,8 +208,8 @@ class TerraformDriver(Driver, VerificationCapability):
             return VerificationResult(VerificationStatus.DRIFT)
         raise DriverError(output.strip() or f"Terraform verification failed with exit code {result.returncode}")
 
-    def semantic_result(self, result: object) -> DriverResult:
+    def semantic_result(self, result: object) -> ReconciliationResult:
         return self._select_semantic_result(result)
 
 
-PLUGIN = TerraformDriver()
+PLUGIN = TerraformPlugin()

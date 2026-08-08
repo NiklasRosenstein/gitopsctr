@@ -39,7 +39,7 @@ def _desired_unit(name: str, revision: str, value: str) -> dict:
             "path": "infra/deploy",
             "revision": revision,
             "inputHash": f"sha256:{value}",
-            "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"],
+            "driverVersion": deploy_release.PLUGIN_VERSIONS["terraform"],
         },
         "terraform": {"variables": {"value": value}},
     }

@@ -694,7 +694,7 @@ def test_desired_unit_rejects_an_incompatible_running_driver_version():
         "source": {
             "path": "infra/deploy",
             "revision": "a" * 40,
-            "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"] + 1,
+            "driverVersion": deploy_release.PLUGIN_VERSIONS["terraform"] + 1,
         },
     }
 

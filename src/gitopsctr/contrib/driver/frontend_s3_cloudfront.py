@@ -9,7 +9,14 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import TypedDict, cast
 
-from gitopsctr.driver import Driver, DriverContext, DriverError, DriverResult, JsonObject
+from gitopsctr.driver import (
+    DriverError,
+    JsonObject,
+    ReconciliationCapability,
+    ReconciliationContext,
+    ReconciliationResult,
+    UnitPlugin,
+)
 
 from ._common import require_strings, run, select_result_fields
 from ._oci import (
@@ -95,11 +102,11 @@ def runtime_configuration(inputs: JsonObject) -> RuntimeConfiguration:
     return cast(RuntimeConfiguration, configuration)
 
 
-class FrontendS3CloudfrontDriver(Driver):
+class FrontendS3CloudfrontPlugin(UnitPlugin, ReconciliationCapability):
     version = 1
     _select_semantic_result = staticmethod(select_result_fields("published"))
 
-    def reconcile(self, context: DriverContext) -> FrontendPlanResult | FrontendResult:
+    def reconcile(self, context: ReconciliationContext) -> FrontendPlanResult | FrontendResult:
         require_strings(
             context.inputs,
             ("bundle", "bucket", "distributionId", "url"),
@@ -227,8 +234,8 @@ class FrontendS3CloudfrontDriver(Driver):
             }
         }
 
-    def semantic_result(self, result: object) -> DriverResult:
+    def semantic_result(self, result: object) -> ReconciliationResult:
         return self._select_semantic_result(result)
 
 
-PLUGIN = FrontendS3CloudfrontDriver()
+PLUGIN = FrontendS3CloudfrontPlugin()

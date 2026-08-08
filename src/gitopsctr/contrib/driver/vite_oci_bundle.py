@@ -11,7 +11,13 @@ import tempfile
 from pathlib import Path
 from typing import TypedDict
 
-from gitopsctr.driver import Driver, DriverContext, DriverError, DriverResult
+from gitopsctr.driver import (
+    DriverError,
+    ReconciliationCapability,
+    ReconciliationContext,
+    ReconciliationResult,
+    UnitPlugin,
+)
 
 from ._common import run, select_result_fields
 from ._oci import (
@@ -89,11 +95,11 @@ def deterministic_archive(source: Path, destination: Path) -> None:
                         raise DriverError(f"frontend bundle contains an unsupported file: {path}")
 
 
-class ViteOciBundleDriver(Driver):
+class ViteOciBundlePlugin(UnitPlugin, ReconciliationCapability):
     version = 1
     _select_semantic_result = staticmethod(select_result_fields("artifacts"))
 
-    def reconcile(self, context: DriverContext) -> ViteBundlePlanResult | ViteBundleResult:
+    def reconcile(self, context: ReconciliationContext) -> ViteBundlePlanResult | ViteBundleResult:
         specification = context.unit
         build = specification.get("build")
         publication = specification.get("publish")
@@ -176,8 +182,8 @@ class ViteOciBundleDriver(Driver):
             }
         }
 
-    def semantic_result(self, result: object) -> DriverResult:
+    def semantic_result(self, result: object) -> ReconciliationResult:
         return self._select_semantic_result(result)
 
 
-PLUGIN = ViteOciBundleDriver()
+PLUGIN = ViteOciBundlePlugin()

@@ -22,13 +22,15 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from gitopsctr.driver import (
-    DRIVER_VERSIONS,
-    RECONCILIATION_DRIVERS,
-    VERIFICATION_DRIVERS,
-    DriverContext,
+    PLUGIN_VERSIONS,
+    RECONCILIATION_PLUGINS,
+    UNIT_PLUGINS,
+    VERIFICATION_PLUGINS,
     DriverError,
+    ReconciliationContext,
+    VerificationContext,
     VerificationStatus,
-    semantic_driver_result,
+    semantic_reconciliation_result,
 )
 from gitopsctr.forges import (
     ChangeRequestResult,
@@ -351,7 +353,7 @@ def require_unit_specification(
         or (expected_name is not None and name != expected_name)
     ):
         raise OperationError(f"invalid unit specification: {expected_name or name!r}")
-    if driver not in RECONCILIATION_DRIVERS:
+    if driver not in UNIT_PLUGINS:
         raise OperationError(f"{name} uses an unknown driver: {driver!r}")
     if not isinstance(source, dict):
         raise OperationError(f"{name} requires a source object")
@@ -380,7 +382,7 @@ def unit_input_hash(specification: dict[str, Any], source_root: Path) -> str:
         {
             "kind": "unit",
             "driver": driver,
-            "driverVersion": DRIVER_VERSIONS[driver],
+            "driverVersion": PLUGIN_VERSIONS[driver],
             "specification": specification,
         },
     )
@@ -524,7 +526,7 @@ def resolved_unit_source(
             **source,
             "revision": revision,
             "inputHash": input_hash,
-            "driverVersion": DRIVER_VERSIONS[driver],
+            "driverVersion": PLUGIN_VERSIONS[driver],
         },
         inputs_changed,
     )
@@ -1135,7 +1137,7 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
     ):
         return False
     try:
-        semantic_driver_result(driver, receipt)
+        semantic_reconciliation_result(driver, receipt)
     except DriverError:
         return False
     return True
@@ -1922,7 +1924,7 @@ def command_verify(args: argparse.Namespace) -> None:
             driver_name, source = require_unit(unit, unit_name)
             if contains_reference(unit):
                 raise OperationError(f"{unit_name} desired state is not fully materialized")
-            if driver_name not in VERIFICATION_DRIVERS:
+            if driver_name not in VERIFICATION_PLUGINS:
                 raise OperationError(f"{unit_name} uses {driver_name}, which does not support verification")
             prepared.append((unit_name, driver_name, unit, source))
 
@@ -1931,8 +1933,11 @@ def command_verify(args: argparse.Namespace) -> None:
             log_status("VERIFY", f"{unit_name} ({driver_name})")
             source_root = temporary / "sources" / unit_name
             materialize_revision(source["revision"], source_root)
-            result = VERIFICATION_DRIVERS[driver_name](
-                DriverContext(
+            result = VERIFICATION_PLUGINS[driver_name].verify(
+                VerificationContext(
+                    environment=args.environment,
+                    desired_root=desired,
+                    desired_revision=desired_revision,
                     source_root=source_root,
                     source_revision=source["revision"],
                     source_path=source["path"],
@@ -1958,8 +1963,8 @@ def require_unit(unit: dict[str, Any], unit_name: str) -> tuple[str, dict[str, s
     if unit.get("schema") != 1 or unit.get("name") != unit_name:
         raise OperationError(f"invalid desired unit: {unit_name}")
     driver = unit.get("driver")
-    if driver not in RECONCILIATION_DRIVERS:
-        raise OperationError(f"{unit_name} uses an unknown driver: {driver!r}")
+    if driver not in UNIT_PLUGINS:
+        raise OperationError(f"{unit_name} uses an unknown unit plugin: {driver!r}")
     source = unit.get("source")
     if not isinstance(source, dict) or not isinstance(source.get("path"), str):
         raise OperationError(f"{unit_name} has an invalid source")
@@ -1967,10 +1972,10 @@ def require_unit(unit: dict[str, Any], unit_name: str) -> tuple[str, dict[str, s
     if not re.fullmatch(r"[0-9a-f]{40}", str(source.get("revision", ""))):
         raise OperationError(f"{unit_name} has an invalid source revision")
     recorded_version = source.get("driverVersion")
-    if recorded_version is not None and recorded_version != DRIVER_VERSIONS[driver]:
+    if recorded_version is not None and recorded_version != PLUGIN_VERSIONS[driver]:
         raise OperationError(
             f"{unit_name} requires {driver} driver version {recorded_version}; "
-            f"controller provides {DRIVER_VERSIONS[driver]}"
+            f"controller provides {PLUGIN_VERSIONS[driver]}"
         )
     return driver, source
 
@@ -2173,8 +2178,8 @@ def publish_receipt_cas(
                 driver = receipt.get("driver")
                 if existing_receipt.get("driver") != driver or not isinstance(driver, str):
                     raise OperationError(f"duplicate {unit_name} receipt changed its reconciliation driver")
-                existing_result = semantic_driver_result(driver, existing_receipt)
-                candidate_result = semantic_driver_result(driver, receipt)
+                existing_result = semantic_reconciliation_result(driver, existing_receipt)
+                candidate_result = semantic_reconciliation_result(driver, receipt)
                 if existing_result != candidate_result:
                     raise OperationError(
                         f"duplicate {unit_name} receipt for the same desired unit has a different semantic result"
@@ -2324,8 +2329,10 @@ def command_reconcile(args: argparse.Namespace) -> bool:
 
         unit_blob = file_blob(unit_path)
         receipt_path = observed / "units" / f"{args.unit}.json"
+        previous_receipt = load_json(receipt_path) if receipt_path.is_file() else None
         if receipt_path.is_file():
-            receipt = load_json(receipt_path)
+            assert previous_receipt is not None
+            receipt = previous_receipt
             skip_clean_unit = not args.dry or bool(unit.get("artifacts"))
             if (
                 not getattr(args, "reapply", False)
@@ -2346,13 +2353,21 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         log_status("RUN", f"execute {driver_name} reconciliation")
         source_root = temporary / "source"
         materialize_revision(source["revision"], source_root)
-        result = RECONCILIATION_DRIVERS[driver_name](
-            DriverContext(
+        try:
+            plugin = RECONCILIATION_PLUGINS[driver_name]
+        except KeyError as exc:
+            raise OperationError(f"{args.unit} uses {driver_name}, which does not support reconciliation") from exc
+        result = plugin.reconcile(
+            ReconciliationContext(
+                environment=args.environment,
+                desired_root=desired,
+                desired_revision=desired_revision,
                 source_root=source_root,
                 source_revision=source["revision"],
                 source_path=source["path"],
                 unit=unit,
                 inputs=unit.get("inputs", {}),
+                previous_receipt=previous_receipt,
                 dry=args.dry,
                 report=report,
             )

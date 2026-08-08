@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from gitopsctr.driver import DriverError, DriverResult, JsonObject, SemanticResultSelector
+from gitopsctr.driver import DriverError, JsonObject, ReconciliationResult, SemanticResultSelector
 
 
 def run(
@@ -40,7 +40,7 @@ def require_strings(values: JsonObject, names: tuple[str, ...], contract: str) -
 
 
 def select_result_fields(*names: str) -> SemanticResultSelector:
-    def select(result: object) -> DriverResult:
+    def select(result: object) -> ReconciliationResult:
         if not isinstance(result, Mapping):
             raise DriverError("driver result must be an object")
         missing = [name for name in names if name not in result]

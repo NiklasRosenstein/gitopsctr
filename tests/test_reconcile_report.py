@@ -4,6 +4,7 @@ import json
 import subprocess
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -191,9 +192,9 @@ def test_dry_reconcile_executes_clean_unit_and_passes_report(tmp_path, monkeypat
     monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
     monkeypatch.setattr(deploy_release, "file_blob", lambda _path: "same-unit")
     monkeypatch.setitem(
-        deploy_release.RECONCILIATION_DRIVERS,
+        deploy_release.RECONCILIATION_PLUGINS,
         "terraform",
-        lambda context: calls.append(context) or {},
+        SimpleNamespace(reconcile=lambda context: calls.append(context) or {}),
     )
 
     deploy_release.command_reconcile(
@@ -261,9 +262,9 @@ def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_p
         lambda reconciled, desired="": outputs.append((reconciled, desired)),
     )
     monkeypatch.setitem(
-        deploy_release.RECONCILIATION_DRIVERS,
+        deploy_release.RECONCILIATION_PLUGINS,
         "oci-images",
-        lambda _context: (_ for _ in ()).throw(AssertionError("clean unit ran its driver")),
+        SimpleNamespace(reconcile=lambda _context: (_ for _ in ()).throw(AssertionError("clean unit ran its driver"))),
     )
 
     deploy_release.command_reconcile(
@@ -341,7 +342,11 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
     monkeypatch.setattr(deploy_release, "resolve_ref", unexpected_resolve)
     monkeypatch.setattr(deploy_release, "file_blob", lambda _path: "unit-blob")
     monkeypatch.setattr(deploy_release, "publish_receipt_cas", fake_publish)
-    monkeypatch.setitem(deploy_release.RECONCILIATION_DRIVERS, "terraform", fake_driver)
+    monkeypatch.setitem(
+        deploy_release.RECONCILIATION_PLUGINS,
+        "terraform",
+        SimpleNamespace(reconcile=fake_driver),
+    )
 
     deploy_release.command_reconcile(
         Namespace(

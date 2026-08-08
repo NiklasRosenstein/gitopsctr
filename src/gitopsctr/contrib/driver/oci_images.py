@@ -5,7 +5,13 @@ from __future__ import annotations
 import subprocess
 from typing import TypedDict, cast
 
-from gitopsctr.driver import Driver, DriverContext, DriverError, DriverResult
+from gitopsctr.driver import (
+    DriverError,
+    ReconciliationCapability,
+    ReconciliationContext,
+    ReconciliationResult,
+    UnitPlugin,
+)
 
 from ._common import require_strings, run, select_result_fields
 from ._oci import (
@@ -67,11 +73,11 @@ def oci_digest(repository: str, tag: str, docker_environment: dict[str, str] | N
     raise DriverError(error or f"could not inspect {reference}")
 
 
-class OciImagesDriver(Driver):
+class OciImagesPlugin(UnitPlugin, ReconciliationCapability):
     version = 2
     _select_semantic_result = staticmethod(select_result_fields("artifacts"))
 
-    def reconcile(self, context: DriverContext) -> OciImagesResult | dict[str, object]:
+    def reconcile(self, context: ReconciliationContext) -> OciImagesResult | dict[str, object]:
         specification = context.unit
         build = specification.get("build")
         publication = specification.get("publish")
@@ -168,8 +174,8 @@ class OciImagesDriver(Driver):
             }
         }
 
-    def semantic_result(self, result: object) -> DriverResult:
+    def semantic_result(self, result: object) -> ReconciliationResult:
         return self._select_semantic_result(result)
 
 
-PLUGIN = OciImagesDriver()
+PLUGIN = OciImagesPlugin()

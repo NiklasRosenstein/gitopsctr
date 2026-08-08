@@ -11,9 +11,10 @@ import pytest
 from gitopsctr import driver as driver_registry
 from gitopsctr.contrib.driver import _oci, frontend_s3_cloudfront, oci_images, terraform, vite_oci_bundle
 from gitopsctr.driver import (
-    Driver,
-    DriverContext,
     DriverError,
+    ReconciliationCapability,
+    ReconciliationContext,
+    UnitPlugin,
     VerificationCapability,
     VerificationResult,
     VerificationStatus,
@@ -34,13 +35,13 @@ def test_contributed_driver_entry_points_load_one_module_per_driver():
         "terraform": "gitopsctr.contrib.driver.terraform:PLUGIN",
         "vite-oci-bundle": "gitopsctr.contrib.driver.vite_oci_bundle:PLUGIN",
     }
-    assert {plugin.reconcile.__module__ for plugin in driver_registry.DRIVER_PLUGINS.values()} == {
+    assert {plugin.reconcile.__module__ for plugin in driver_registry.RECONCILIATION_PLUGINS.values()} == {
         "gitopsctr.contrib.driver.frontend_s3_cloudfront",
         "gitopsctr.contrib.driver.oci_images",
         "gitopsctr.contrib.driver.terraform",
         "gitopsctr.contrib.driver.vite_oci_bundle",
     }
-    assert all(isinstance(plugin, Driver) for plugin in driver_registry.DRIVER_PLUGINS.values())
+    assert all(isinstance(plugin, UnitPlugin) for plugin in driver_registry.UNIT_PLUGINS.values())
 
 
 def test_driver_capabilities_are_independent_and_explicit():
@@ -48,15 +49,15 @@ def test_driver_capabilities_are_independent_and_explicit():
     assert not isinstance(oci_images.PLUGIN, VerificationCapability)
     assert not isinstance(vite_oci_bundle.PLUGIN, VerificationCapability)
     assert not isinstance(frontend_s3_cloudfront.PLUGIN, VerificationCapability)
-    assert driver_registry.VERIFICATION_DRIVERS == {"terraform": terraform.PLUGIN.verify}
+    assert driver_registry.VERIFICATION_PLUGINS == {"terraform": terraform.PLUGIN}
 
 
-def test_driver_base_class_requires_core_operations():
-    class IncompleteDriver(Driver):
+def test_reconciliation_capability_requires_core_operations():
+    class IncompletePlugin(UnitPlugin, ReconciliationCapability):
         version = 1
 
     with pytest.raises(TypeError, match="abstract"):
-        IncompleteDriver()
+        IncompletePlugin()
 
 
 def _oci_context(
@@ -65,7 +66,7 @@ def _oci_context(
     credential_provider: object = None,
     repositories: dict[str, str] | None = None,
     dry: bool = False,
-) -> DriverContext:
+) -> ReconciliationContext:
     publication: dict[str, object] = {
         "repositories": repositories
         or {
@@ -75,7 +76,10 @@ def _oci_context(
     }
     if credential_provider is not None:
         publication["credentialProvider"] = credential_provider
-    return DriverContext(
+    return ReconciliationContext(
+        environment="dev",
+        desired_root=tmp_path,
+        desired_revision="d" * 40,
         source_root=tmp_path,
         source_revision="a" * 40,
         source_path=".",
@@ -293,7 +297,10 @@ def test_oci_images_rejects_disagreeing_repository_digests(tmp_path, monkeypatch
 
 
 def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path, monkeypatch):
-    context = DriverContext(
+    context = ReconciliationContext(
+        environment="dev",
+        desired_root=tmp_path,
+        desired_revision="d" * 40,
         source_root=tmp_path,
         source_revision="a" * 40,
         source_path="frontend",
@@ -381,7 +388,10 @@ def test_frontend_deploy_overwrites_index_and_verifies_cloudfront(tmp_path, monk
 
     monkeypatch.setattr(frontend_s3_cloudfront, "oras_authentication", fake_authentication)
     monkeypatch.setattr(frontend_s3_cloudfront, "run", fake_run)
-    context = DriverContext(
+    context = ReconciliationContext(
+        environment="dev",
+        desired_root=tmp_path,
+        desired_revision="d" * 40,
         source_root=tmp_path,
         source_revision="a" * 40,
         source_path="scripts/deployment_drivers.py",
@@ -433,10 +443,13 @@ def _terraform_context(
     tmp_path: Path,
     report: Path,
     backend: dict[str, object] | None = None,
-) -> DriverContext:
+) -> ReconciliationContext:
     terraform_root = tmp_path / "source/infra/deploy"
     terraform_root.mkdir(parents=True)
-    return DriverContext(
+    return ReconciliationContext(
+        environment="dev",
+        desired_root=tmp_path,
+        desired_revision="d" * 40,
         source_root=tmp_path / "source",
         source_revision="a" * 40,
         source_path="infra/deploy",
@@ -547,7 +560,20 @@ def test_terraform_verification_uses_refresh_enabled_read_only_saved_plan(
 
     monkeypatch.setattr(terraform, "run", fake_run)
 
-    result = driver_registry.VERIFICATION_DRIVERS["terraform"](_terraform_context(tmp_path, report))
+    reconciliation = _terraform_context(tmp_path, report)
+    result = driver_registry.VERIFICATION_PLUGINS["terraform"].verify(
+        driver_registry.VerificationContext(
+            environment=reconciliation.environment,
+            desired_root=reconciliation.desired_root,
+            desired_revision=reconciliation.desired_revision,
+            source_root=reconciliation.source_root,
+            source_revision=reconciliation.source_revision,
+            source_path=reconciliation.source_path,
+            unit=reconciliation.unit,
+            inputs=reconciliation.inputs,
+            report=reconciliation.report,
+        )
+    )
 
     assert result == VerificationResult(expected_status)
     assert (report / "verify.tfplan").read_bytes() == b"verification plan"
@@ -613,22 +639,22 @@ def test_terraform_verification_turns_other_exit_codes_into_driver_errors(tmp_pa
     ),
 )
 def test_driver_semantics_select_only_driver_defined_result_fields(driver, result, expected):
-    assert driver_registry.semantic_driver_result(driver, result) == expected
+    assert driver_registry.semantic_reconciliation_result(driver, result) == expected
 
 
 def test_every_reconciliation_driver_defines_result_semantics():
-    assert set(driver_registry.DRIVER_PLUGINS) == set(driver_registry.RECONCILIATION_DRIVERS)
-    assert driver_registry.load_driver_plugins() == driver_registry.DRIVER_PLUGINS
+    assert set(driver_registry.UNIT_PLUGINS) == set(driver_registry.RECONCILIATION_PLUGINS)
+    assert driver_registry.load_unit_plugins() == driver_registry.UNIT_PLUGINS
 
 
 @pytest.mark.parametrize(
     ("driver", "result", "message"),
     (
-        ("unknown", {}, "unsupported driver"),
+        ("unknown", {}, "does not support reconciliation"),
         ("terraform", {"applied": {}}, "missing semantic fields: outputs"),
         ("oci-images", None, "driver result must be an object"),
     ),
 )
 def test_driver_semantics_fail_loudly_for_unknown_or_incomplete_results(driver, result, message):
     with pytest.raises(DriverError, match=message):
-        driver_registry.semantic_driver_result(driver, result)
+        driver_registry.semantic_reconciliation_result(driver, result)
