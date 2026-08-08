@@ -6,6 +6,7 @@ Desired and observed JSON remain the contract; GitHub Actions and local callers 
 from __future__ import annotations
 
 import argparse
+import glob as globlib
 import hashlib
 import json
 import os
@@ -298,15 +299,24 @@ def hash_source_inputs(
     files: dict[str, Path] = {}
     for input_name in inputs:
         relative = safe_source_path(input_name, "source input")
-        target = root / relative
-        if target.is_symlink() or target.is_file():
-            files[target.relative_to(root).as_posix()] = target
-        elif target.is_dir():
-            for path in target.rglob("*"):
-                if path.is_symlink() or path.is_file():
-                    files[path.relative_to(root).as_posix()] = path
+        if globlib.has_magic(input_name):
+            try:
+                targets = list(root.glob(input_name))
+            except (OSError, ValueError) as exc:
+                raise OperationError(f"invalid source input pattern: {source_path}/{input_name}: {exc}") from exc
+            if not targets:
+                raise OperationError(f"source input pattern does not match: {source_path}/{input_name}")
         else:
-            raise OperationError(f"source input does not exist: {source_path}/{input_name}")
+            targets = [root / relative]
+        for target in targets:
+            if target.is_symlink() or target.is_file():
+                files[target.relative_to(root).as_posix()] = target
+            elif target.is_dir():
+                for path in target.rglob("*"):
+                    if path.is_symlink() or path.is_file():
+                        files[path.relative_to(root).as_posix()] = path
+            else:
+                raise OperationError(f"source input does not exist: {source_path}/{input_name}")
 
     entries = []
     for name, path in sorted(files.items()):
@@ -348,7 +358,7 @@ def require_unit_specification(
     safe_source_path(source.get("path"), f"{name} source path")
     inputs = source.get("inputs")
     if inputs is not None and (not isinstance(inputs, list) or not all(isinstance(value, str) for value in inputs)):
-        raise OperationError(f"{name} source inputs must be a list of paths")
+        raise OperationError(f"{name} source inputs must be a list of paths or glob patterns")
     artifacts = specification.get("artifacts", [])
     if not isinstance(artifacts, list) or not all(re.fullmatch(r"[a-z0-9-]+\.json", str(value)) for value in artifacts):
         raise OperationError(f"{name} artifacts must be JSON filenames")
@@ -661,7 +671,11 @@ def unit_source_paths(source: dict[str, Any]) -> list[str]:
     inputs = source.get("inputs")
     if not isinstance(inputs, list):
         return [source_path]
-    return [str(PurePosixPath(source_path) / value) for value in inputs]
+    paths = []
+    for value in inputs:
+        path = str(PurePosixPath(source_path) / value)
+        paths.append(f":(glob){path}" if globlib.has_magic(value) else path)
+    return paths
 
 
 def source_change_evidence(

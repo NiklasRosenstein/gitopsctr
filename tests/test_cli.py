@@ -282,6 +282,67 @@ def test_removing_producer_environment_preserves_existing_input_hash(tmp_path):
     assert changed is False
 
 
+def test_source_input_globs_hash_only_matching_files(tmp_path):
+    source = tmp_path / "source"
+    deploy = source / "infra/deploy"
+    (deploy / "modules/api").mkdir(parents=True)
+    (deploy / "main.tf").write_text("terraform {}\n")
+    (deploy / "variables.tf").write_text('variable "name" {}\n')
+    (deploy / "modules/api/main.tf").write_text('output "name" { value = "api" }\n')
+    (deploy / "README.md").write_text("Documentation\n")
+
+    glob_hash = deploy_release.hash_source_inputs(
+        source,
+        "infra/deploy",
+        ["*.tf", "modules/**/*.tf"],
+        {"kind": "test"},
+    )
+    explicit_hash = deploy_release.hash_source_inputs(
+        source,
+        "infra/deploy",
+        ["main.tf", "variables.tf", "modules/api/main.tf"],
+        {"kind": "test"},
+    )
+    (deploy / "README.md").write_text("Changed documentation\n")
+
+    assert glob_hash == explicit_hash
+    assert glob_hash == deploy_release.hash_source_inputs(
+        source,
+        "infra/deploy",
+        ["*.tf", "modules/**/*.tf"],
+        {"kind": "test"},
+    )
+
+    (deploy / "modules/api/main.tf").write_text('output "name" { value = "changed" }\n')
+    assert glob_hash != deploy_release.hash_source_inputs(
+        source,
+        "infra/deploy",
+        ["*.tf", "modules/**/*.tf"],
+        {"kind": "test"},
+    )
+
+
+def test_source_input_glob_must_match_at_least_one_path(tmp_path):
+    source = tmp_path / "source"
+    (source / "infra/deploy").mkdir(parents=True)
+
+    with pytest.raises(deploy_release.OperationError, match=r"source input pattern does not match: .*\*\.tf"):
+        deploy_release.hash_source_inputs(source, "infra/deploy", ["*.tf"], {"kind": "test"})
+
+
+def test_source_input_globs_become_git_glob_pathspecs():
+    assert deploy_release.unit_source_paths(
+        {
+            "path": "infra/deploy",
+            "inputs": ["*.tf", "modules/**/*.tf", ".terraform.lock.hcl"],
+        }
+    ) == [
+        ":(glob)infra/deploy/*.tf",
+        ":(glob)infra/deploy/modules/**/*.tf",
+        "infra/deploy/.terraform.lock.hcl",
+    ]
+
+
 def test_promotion_reference_materializes_from_source_desired_unit(tmp_path):
     promotion = tmp_path / "promotion"
     source_unit = promotion / "units/aws-application.json"
