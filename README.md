@@ -60,8 +60,9 @@ Built-in unit drivers publish Draft 2020-12 schemas for authored units, desired 
 Core environment, promotion, materialization, desired-unit, and receipt-envelope schemas are published alongside them.
 
 Use `gitopsctr schemas show DRIVER KIND` for one schema and `gitopsctr schemas export DIRECTORY` to generate the complete
-catalog. Committed specifications should use pinned `$schema` URLs; gitopsctr treats the field as an untrusted editor
-hint and never fetches it.
+catalog. Committed YAML specifications should use a pinned `# yaml-language-server: $schema=...` directive; JSON
+specifications should use the same pinned URL in `$schema`. gitopsctr treats both forms as untrusted editor hints and
+never fetches them.
 
 ## GitHub Action
 

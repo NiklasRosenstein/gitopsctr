@@ -10,7 +10,7 @@ Terraform outputs and supports a refresh-enabled read-only verification.
 ## Authored unit
 
 ```yaml
-$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json
+# yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json
 apiVersion: unit.gitopsctr.io/v1
 kind: Terraform
 metadata:

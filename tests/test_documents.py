@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -34,6 +35,22 @@ def test_yaml_is_the_default_and_project_config_can_select_json(tmp_path: Path):
     assert config.environments_path.as_posix() == "deployment/environments"
     write_document(tmp_path / "configured.json", value, format=DocumentFormat.JSON)
     assert cli.load_json(tmp_path / "configured.json") == value
+
+
+def test_yaml_uses_language_server_schema_directive_while_json_keeps_schema_property(tmp_path: Path):
+    schema = "https://example.invalid/resource.schema.json"
+    value = {"$schema": schema, "name": "example"}
+
+    yaml_path = write_document(tmp_path / "resource.yaml", value)
+    json_path = write_document(tmp_path / "resource.json", value)
+
+    assert yaml_path.read_text() == (
+        f"# yaml-language-server: $schema={schema}\n"
+        "name: example\n"
+    )
+    assert yaml.safe_load(yaml_path.read_text()) == {"name": "example"}
+    assert json.loads(json_path.read_text()) == value
+    assert value == {"$schema": schema, "name": "example"}
 
 
 @pytest.mark.parametrize(
@@ -170,8 +187,11 @@ def test_yaml_demo_documents_validate_against_published_resource_schemas():
         root / "demo/kubernetes/repository/deployment/environments/dev/units/web.yaml",
     ]
     for path in paths:
-        document = yaml.safe_load(path.read_text())
-        Draft202012Validator(by_id[document["$schema"]]).validate(document)
+        text = path.read_text()
+        match = re.match(r"# yaml-language-server: \$schema=(\S+)\n", text)
+        assert match, path
+        document = yaml.safe_load(text)
+        Draft202012Validator(by_id[match.group(1)]).validate(document)
 
 
 def test_migration_script_converts_a_source_branch_in_one_forward_commit(tmp_path: Path):

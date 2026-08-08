@@ -174,6 +174,12 @@ def write_document(path: Path, value: dict[str, Any], *, format: DocumentFormat 
     if selected is DocumentFormat.JSON:
         text = json.dumps(value, indent=2, sort_keys=True) + "\n"
     else:
-        text = yaml.safe_dump(value, sort_keys=False, default_flow_style=False, allow_unicode=False)
+        yaml_value = dict(value)
+        schema_hint = yaml_value.get("$schema")
+        if isinstance(schema_hint, str):
+            yaml_value.pop("$schema")
+        text = yaml.safe_dump(yaml_value, sort_keys=False, default_flow_style=False, allow_unicode=False)
+        if isinstance(schema_hint, str):
+            text = f"# yaml-language-server: $schema={schema_hint}\n{text}"
     output.write_text(text)
     return output

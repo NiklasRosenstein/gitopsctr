@@ -441,17 +441,26 @@ def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path
         promotion=context,
     )
 
-    raw_unit = deploy_release.load_json(candidate / "units/aws-application.json")
-    assert raw_unit["$schema"].endswith("/apis/unit.gitopsctr.io/v1/Terraform/desired.schema.json")
-    unit = deploy_release.load_unit(candidate / "units/aws-application.json", "aws-application")
+    unit_path = deploy_release.unit_document_path(candidate, "aws-application")
+    assert unit_path.read_text().startswith(
+        "# yaml-language-server: $schema="
+        "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/"
+        "unit.gitopsctr.io/v1/Terraform/desired.schema.json\n"
+    )
+    unit = deploy_release.load_unit(unit_path, "aws-application")
     assert unit["terraform"]["variables"]["control_image_uri"].endswith("1" * 64)
     assert unit["resolvedInputs"]["promotion"] == {
         "units/aws-application.json": deploy_release.file_blob(promoted_unit)
     }
-    raw_promotion = deploy_release.load_json(candidate / "promotion.json")
+    promotion_path = deploy_release.document_candidates(candidate, "promotion")[0]
+    assert promotion_path.read_text().startswith(
+        "# yaml-language-server: $schema="
+        "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/"
+        "gitopsctr.io/v1/Promotion.schema.json\n"
+    )
+    raw_promotion = deploy_release.load_json(promotion_path)
     promotion = deploy_release.normalize_promotion_document(raw_promotion)
     assert promotion == {key: value for key, value in context.document().items() if key != "$schema"}
-    assert raw_promotion["$schema"].endswith("/apis/gitopsctr.io/v1/Promotion.schema.json")
 
 
 def test_promotion_requires_every_source_unit_to_be_clean(tmp_path):

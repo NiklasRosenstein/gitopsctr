@@ -5,7 +5,7 @@ project, locates authored environments, and selects the preferred format for
 generated documents.
 
 ```yaml
-$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Project.schema.json
+# yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Project.schema.json
 apiVersion: gitopsctr.io/v1
 kind: Project
 metadata:
@@ -38,9 +38,9 @@ Use the canonical filename `gitopsctr.yaml`; `.yml`, `.gitopsctr.yaml`, and
 `.gitopsctr.yml` are also accepted. A source tree must contain exactly one of
 these files. The legacy flat configuration shape is not accepted.
 
-Unknown fields and unsupported values fail before an operation starts. The
-`$schema` value is an editor hint: it is not fetched and does not change runtime
-validation.
+Unknown fields and unsupported values fail before an operation starts. The YAML
+language-server directive (or JSON `$schema` property) is an editor hint: it is
+not fetched and does not change runtime validation.
 
 The published Draft 2020-12 resource schema is
 [`Project.schema.json`](schemas/apis/gitopsctr.io/v1/Project.schema.json), next

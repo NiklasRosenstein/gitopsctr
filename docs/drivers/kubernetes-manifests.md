@@ -25,7 +25,7 @@ copies historical bytes and their unit descriptor exactly; it never reruns Helm.
 Helm rendering uses the `helm` executable and records its installed version without enforcing one:
 
 ```yaml
-$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/KubernetesManifests/authored.schema.json
+# yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/KubernetesManifests/authored.schema.json
 apiVersion: unit.gitopsctr.io/v1
 kind: KubernetesManifests
 metadata:

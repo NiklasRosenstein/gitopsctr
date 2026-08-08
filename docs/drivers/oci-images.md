@@ -11,7 +11,7 @@ which makes retries idempotent and lets downstream units consume
 ## Authored unit
 
 ```yaml
-$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/OciImages/authored.schema.json
+# yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/OciImages/authored.schema.json
 apiVersion: unit.gitopsctr.io/v1
 kind: OciImages
 metadata:

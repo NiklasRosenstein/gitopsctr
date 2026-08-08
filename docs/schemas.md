@@ -18,7 +18,7 @@ The complete machine-readable catalog is
 Authored documents should point to the exact API schema:
 
 ```yaml
-$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json
+# yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json
 apiVersion: unit.gitopsctr.io/v1
 kind: Terraform
 metadata:
@@ -35,8 +35,9 @@ spec:
     observeOutputs: []
 ```
 
-`$schema` helps editors but is never trusted by the runtime: gitopsctr does not fetch it or select validation behavior
-from it. Newly generated desired units, promotions, and receipts always contain a canonical pinned URL.
+The YAML language-server directive helps editors but is never trusted by the runtime: gitopsctr does not fetch it or
+select validation behavior from it. Newly generated YAML resources use the directive; JSON resources contain the same
+canonical pinned URL in their `$schema` property.
 
 `latest` aliases are convenient for discovery, but committed specifications should use pinned versions. The repository-level
 [`Project` resource](project-configuration.md) has a published

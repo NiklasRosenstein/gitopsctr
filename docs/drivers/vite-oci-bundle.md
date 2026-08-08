@@ -11,7 +11,7 @@ URI to downstream units.
 ## Authored unit
 
 ```yaml
-$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/ViteOciBundle/authored.schema.json
+# yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/ViteOciBundle/authored.schema.json
 apiVersion: unit.gitopsctr.io/v1
 kind: ViteOciBundle
 metadata:
