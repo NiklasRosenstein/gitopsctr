@@ -429,7 +429,11 @@ def test_hosted_frontend_runtime_config_requires_cognito_contract():
         )
 
 
-def _terraform_context(tmp_path: Path, report: Path) -> DriverContext:
+def _terraform_context(
+    tmp_path: Path,
+    report: Path,
+    backend: dict[str, object] | None = None,
+) -> DriverContext:
     terraform_root = tmp_path / "source/infra/deploy"
     terraform_root.mkdir(parents=True)
     return DriverContext(
@@ -438,7 +442,7 @@ def _terraform_context(tmp_path: Path, report: Path) -> DriverContext:
         source_path="infra/deploy",
         unit={
             "terraform": {
-                "backend": {"key": "application/dev.tfstate"},
+                "backend": backend or {"key": "application/dev.tfstate"},
                 "variables": {"environment": "dev"},
                 "observeOutputs": [],
             }
@@ -447,6 +451,29 @@ def _terraform_context(tmp_path: Path, report: Path) -> DriverContext:
         dry=True,
         report=report,
     )
+
+
+def test_terraform_accepts_driver_neutral_backend_configuration(tmp_path, monkeypatch):
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(*args, **_kwargs):
+        commands.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(terraform, "run", fake_run)
+    state = tmp_path / "state/demo.tfstate"
+
+    terraform.PLUGIN.reconcile(_terraform_context(tmp_path, tmp_path / "report", {"path": str(state)}))
+
+    init = next(command for command in commands if command[1] == "init")
+    assert init == ("terraform", "init", f"-backend-config=path={state}")
+
+
+def test_terraform_rejects_structured_backend_values(tmp_path):
+    with pytest.raises(DriverError, match="strings, numbers, or booleans"):
+        terraform.PLUGIN.reconcile(
+            _terraform_context(tmp_path, tmp_path / "report", {"path": ["not", "a", "scalar"]})
+        )
 
 
 def test_terraform_dry_run_saves_binary_plan_and_rendered_report(tmp_path, monkeypatch):

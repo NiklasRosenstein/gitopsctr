@@ -34,6 +34,12 @@ Important commands include:
 - `rollback`: publish a forward desired-state commit from historical state.
 - `verify`: ask supported drivers to check external state without writing receipts.
 
+## Demo
+
+`mise run demo` creates an isolated local Git remote, builds and publishes a real OCI image to a local
+registry, and deploys it as a Docker container through the Terraform driver. See [`demo/README.md`](demo/README.md)
+for prerequisites, the reconciliation flow, and cleanup instructions.
+
 ## Driver plugins
 
 Drivers are discovered from the `gitopsctr.drivers` Python entry-point group. An entry point must load

@@ -43,7 +43,7 @@ class TerraformResult(TypedDict):
 
 def terraform_runtime(
     context: DriverContext,
-) -> tuple[Path, dict[str, str], str, list[str], list[object]]:
+) -> tuple[Path, dict[str, str], list[str], list[str], list[object]]:
     configuration = context.unit.get("terraform")
     if not isinstance(configuration, dict):
         raise DriverError("terraform driver requires a terraform configuration")
@@ -53,9 +53,17 @@ def terraform_runtime(
     checks = configuration.get("checks", [])
     if not isinstance(backend, dict) or not isinstance(variables, dict):
         raise DriverError("terraform driver requires backend and variables objects")
-    backend_key = backend.get("key")
-    if not isinstance(backend_key, str) or not backend_key:
-        raise DriverError("terraform backend requires a key")
+    invalid_backend_fields = [
+        name
+        for name, value in backend.items()
+        if not isinstance(name, str) or not name or not isinstance(value, (str, int, float, bool))
+    ]
+    if invalid_backend_fields:
+        raise DriverError("terraform backend values must be strings, numbers, or booleans")
+    backend_args = [
+        f"-backend-config={name}={value if isinstance(value, str) else json.dumps(value)}"
+        for name, value in backend.items()
+    ]
     if not isinstance(output_names, list) or not all(isinstance(name, str) for name in output_names):
         raise DriverError("terraform observeOutputs must be a list of names")
     output_names = cast(list[str], output_names)
@@ -66,7 +74,7 @@ def terraform_runtime(
     terraform_environment = os.environ | {
         f"TF_VAR_{name}": value if isinstance(value, str) else json.dumps(value) for name, value in variables.items()
     }
-    return terraform_root, terraform_environment, backend_key, output_names, cast(list[object], checks)
+    return terraform_root, terraform_environment, backend_args, output_names, cast(list[object], checks)
 
 
 class TerraformDriver(Driver, VerificationCapability):
@@ -91,7 +99,7 @@ class TerraformDriver(Driver, VerificationCapability):
         return plan, report
 
     def reconcile(self, context: DriverContext) -> TerraformPlanResult | TerraformResult:
-        terraform_root, terraform_environment, backend_key, output_names, checks = terraform_runtime(context)
+        terraform_root, terraform_environment, backend_args, output_names, checks = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,
             "plan.tfplan",
@@ -121,7 +129,7 @@ class TerraformDriver(Driver, VerificationCapability):
                 report_text.write_text(output)
             return result
 
-        terraform("init", f"-backend-config=key={backend_key}")
+        terraform("init", *backend_args)
         plan_args = ["plan", f"-out={plan}"]
         if context.dry:
             plan_args.extend(("-refresh=false", "-lock=false", "-input=false", "-no-color"))
@@ -165,7 +173,7 @@ class TerraformDriver(Driver, VerificationCapability):
         }
 
     def verify(self, context: DriverContext) -> VerificationResult:
-        terraform_root, terraform_environment, backend_key, _, _ = terraform_runtime(context)
+        terraform_root, terraform_environment, backend_args, _, _ = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,
             "verify.tfplan",
@@ -173,7 +181,7 @@ class TerraformDriver(Driver, VerificationCapability):
             ".verify.tfplan",
         )
 
-        run("terraform", "init", f"-backend-config=key={backend_key}", cwd=terraform_root, env=terraform_environment)
+        run("terraform", "init", *backend_args, cwd=terraform_root, env=terraform_environment)
         result = run(
             "terraform",
             "plan",

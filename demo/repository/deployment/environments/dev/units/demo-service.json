@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "name": "demo-service",
+  "driver": "terraform",
+  "source": {
+    "path": "infrastructure",
+    "inputs": ["*.tf"]
+  },
+  "terraform": {
+    "backend": {
+      "path": "__TERRAFORM_STATE__"
+    },
+    "variables": {
+      "container_name": "gitopsctr-demo-app",
+      "host_port": "__APP_PORT__",
+      "image": {
+        "fromObservation": "units/demo-image.json",
+        "pointer": "/artifacts/containers.json/artifacts/application/uri"
+      }
+    },
+    "observeOutputs": ["container_id", "url"],
+    "checks": [
+      {
+        "type": "http",
+        "urlOutput": "url",
+        "path": "/"
+      }
+    ]
+  }
+}

@@ -2,6 +2,7 @@
 actionlint = "latest"
 oras = "latest"
 python = "3.12"
+terraform = "latest"
 uv = "latest"
 
 [tasks.sync]
@@ -17,7 +18,7 @@ run = "uv run ruff check ."
 run = "uv run ruff format ."
 
 [tasks.typecheck]
-run = "uv run ty check src"
+run = "uv run ty check src demo"
 
 [tasks.actionlint]
 run = "actionlint"
@@ -27,3 +28,15 @@ depends = ["actionlint", "lint", "typecheck", "test"]
 
 [tasks.build]
 run = "uv build"
+
+[tasks.demo]
+description = "Run the real local Docker/Terraform demo"
+run = "uv run python demo/run.py run"
+
+[tasks.demo-reset]
+description = "Recreate and run the local demo from scratch"
+run = "uv run python demo/run.py reset"
+
+[tasks.demo-clean]
+description = "Remove the local demo resources and state"
+run = "uv run python demo/run.py clean"

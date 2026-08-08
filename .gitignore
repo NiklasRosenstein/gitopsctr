@@ -5,3 +5,4 @@ __pycache__/
 .ty/
 dist/
 *.egg-info/
+.demo-state/

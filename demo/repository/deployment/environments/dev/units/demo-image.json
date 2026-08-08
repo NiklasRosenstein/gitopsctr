@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "name": "demo-image",
+  "driver": "oci-images",
+  "source": {
+    "path": ".",
+    "inputs": ["Dockerfile", "app.py"]
+  },
+  "build": {
+    "dockerfile": "Dockerfile",
+    "platform": "__DOCKER_PLATFORM__"
+  },
+  "publish": {
+    "repositories": {
+      "application": "__REGISTRY__/gitopsctr-demo/app"
+    }
+  },
+  "artifacts": ["containers.json"]
+}
