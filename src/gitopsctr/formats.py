@@ -164,14 +164,20 @@ def document_path(directory: Path, stem: str, root: Path, *, prefer_existing: bo
     if prefer_existing:
         existing = [path for path in candidates if path.is_file()]
         if len(existing) > 1:
-            raise DocumentFormatError("multiple representations exist for " + stem + ": " + ", ".join(map(str, existing)))
+            raise DocumentFormatError(
+                "multiple representations exist for " + stem + ": " + ", ".join(map(str, existing))
+            )
         if existing:
             return existing[0]
     return directory / f"{stem}{load_project_config(root).write_format.suffix}"
 
 
 def document_candidates(directory: Path, stem: str) -> tuple[Path, ...]:
-    return tuple(path for path in (directory / f"{stem}.yaml", directory / f"{stem}.yml", directory / f"{stem}.json") if path.is_file())
+    return tuple(
+        path
+        for path in (directory / f"{stem}.yaml", directory / f"{stem}.yml", directory / f"{stem}.json")
+        if path.is_file()
+    )
 
 
 def write_document(path: Path, value: dict[str, Any], *, format: DocumentFormat | None = None) -> Path:

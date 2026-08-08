@@ -86,7 +86,9 @@ def test_artifact_documents_follow_project_format_and_replace_stale_files(
     assert path.is_file()
     assert not stale.exists()
     document = cli.load_document(path)
-    schema_url = "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/artifact.gitopsctr.io/v1/ContainerImages.schema.json"
+    schema_url = (
+        "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/artifact.gitopsctr.io/v1/ContainerImages.schema.json"
+    )
     if write_format == "yaml":
         assert path.read_text().startswith(f"# yaml-language-server: $schema={schema_url}\n")
     else:
@@ -363,20 +365,20 @@ def test_stale_artifact_receipt_does_not_block_reconciliation_status(tmp_path: P
     receipt_path.parent.mkdir(parents=True)
     receipt_path.write_text(
         json.dumps(
-                {
-                    "unit": "images",
-                    "driver": "oci-images",
-                    "desired": {"unitBlob": "stale-unit-blob"},
-                    "artifacts": {
-                        "containers": {
-                            "apiVersion": "artifact.gitopsctr.io/v1",
-                            "kind": "ContainerImages",
-                            "path": "artifacts/images/containers.json",
-                            "digest": "sha256:" + "0" * 64,
-                            "mediaType": "application/vnd.gitopsctr.container-images.v1+json",
-                        }
-                    },
-                }
+            {
+                "unit": "images",
+                "driver": "oci-images",
+                "desired": {"unitBlob": "stale-unit-blob"},
+                "artifacts": {
+                    "containers": {
+                        "apiVersion": "artifact.gitopsctr.io/v1",
+                        "kind": "ContainerImages",
+                        "path": "artifacts/images/containers.json",
+                        "digest": "sha256:" + "0" * 64,
+                        "mediaType": "application/vnd.gitopsctr.container-images.v1+json",
+                    }
+                },
+            }
         )
     )
 

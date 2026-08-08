@@ -158,12 +158,7 @@ def test_receipt_reference_normalizes_resource_receipt_before_applying_pointer(t
     observed = tmp_path / "observed"
     producer = candidate / "units/infrastructure.yaml"
     producer.parent.mkdir(parents=True)
-    producer.write_text(
-        "name: infrastructure\n"
-        "driver: terraform\n"
-        "source:\n"
-        "  path: infra/deploy\n"
-    )
+    producer.write_text("name: infrastructure\ndriver: terraform\nsource:\n  path: infra/deploy\n")
     receipt_path = observed / "units/infrastructure.yaml"
     receipt_path.parent.mkdir(parents=True)
     receipt_path.write_text(
@@ -489,9 +484,7 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
 
     def fake_driver(context):
         events.append(("driver", context.source_revision))
-        return ReconciliationOutput(
-            result={"applied": {"sourceRevision": context.source_revision}, "outputs": {}}
-        )
+        return ReconciliationOutput(result={"applied": {"sourceRevision": context.source_revision}, "outputs": {}})
 
     def fake_publish(*_args):
         events.append(("receipt",))

@@ -199,9 +199,7 @@ def load_unit_drivers(
         for kind in ("unit", "desired_unit", "result"):
             contract = getattr(driver, f"{kind}_contract", None)
             if not isinstance(contract, DocumentContract):
-                raise DriverError(
-                    f"unit driver API {api_kind.gvk!s} has no {kind.replace('_', '-')} contract"
-                )
+                raise DriverError(f"unit driver API {api_kind.gvk!s} has no {kind.replace('_', '-')} contract")
         for artifact_name, artifact_kind in driver.artifact_outputs.items():
             if not artifact_name or not artifact_name.replace("-", "").isalnum() or not artifact_name.islower():
                 raise DriverError(f"unit driver API {api_kind.gvk!s} has invalid artifact name {artifact_name!r}")

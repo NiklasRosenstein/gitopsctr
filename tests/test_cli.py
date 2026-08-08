@@ -150,16 +150,12 @@ def test_show_receipt_reports_receipt_and_artifacts(monkeypatch, capsys):
 
 
 def test_show_document_format_can_force_yaml_or_json():
-    args = deploy_release.build_parser().parse_args(
-        ["show", "receipt", "--environment", "dev", "web", "--yaml"]
-    )
+    args = deploy_release.build_parser().parse_args(["show", "receipt", "--environment", "dev", "web", "--yaml"])
     assert args.yaml is True
     assert args.json is False
 
     with pytest.raises(SystemExit):
-        deploy_release.build_parser().parse_args(
-            ["show", "receipt", "--environment", "dev", "web", "--json", "--yaml"]
-        )
+        deploy_release.build_parser().parse_args(["show", "receipt", "--environment", "dev", "web", "--json", "--yaml"])
 
 
 def test_blocked_driver_transition_omits_previous_unit_and_reports_wait(tmp_path, monkeypatch, capsys):
@@ -477,9 +473,7 @@ def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path
     )
     unit = deploy_release.load_unit(unit_path, "aws-application")
     assert unit["terraform"]["variables"]["control_image_uri"].endswith("1" * 64)
-    assert unit["resolvedInputs"]["promotions"] == {
-        "aws-application": deploy_release.file_blob(promoted_unit)
-    }
+    assert unit["resolvedInputs"]["promotions"] == {"aws-application": deploy_release.file_blob(promoted_unit)}
     promotion_path = deploy_release.document_candidates(candidate, "promotion")[0]
     assert promotion_path.read_text().startswith(
         "# yaml-language-server: $schema="
@@ -746,8 +740,7 @@ def test_colored_progress_uses_semantic_roles_and_keeps_stdout_clean(monkeypatch
     deploy_release.log_status("DONE", f"{deploy_release.style_unit('frontend')}: clean")
     deploy_release.log_status(
         "DESIRED",
-        f"{deploy_release.style_branch('deploy/dev')} in "
-        f"{deploy_release.style_environment('dev')}",
+        f"{deploy_release.style_branch('deploy/dev')} in {deploy_release.style_environment('dev')}",
     )
     deploy_release.log_status("RESULT", "FAILED: reconciliation failed")
 
@@ -818,9 +811,7 @@ def test_status_and_ref_movement_include_commit_subjects(tmp_path, monkeypatch, 
     args = deploy_release.build_parser().parse_args(["status", "--environment", "dev"])
 
     args.handler(args)
-    deploy_release.log_ref_advance(
-        deploy_release.RefAdvance("desired", "deploy/dev", "a" * 40, "b" * 40)
-    )
+    deploy_release.log_ref_advance(deploy_release.RefAdvance("desired", "deploy/dev", "a" * 40, "b" * 40))
 
     output = capsys.readouterr()
     assert output.out == ""
@@ -896,12 +887,12 @@ def test_duplicate_receipt_reuses_identical_semantic_result_without_writing(tmp_
 
     assert (
         deploy_release.publish_observation_cas(
-                "observed/dev",
-                "aws-application",
-                candidate,
-                {"name": "aws-application", "driver": "terraform"},
-                {},
-                "c" * 40,
+            "observed/dev",
+            "aws-application",
+            candidate,
+            {"name": "aws-application", "driver": "terraform"},
+            {},
+            "c" * 40,
         )
         == "b" * 40
     )

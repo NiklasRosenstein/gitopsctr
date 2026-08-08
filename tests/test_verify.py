@@ -208,9 +208,7 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
 
     def driver(context):
         calls.append(context.unit["name"])
-        return ReconciliationOutput(
-            result={"applied": {"sourceRevision": context.source_revision}, "outputs": {}}
-        )
+        return ReconciliationOutput(result={"applied": {"sourceRevision": context.source_revision}, "outputs": {}})
 
     monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
     monkeypatch.setattr(deploy_release, "materialize_revision", materialize)

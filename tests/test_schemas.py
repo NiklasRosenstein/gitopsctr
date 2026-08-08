@@ -195,7 +195,9 @@ def test_core_schemas_are_draft_2020_12_and_environment_examples_validate():
     for contract in CORE_CONTRACTS.values():
         Draft202012Validator.check_schema(contract.json_schema())
     for path in sorted((ROOT / "tests/fixtures").rglob("environment.json")):
-        CORE_CONTRACTS["environment"].validate(cli.normalize_environment_document(json.loads(path.read_text()), path.parent.name))
+        CORE_CONTRACTS["environment"].validate(
+            cli.normalize_environment_document(json.loads(path.read_text()), path.parent.name)
+        )
 
 
 def test_schema_cli_show_export_and_check_work_outside_a_git_repository(tmp_path):

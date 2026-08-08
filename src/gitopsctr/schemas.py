@@ -35,9 +35,7 @@ def _specification_schema(contract: DocumentContract) -> JsonObject:
     schema.pop("title", None)
     properties = cast(dict[str, Any], schema.get("properties", {}))
     required = [
-        value
-        for value in cast(list[str], schema.get("required", []))
-        if value not in {"$schema", "name", "driver"}
+        value for value in cast(list[str], schema.get("required", [])) if value not in {"$schema", "name", "driver"}
     ]
     for key in ("$schema", "name", "driver"):
         properties.pop(key, None)
@@ -300,11 +298,11 @@ def export_schemas(directory: Path, *, check: bool = False) -> list[Path]:
                 path.write_text(expected)
 
     expected_paths = set(documents)
-    existing_paths = {
-        path.relative_to(directory)
-        for path in directory.rglob("*.json")
-        if path.is_file()
-    } if directory.is_dir() else set()
+    existing_paths = (
+        {path.relative_to(directory) for path in directory.rglob("*.json") if path.is_file()}
+        if directory.is_dir()
+        else set()
+    )
     obsolete = sorted(existing_paths - expected_paths)
     changed.extend(obsolete)
     if not check:

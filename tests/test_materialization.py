@@ -132,9 +132,7 @@ def test_advancement_materializes_and_reuses_an_unchanged_payload(tmp_path, monk
     second = materialize_candidate(tmp_path, source, first, "second")
 
     assert plugin.calls == 1
-    assert cli.directory_files(second / "materialized/rendered") == cli.directory_files(
-        first / "materialized/rendered"
-    )
+    assert cli.directory_files(second / "materialized/rendered") == cli.directory_files(first / "materialized/rendered")
     assert cli.load_unit(second / "units/rendered.json", "rendered")["materialization"] == first_unit["materialization"]
 
 

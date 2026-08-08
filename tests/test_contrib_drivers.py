@@ -482,9 +482,7 @@ def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path,
 
     result = vite_oci_bundle.DRIVER.reconcile(context)
 
-    assert result.artifacts["frontend"]["bundle"]["uri"] == (
-        f"{REGISTRY}/example-application-frontend@{DIGEST}"
-    )
+    assert result.artifacts["frontend"]["bundle"]["uri"] == (f"{REGISTRY}/example-application-frontend@{DIGEST}")
 
 
 def test_frontend_bundle_archive_is_deterministic_and_contains_dist_tree(tmp_path):

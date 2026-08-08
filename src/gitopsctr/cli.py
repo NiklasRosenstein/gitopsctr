@@ -346,10 +346,7 @@ def describe_revision(revision: str | None, stream: TextIO | None = None) -> str
     subject = commit_subject(REPOSITORY_ROOT, resolved_revision)
     if not subject:
         return style_text(shortened, "revision", stream)
-    return (
-        f"{style_text(shortened, 'revision', stream)} "
-        f"({style_text(subject, 'muted', stream)})"
-    )
+    return f"{style_text(shortened, 'revision', stream)} ({style_text(subject, 'muted', stream)})"
 
 
 def git(*args: str, check: bool = True, input_text: str | None = None, env=None):
@@ -527,7 +524,11 @@ def normalize_environment_document(document: dict[str, Any], expected_name: str 
         raise OperationError("environment must use apiVersion gitopsctr.io/v1 and kind Environment")
     metadata = document.get("metadata")
     specification = document.get("spec")
-    if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str) or not isinstance(specification, dict):
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(metadata.get("name"), str)
+        or not isinstance(specification, dict)
+    ):
         raise OperationError("environment envelope requires metadata.name and a spec mapping")
     name = metadata["name"]
     if expected_name is not None and name != expected_name:
@@ -659,7 +660,9 @@ def serialize_receipt_document(receipt: dict[str, Any]) -> dict[str, Any]:
         raise OperationError("receipt is missing a known driver or unit")
     reserved = {"schema", "unit", "driver", "desired", "resolvedInputs", "controller", "artifacts", "$schema"}
     return {
-        "$schema": resource_schema_url(DRIVER_GVKS[driver].rsplit("/", 1)[0], DRIVER_GVKS[driver].rsplit("/", 1)[1], "receipt"),
+        "$schema": resource_schema_url(
+            DRIVER_GVKS[driver].rsplit("/", 1)[0], DRIVER_GVKS[driver].rsplit("/", 1)[1], "receipt"
+        ),
         "apiVersion": CORE_API_VERSION,
         "kind": "Receipt",
         "metadata": {"name": unit},
@@ -1027,9 +1030,7 @@ def write_artifact_documents(
     driver = UNIT_DRIVERS[driver_name]
     expected = set(driver.artifact_outputs)
     if set(documents) != expected:
-        raise DriverError(
-            f"{driver_name} returned artifact documents {sorted(documents)}; expected {sorted(expected)}"
-        )
+        raise DriverError(f"{driver_name} returned artifact documents {sorted(documents)}; expected {sorted(expected)}")
     target = observed / "artifacts" / unit_name
     if target.exists():
         shutil.rmtree(target)
@@ -1062,8 +1063,7 @@ def validate_artifact_output_identity(
     driver = UNIT_DRIVERS[driver_name]
     if set(documents) != set(driver.artifact_outputs):
         raise DriverError(
-            f"{driver_name} returned artifact documents {sorted(documents)}; "
-            f"expected {sorted(driver.artifact_outputs)}"
+            f"{driver_name} returned artifact documents {sorted(documents)}; expected {sorted(driver.artifact_outputs)}"
         )
     if not documents:
         return
@@ -1113,7 +1113,11 @@ def load_artifact_document(
         raise ReferenceUnavailable(f"receipt does not describe artifact {artifact_name!r}")
     expected_path = artifact_document_path(observed, str(receipt.get("unit")), artifact_name)
     recorded_path = descriptor.get("path")
-    if not isinstance(recorded_path, str) or PurePosixPath(recorded_path).is_absolute() or ".." in PurePosixPath(recorded_path).parts:
+    if (
+        not isinstance(recorded_path, str)
+        or PurePosixPath(recorded_path).is_absolute()
+        or ".." in PurePosixPath(recorded_path).parts
+    ):
         raise ReferenceUnavailable(f"artifact {artifact_name!r} has an unsafe path")
     path = observed / recorded_path
     if path != expected_path or not path.is_file():
@@ -1185,9 +1189,7 @@ def validate_receipt_artifacts(
     actual_paths = {path for path in directory.rglob("*") if path.is_file()} if directory.is_dir() else set()
     expected_paths = {artifact_document_path(observed, str(unit.get("name")), name) for name in expected}
     if actual_paths != expected_paths:
-        raise OperationError(
-            f"persisted {driver_name} artifact files do not match its complete contract set"
-        )
+        raise OperationError(f"persisted {driver_name} artifact files do not match its complete contract set")
     for artifact_name in expected:
         load_artifact_document(observed, unit, receipt, artifact_name)
 
@@ -1292,7 +1294,14 @@ def resolve_template(
                 if reference_type == "fromReceipt":
                     receipt_inputs[referenced_unit] = file_blob(unit_document_path(observed, referenced_unit))
                     reserved = {
-                        "$schema", "schema", "unit", "driver", "desired", "resolvedInputs", "controller", "artifacts"
+                        "$schema",
+                        "schema",
+                        "unit",
+                        "driver",
+                        "desired",
+                        "resolvedInputs",
+                        "controller",
+                        "artifacts",
                     }
                     document = {key: item for key, item in receipt.items() if key not in reserved}
                 else:
@@ -1504,9 +1513,7 @@ def load_environment_specifications(source_root: Path, environment_name: str) ->
                 driver_name = specifications[producer].get("driver")
                 driver = UNIT_DRIVERS.get(driver_name) if isinstance(driver_name, str) else None
                 if driver is not None and artifact_name not in driver.artifact_outputs:
-                    raise OperationError(
-                        f"{consumer} references unknown artifact {producer}/{artifact_name}"
-                    )
+                    raise OperationError(f"{consumer} references unknown artifact {producer}/{artifact_name}")
                 elif driver is not None and driver.artifact_outputs[artifact_name].gvk != reference.gvk:
                     raise OperationError(
                         f"{consumer} expects artifact {producer}/{artifact_name} to be {reference.gvk}; "
@@ -2185,11 +2192,15 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
 
 
 def require_clean_source(desired: Path, observed: Path, minimum_evidence: str = "reconciled") -> None:
-    unit_names = sorted({path.stem for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}})
+    unit_names = sorted(
+        {path.stem for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}}
+    )
     if not unit_names:
         raise OperationError("promotion source desired state has no units")
     unresolved = [
-        unit_name for unit_name in unit_names if contains_reference(load_unit(unit_document_path(desired, unit_name), unit_name))
+        unit_name
+        for unit_name in unit_names
+        if contains_reference(load_unit(unit_document_path(desired, unit_name), unit_name))
     ]
     if unresolved:
         raise OperationError(f"promotion source has unresolved desired units: {', '.join(unresolved)}")
@@ -2465,9 +2476,7 @@ def write_change_outputs(
 
 def command_promote(args: argparse.Namespace) -> None:
     specification_revision = git("rev-parse", f"{args.specification_revision or 'HEAD'}^{{commit}}").stdout.strip()
-    log_heading(
-        f"Promote {style_environment(args.from_environment)} to {style_environment(args.to_environment)}"
-    )
+    log_heading(f"Promote {style_environment(args.from_environment)} to {style_environment(args.to_environment)}")
     log_status("SPEC", f"reviewed source {describe_revision(specification_revision)}")
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
@@ -2960,15 +2969,11 @@ def _unit_status_snapshot(environment: str, desired_ref: str, observed_ref: str)
         return {
             "desired": {"ref": desired_ref, "revision": desired_revision},
             "observed": {"ref": observed_ref, "revision": observed_revision},
-            "statuses": [
-                {"unit": unit, "status": status, "reason": reason} for unit, status, reason in statuses
-            ],
+            "statuses": [{"unit": unit, "status": status, "reason": reason} for unit, status, reason in statuses],
         }
 
 
-def print_inspection_document(
-    document: dict[str, Any], *, force_json: bool = False, force_yaml: bool = False
-) -> None:
+def print_inspection_document(document: dict[str, Any], *, force_json: bool = False, force_yaml: bool = False) -> None:
     """Print one inspection document using the project's configured format."""
     selected = (
         DocumentFormat.JSON
@@ -3068,7 +3073,9 @@ def command_show_receipt(args: argparse.Namespace) -> None:
     if args.artifact is not None:
         if args.artifact not in artifacts:
             available = ", ".join(sorted(artifacts)) or "none"
-            raise OperationError(f"{observed_ref} receipt for {args.unit} has no artifact {args.artifact!r}; available: {available}")
+            raise OperationError(
+                f"{observed_ref} receipt for {args.unit} has no artifact {args.artifact!r}; available: {available}"
+            )
         print_inspection_document(artifacts[args.artifact], force_json=args.json, force_yaml=args.yaml)
     elif args.artifacts:
         print_inspection_document(artifacts, force_json=args.json, force_yaml=args.yaml)
@@ -3086,9 +3093,7 @@ def command_verify(args: argparse.Namespace) -> None:
         materialize_revision(desired_revision, desired)
         log_status("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(desired_revision)}")
 
-        unit_paths = sorted(
-            path for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}
-        )
+        unit_paths = sorted(path for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"})
         available = {path.stem: path for path in unit_paths}
         requested = args.unit or sorted(available)
         invalid = sorted({unit_name for unit_name in requested if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name)})
@@ -3327,9 +3332,7 @@ def convergence_order(specifications: dict[str, dict[str, Any]], scope: list[str
 def observation_dependency_graph(specifications: dict[str, dict[str, Any]], scope: list[str]) -> dict[str, list[str]]:
     included = set(scope)
     return {
-        unit_name: sorted(
-            observation_reference_units(specifications[unit_name]) & included
-        )
+        unit_name: sorted(observation_reference_units(specifications[unit_name]) & included)
         for unit_name in sorted(scope)
     }
 
@@ -3338,8 +3341,7 @@ def log_dependency_graph(graph: dict[str, list[str]]) -> None:
     for unit_name, dependencies in graph.items():
         log_status(
             "DEPEND",
-            f"{style_unit(unit_name)}: "
-            f"{', '.join(style_unit(dependency) for dependency in dependencies) or 'none'}",
+            f"{style_unit(unit_name)}: {', '.join(style_unit(dependency) for dependency in dependencies) or 'none'}",
         )
 
 
@@ -3406,9 +3408,9 @@ def publish_observation_cas(
             descriptors = write_artifact_documents(observed, unit_name, driver, artifact_documents)
             candidate_receipt = {**receipt, "artifacts": descriptors}
             validate_receipt_document(candidate_receipt, f"candidate receipt for {unit_name}")
-            if existing_receipt is not None and existing_receipt.get("desired", {}).get("unitBlob") == candidate_receipt.get(
-                "desired", {}
-            ).get("unitBlob"):
+            if existing_receipt is not None and existing_receipt.get("desired", {}).get(
+                "unitBlob"
+            ) == candidate_receipt.get("desired", {}).get("unitBlob"):
                 if observed_revision is None:
                     raise OperationError(f"{observed_ref} receipt has no revision")
                 if existing_receipt.get("driver") != driver:
@@ -4001,9 +4003,7 @@ def command_converge(args: argparse.Namespace) -> None:
                 if not args.yes:
                     require_reconciliation_approval(unit_name)
                 if args.verbose:
-                    log_heading(
-                        f"Convergence step {len(steps) + 1} (limit {max_steps}): {style_unit(unit_name)}"
-                    )
+                    log_heading(f"Convergence step {len(steps) + 1} (limit {max_steps}): {style_unit(unit_name)}")
                 else:
                     log_status("RUN", style_unit(unit_name))
                 before_observed = last_observed
@@ -4529,9 +4529,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_command = commands.add_parser("list", help="list project environments or deployment units")
     list_commands = list_command.add_subparsers(dest="list_command", required=True)
-    list_environments = list_commands.add_parser(
-        "environments", help="list environments and their deployment summary"
-    )
+    list_environments = list_commands.add_parser("environments", help="list environments and their deployment summary")
     list_environments.add_argument("--json", action="store_true", help="emit one machine-readable document")
     list_environments.set_defaults(handler=command_list_environments)
     list_units = list_commands.add_parser("units", help="list units and their reconciliation status")

@@ -267,12 +267,15 @@ def artifact_descriptors_schema(artifacts: Mapping[str, tuple[str, str, str]]) -
             "required": ["apiVersion", "kind", "path", "digest", "mediaType"],
             "additionalProperties": False,
         }
-    return cast(JsonObject, {
-        "type": "object",
-        "properties": properties,
-        "required": sorted(properties),
-        "additionalProperties": False,
-    })
+    return cast(
+        JsonObject,
+        {
+            "type": "object",
+            "properties": properties,
+            "required": sorted(properties),
+            "additionalProperties": False,
+        },
+    )
 
 
 def receipt_schema(

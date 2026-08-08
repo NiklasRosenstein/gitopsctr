@@ -53,9 +53,7 @@ def load_api_kinds() -> dict[GVK, ApiKind[object]]:
         if not isinstance(api_kind, ApiKind):
             raise ApiError(f"API entry point {entry_point.name!r} did not load an ApiKind")
         if entry_point.name != str(api_kind.gvk):
-            raise ApiError(
-                f"API entry point {entry_point.name!r} does not match declared GVK {str(api_kind.gvk)!r}"
-            )
+            raise ApiError(f"API entry point {entry_point.name!r} does not match declared GVK {str(api_kind.gvk)!r}")
         if api_kind.gvk in kinds:
             raise ApiError(f"duplicate API kind entry point: {api_kind.gvk}")
         kinds[api_kind.gvk] = cast(ApiKind[object], api_kind)

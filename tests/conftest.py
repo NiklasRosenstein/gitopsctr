@@ -17,11 +17,7 @@ def write_test_document(path: Path, value: object) -> None:
         return
     parts = path.parts
     deployment_index = next(
-        (
-            index
-            for index in range(len(parts) - 1)
-            if parts[index : index + 2] == ("deployment", "environments")
-        ),
+        (index for index in range(len(parts) - 1) if parts[index : index + 2] == ("deployment", "environments")),
         None,
     )
     if deployment_index is not None:
@@ -40,9 +36,7 @@ def write_test_document(path: Path, value: object) -> None:
                 )
             )
         if path.stem == "environment":
-            value = cli.serialize_environment_document(
-                cli.normalize_environment_document(value, path.parent.name)
-            )
+            value = cli.serialize_environment_document(cli.normalize_environment_document(value, path.parent.name))
         elif path.parent.name == "units":
             value = cli.serialize_unit_document(
                 cli.normalize_unit_document(value, path.stem),
