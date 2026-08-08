@@ -42,6 +42,7 @@ PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
                     "type": "string",
                     "minLength": 1,
                     "pattern": r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+$",
+                    "description": "Repository-relative directory containing authored environments.",
                 },
             },
             "additionalProperties": False,
@@ -89,12 +90,9 @@ def _validate_project_name(name: str, path: Path) -> None:
         raise DocumentFormatError(f"invalid project config {path}: metadata.name must be a DNS-1123 subdomain")
 
 
-def load_project_config(root: Path) -> Project:
-    path = project_config_path(root)
-    try:
-        value = yaml.safe_load(path.read_text())
-    except (OSError, yaml.YAMLError) as exc:
-        raise DocumentFormatError(f"could not read project config {path}: {exc}") from exc
+def validate_project_document(value: object, path: Path) -> Project:
+    """Validate a Project resource and return its runtime configuration."""
+
     if not isinstance(value, dict):
         raise DocumentFormatError(f"project config {path} must be a mapping")
     try:
@@ -116,6 +114,15 @@ def load_project_config(root: Path) -> Project:
         write_format=DocumentFormat.JSON if selected == "json" else DocumentFormat.YAML,
         environments_path=environments_path,
     )
+
+
+def load_project_config(root: Path) -> Project:
+    path = project_config_path(root)
+    try:
+        value = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError) as exc:
+        raise DocumentFormatError(f"could not read project config {path}: {exc}") from exc
+    return validate_project_document(value, path)
 
 
 def project_environment_root(root: Path, environment_name: str) -> Path:
@@ -170,7 +177,7 @@ def document_candidates(directory: Path, stem: str) -> tuple[Path, ...]:
 def write_document(path: Path, value: dict[str, Any], *, format: DocumentFormat | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     selected = format or (DocumentFormat.JSON if path.suffix.lower() == ".json" else DocumentFormat.YAML)
-    output = path.with_suffix(selected.suffix)
+    output = path if selected is DocumentFormat.YAML and path.suffix.lower() == ".yml" else path.with_suffix(selected.suffix)
     if selected is DocumentFormat.JSON:
         text = json.dumps(value, indent=2, sort_keys=True) + "\n"
     else:

@@ -452,6 +452,13 @@ class KubernetesManifestsDriver(
     _select_direct_result = staticmethod(select_result_fields("applied"))
     _select_argo_result = staticmethod(select_result_fields("observed"))
 
+    def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject:
+        return {
+            "source": {"path": source_path},
+            "materialize": {"type": "plain", "paths": ["**/*.yaml", "**/*.yml"], "allowSecrets": False},
+            "delivery": {"mode": "external"},
+        }
+
     def materialize(self, context: MaterializationContext) -> MaterializationResult:
         configuration = materialization_configuration(context.unit)
         delivery = delivery_configuration(context.unit)

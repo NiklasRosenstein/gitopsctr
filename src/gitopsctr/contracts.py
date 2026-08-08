@@ -147,17 +147,27 @@ class MaterializationDocument(SchemaDocument):
 
 @dataclass(frozen=True, kw_only=True)
 class AuthoredSource(StrictModel):
-    path: str
-    inputs: list[str] | None = None
+    path: str = field(
+        metadata={"description": "Repository-relative path resolved from the root of the selected source revision."}
+    )
+    inputs: list[str] | None = field(
+        default=None,
+        metadata={"description": "Input paths or glob patterns resolved relative to source.path."},
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
 class DesiredSource(StrictModel):
-    path: str
+    path: str = field(
+        metadata={"description": "Repository-relative path resolved from the root of the selected source revision."}
+    )
     revision: str | None = None
     driverVersion: int | None = None
     inputHash: str | None = None
-    inputs: list[str] | None = None
+    inputs: list[str] | None = field(
+        default=None,
+        metadata={"description": "Input paths or glob patterns resolved relative to source.path."},
+    )
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -15,6 +15,7 @@ from gitopsctr.contracts import (
     StrictModel,
     schema_url,
 )
+from gitopsctr.document import JsonObject
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -178,6 +179,9 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
     )
     result_contract = MashumaroContract(OciImagesResultModel, schema_url("drivers/oci-images", version, "result"))
     _select_semantic_result = staticmethod(select_result_fields("artifacts"))
+
+    def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject:
+        return {"source": {"path": source_path}}
 
     @staticmethod
     def _runtime(context: PlanningContext | ReconciliationContext) -> OciRuntime:

@@ -21,6 +21,7 @@ from gitopsctr.contracts import (
     StrictModel,
     schema_url,
 )
+from gitopsctr.document import JsonObject
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -187,6 +188,9 @@ class ViteOciBundleDriver(UnitDriver, PlanningCapability, ReconciliationCapabili
     )
     result_contract = MashumaroContract(ViteBundleResultModel, schema_url("drivers/vite-oci-bundle", version, "result"))
     _select_semantic_result = staticmethod(select_result_fields("artifacts"))
+
+    def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject:
+        return {"source": {"path": source_path}}
 
     @staticmethod
     def _runtime(context: UnitExecutionContext) -> ViteRuntime:

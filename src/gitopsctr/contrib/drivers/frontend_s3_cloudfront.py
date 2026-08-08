@@ -211,6 +211,9 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
     )
     _select_semantic_result = staticmethod(select_result_fields("published"))
 
+    def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject:
+        return {"source": {"path": source_path}}
+
     @staticmethod
     def _runtime(context: UnitExecutionContext) -> FrontendRuntime:
         require_strings(

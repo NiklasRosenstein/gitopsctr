@@ -36,6 +36,16 @@ class UnitDriver:
     desired_unit_contract: ClassVar[DocumentContract]
     result_contract: ClassVar[DocumentContract]
 
+    def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject | None:
+        """Return an authored unit spec body, or ``None`` when scaffolding is unsupported.
+
+        The CLI owns the resource identity and envelope. Drivers only provide
+        fields below ``spec`` so they cannot accidentally select a different
+        API kind, driver name, or unit name.
+        """
+
+        return None
+
 
 @dataclass(frozen=True)
 class MaterializationContext:

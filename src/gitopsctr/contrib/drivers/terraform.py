@@ -18,7 +18,7 @@ from gitopsctr.contracts import (
     StrictModel,
     schema_url,
 )
-from gitopsctr.document import JsonValue
+from gitopsctr.document import JsonObject, JsonValue
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -164,6 +164,12 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
     )
     result_contract = MashumaroContract(TerraformResultModel, schema_url("drivers/terraform", version, "result"))
     _select_semantic_result = staticmethod(select_result_fields("applied", "outputs"))
+
+    def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject:
+        return {
+            "source": {"path": source_path},
+            "terraform": {"backend": {}, "variables": {}, "observeOutputs": [], "checks": []},
+        }
 
     @staticmethod
     def _prepare_plan_artifacts(

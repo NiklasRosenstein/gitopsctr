@@ -52,11 +52,13 @@ from gitopsctr.forges import (
 )
 from gitopsctr.formats import (
     PROJECT_CONFIG_NAMES,
+    DocumentFormat,
     DocumentFormatError,
     document_candidates,
     load_document,
     load_project_config,
     project_environment_root,
+    validate_project_document,
     write_document,
 )
 from gitopsctr.schemas import driver_schema, encoded_schema, export_schemas, resource_schema_url, show_schema
@@ -3409,6 +3411,278 @@ def command_converge(args: argparse.Namespace) -> None:
             raise
 
 
+def _resource_name(value: str, description: str) -> str:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", value):
+        raise OperationError(f"invalid {description}: {value!r}")
+    return value
+
+
+def _creation_target(directory: Path, stem: str, *, suffix: str, force: bool) -> Path:
+    candidates = document_candidates(directory, stem)
+    if len(candidates) > 1:
+        raise OperationError(f"multiple document formats exist for {stem}: {', '.join(map(str, candidates))}")
+    if candidates:
+        if not force:
+            raise OperationError(f"resource already exists: {candidates[0]}")
+        return candidates[0]
+    return directory / f"{stem}{suffix}"
+
+
+def _print_created(path: Path) -> None:
+    try:
+        print(path.relative_to(REPOSITORY_ROOT))
+    except ValueError:
+        print(path)
+
+
+def _document_format_for_path(path: Path) -> DocumentFormat:
+    return DocumentFormat.JSON if path.suffix.lower() == ".json" else DocumentFormat.YAML
+
+
+def command_create_project(args: argparse.Namespace) -> None:
+    project_document = {
+        "$schema": resource_schema_url(CORE_API_VERSION, "Project"),
+        "apiVersion": CORE_API_VERSION,
+        "kind": "Project",
+        "metadata": {"name": args.name},
+        "spec": {
+            "writeFormat": args.write_format,
+            "environmentsPath": args.environments_path,
+        },
+    }
+    try:
+        validate_project_document(project_document, REPOSITORY_ROOT / "gitopsctr.yaml")
+    except DocumentFormatError as exc:
+        raise OperationError(str(exc)) from exc
+
+    candidates = [REPOSITORY_ROOT / name for name in PROJECT_CONFIG_NAMES if (REPOSITORY_ROOT / name).is_file()]
+    if len(candidates) > 1:
+        raise OperationError("multiple Project configuration files exist: " + ", ".join(map(str, candidates)))
+    if candidates and not args.force:
+        raise OperationError(f"resource already exists: {candidates[0]}")
+    target = candidates[0] if candidates else REPOSITORY_ROOT / "gitopsctr.yaml"
+    written = write_document(target, project_document, format=DocumentFormat.YAML)
+    _print_created(written)
+
+
+def command_create_environment(args: argparse.Namespace) -> None:
+    _resource_name(args.name, "environment name")
+    try:
+        project = load_project_config(REPOSITORY_ROOT)
+        environment_root = project_environment_root(REPOSITORY_ROOT, args.name)
+    except DocumentFormatError as exc:
+        raise OperationError(str(exc)) from exc
+    target = _creation_target(
+        environment_root,
+        "environment",
+        suffix=project.write_format.suffix,
+        force=args.force,
+    )
+    environment = {"name": args.name, "changeGate": args.change_gate}
+    validate_document(CORE_CONTRACTS["environment"], environment, f"environment specification {args.name}")
+    written = write_document(target, serialize_environment_document(environment), format=_document_format_for_path(target))
+    _print_created(written)
+
+
+def command_create_unit(args: argparse.Namespace) -> None:
+    _resource_name(args.name, "unit name")
+    safe_source_path(args.source_path, f"{args.name} source path")
+    try:
+        project = load_project_config(REPOSITORY_ROOT)
+        environment_root = project_environment_root(REPOSITORY_ROOT, args.environment)
+    except DocumentFormatError as exc:
+        raise OperationError(str(exc)) from exc
+    load_environment(REPOSITORY_ROOT, args.environment)
+
+    driver = UNIT_DRIVERS[args.driver]
+    scaffold = driver.scaffold_unit_spec(args.name, args.source_path)
+    if scaffold is None:
+        raise OperationError(
+            f"unit driver {args.driver!r} does not support scaffolding; create the document from its authored schema"
+        )
+    unit = {"name": args.name, "driver": args.driver, **scaffold}
+    require_unit_specification(unit, args.name)
+    target = _creation_target(
+        environment_root / "units",
+        args.name,
+        suffix=project.write_format.suffix,
+        force=args.force,
+    )
+    written = write_document(
+        target,
+        serialize_unit_document(unit, profile="authored"),
+        format=_document_format_for_path(target),
+    )
+    _print_created(written)
+
+
+@dataclass(frozen=True)
+class ValidationIssue:
+    target: str
+    detail: str
+
+
+class ValidationCollector:
+    def __init__(self, fail_fast: bool) -> None:
+        self.fail_fast = fail_fast
+        self.issues: list[ValidationIssue] = []
+        self.documents: set[Path] = set()
+        self.environments: set[str] = set()
+
+    def invalid(self, target: Path | str, exc: Exception | str) -> None:
+        detail = str(exc)
+        label = str(target)
+        if self.fail_fast:
+            raise OperationError(f"{label}: {detail}")
+        self.issues.append(ValidationIssue(label, detail))
+
+    def valid_document(self, path: Path) -> None:
+        self.documents.add(path.resolve())
+
+
+def _validate_project_file(path: Path, collector: ValidationCollector) -> None:
+    try:
+        validate_project_document(load_document(path), path)
+        collector.valid_document(path)
+    except (DocumentFormatError, OSError) as exc:
+        collector.invalid(path, exc)
+
+
+def _validate_environment_file(path: Path, collector: ValidationCollector) -> None:
+    try:
+        environment = normalize_environment_document(load_json(path), path.parent.name)
+        validate_document(CORE_CONTRACTS["environment"], environment, f"environment specification {path.parent.name}")
+        collector.valid_document(path)
+    except (DocumentFormatError, OperationError) as exc:
+        collector.invalid(path, exc)
+
+
+def _validate_unit_file(path: Path, collector: ValidationCollector) -> dict[str, Any] | None:
+    try:
+        unit = normalize_unit_document(load_json(path), path.stem)
+        require_unit_specification(unit, path.stem)
+        collector.valid_document(path)
+        return unit
+    except (DocumentFormatError, OperationError) as exc:
+        collector.invalid(path, exc)
+        return None
+
+
+def _validate_authored_file(path: Path, collector: ValidationCollector) -> None:
+    if not path.is_file():
+        collector.invalid(path, "file does not exist")
+        return
+    try:
+        document = load_document(path)
+    except DocumentFormatError as exc:
+        collector.invalid(path, exc)
+        return
+    api_version = document.get("apiVersion")
+    kind = document.get("kind")
+    if api_version == CORE_API_VERSION and kind == "Project":
+        _validate_project_file(path, collector)
+    elif api_version == CORE_API_VERSION and kind == "Environment":
+        _validate_environment_file(path, collector)
+    elif api_version == UNIT_API_VERSION:
+        _validate_unit_file(path, collector)
+    else:
+        collector.invalid(path, f"unsupported authored resource {api_version}/{kind}")
+
+
+def _validate_environment(environment_name: str, collector: ValidationCollector) -> None:
+    if environment_name in collector.environments:
+        return
+    collector.environments.add(environment_name)
+    try:
+        environment_root = project_environment_root(REPOSITORY_ROOT, environment_name)
+    except DocumentFormatError as exc:
+        collector.invalid(environment_name, exc)
+        return
+
+    environment_paths = document_candidates(environment_root, "environment")
+    if len(environment_paths) != 1:
+        collector.invalid(
+            environment_root,
+            f"expected exactly one environment document for {environment_name}; found {len(environment_paths)}",
+        )
+    else:
+        _validate_environment_file(environment_paths[0], collector)
+
+    units_root = environment_root / "units"
+    stems = sorted({path.stem for path in units_root.glob("*") if path.suffix in {".json", ".yaml", ".yml"}})
+    if not stems:
+        collector.invalid(units_root, f"environment has no units: {environment_name}")
+        return
+
+    specifications: dict[str, dict[str, Any]] = {}
+    for stem in stems:
+        paths = document_candidates(units_root, stem)
+        if len(paths) != 1:
+            collector.invalid(units_root / stem, f"multiple document formats exist for unit {stem}")
+            continue
+        specification = _validate_unit_file(paths[0], collector)
+        if specification is not None:
+            specifications[stem] = specification
+
+    for consumer, specification in specifications.items():
+        try:
+            references = reference_paths(specification, "fromObservation")
+        except OperationError as exc:
+            collector.invalid(units_root / consumer, exc)
+            continue
+        for reference in references:
+            producer = Path(reference).stem
+            if producer in specifications:
+                try:
+                    reconciles = unit_requires_reconciliation(specifications[producer])
+                except OperationError as exc:
+                    collector.invalid(units_root / producer, exc)
+                    continue
+                if not reconciles:
+                    collector.invalid(
+                        units_root / consumer,
+                        f"{consumer} cannot observe materialization-only unit {producer!r}",
+                    )
+
+
+def command_validate(args: argparse.Namespace) -> None:
+    collector = ValidationCollector(args.fail_fast)
+    file_targets = list(dict.fromkeys(Path(value) for value in args.files))
+    environment_targets = list(dict.fromkeys(args.environment or []))
+
+    if file_targets or environment_targets:
+        for path in file_targets:
+            target = path if path.is_absolute() else REPOSITORY_ROOT / path
+            _validate_authored_file(target.resolve(), collector)
+        for environment_name in environment_targets:
+            _validate_environment(environment_name, collector)
+    else:
+        try:
+            project = load_project_config(REPOSITORY_ROOT)
+            project_path = next(REPOSITORY_ROOT / name for name in PROJECT_CONFIG_NAMES if (REPOSITORY_ROOT / name).is_file())
+            collector.valid_document(project_path)
+        except (DocumentFormatError, StopIteration) as exc:
+            collector.invalid(REPOSITORY_ROOT / "gitopsctr.yaml", exc)
+            project = None
+        if project is not None:
+            environments_root = REPOSITORY_ROOT.joinpath(*project.environments_path.parts)
+            for path in sorted(environments_root.iterdir()) if environments_root.is_dir() else []:
+                if path.is_dir():
+                    _validate_environment(path.name, collector)
+
+    if collector.issues:
+        for issue in collector.issues:
+            log_status("INVALID", f"{issue.target}: {issue.detail}")
+        raise OperationError(
+            f"validation failed with {len(collector.issues)} error{'s' if len(collector.issues) != 1 else ''}"
+        )
+    log_status(
+        "VALID",
+        f"{len(collector.documents)} document{'s' if len(collector.documents) != 1 else ''}"
+        f" across {len(collector.environments)} environment{'s' if len(collector.environments) != 1 else ''}",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -3416,6 +3690,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="Git working tree; defaults to the repository containing the current directory",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+
+    create = commands.add_parser("create", help="create an authored Project, Environment, or Unit resource")
+    create_commands = create.add_subparsers(dest="create_command", required=True)
+    create_project = create_commands.add_parser("project", help="create the repository Project resource")
+    create_project.add_argument("--name", required=True, help="DNS-1123 project name")
+    create_project.add_argument("--write-format", choices=("yaml", "json"), default="yaml")
+    create_project.add_argument(
+        "--environments-path",
+        default="deployment/environments",
+        help="repository-relative authored environments directory",
+    )
+    create_project.add_argument("--force", action="store_true", help="replace an existing Project resource")
+    create_project.set_defaults(handler=command_create_project)
+
+    create_environment = create_commands.add_parser("environment", help="create an authored Environment resource")
+    create_environment.add_argument("--name", required=True)
+    create_environment.add_argument("--change-gate", choices=("none", "pullRequest"), default="none")
+    create_environment.add_argument("--force", action="store_true", help="replace an existing Environment resource")
+    create_environment.set_defaults(handler=command_create_environment)
+
+    create_unit = create_commands.add_parser("unit", help="create a driver-specific authored Unit resource")
+    create_unit.add_argument("--environment", required=True)
+    create_unit.add_argument("--name", required=True)
+    create_unit.add_argument("--driver", required=True, choices=tuple(sorted(UNIT_DRIVERS)))
+    create_unit.add_argument(
+        "--source-path",
+        default=".",
+        help="path relative to the root of the selected source revision",
+    )
+    create_unit.add_argument("--force", action="store_true", help="replace an existing Unit resource")
+    create_unit.set_defaults(handler=command_create_unit)
+
+    validate = commands.add_parser("validate", help="validate authored Project, Environment, and Unit resources")
+    validate.add_argument(
+        "files",
+        nargs="*",
+        metavar="FILE",
+        help="authored resource file relative to the repository root; defaults to the whole Project",
+    )
+    validate.add_argument(
+        "--environment",
+        action="append",
+        help="environment to validate; repeat to validate multiple environments",
+    )
+    validate.add_argument("--fail-fast", action="store_true", help="stop after the first validation error")
+    validate.set_defaults(handler=command_validate)
 
     schemas = commands.add_parser("schemas", help="show or export public JSON Schemas")
     schema_commands = schemas.add_subparsers(dest="schema_command", required=True)
