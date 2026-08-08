@@ -1,4 +1,43 @@
 {
+  "$defs": {
+    "ResolvedJsonValue": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/ResolvedJsonValue"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/ResolvedJsonValue"
+          },
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "fromArtifact",
+                "fromPromotion",
+                "fromReceipt"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      ]
+    }
+  },
   "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/KubernetesManifests/desired.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
@@ -179,6 +218,18 @@
         "inputs": {
           "anyOf": [
             {
+              "additionalProperties": {
+                "$ref": "#/$defs/ResolvedJsonValue"
+              },
+              "propertyNames": {
+                "not": {
+                  "enum": [
+                    "fromArtifact",
+                    "fromPromotion",
+                    "fromReceipt"
+                  ]
+                }
+              },
               "type": "object"
             },
             {
@@ -306,6 +357,18 @@
                   "const": "helm"
                 },
                 "values": {
+                  "additionalProperties": {
+                    "$ref": "#/$defs/ResolvedJsonValue"
+                  },
+                  "propertyNames": {
+                    "not": {
+                      "enum": [
+                        "fromArtifact",
+                        "fromPromotion",
+                        "fromReceipt"
+                      ]
+                    }
+                  },
                   "type": "object"
                 }
               },

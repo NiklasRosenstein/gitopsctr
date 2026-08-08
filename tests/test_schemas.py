@@ -6,13 +6,14 @@ import sys
 from pathlib import Path
 
 import pytest
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, ValidationError
 from referencing import Registry, Resource
 
 from gitopsctr import cli, schemas
 from gitopsctr.contracts import CORE_CONTRACTS, ContractError, DesiredSource, MaterializationDocument
 from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import DriverError, MaterializationCapability, UnitResolutionContext
+from gitopsctr.errors import ReferenceUnavailable
 from gitopsctr.registry import UNIT_DRIVERS
 from gitopsctr.resolution import FingerprintedValue, ResolutionContext, resolve_template
 from gitopsctr.resources import UnitResource
@@ -74,8 +75,8 @@ def desired_example(unit: UnitResource) -> UnitResource:
 
 
 def has_incomplete_frontend_inputs(unit: UnitResource) -> bool:
-    return unit.driver_name == "frontend-s3-cloudfront" and any(
-        value is None for value in unit.spec.inputs.to_dict().values()
+    return unit.driver_name == "frontend-s3-cloudfront" and (
+        unit.spec.inputs is None or any(value is None for value in unit.spec.inputs.to_dict().values())
     )
 
 
@@ -86,7 +87,7 @@ def test_builtin_contracts_validate_the_full_typed_unit_pipeline(unit):
 
     plugin.unit_contract.validate(authored)
     if has_incomplete_frontend_inputs(unit):
-        with pytest.raises(DriverError, match="resolved frontend inputs are invalid"):
+        with pytest.raises((DriverError, ReferenceUnavailable)):
             desired_example(unit)
         return
     desired = desired_example(unit)
@@ -114,6 +115,14 @@ def test_source_schema_describes_repository_relative_path_semantics():
     source = schema["properties"]["source"]
     assert "root of the selected source revision" in source["properties"]["path"]["description"]
     assert "relative to source.path" in source["properties"]["inputs"]["description"]
+
+
+def test_template_schema_accepts_integer_values():
+    document = {
+        "source": {"path": "."},
+        "terraform": {"variables": {"replicas": 2}},
+    }
+    UNIT_DRIVERS["terraform"].unit_contract.validate(document)
 
 
 def test_resource_contracts_use_api_version_instead_of_envelope_schema_field():
@@ -177,6 +186,12 @@ def test_result_contracts_and_receipt_resource_schemas(driver):
     receipt_schema = schemas.receipt_resource_schema(driver)
     Draft202012Validator.check_schema(receipt_schema)
     Draft202012Validator(receipt_schema).validate(receipt)
+    invalid_receipt = {
+        **receipt,
+        "spec": {**receipt["spec"], "resolvedInputs": {"nonsense": [1, 2]}},
+    }
+    with pytest.raises(ValidationError):
+        Draft202012Validator(receipt_schema).validate(invalid_receipt)
 
 
 def test_generated_schemas_and_examples_validate_from_the_local_catalog():

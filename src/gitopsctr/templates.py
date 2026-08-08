@@ -13,7 +13,7 @@ from mashumaro.mixins.dict import DataClassDictMixin
 from mashumaro.types import SerializableType
 
 from gitopsctr.api import GVK
-from gitopsctr.document import JsonScalar, JsonValue
+from gitopsctr.document import REFERENCE_KEYS, JsonScalar, JsonValue
 
 type ResourceName = Annotated[str, Pattern("^[a-z0-9][a-z0-9-]*$")]
 type JsonPointer = Annotated[str, Pattern("^(?:$|/(?:[^~]|~[01])*)$")]
@@ -117,7 +117,6 @@ class TemplateObject(dict[str, TemplateValue], SerializableType):
         return cls(parsed)
 
 
-REFERENCE_KEYS = frozenset(("fromReceipt", "fromArtifact", "fromPromotion"))
 _RESOURCE_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
 _KIND = re.compile(r"[A-Z][A-Za-z0-9]*")
 

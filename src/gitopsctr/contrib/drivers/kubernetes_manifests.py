@@ -23,7 +23,7 @@ from gitopsctr.contracts import (
     StrictModel,
     schema_url,
 )
-from gitopsctr.document import JsonObject, JsonObjectValue
+from gitopsctr.document import JsonObject, ResolvedJsonObjectValue
 from gitopsctr.driver import (
     DriverError,
     MaterializationCapability,
@@ -92,7 +92,7 @@ class HelmMaterialization(StrictModel):
     type: Literal["helm"]
     releaseName: str
     namespace: str
-    values: JsonObjectValue
+    values: ResolvedJsonObjectValue
     allowSecrets: bool = False
 
 
@@ -182,7 +182,7 @@ class KubernetesResolvedUnit(StrictModel):
     source: DesiredSource
     materialize: HelmMaterialization | PlainMaterialization
     delivery: DirectDelivery | ExternalDelivery
-    inputs: JsonObjectValue | None = None
+    inputs: ResolvedJsonObjectValue | None = None
     resolvedInputs: ResolvedInputs | None = None
 
 
@@ -495,7 +495,7 @@ class KubernetesManifestsDriver(
                 type="helm",
                 releaseName=unit.materialize.releaseName,
                 namespace=unit.materialize.namespace,
-                values=JsonObjectValue(values.value),
+                values=ResolvedJsonObjectValue(values.value),
                 allowSecrets=unit.materialize.allowSecrets,
             )
             resolved = (values,)

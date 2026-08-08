@@ -35,6 +35,7 @@ from gitopsctr.driver import (
     reference_fingerprints,
     unit_driver_api,
 )
+from gitopsctr.errors import ReferenceUnavailable
 from gitopsctr.execution import CommandOutput
 from gitopsctr.templates import AuthoredValue
 
@@ -239,15 +240,16 @@ class FrontendS3CloudfrontDriver(
     def resolve_unit(self, unit: FrontendUnit, context: UnitResolutionContext) -> UnitResolution[FrontendDesiredUnit]:
         resolutions = []
         inputs = None
-        if unit.inputs is not None:
-            input_resolution = context.resolve_template(unit.inputs.to_dict())
-            if not isinstance(input_resolution.value, dict):
-                raise DriverError("resolved frontend inputs must be an object")
-            try:
-                inputs = FrontendDesiredInputs.from_dict(input_resolution.value)
-            except (TypeError, ValueError) as exc:
-                raise DriverError(f"resolved frontend inputs are invalid: {exc}") from exc
-            resolutions.append(input_resolution)
+        if unit.inputs is None:
+            raise ReferenceUnavailable("frontend-s3-cloudfront inputs are not available")
+        input_resolution = context.resolve_template(unit.inputs.to_dict())
+        if not isinstance(input_resolution.value, dict):
+            raise DriverError("resolved frontend inputs must be an object")
+        try:
+            inputs = FrontendDesiredInputs.from_dict(input_resolution.value)
+        except (TypeError, ValueError) as exc:
+            raise DriverError(f"resolved frontend inputs are invalid: {exc}") from exc
+        resolutions.append(input_resolution)
         fingerprints = reference_fingerprints(*resolutions)
         return UnitResolution(
             FrontendDesiredUnit(

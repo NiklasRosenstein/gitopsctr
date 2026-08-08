@@ -22,6 +22,7 @@ from gitopsctr.document import (
     JsonObject,
     JsonObjectValue,
     JsonValue,
+    ResolvedJsonObjectValue,
     TypedDocumentContract,
 )
 from gitopsctr.templates import REFERENCE_KEYS, TemplateObject
@@ -42,6 +43,8 @@ class _ContractSchemaPlugin(BasePlugin):
             return JSONSchema(title="__gitopsctr_template_object__")
         if instance.type is JsonObjectValue:
             return JSONSchema(type=JSONSchemaInstanceType.OBJECT)
+        if instance.type is ResolvedJsonObjectValue:
+            return JSONSchema(title="__gitopsctr_resolved_json_object__")
         return None
 
 
@@ -85,7 +88,6 @@ def _template_definitions() -> JsonObject:
             [
                 {"type": "null"},
                 {"type": "boolean"},
-                {"type": "integer"},
                 {"type": "number"},
                 {"type": "string"},
                 {"type": "array", "items": {"$ref": "#/$defs/TemplateValue"}},
@@ -102,9 +104,11 @@ def _template_definitions() -> JsonObject:
 
 def _expand_special_schemas(schema: JsonObject) -> JsonObject:
     used_template = False
+    used_resolved_json = False
 
     def visit(value: JsonValue) -> JsonValue:
         nonlocal used_template
+        nonlocal used_resolved_json
         if isinstance(value, list):
             return [visit(item) for item in value]
         if not isinstance(value, dict):
@@ -119,12 +123,41 @@ def _expand_special_schemas(schema: JsonObject) -> JsonObject:
                     "additionalProperties": {"$ref": "#/$defs/TemplateValue"},
                 },
             )
+        if value.get("title") == "__gitopsctr_resolved_json_object__":
+            used_resolved_json = True
+            return cast(
+                JsonObject,
+                {
+                    "type": "object",
+                    "propertyNames": {"not": {"enum": sorted(REFERENCE_KEYS)}},
+                    "additionalProperties": {"$ref": "#/$defs/ResolvedJsonValue"},
+                },
+            )
         return {name: visit(item) for name, item in value.items()}
 
     expanded = cast(JsonObject, visit(schema))
     if used_template:
         definitions = cast(JsonObject, expanded.setdefault("$defs", {}))
         definitions.update(_template_definitions())
+    if used_resolved_json:
+        definitions = cast(JsonObject, expanded.setdefault("$defs", {}))
+        definitions["ResolvedJsonValue"] = cast(
+            JsonValue,
+            {
+                "anyOf": [
+                    {"type": "null"},
+                    {"type": "boolean"},
+                    {"type": "number"},
+                    {"type": "string"},
+                    {"type": "array", "items": {"$ref": "#/$defs/ResolvedJsonValue"}},
+                    {
+                        "type": "object",
+                        "propertyNames": {"not": {"enum": sorted(REFERENCE_KEYS)}},
+                        "additionalProperties": {"$ref": "#/$defs/ResolvedJsonValue"},
+                    },
+                ]
+            },
+        )
     return expanded
 
 

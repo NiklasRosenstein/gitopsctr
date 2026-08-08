@@ -10,6 +10,7 @@ from mashumaro.types import SerializableType
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
+REFERENCE_KEYS = frozenset(("fromReceipt", "fromArtifact", "fromPromotion"))
 
 
 def require_json_value(value: object) -> JsonValue:
@@ -35,6 +36,34 @@ class JsonObjectValue(dict[str, JsonValue], SerializableType):
         parsed = require_json_value(value)
         if not isinstance(parsed, dict):
             raise ValueError("expected a JSON object")
+        return cls(parsed)
+
+
+def require_resolved_json_value(value: object) -> JsonValue:
+    """Validate JSON while rejecting authored reference-expression keys."""
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, list):
+        return [require_resolved_json_value(item) for item in value]
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        if REFERENCE_KEYS.intersection(value):
+            raise ValueError("resolved JSON must not contain authored reference expressions")
+        return {cast(str, key): require_resolved_json_value(item) for key, item in value.items()}
+    raise ValueError(f"expected a resolved JSON value, got {type(value).__name__}")
+
+
+class ResolvedJsonObjectValue(dict[str, JsonValue], SerializableType):
+    """Mashumaro-compatible JSON object that cannot contain authored references."""
+
+    def _serialize(self) -> JsonObject:
+        return dict(self)
+
+    @classmethod
+    def _deserialize(cls, value: object) -> ResolvedJsonObjectValue:
+        parsed = require_resolved_json_value(value)
+        if not isinstance(parsed, dict):
+            raise ValueError("expected a resolved JSON object")
         return cls(parsed)
 
 

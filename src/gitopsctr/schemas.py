@@ -44,6 +44,12 @@ def _specification_schema(contract: DocumentContract) -> JsonObject:
     return schema
 
 
+def _resolved_inputs_schema() -> JsonObject:
+    schema = CORE_CONTRACTS["receipt"].json_schema()
+    properties = cast(dict[str, JsonObject], schema["properties"])
+    return deepcopy(properties["resolvedInputs"])
+
+
 def _resource_schema(
     *,
     schema_id: str,
@@ -147,7 +153,7 @@ def receipt_resource_schema(driver: str) -> JsonObject:
                         "additionalProperties": False,
                     },
                     "desired": {"type": "object"},
-                    "resolvedInputs": {"type": "object"},
+                    "resolvedInputs": _resolved_inputs_schema(),
                 },
                 "required": ["subject", "desired"],
                 "additionalProperties": False,
@@ -175,7 +181,7 @@ def core_resource_schema(kind: str) -> JsonObject:
             "properties": {
                 "subject": {"type": "object"},
                 "desired": {"type": "object"},
-                "resolvedInputs": {"type": "object"},
+                "resolvedInputs": _resolved_inputs_schema(),
             },
             "required": ["subject", "desired"],
             "additionalProperties": False,

@@ -23,7 +23,7 @@ from gitopsctr.contracts import (
     StrictModel,
     schema_url,
 )
-from gitopsctr.document import JsonObject, JsonObjectValue
+from gitopsctr.document import JsonObject, ResolvedJsonObjectValue
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -99,7 +99,7 @@ class OciImagesDesiredUnit(StrictModel):
     source: DesiredSource
     build: OciBuild | None = None
     publish: OciPublication | None = None
-    inputs: JsonObjectValue | None = None
+    inputs: ResolvedJsonObjectValue | None = None
     resolvedInputs: ResolvedInputs | None = None
 
 

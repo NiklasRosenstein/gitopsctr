@@ -16,7 +16,7 @@ from typing import Any, ClassVar
 from gitopsctr.api import GVK, ApiKind, api_kinds
 from gitopsctr.artifacts import ArtifactApi, require_artifact_api
 from gitopsctr.contracts import DesiredSource, MaterializationDocument, ResolvedInputs, StrictModel
-from gitopsctr.document import DocumentContract, JsonObject, TypedDocumentContract
+from gitopsctr.document import JsonObject, TypedDocumentContract
 from gitopsctr.execution import DriverExecution, default_driver_execution
 from gitopsctr.resolution import TemplateResolution
 
@@ -266,7 +266,7 @@ def load_unit_drivers(
             raise DriverError(f"duplicate unit driver entry point: {driver.driver_name}")
         for kind in ("unit", "resolved_unit", "desired_unit", "result"):
             contract = getattr(driver, f"{kind}_contract", None)
-            if not isinstance(contract, DocumentContract):
+            if not isinstance(contract, TypedDocumentContract):
                 raise DriverError(f"unit driver API {api_kind.gvk!s} has no {kind.replace('_', '-')} contract")
         for artifact_name, artifact_kind in driver.artifact_outputs.items():
             if not artifact_name or not artifact_name.replace("-", "").isalnum() or not artifact_name.islower():

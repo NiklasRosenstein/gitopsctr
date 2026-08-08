@@ -990,19 +990,26 @@ def parse_artifact_reference(reference: object) -> ArtifactReferenceTarget:
         gvk = GVK(api_version, kind)
     except ValueError as exc:
         raise OperationError(str(exc)) from exc
-    api_kind = API_KINDS.get(gvk)
-    if api_kind is None:
-        raise OperationError(f"fromArtifact references an unregistered API kind: {gvk}")
-    try:
-        require_artifact_api(api_kind)
-    except ApiError as exc:
-        raise OperationError(f"fromArtifact API kind is not an artifact resource: {gvk}") from exc
-    return ArtifactReferenceTarget(
+    target = ArtifactReferenceTarget(
         unit=unit_name,
         name=artifact_name,
         apiVersion=gvk.api_version,
         kind=gvk.kind,
     )
+    validate_artifact_reference_target(target)
+    return target
+
+
+def validate_artifact_reference_target(reference: ArtifactReferenceTarget) -> None:
+    """Require an artifact reference to target an installed artifact API."""
+
+    api_kind = API_KINDS.get(reference.gvk)
+    if api_kind is None:
+        raise OperationError(f"fromArtifact references an unregistered API kind: {reference.gvk}")
+    try:
+        require_artifact_api(api_kind)
+    except ApiError as exc:
+        raise OperationError(f"fromArtifact API kind is not an artifact resource: {reference.gvk}") from exc
 
 
 def resolve_template(
@@ -1042,13 +1049,7 @@ def resolve_template(
         receipt = current_receipt(observed, candidate / "units", reference.unit)
         if receipt is None:
             raise ReferenceUnavailable(f"receipt is stale: {reference.unit}")
-        api_kind = API_KINDS.get(reference.gvk)
-        if api_kind is None:
-            raise OperationError(f"fromArtifact references an unregistered API kind: {reference.gvk}")
-        try:
-            require_artifact_api(api_kind)
-        except ApiError as exc:
-            raise OperationError(f"fromArtifact API kind is not an artifact resource: {reference.gvk}") from exc
+        validate_artifact_reference_target(reference)
         producer_unit = load_desired_unit(unit_document_path(candidate, reference.unit), reference.unit)
         producer_driver = producer_unit.driver
         artifact_kind = producer_driver.artifact_outputs.get(reference.name) if producer_driver is not None else None
@@ -1285,6 +1286,9 @@ def reconciliation_statuses(unit_names: Sequence[str], desired: Path, observed: 
         unit_path = unit_document_path(desired, unit_name)
         receipt_path = unit_document_path(observed, unit_name)
         if not unit_path.is_file():
+            statuses.append((unit_name, "WAIT", "desired inputs are not materialized"))
+            continue
+        if raw_unit_contains_reference(load_json(unit_path)):
             statuses.append((unit_name, "WAIT", "desired inputs are not materialized"))
             continue
         unit = load_desired_unit(unit_path, unit_name)
@@ -1705,6 +1709,13 @@ def materialize_resolved_unit(
     return desired
 
 
+@dataclass(frozen=True)
+class BuildDesiredResult:
+    """Outcome of desired-state construction, including units blocked by unavailable inputs."""
+
+    blocked: Mapping[str, str]
+
+
 def build_desired_candidate(
     environment_name: str,
     source_root: Path,
@@ -1715,7 +1726,7 @@ def build_desired_candidate(
     candidate: Path,
     promotion: PromotionContext | None = None,
     verbose: bool = True,
-) -> None:
+) -> BuildDesiredResult:
     if verbose:
         log_heading(f"Resolve desired state for {style_environment(environment_name)}")
         log_status("SOURCE", f"candidate revision {describe_revision(source_revision)}")
@@ -1750,6 +1761,7 @@ def build_desired_candidate(
 
     unresolved = set(prepared)
     unavailable: dict[str, str] = {}
+    blocked: dict[str, str] = {}
     while unresolved:
         progressed = False
         for unit_name in sorted(unresolved):
@@ -1833,6 +1845,8 @@ def build_desired_candidate(
             resolution = "omit until its inputs are available"
         if verbose:
             log_status("WAIT", f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}")
+        blocked[unit_name] = unavailable[unit_name]
+    return BuildDesiredResult(blocked=blocked)
 
 
 def retryable_push_failure(exc: subprocess.CalledProcessError) -> bool:
@@ -2833,6 +2847,8 @@ def command_verify(args: argparse.Namespace) -> None:
 
         prepared: list[tuple[str, str, UnitResource[Any], DesiredSource]] = []
         for unit_name in selected:
+            if raw_unit_contains_reference(load_json(available[unit_name])):
+                raise OperationError(f"{unit_name} desired state is not fully materialized")
             unit = load_desired_unit(available[unit_name], unit_name)
             driver_name, source = require_unit(unit, unit_name)
             validate_unit_materialization(desired, unit_name, unit)
@@ -2948,6 +2964,14 @@ def unit_contains_reference(unit: UnitResource[Any]) -> bool:
     return contains_reference(unit.driver.desired_unit_contract.dump(unit.spec))
 
 
+def raw_unit_contains_reference(document: object) -> bool:
+    """Check an untrusted persisted unit before requiring its final desired contract."""
+
+    if isinstance(document, dict) and isinstance(document.get("spec"), dict):
+        return contains_reference(document["spec"])
+    return contains_reference(document)
+
+
 def reference_paths(value: object, reference_type: str, pointer: str = "") -> set[str]:
     """Collect validated logical unit names referenced by one reference type."""
     if reference_type not in {"fromReceipt", "fromArtifact", "fromPromotion"}:
@@ -2978,11 +3002,12 @@ def artifact_references(value: Any, pointer: str = "") -> set[ArtifactReferenceT
     Invalid references include their JSON Pointer location so callers can identify
     the offending field in a larger unit document.
     """
-    return {
-        reference.fromArtifact
-        for reference in template_references(_template(value, pointer))
-        if isinstance(reference, ArtifactReferenceExpression)
-    }
+    found: set[ArtifactReferenceTarget] = set()
+    for expression in template_references(_template(value, pointer)):
+        if isinstance(expression, ArtifactReferenceExpression):
+            validate_artifact_reference_target(expression.fromArtifact)
+            found.add(expression.fromArtifact)
+    return found
 
 
 def log_dependency_graph(graph: Mapping[str, tuple[str, ...]]) -> None:
@@ -3135,7 +3160,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             assert source_revision is not None
             current_desired = temporary / "current-desired"
             observed_tree(desired_ref, current_desired)
-            build_desired_candidate(
+            candidate_result = build_desired_candidate(
                 args.environment,
                 candidate_source_root,
                 source_revision,
@@ -3144,6 +3169,11 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 observed_revision,
                 desired,
             )
+            if args.unit in candidate_result.blocked:
+                log_status("WAIT", candidate_result.blocked[args.unit])
+                log_status("DONE", f"{style_unit(args.unit)}: no changes")
+                write_reconcile_outputs(False)
+                return False
             desired_revision = f"dry:{source_revision}"
         elif not pre_advance:
             desired_revision = resolve_ref(desired_ref, args.desired_revision)
@@ -3158,6 +3188,11 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         )
         unit_path = unit_document_path(desired, args.unit)
         if not unit_path.is_file():
+            log_status("WAIT", "desired inputs are not materialized")
+            log_status("DONE", f"{style_unit(args.unit)}: no changes")
+            write_reconcile_outputs(False)
+            return False
+        if raw_unit_contains_reference(load_json(unit_path)):
             log_status("WAIT", "desired inputs are not materialized")
             log_status("DONE", f"{style_unit(args.unit)}: no changes")
             write_reconcile_outputs(False)

@@ -19,6 +19,7 @@ from gitopsctr.api import GVK, ApiError, ApiKind
 from gitopsctr.artifacts import CONTAINER_IMAGES, ArtifactApi, ContainerImagesResource, require_artifact_api
 from gitopsctr.contracts import DesiredSource, MashumaroContract
 from gitopsctr.contrib.drivers.oci_images import OciImagesDesiredUnit
+from gitopsctr.document import DocumentContract, JsonObject
 from gitopsctr.driver import (
     DriverError,
     ReconciliationCapability,
@@ -261,6 +262,38 @@ def test_driver_rejects_non_authoritative_artifact_api_handle() -> None:
         driver_registry.load_unit_drivers(installed)
 
 
+def test_driver_rejects_untyped_contracts_at_registration() -> None:
+    contracts = cli.UNIT_DRIVERS["oci-images"]
+
+    class LegacyContract(DocumentContract):
+        def validate(self, document: object) -> JsonObject:
+            return {}
+
+        def json_schema(self) -> JsonObject:
+            return {"type": "object"}
+
+    class InvalidDriver(UnitDriver, ReconciliationCapability):
+        api_version = "example.test/v1"
+        kind = "Invalid"
+        driver_name = "invalid"
+        version = 1
+        unit_contract = contracts.unit_contract
+        resolved_unit_contract = contracts.resolved_unit_contract
+        desired_unit_contract = contracts.desired_unit_contract
+        result_contract = LegacyContract()
+
+        def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
+            raise NotImplementedError
+
+        def semantic_result(self, result: object) -> ReconciliationResult:
+            return {}
+
+    invalid = ApiKind(GVK(InvalidDriver.api_version, InvalidDriver.kind), InvalidDriver())
+
+    with pytest.raises(DriverError, match="result contract"):
+        driver_registry.load_unit_drivers({invalid.gvk: invalid})
+
+
 def test_artifact_reference_requires_an_explicit_registered_type() -> None:
     with pytest.raises(cli.OperationError, match="requires string apiVersion and kind"):
         cli.parse_artifact_reference({"unit": "images", "name": "containers"})
@@ -273,6 +306,20 @@ def test_artifact_reference_requires_an_explicit_registered_type() -> None:
             "kind": "ContainerImages",
         }
     )
+
+    with pytest.raises(cli.OperationError, match="unregistered API kind"):
+        cli.artifact_references(
+            {
+                "image": {
+                    "fromArtifact": {
+                        "unit": "images",
+                        "name": "containers",
+                        "apiVersion": "artifact.gitopsctr.io/v1",
+                        "kind": "UnknownArtifact",
+                    }
+                }
+            }
+        )
     assert reference.gvk == CONTAINER_IMAGES.gvk
 
     with pytest.raises(cli.OperationError, match="unregistered API kind"):

@@ -1,5 +1,6 @@
 import pytest
 
+from gitopsctr.document import ResolvedJsonObjectValue
 from gitopsctr.errors import OperationError
 from gitopsctr.resolution import FingerprintedValue, ResolutionContext, resolve_template
 from gitopsctr.templates import (
@@ -105,3 +106,8 @@ def test_resolution_wraps_invalid_authored_values_as_operation_errors():
     )
     with pytest.raises(OperationError, match="dryFallback"):
         resolve_template({"fromReceipt": {"unit": "db", "dryFallback": None}}, context)
+
+
+def test_resolved_json_rejects_authored_reference_shapes_recursively():
+    with pytest.raises(ValueError, match="authored reference"):
+        ResolvedJsonObjectValue._deserialize({"nested": [{"fromReceipt": {"unit": "db"}}]})

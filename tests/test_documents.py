@@ -189,6 +189,26 @@ def test_yaml_demo_documents_validate_against_published_resource_schemas():
         Draft202012Validator(by_id[match.group(1)]).validate(document)
 
 
+def test_receipt_result_cannot_override_envelope_identity():
+    with pytest.raises(cli.OperationError, match="reserved fields"):
+        cli.RESOURCE_CATALOG.normalize_receipt(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "Receipt",
+                "metadata": {"name": "terraform"},
+                "spec": {
+                    "subject": {
+                        "apiVersion": "unit.gitopsctr.io/v1",
+                        "kind": "Terraform",
+                        "name": "terraform",
+                    },
+                    "desired": {"unitBlob": "f" * 40},
+                },
+                "status": {"result": {"driver": "oci-images"}},
+            }
+        )
+
+
 def test_migration_script_converts_a_source_branch_in_one_forward_commit(tmp_path: Path):
     environment_root = tmp_path / "deployment/environments/dev"
     units_root = environment_root / "units"

@@ -17,7 +17,7 @@ from gitopsctr.contracts import (
     StrictModel,
     schema_url,
 )
-from gitopsctr.document import JsonObject, JsonObjectValue, JsonValue
+from gitopsctr.document import JsonObject, JsonValue, ResolvedJsonObjectValue
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -70,7 +70,7 @@ class TerraformAuthoredConfiguration(StrictModel):
 @dataclass(frozen=True, kw_only=True)
 class TerraformConfiguration(StrictModel):
     backend: dict[str, str | int | float | bool] | None = None
-    variables: JsonObjectValue | None = None
+    variables: ResolvedJsonObjectValue | None = None
     observeOutputs: list[str] | None = None
     checks: list[TerraformHttpCheck] | None = None
 
@@ -86,7 +86,7 @@ class TerraformUnit(StrictModel):
 class TerraformDesiredUnit(StrictModel):
     source: DesiredSource
     terraform: TerraformConfiguration | None = None
-    inputs: JsonObjectValue | None = None
+    inputs: ResolvedJsonObjectValue | None = None
     resolvedInputs: ResolvedInputs | None = None
 
 
@@ -198,7 +198,7 @@ class TerraformDriver(
                 variable_resolution = context.resolve_template(unit.terraform.variables._serialize())
                 if not isinstance(variable_resolution.value, dict):
                     raise DriverError("resolved Terraform variables must be an object")
-                variables = JsonObjectValue(variable_resolution.value)
+                variables = ResolvedJsonObjectValue(variable_resolution.value)
                 resolutions.append(variable_resolution)
             configuration = TerraformConfiguration(
                 backend=unit.terraform.backend,
@@ -211,7 +211,7 @@ class TerraformDriver(
             input_resolution = context.resolve_template(unit.inputs._serialize())
             if not isinstance(input_resolution.value, dict):
                 raise DriverError("resolved Terraform inputs must be an object")
-            inputs = JsonObjectValue(input_resolution.value)
+            inputs = ResolvedJsonObjectValue(input_resolution.value)
             resolutions.append(input_resolution)
         fingerprints = reference_fingerprints(*resolutions)
         return UnitResolution(

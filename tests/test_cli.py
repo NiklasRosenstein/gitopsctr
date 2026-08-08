@@ -290,9 +290,10 @@ def test_blocked_unit_with_same_driver_retains_previous_desired_state(tmp_path, 
         ),
     )
 
-    deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate)
+    result = deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate)
 
     assert (candidate / "units/frontend.json").read_bytes() == previous.read_bytes()
+    assert "frontend" in result.blocked
 
 
 def test_removing_producer_environment_preserves_existing_input_hash(tmp_path):
@@ -1506,18 +1507,18 @@ def _install_convergence_simulation(
         index = desired_revisions.index(revision)
         for unit_name, blob in desired_units[index].items():
             specification = specifications[unit_name]
-            _write_json(
-                output / f"units/{unit_name}.json",
-                {
-                    **specification,
-                    "source": {
-                        **specification["source"],
-                        "revision": source_revision,
-                        "driverVersion": deploy_release.DRIVER_VERSIONS[specification["driver"]],
-                    },
-                    "terraform": {"variables": {"blob": blob}},
+            desired = {
+                **specification,
+                "source": {
+                    **specification["source"],
+                    "revision": source_revision,
+                    "driverVersion": deploy_release.DRIVER_VERSIONS[specification["driver"]],
                 },
-            )
+                "terraform": {"variables": {"blob": blob}},
+            }
+            if "inputs" in specification:
+                desired["inputs"] = {"value": blob}
+            _write_json(output / f"units/{unit_name}.json", desired)
 
     def observed_tree(ref: str, output: Path):
         output.mkdir(parents=True, exist_ok=True)

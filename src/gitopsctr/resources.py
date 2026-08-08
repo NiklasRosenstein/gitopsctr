@@ -216,6 +216,10 @@ class ResourceCatalog:
         result = status.get("result", {})
         if not isinstance(result, dict):
             raise OperationError("receipt status.result must be a mapping")
+        reserved = {"unit", "driver", "desired", "resolvedInputs", "controller", "artifacts", "$schema", "schema"}
+        overlap = reserved.intersection(result)
+        if overlap:
+            raise OperationError(f"receipt result contains reserved fields: {sorted(overlap)}")
         return {
             "unit": name,
             "driver": driver,
