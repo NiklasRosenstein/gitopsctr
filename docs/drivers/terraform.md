@@ -31,8 +31,9 @@ spec:
         path: /health
 ```
 
-`source.path` identifies the Terraform working directory. `source.inputs` is
-the input fingerprint; glob patterns are supported. `backend` is passed to
+`source.path` identifies the Terraform working directory relative to the root
+of the selected source revision. `source.inputs` is the input fingerprint,
+resolved relative to that working directory; glob patterns are supported. `backend` is passed to
 `terraform init`, `variables` become `TF_VAR_*` values, and `observeOutputs`
 selects outputs that downstream units may consume. HTTP checks are optional and
 run after apply. Backend and variable values must be JSON-compatible scalar or

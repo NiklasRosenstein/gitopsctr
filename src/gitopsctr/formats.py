@@ -177,7 +177,9 @@ def document_candidates(directory: Path, stem: str) -> tuple[Path, ...]:
 def write_document(path: Path, value: dict[str, Any], *, format: DocumentFormat | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     selected = format or (DocumentFormat.JSON if path.suffix.lower() == ".json" else DocumentFormat.YAML)
-    output = path if selected is DocumentFormat.YAML and path.suffix.lower() == ".yml" else path.with_suffix(selected.suffix)
+    output = (
+        path if selected is DocumentFormat.YAML and path.suffix.lower() == ".yml" else path.with_suffix(selected.suffix)
+    )
     if selected is DocumentFormat.JSON:
         text = json.dumps(value, indent=2, sort_keys=True) + "\n"
     else:

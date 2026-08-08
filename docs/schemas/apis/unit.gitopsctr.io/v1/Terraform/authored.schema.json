@@ -59,9 +59,11 @@
                   "type": "null"
                 }
               ],
-              "default": null
+              "default": null,
+              "description": "Input paths or glob patterns resolved relative to source.path."
             },
             "path": {
+              "description": "Repository-relative path resolved from the root of the selected source revision.",
               "type": "string"
             }
           },

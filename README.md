@@ -27,6 +27,8 @@ the current directory. Use `--repository PATH` or `GITOPSCTR_REPOSITORY` to sele
 
 Important commands include:
 
+- `create project|environment|unit`: scaffold schema-valid authored resources.
+- `validate`: validate files, environments, or the complete authored Project.
 - `advance-desired`: materialize the next desired-state commit.
 - `reconcile --plan`: run a speculative unit-driver plan without applying or publishing a receipt.
 - `reconcile`: apply one unit and publish its receipt.

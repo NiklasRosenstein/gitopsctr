@@ -31,6 +31,7 @@
       "additionalProperties": false,
       "properties": {
         "environmentsPath": {
+          "description": "Repository-relative directory containing authored environments.",
           "minLength": 1,
           "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$",
           "type": "string"

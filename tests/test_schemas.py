@@ -73,6 +73,13 @@ def test_schema_hint_is_ignored_for_runtime_validation():
         assert contract.validate(candidate) == candidate
 
 
+def test_source_schema_describes_repository_relative_path_semantics():
+    schema = UNIT_DRIVERS["terraform"].unit_contract.json_schema()
+    source = schema["properties"]["source"]
+    assert "root of the selected source revision" in source["properties"]["path"]["description"]
+    assert "relative to source.path" in source["properties"]["inputs"]["description"]
+
+
 def test_resource_contracts_use_api_version_instead_of_envelope_schema_field():
     for driver in UNIT_DRIVERS.values():
         for contract in (driver.unit_contract, driver.desired_unit_contract):

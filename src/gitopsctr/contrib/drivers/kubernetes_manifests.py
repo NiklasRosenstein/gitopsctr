@@ -455,7 +455,11 @@ class KubernetesManifestsDriver(
     def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject:
         return {
             "source": {"path": source_path},
-            "materialize": {"type": "plain", "paths": ["**/*.yaml", "**/*.yml"], "allowSecrets": False},
+            "materialize": {
+                "type": "plain",
+                "paths": ["manifests/**/*.yaml", "manifests/**/*.yml"],
+                "allowSecrets": False,
+            },
             "delivery": {"mode": "external"},
         }
 

@@ -83,6 +83,19 @@ def test_create_project_validates_before_writing_and_requires_force(tmp_path: Pa
     run_command(tmp_path, ["create", "project", "--name", "second", "--force"])
     assert yaml.safe_load((tmp_path / "gitopsctr.yaml").read_text())["metadata"]["name"] == "second"
 
+    with pytest.raises(cli.OperationError, match="environmentsPath"):
+        run_command(
+            tmp_path,
+            ["create", "project", "--name", "second", "--environments-path", "../outside", "--force"],
+        )
+
+
+def test_create_project_rejects_ambiguous_configuration_even_with_force(tmp_path: Path):
+    write_yaml(tmp_path / "gitopsctr.yaml", project_document())
+    write_yaml(tmp_path / ".gitopsctr.yml", project_document())
+    with pytest.raises(cli.OperationError, match="multiple Project configuration"):
+        run_command(tmp_path, ["create", "project", "--name", "replacement", "--force"])
+
 
 def test_create_environment_uses_the_project_path_format_and_gate(tmp_path: Path):
     create_project(tmp_path, write_format="json", environments_path="config/environments")
@@ -93,6 +106,26 @@ def test_create_environment_uses_the_project_path_format_and_gate(tmp_path: Path
     assert document["metadata"]["name"] == "dev"
     assert document["spec"] == {"changeGate": "pullRequest"}
     assert not (tmp_path / "deployment/environments").exists()
+
+    run_command(tmp_path, ["validate", "--environment", "dev"])
+
+
+def test_create_environment_requires_a_project_and_handles_force_and_duplicates(tmp_path: Path):
+    with pytest.raises(cli.OperationError, match="no Project configuration"):
+        create_environment(tmp_path)
+    create_project(tmp_path)
+    create_environment(tmp_path)
+    with pytest.raises(cli.OperationError, match="already exists"):
+        create_environment(tmp_path)
+    run_command(
+        tmp_path,
+        ["create", "environment", "--name", "dev", "--change-gate", "pullRequest", "--force"],
+    )
+    environment_root = tmp_path / "deployment/environments/dev"
+    assert yaml.safe_load((environment_root / "environment.yaml").read_text())["spec"]["changeGate"] == "pullRequest"
+    (environment_root / "environment.json").write_text("{}")
+    with pytest.raises(cli.OperationError, match="multiple document formats"):
+        run_command(tmp_path, ["create", "environment", "--name", "dev", "--force"])
 
 
 @pytest.mark.parametrize("driver_name", sorted(UNIT_DRIVERS))
@@ -136,7 +169,18 @@ def test_create_unit_rejects_unsafe_source_paths_and_unsupported_scaffolding(
     with pytest.raises(cli.OperationError, match="stay inside"):
         run_command(
             tmp_path,
-            ["create", "unit", "--environment", "dev", "--name", "bad", "--driver", "terraform", "--source-path", "../bad"],
+            [
+                "create",
+                "unit",
+                "--environment",
+                "dev",
+                "--name",
+                "bad",
+                "--driver",
+                "terraform",
+                "--source-path",
+                "../bad",
+            ],
         )
 
     unsupported = UnitDriver()
@@ -171,6 +215,17 @@ def test_force_replaces_one_existing_representation_without_creating_a_duplicate
     units = tmp_path / "deployment/environments/dev/units"
     assert [path.name for path in units.iterdir()] == ["infra.yaml"]
     assert yaml.safe_load((units / "infra.yaml").read_text())["kind"] == "OciImages"
+
+
+def test_json_unit_contains_the_pinned_schema_property(tmp_path: Path):
+    create_project(tmp_path, write_format="json")
+    create_environment(tmp_path)
+    run_command(
+        tmp_path,
+        ["create", "unit", "--environment", "dev", "--name", "infra", "--driver", "terraform"],
+    )
+    document = json.loads((tmp_path / "deployment/environments/dev/units/infra.json").read_text())
+    assert document["$schema"].endswith("/Terraform/authored.schema.json")
 
 
 def test_validate_whole_project_selected_environment_and_files(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
@@ -222,3 +277,35 @@ def test_validate_rejects_duplicate_unit_representations(tmp_path: Path):
 
     with pytest.raises(cli.OperationError, match="1 error"):
         run_command(tmp_path, ["validate", "--environment", "dev"])
+    with pytest.raises(cli.OperationError, match="1 error"):
+        run_command(tmp_path, ["validate", "deployment/environments/dev/units/infra.yaml"])
+
+
+def test_validate_applies_cross_unit_observation_rules(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    create_project(tmp_path)
+    create_environment(tmp_path)
+    units = tmp_path / "deployment/environments/dev/units"
+    producer = {
+        "name": "manifests",
+        "driver": "kubernetes-manifests",
+        **UNIT_DRIVERS["kubernetes-manifests"].scaffold_unit_spec("manifests", "kubernetes"),
+    }
+    consumer = {
+        "name": "consumer",
+        "driver": "terraform",
+        **UNIT_DRIVERS["terraform"].scaffold_unit_spec("consumer", "terraform"),
+        "inputs": {"value": {"fromObservation": "units/manifests.yaml"}},
+    }
+    write_yaml(units / "manifests.yaml", cli.serialize_unit_document(producer, profile="authored"))
+    write_yaml(units / "consumer.yaml", cli.serialize_unit_document(consumer, profile="authored"))
+    capsys.readouterr()
+
+    with pytest.raises(cli.OperationError, match="1 error"):
+        run_command(tmp_path, ["validate", "--environment", "dev"])
+    assert "cannot observe materialization-only unit" in capsys.readouterr().err
+
+
+def test_validate_rejects_an_invalid_environment_target_before_path_resolution(tmp_path: Path):
+    create_project(tmp_path)
+    with pytest.raises(cli.OperationError, match="invalid environment name"):
+        run_command(tmp_path, ["validate", "--environment", "../outside", "--fail-fast"])

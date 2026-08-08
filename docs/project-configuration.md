@@ -4,6 +4,16 @@ Every GitOpsCTR source tree contains a `Project` resource. It identifies the
 project, locates authored environments, and selects the preferred format for
 generated documents.
 
+Create it from the root of an existing Git working tree:
+
+```console
+gitopsctr create project --name my-project
+```
+
+Use `--write-format json` or `--environments-path config/environments` to
+select non-default values. The command writes only `gitopsctr.yaml`; create
+environments separately after the Project exists.
+
 ```yaml
 # yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Project.schema.json
 apiVersion: gitopsctr.io/v1
@@ -33,6 +43,13 @@ create a second copy of a logical document.
 `<environmentsPath>/dev/units/`. Absolute paths and paths containing `..` are
 rejected. Generated desired and observed branches continue to store documents
 under top-level `units/`.
+
+Create an environment in that configured location with:
+
+```console
+gitopsctr create environment --name dev
+gitopsctr create environment --name prod --change-gate pullRequest
+```
 
 Use the canonical filename `gitopsctr.yaml`; `.yml`, `.gitopsctr.yaml`, and
 `.gitopsctr.yml` are also accepted. A source tree must contain exactly one of

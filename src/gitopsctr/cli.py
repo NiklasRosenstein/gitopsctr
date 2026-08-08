@@ -3480,7 +3480,9 @@ def command_create_environment(args: argparse.Namespace) -> None:
     )
     environment = {"name": args.name, "changeGate": args.change_gate}
     validate_document(CORE_CONTRACTS["environment"], environment, f"environment specification {args.name}")
-    written = write_document(target, serialize_environment_document(environment), format=_document_format_for_path(target))
+    written = write_document(
+        target, serialize_environment_document(environment), format=_document_format_for_path(target)
+    )
     _print_created(written)
 
 
@@ -3500,7 +3502,7 @@ def command_create_unit(args: argparse.Namespace) -> None:
         raise OperationError(
             f"unit driver {args.driver!r} does not support scaffolding; create the document from its authored schema"
         )
-    unit = {"name": args.name, "driver": args.driver, **scaffold}
+    unit = {**scaffold, "name": args.name, "driver": args.driver}
     require_unit_specification(unit, args.name)
     target = _creation_target(
         environment_root / "units",
@@ -3580,11 +3582,22 @@ def _validate_authored_file(path: Path, collector: ValidationCollector) -> None:
     api_version = document.get("apiVersion")
     kind = document.get("kind")
     if api_version == CORE_API_VERSION and kind == "Project":
-        _validate_project_file(path, collector)
+        if path.name not in PROJECT_CONFIG_NAMES:
+            collector.invalid(path, f"Project resource must use one of: {', '.join(PROJECT_CONFIG_NAMES)}")
+        elif len([path.parent / name for name in PROJECT_CONFIG_NAMES if (path.parent / name).is_file()]) != 1:
+            collector.invalid(path.parent, "multiple Project configuration files exist")
+        else:
+            _validate_project_file(path, collector)
     elif api_version == CORE_API_VERSION and kind == "Environment":
-        _validate_environment_file(path, collector)
+        if len(document_candidates(path.parent, "environment")) != 1:
+            collector.invalid(path.parent, "multiple document formats exist for environment")
+        else:
+            _validate_environment_file(path, collector)
     elif api_version == UNIT_API_VERSION:
-        _validate_unit_file(path, collector)
+        if len(document_candidates(path.parent, path.stem)) != 1:
+            collector.invalid(path.parent / path.stem, f"multiple document formats exist for unit {path.stem}")
+        else:
+            _validate_unit_file(path, collector)
     else:
         collector.invalid(path, f"unsupported authored resource {api_version}/{kind}")
 
@@ -3594,8 +3607,9 @@ def _validate_environment(environment_name: str, collector: ValidationCollector)
         return
     collector.environments.add(environment_name)
     try:
+        _resource_name(environment_name, "environment name")
         environment_root = project_environment_root(REPOSITORY_ROOT, environment_name)
-    except DocumentFormatError as exc:
+    except (DocumentFormatError, OperationError) as exc:
         collector.invalid(environment_name, exc)
         return
 
@@ -3611,7 +3625,6 @@ def _validate_environment(environment_name: str, collector: ValidationCollector)
     units_root = environment_root / "units"
     stems = sorted({path.stem for path in units_root.glob("*") if path.suffix in {".json", ".yaml", ".yml"}})
     if not stems:
-        collector.invalid(units_root, f"environment has no units: {environment_name}")
         return
 
     specifications: dict[str, dict[str, Any]] = {}
@@ -3659,7 +3672,9 @@ def command_validate(args: argparse.Namespace) -> None:
     else:
         try:
             project = load_project_config(REPOSITORY_ROOT)
-            project_path = next(REPOSITORY_ROOT / name for name in PROJECT_CONFIG_NAMES if (REPOSITORY_ROOT / name).is_file())
+            project_path = next(
+                REPOSITORY_ROOT / name for name in PROJECT_CONFIG_NAMES if (REPOSITORY_ROOT / name).is_file()
+            )
             collector.valid_document(project_path)
         except (DocumentFormatError, StopIteration) as exc:
             collector.invalid(REPOSITORY_ROOT / "gitopsctr.yaml", exc)
