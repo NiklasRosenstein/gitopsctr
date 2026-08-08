@@ -678,6 +678,67 @@ def test_progress_helpers_keep_result_stdout_clean(capsys):
     assert output.err == "\n==> Reconcile frontend\n    DONE     frontend: clean\n"
 
 
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "expected"),
+    [
+        ("Deploy frontend\n", 0, "Deploy frontend"),
+        ("  Deploy\tfrontend\x00 now  \n", 0, "Deploy frontend now"),
+        ("x" * 73 + "\n", 0, "x" * 71 + "…"),
+        ("\n", 0, None),
+        ("", 128, None),
+    ],
+)
+def test_commit_subject_is_safe_bounded_and_optional(monkeypatch, stdout, returncode, expected):
+    deploy_release.commit_subject.cache_clear()
+    monkeypatch.setattr(
+        deploy_release,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(_args, returncode, stdout, ""),
+    )
+
+    assert deploy_release.commit_subject(Path("/repository"), "a" * 40) == expected
+
+
+def test_describe_revision_includes_cached_subject_and_preserves_dry_prefix(tmp_path, monkeypatch):
+    calls = []
+    deploy_release.commit_subject.cache_clear()
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
+
+    def run(*args, **_kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "Preview deployment\n", "")
+
+    monkeypatch.setattr(deploy_release, "run", run)
+    revision = "a" * 40
+
+    assert deploy_release.describe_revision(revision) == "aaaaaaaaaaaa (Preview deployment)"
+    assert deploy_release.describe_revision(f"dry:{revision}") == "dry:aaaaaaaaaaaa (Preview deployment)"
+    assert deploy_release.describe_revision(None) == "none"
+    assert len(calls) == 1
+
+
+def test_status_and_ref_movement_include_commit_subjects(tmp_path, monkeypatch, capsys):
+    revisions = {"deploy/dev": "a" * 40, "observed/dev": "b" * 40}
+    subjects = {"a" * 40: "Prepare desired state", "b" * 40: "Observe frontend"}
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(deploy_release, "observed_tree", lambda ref, _output: revisions[ref])
+    monkeypatch.setattr(deploy_release, "load_environment_specifications", lambda *_args: {})
+    monkeypatch.setattr(deploy_release, "commit_subject", lambda _root, revision: subjects.get(revision))
+    args = deploy_release.build_parser().parse_args(["status", "--environment", "dev"])
+
+    args.handler(args)
+    deploy_release.log_ref_advance(
+        deploy_release.RefAdvance("desired", "deploy/dev", "a" * 40, "b" * 40)
+    )
+
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "DESIRED  deploy/dev at aaaaaaaaaaaa (Prepare desired state)" in output.err
+    assert "OBSERVED observed/dev at bbbbbbbbbbbb (Observe frontend)" in output.err
+    assert "ADVANCE  deploy/dev aaaaaaaaaaaa (Prepare desired state) -> bbbbbbbbbbbb (Observe frontend)" in output.err
+
+
 def test_reconciliation_statuses_identify_clean_ready_and_waiting_units(tmp_path):
     desired = tmp_path / "desired"
     observed = tmp_path / "observed"

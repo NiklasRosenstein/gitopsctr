@@ -18,6 +18,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import cache
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -159,6 +160,42 @@ def run(
     }
     kwargs["capture_output"] = True
     return subprocess.run(args, **kwargs)
+
+
+@cache
+def commit_subject(repository_root: Path, revision: str) -> str | None:
+    """Return a safe, single-line commit subject without disrupting CLI output on failure."""
+    try:
+        result = run(
+            "git",
+            "show",
+            "--no-patch",
+            "--format=%s",
+            revision,
+            check=False,
+            cwd=repository_root,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    printable = "".join(character if character.isprintable() else " " for character in result.stdout)
+    subject = " ".join(printable.split())
+    if not subject:
+        return None
+    if len(subject) > 72:
+        subject = subject[:71] + "…"
+    return subject
+
+
+def describe_revision(revision: str | None) -> str:
+    """Render a shortened revision with its bounded commit subject when available."""
+    shortened = short_revision(revision)
+    if revision is None:
+        return shortened
+    resolved_revision = revision.removeprefix("dry:")
+    subject = commit_subject(REPOSITORY_ROOT, resolved_revision)
+    return f"{shortened} ({subject})" if subject else shortened
 
 
 def git(*args: str, check: bool = True, input_text: str | None = None, env=None):
@@ -1267,12 +1304,12 @@ def log_unit_change_explanation(
         return
     log_status(
         "LAST",
-        f"desired {short_revision(explanation.previous_desired_revision)}; "
-        f"source {short_revision(explanation.previous_source_revision)}",
+        f"desired {describe_revision(explanation.previous_desired_revision)}; "
+        f"source {describe_revision(explanation.previous_source_revision)}",
     )
     log_status(
         "CURRENT",
-        f"desired {short_revision(desired_revision)}; source {short_revision(explanation.current_source_revision)}",
+        f"desired {describe_revision(desired_revision)}; source {describe_revision(explanation.current_source_revision)}",
     )
     for cause in explanation.causes:
         log_status("CAUSE", cause)
@@ -1371,8 +1408,8 @@ def log_convergence_action(
         if explanation.previous_source_revision or explanation.current_source_revision:
             log_status(
                 "SOURCE",
-                f"{short_revision(explanation.previous_source_revision)} -> "
-                f"{short_revision(explanation.current_source_revision)}",
+                f"{describe_revision(explanation.previous_source_revision)} -> "
+                f"{describe_revision(explanation.current_source_revision)}",
             )
         for cause in explanation.causes:
             log_status("CAUSE", cause)
@@ -1484,11 +1521,11 @@ def build_desired_candidate(
 ) -> None:
     if verbose:
         log_heading(f"Resolve desired state for {environment_name}")
-        log_status("SOURCE", f"candidate revision {short_revision(source_revision)}")
+        log_status("SOURCE", f"candidate revision {describe_revision(source_revision)}")
         log_status("DESIRED", "no current state" if not any(current_desired.iterdir()) else "loaded")
         log_status(
             "OBSERVED",
-            f"revision {short_revision(observed_revision)}" if observed_revision else "no observations yet",
+            f"revision {describe_revision(observed_revision)}" if observed_revision else "no observations yet",
         )
     legacy_path = current_desired / "release.json"
     legacy = load_json(legacy_path) if legacy_path.is_file() else None
@@ -1513,7 +1550,7 @@ def build_desired_candidate(
         elif source_changed:
             source_resolution = "inputs changed; use candidate revision"
         else:
-            source_resolution = f"inputs unchanged; retain {short_revision(resolved_source['revision'])}"
+            source_resolution = f"inputs unchanged; retain {describe_revision(resolved_source['revision'])}"
         if verbose:
             log_status("CHECK", f"{unit_name}: {source_resolution}")
 
@@ -1728,7 +1765,7 @@ def desired_specification_revision(
         if match is not None:
             return match.group(1)
     raise OperationError(
-        f"desired revision {short_revision(desired_revision)} does not record its specification revision"
+        f"desired revision {describe_revision(desired_revision)} does not record its specification revision"
     )
 
 
@@ -1801,7 +1838,7 @@ def advance_desired(
         log_status(
             "START",
             (
-                f"environment {environment} from {short_revision(requested_source_revision)}"
+                f"environment {environment} from {describe_revision(requested_source_revision)}"
                 if requested_source_revision is not None
                 else f"environment {environment} from its merged promotion"
             ),
@@ -1836,7 +1873,7 @@ def advance_desired(
             if promotion is not None and verbose:
                 log_status(
                     "PIN",
-                    f"use reviewed specification {short_revision(effective_source_revision)} from promotion",
+                    f"use reviewed specification {describe_revision(effective_source_revision)} from promotion",
                 )
             if require_source_ref:
                 required_head = fetch_ref(require_source_ref)
@@ -1870,7 +1907,7 @@ def advance_desired(
                 if verbose:
                     log_status(
                         "KEEP",
-                        f"{desired_ref} already resolved at {short_revision(current_revision)}",
+                        f"{desired_ref} already resolved at {describe_revision(current_revision)}",
                     )
                 if summarize:
                     log_reconciliation_summary(environment, source_root, candidate, observed)
@@ -1889,7 +1926,7 @@ def advance_desired(
                     f"Desired {environment} state from {effective_source_revision}",
                 )
                 if verbose:
-                    log_status("UPDATE", f"{desired_ref} advanced to {short_revision(revision)}")
+                    log_status("UPDATE", f"{desired_ref} advanced to {describe_revision(revision)}")
                 if summarize:
                     log_reconciliation_summary(environment, source_root, candidate, observed)
                 return revision, True
@@ -1981,7 +2018,7 @@ def write_change_outputs(
 def command_promote(args: argparse.Namespace) -> None:
     specification_revision = git("rev-parse", f"{args.specification_revision or 'HEAD'}^{{commit}}").stdout.strip()
     log_heading(f"Promote {args.from_environment} to {args.to_environment}")
-    log_status("SPEC", f"reviewed source {short_revision(specification_revision)}")
+    log_status("SPEC", f"reviewed source {describe_revision(specification_revision)}")
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
         source_root = temporary / "source"
@@ -2007,8 +2044,8 @@ def command_promote(args: argparse.Namespace) -> None:
         evidence_label = "reconciled" if evidence == "reconciled" else "promotion-complete"
         log_status(
             "SOURCE",
-            f"{source_desired_ref} {short_revision(source_desired_revision)} is {evidence_label} at "
-            f"{short_revision(source_observed_revision)}",
+            f"{source_desired_ref} {describe_revision(source_desired_revision)} is {evidence_label} at "
+            f"{describe_revision(source_observed_revision)}",
         )
 
         target_desired_ref, target_observed_ref = deployment_refs(source_root, args.to_environment)
@@ -2040,7 +2077,7 @@ def command_promote(args: argparse.Namespace) -> None:
             )
             log_status(
                 "INIT",
-                f"created inert {target_desired_ref} at {short_revision(target_revision)}",
+                f"created inert {target_desired_ref} at {describe_revision(target_revision)}",
             )
         promotion = PromotionContext(
             source_environment=args.from_environment,
@@ -2086,7 +2123,7 @@ def command_promote(args: argparse.Namespace) -> None:
             )
             log_status(
                 "CANDIDATE",
-                f"{candidate_ref} at {short_revision(change_revision)} targets {target_desired_ref}",
+                f"{candidate_ref} at {describe_revision(change_revision)} targets {target_desired_ref}",
             )
         else:
             if args.candidate_ref:
@@ -2100,7 +2137,7 @@ def command_promote(args: argparse.Namespace) -> None:
             )
             log_status(
                 "UPDATE",
-                f"{target_desired_ref} advanced to {short_revision(change_revision)}",
+                f"{target_desired_ref} advanced to {describe_revision(change_revision)}",
             )
         print(change_revision)
         write_change_outputs(
@@ -2170,11 +2207,11 @@ def publish_desired_change(
         )
         log_status(
             "CANDIDATE",
-            f"{candidate_ref} at {short_revision(revision)} targets {target_ref}",
+            f"{candidate_ref} at {describe_revision(revision)} targets {target_ref}",
         )
         return revision, outcome
     revision = publish_tree(target_ref, candidate, target_revision, commit_message)
-    log_status("UPDATE", f"{target_ref} advanced to {short_revision(revision)}")
+    log_status("UPDATE", f"{target_ref} advanced to {describe_revision(revision)}")
     return revision, None
 
 
@@ -2191,7 +2228,7 @@ def validate_materialized_desired(
         {path.stem for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}}
     )
     if desired_units != expected_units:
-        raise OperationError(f"{description} {short_revision(desired_revision)} is not fully materialized")
+        raise OperationError(f"{description} {describe_revision(desired_revision)} is not fully materialized")
     for unit_name in desired_units:
         unit = load_unit(unit_document_path(desired, unit_name), unit_name)
         if contains_reference(unit):
@@ -2418,13 +2455,13 @@ def command_status(args: argparse.Namespace) -> None:
         log_heading(f"Deployment status for {args.environment}")
         log_status(
             "DESIRED",
-            f"{desired_ref} at {short_revision(desired_revision)}"
+            f"{desired_ref} at {describe_revision(desired_revision)}"
             if desired_revision
             else f"{desired_ref} does not exist",
         )
         log_status(
             "OBSERVED",
-            f"{observed_ref} at {short_revision(observed_revision)}"
+            f"{observed_ref} at {describe_revision(observed_revision)}"
             if observed_revision
             else f"{observed_ref} has no receipts yet",
         )
@@ -2479,7 +2516,7 @@ def command_facts(args: argparse.Namespace) -> None:
             print(json.dumps(result, indent=2, sort_keys=True))
             return
 
-        revision = short_revision(observed_revision) if observed_revision else "no receipts"
+        revision = describe_revision(observed_revision) if observed_revision else "no receipts"
         print(f"Observed facts for {args.environment} ({observed_ref} at {revision})")
         for unit_name, facts in units.items():
             print(f"\n{unit_name}")
@@ -2494,7 +2531,7 @@ def command_verify(args: argparse.Namespace) -> None:
         desired = temporary / "desired"
         desired_revision = resolve_ref(desired_ref)
         materialize_revision(desired_revision, desired)
-        log_status("DESIRED", f"{desired_ref} at {short_revision(desired_revision)}")
+        log_status("DESIRED", f"{desired_ref} at {describe_revision(desired_revision)}")
 
         unit_paths = sorted(
             path for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}
@@ -2873,7 +2910,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             desired_revision = advanced
             if changed:
                 pre_advanced_revision = advanced
-            log_status("PIN", f"reconcile advanced desired state at {short_revision(advanced)}")
+            log_status("PIN", f"reconcile advanced desired state at {describe_revision(advanced)}")
         observed_revision = observed_tree(observed_ref, observed)
         if args.plan and candidate_source_root is not None:
             assert source_revision is not None
@@ -2894,10 +2931,10 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             desired_revision = resolve_ref(desired_ref, args.desired_revision)
         if candidate_source_root is None:
             materialize_revision(desired_revision, desired)
-        log_status("DESIRED", f"{desired_ref} at {short_revision(desired_revision)}")
+        log_status("DESIRED", f"{desired_ref} at {describe_revision(desired_revision)}")
         log_status(
             "OBSERVED",
-            f"{observed_ref} at {short_revision(observed_revision)}"
+            f"{observed_ref} at {describe_revision(observed_revision)}"
             if observed_revision
             else f"{observed_ref} has no receipts yet",
         )
@@ -2911,7 +2948,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         driver_name, source = require_unit(unit, args.unit)
         validate_unit_materialization(desired, args.unit, unit)
         log_status("DRIVER", driver_name)
-        log_status("SOURCE", f"{short_revision(source['revision'])} ({source['path']})")
+        log_status("SOURCE", f"{describe_revision(source['revision'])} ({source['path']})")
         if contains_reference(unit):
             raise OperationError(f"{args.unit} desired state is not fully materialized")
         if not unit_requires_reconciliation(unit):
@@ -3029,7 +3066,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         )
         log_status(
             "OBSERVE",
-            f"receipt published to {observed_ref} at {short_revision(revision)}",
+            f"receipt published to {observed_ref} at {describe_revision(revision)}",
         )
         advanced_revision = advance_if_requested() or pre_advanced_revision
         write_reconcile_outputs(True, advanced_revision)
@@ -3041,7 +3078,7 @@ def log_ref_advance(advance: RefAdvance) -> None:
     attribution = f" after {advance.unit}" if advance.unit else ""
     log_status(
         "ADVANCE",
-        f"{advance.ref} {short_revision(advance.before)} -> {short_revision(advance.after)}{attribution}",
+        f"{advance.ref} {describe_revision(advance.before)} -> {describe_revision(advance.after)}{attribution}",
     )
 
 
@@ -3098,18 +3135,18 @@ def log_convergence_summary(
             log_status(
                 "MOVE",
                 f"{index}. {advance.kind} {advance.ref} "
-                f"{short_revision(advance.before)} -> "
-                f"{short_revision(advance.after)}{attribution}",
+                f"{describe_revision(advance.before)} -> "
+                f"{describe_revision(advance.after)}{attribution}",
             )
     else:
         log_status("MOVE", "no desired or observed ref advances")
     log_status(
         "DESIRED",
-        f"{short_revision(start_heads[0])} -> {short_revision(end_heads[0])}",
+        f"{describe_revision(start_heads[0])} -> {describe_revision(end_heads[0])}",
     )
     log_status(
         "OBSERVED",
-        f"{short_revision(start_heads[1])} -> {short_revision(end_heads[1])}",
+        f"{describe_revision(start_heads[1])} -> {describe_revision(end_heads[1])}",
     )
     for unit_name, status, reason in unselected or []:
         if status not in {"CLEAN", "MATERIALIZED"}:
@@ -3159,7 +3196,7 @@ def command_converge(args: argparse.Namespace) -> None:
     log_heading(f"Converge {args.environment}")
     log_status(
         "SOURCE",
-        short_revision(source_revision) if source_revision else "merged promotion",
+        describe_revision(source_revision) if source_revision else "merged promotion",
     )
 
     with tempfile.TemporaryDirectory() as temporary_directory:
@@ -3198,7 +3235,7 @@ def command_converge(args: argparse.Namespace) -> None:
                 args.observed_ref,
             ) != (desired_ref, observed_ref):
                 raise OperationError("reviewed specification changes deployment refs")
-            log_status("PIN", f"reviewed specification {short_revision(effective_source_revision)}")
+            log_status("PIN", f"reviewed specification {describe_revision(effective_source_revision)}")
         else:
             assert source_revision is not None
             effective_source_revision = source_revision
@@ -3212,8 +3249,8 @@ def command_converge(args: argparse.Namespace) -> None:
             log_status("SCOPE", ", ".join(scope))
             log_dependency_graph(observation_dependency_graph(specifications, scope))
         else:
-            log_status("DESIRED", f"{desired_ref} at {short_revision(start_desired)}")
-            log_status("OBSERVED", f"{observed_ref} at {short_revision(start_observed)}")
+            log_status("DESIRED", f"{desired_ref} at {describe_revision(start_desired)}")
+            log_status("OBSERVED", f"{observed_ref} at {describe_revision(start_observed)}")
             if targets != scope:
                 log_status("TARGET", ", ".join(targets))
                 log_status("SCOPE", ", ".join(scope))
@@ -3271,8 +3308,8 @@ def command_converge(args: argparse.Namespace) -> None:
                     else:
                         log_status(
                             "DESIRED",
-                            f"{desired_ref} {short_revision(before_desired)} -> "
-                            f"{short_revision(desired_revision)} (advanced)",
+                            f"{desired_ref} {describe_revision(before_desired)} -> "
+                            f"{describe_revision(desired_revision)} (advanced)",
                         )
 
                 state = temporary / f"state-{iterations}"
@@ -3392,8 +3429,8 @@ def command_converge(args: argparse.Namespace) -> None:
                     else:
                         log_status(
                             "OBSERVED",
-                            f"{observed_ref} {short_revision(before_observed)} -> "
-                            f"{short_revision(after_observed)} ({unit_name})",
+                            f"{observed_ref} {describe_revision(before_observed)} -> "
+                            f"{describe_revision(after_observed)} ({unit_name})",
                         )
         except (DriverError, OperationError, subprocess.CalledProcessError) as exc:
             detail = (
