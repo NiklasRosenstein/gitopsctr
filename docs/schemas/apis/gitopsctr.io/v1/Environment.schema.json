@@ -26,8 +26,6 @@
       "type": "object"
     },
     "spec": {
-      "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/core/v1/environment.schema.json",
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
         "changeGate": {
@@ -122,7 +120,6 @@
         }
       },
       "required": [],
-      "title": "EnvironmentDocument",
       "type": "object"
     }
   },

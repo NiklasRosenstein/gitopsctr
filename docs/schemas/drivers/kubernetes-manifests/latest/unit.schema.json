@@ -1,5 +1,0 @@
-{
-  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/kubernetes-manifests/latest/unit.schema.json",
-  "$ref": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/kubernetes-manifests/v1/unit.schema.json",
-  "$schema": "https://json-schema.org/draft/2020-12/schema"
-}

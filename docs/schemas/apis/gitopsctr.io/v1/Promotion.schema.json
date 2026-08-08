@@ -26,8 +26,6 @@
       "type": "object"
     },
     "spec": {
-      "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/core/v1/promotion.schema.json",
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
         "source": {
@@ -74,7 +72,6 @@
         "source",
         "specificationRevision"
       ],
-      "title": "PromotionDocument",
       "type": "object"
     }
   },

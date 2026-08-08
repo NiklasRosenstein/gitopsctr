@@ -39,9 +39,8 @@ The YAML language-server directive helps editors but is never trusted by the run
 select validation behavior from it. Newly generated YAML resources use the directive; JSON resources contain the same
 canonical pinned URL in their `$schema` property.
 
-`latest` aliases are convenient for discovery, but committed specifications should use pinned versions. The repository-level
-[`Project` resource](project-configuration.md) has a published
-[`Project.schema.json`](schemas/apis/gitopsctr.io/v1/Project.schema.json) in the same core API group.
+The repository-level [`Project` resource](project-configuration.md) has a published
+[`Project.schema.json`](schemas/apis/gitopsctr.io/v1/Project.schema.json) in the controller API group.
 
 ## CLI
 
@@ -55,5 +54,5 @@ gitopsctr schemas export docs/schemas
 gitopsctr schemas export docs/schemas --check
 ```
 
-`--check` fails when a current generated document is missing or stale. Historical version directories are retained and
-are not removed by export.
+`--check` fails when a generated document is missing, stale, or obsolete. Until the API reaches production, export keeps
+only the current resource schemas and removes superseded generated files.

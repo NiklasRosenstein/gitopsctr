@@ -28,7 +28,11 @@ def desired_example(unit: dict) -> dict:
     desired = deepcopy(unit)
     desired.pop("schema", None)
     driver = desired["driver"]
-    desired["$schema"] = schemas.driver_schema(driver, "desired-unit")["$id"]
+    desired["$schema"] = schemas.resource_schema_url(
+        UNIT_DRIVERS[driver].api_version,
+        UNIT_DRIVERS[driver].kind,
+        "desired",
+    )
     desired["source"] |= {
         "revision": REVISION,
         "inputHash": DIGEST,
@@ -107,21 +111,27 @@ RESULTS = {
 
 
 @pytest.mark.parametrize("driver", sorted(RESULTS))
-def test_result_and_composed_receipt_schemas(driver):
+def test_result_contracts_and_receipt_resource_schemas(driver):
     plugin = UNIT_DRIVERS[driver]
     result = RESULTS[driver]
     plugin.result_contract.validate(result)
     receipt = {
-        "$schema": schemas.driver_schema(driver, "receipt")["$id"],
-        "unit": "example",
-        "driver": driver,
-        "desired": {"revision": REVISION, "unitBlob": "f" * 40},
-        "resolvedInputs": {},
-        "controller": {"version": "0.1.0", "revision": REVISION, "observed_at": "2026-08-08T00:00:00Z"},
-        **result,
+        "$schema": schemas.resource_schema_url(plugin.api_version, plugin.kind, "receipt"),
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "Receipt",
+        "metadata": {"name": "example"},
+        "spec": {
+            "subject": {"apiVersion": plugin.api_version, "kind": plugin.kind, "name": "example"},
+            "desired": {"revision": REVISION, "unitBlob": "f" * 40},
+            "resolvedInputs": {},
+        },
+        "status": {
+            "controller": {"version": "0.1.0", "revision": REVISION, "observed_at": "2026-08-08T00:00:00Z"},
+            "result": result,
+        },
     }
     if plugin.artifact_contracts:
-        receipt["artifacts"] = {
+        receipt["status"]["artifacts"] = {
             name: {
                 "apiVersion": artifact.api_version,
                 "kind": artifact.kind,
@@ -132,23 +142,9 @@ def test_result_and_composed_receipt_schemas(driver):
             for name, artifact in plugin.artifact_contracts.items()
         }
 
-    receipt_schema = schemas.driver_schema(driver, "receipt")
+    receipt_schema = schemas.receipt_resource_schema(driver)
     Draft202012Validator.check_schema(receipt_schema)
     Draft202012Validator(receipt_schema).validate(receipt)
-    assert len(receipt_schema["allOf"]) == 2
-
-
-def test_latest_aliases_resolve_from_the_local_schema_catalog():
-    documents = schemas.schema_documents()
-    registry = Registry().with_resources(
-        (document["$id"], Resource.from_contents(document)) for document in documents.values() if "$id" in document
-    )
-    terraform_unit = next(unit for unit in authored_examples() if unit["driver"] == "terraform")
-
-    Draft202012Validator(
-        documents[Path("drivers/terraform/latest/unit.schema.json")],
-        registry=registry,
-    ).validate(terraform_unit)
 
 
 def test_generated_schemas_and_examples_validate_from_the_local_catalog():
@@ -170,28 +166,29 @@ def test_generated_schemas_and_examples_validate_from_the_local_catalog():
         Draft202012Validator(by_id[environment["$schema"]], registry=registry).validate(environment)
 
 
-def test_schema_catalog_is_deterministic_checkable_and_preserves_history(tmp_path):
+def test_schema_catalog_is_deterministic_checkable_and_prunes_obsolete_schemas(tmp_path):
     assert schemas.export_schemas(tmp_path)
     first = {path: path.read_bytes() for path in sorted(tmp_path.rglob("*")) if path.is_file()}
     assert schemas.export_schemas(tmp_path, check=True) == []
     assert first == {path: path.read_bytes() for path in sorted(tmp_path.rglob("*")) if path.is_file()}
 
-    historical = tmp_path / "drivers/terraform/v1/unit.schema.json"
-    historical.parent.mkdir(parents=True, exist_ok=True)
-    historical.write_text("{}\n")
-    current = tmp_path / "drivers/terraform/v2/unit.schema.json"
+    obsolete = tmp_path / "drivers/terraform/v1/unit.schema.json"
+    obsolete.parent.mkdir(parents=True, exist_ok=True)
+    obsolete.write_text("{}\n")
+    current = tmp_path / "apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json"
     current.write_text("{}\n")
-    assert Path("drivers/terraform/v2/unit.schema.json") in schemas.export_schemas(tmp_path, check=True)
+    changed = schemas.export_schemas(tmp_path, check=True)
+    assert Path("drivers/terraform/v1/unit.schema.json") in changed
+    assert Path("apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json") in changed
     schemas.export_schemas(tmp_path)
-    assert historical.read_text() == "{}\n"
+    assert not obsolete.exists()
+    assert json.loads(current.read_text())["properties"]["kind"]["const"] == "Terraform"
 
     index = json.loads((tmp_path / "index.json").read_text())
-    assert index["drivers"]["terraform"]["version"] == 2
+    assert set(index) == {"schema", "apis"}
     assert index["apis"]["artifact.gitopsctr.io/v1/ContainerImages"] == (
         "apis/artifact.gitopsctr.io/v1/ContainerImages.schema.json"
     )
-    latest = json.loads((tmp_path / "drivers/terraform/latest/unit.schema.json").read_text())
-    assert latest["$ref"].endswith("/drivers/terraform/v2/unit.schema.json")
 
 
 def test_core_schemas_are_draft_2020_12_and_environment_examples_validate():
@@ -204,18 +201,18 @@ def test_core_schemas_are_draft_2020_12_and_environment_examples_validate():
 def test_schema_cli_show_export_and_check_work_outside_a_git_repository(tmp_path):
     command = [sys.executable, "-m", "gitopsctr.cli"]
     shown = subprocess.run(
-        [*command, "schemas", "show", "terraform", "unit"],
+        [*command, "schemas", "show", "unit.gitopsctr.io/v1/Terraform", "authored"],
         cwd=tmp_path,
         check=True,
         capture_output=True,
         text=True,
     )
-    assert json.loads(shown.stdout)["$id"].endswith("/drivers/terraform/v2/unit.schema.json")
+    assert json.loads(shown.stdout)["$id"].endswith("/apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json")
 
     destination = tmp_path / "schemas"
     subprocess.run([*command, "schemas", "export", str(destination)], cwd=tmp_path, check=True)
     subprocess.run([*command, "schemas", "export", str(destination), "--check"], cwd=tmp_path, check=True)
-    (destination / "core/v1/environment.schema.json").write_text("{}\n")
+    (destination / "apis/gitopsctr.io/v1/Environment.schema.json").write_text("{}\n")
     stale = subprocess.run(
         [*command, "schemas", "export", str(destination), "--check"],
         cwd=tmp_path,

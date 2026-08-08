@@ -26,8 +26,6 @@
       "type": "object"
     },
     "spec": {
-      "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/frontend-s3-cloudfront/v1/unit.schema.json",
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
         "inputs": {
@@ -129,7 +127,6 @@
       "required": [
         "source"
       ],
-      "title": "FrontendUnit",
       "type": "object"
     }
   },

@@ -26,8 +26,6 @@
       "type": "object"
     },
     "spec": {
-      "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/vite-oci-bundle/v1/unit.schema.json",
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
         "build": {
@@ -126,7 +124,6 @@
       "required": [
         "source"
       ],
-      "title": "ViteOciBundleUnit",
       "type": "object"
     }
   },

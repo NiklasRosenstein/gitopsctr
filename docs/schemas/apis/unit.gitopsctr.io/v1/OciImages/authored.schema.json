@@ -26,8 +26,6 @@
       "type": "object"
     },
     "spec": {
-      "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/oci-images/v1/unit.schema.json",
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
         "build": {
@@ -199,7 +197,6 @@
       "required": [
         "source"
       ],
-      "title": "OciImagesUnit",
       "type": "object"
     }
   },

@@ -26,8 +26,6 @@
       "type": "object"
     },
     "spec": {
-      "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/kubernetes-manifests/v1/unit.schema.json",
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
         "delivery": {
@@ -280,7 +278,6 @@
         "materialize",
         "delivery"
       ],
-      "title": "KubernetesUnit",
       "type": "object"
     }
   },

@@ -1,4 +1,4 @@
-"""Deterministic JSON Schema catalog for core and plugin documents."""
+"""Deterministic JSON Schema catalog for public resource documents."""
 
 from __future__ import annotations
 
@@ -7,13 +7,10 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
 
-from gitopsctr.contracts import CORE_CONTRACTS, SCHEMA_ROOT, artifact_descriptors_schema, receipt_schema, schema_url
+from gitopsctr.contracts import CORE_CONTRACTS, SCHEMA_ROOT, artifact_descriptors_schema, receipt_schema
 from gitopsctr.document import DocumentContract, JsonObject
 from gitopsctr.driver import UNIT_DRIVERS, UnitDriver
 from gitopsctr.formats import PROJECT_RESOURCE_SCHEMA
-
-DRIVER_KINDS = ("unit", "desired-unit", "result", "receipt")
-CORE_KINDS = tuple(CORE_CONTRACTS)
 
 
 def _driver_schema_id(driver: str, plugin: UnitDriver, kind: str) -> str:
@@ -30,6 +27,9 @@ def resource_schema_url(api_version: str, kind: str, profile: str | None = None)
 
 def _specification_schema(contract: DocumentContract) -> JsonObject:
     schema = deepcopy(contract.json_schema())
+    schema.pop("$schema", None)
+    schema.pop("$id", None)
+    schema.pop("title", None)
     properties = cast(dict[str, Any], schema.get("properties", {}))
     required = [
         value
@@ -218,11 +218,6 @@ def driver_schema(driver: str, kind: str) -> JsonObject:
 
 
 def show_schema(scope: str, kind: str) -> JsonObject:
-    if scope == "core":
-        try:
-            return CORE_CONTRACTS[kind].json_schema()
-        except KeyError as exc:
-            raise ValueError(f"unknown core schema kind: {kind}") from exc
     if scope == "gitopsctr.io/v1":
         if kind == "Project":
             return project_resource_schema()
@@ -248,33 +243,12 @@ def show_schema(scope: str, kind: str) -> JsonObject:
         if profile not in {"authored", "desired"}:
             raise ValueError(f"unknown unit API schema profile: {profile}")
         return unit_resource_schema(driver, profile)
-    return driver_schema(scope, kind)
+    raise ValueError(f"unknown schema API version: {scope}")
 
 
 def schema_documents() -> dict[Path, JsonObject]:
     documents: dict[Path, JsonObject] = {}
-    index: dict[str, Any] = {"schema": 1, "core": {}, "drivers": {}, "apis": {}}
-    for kind, contract in sorted(CORE_CONTRACTS.items()):
-        path = Path("core/v1") / f"{kind}.schema.json"
-        documents[path] = contract.json_schema()
-        index["core"][kind] = path.as_posix()
-    for driver, plugin in sorted(UNIT_DRIVERS.items()):
-        version_root = Path("drivers") / driver / f"v{plugin.version}"
-        latest_root = Path("drivers") / driver / "latest"
-        driver_index = {"version": plugin.version, "schemas": {}}
-        for kind in DRIVER_KINDS:
-            version_path = version_root / f"{kind}.schema.json"
-            latest_path = latest_root / f"{kind}.schema.json"
-            documents[version_path] = driver_schema(driver, kind)
-            documents[latest_path] = {
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "$id": schema_url(f"drivers/{driver}/latest", plugin.version, kind).replace(
-                    f"/v{plugin.version}/", "/"
-                ),
-                "$ref": documents[version_path]["$id"],
-            }
-            driver_index["schemas"][kind] = version_path.as_posix()
-        index["drivers"][driver] = driver_index
+    index: dict[str, Any] = {"schema": 1, "apis": {}}
     for kind in ("Environment", "Promotion", "Receipt", "Project"):
         path = Path("apis/gitopsctr.io/v1") / f"{kind}.schema.json"
         documents[path] = project_resource_schema() if kind == "Project" else core_resource_schema(kind)
@@ -307,8 +281,9 @@ def encoded_schema(document: JsonObject) -> str:
 
 
 def export_schemas(directory: Path, *, check: bool = False) -> list[Path]:
+    documents = schema_documents()
     changed: list[Path] = []
-    for relative, document in schema_documents().items():
+    for relative, document in documents.items():
         path = directory / relative
         expected = encoded_schema(document)
         if not path.is_file() or path.read_text() != expected:
@@ -316,4 +291,25 @@ def export_schemas(directory: Path, *, check: bool = False) -> list[Path]:
             if not check:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(expected)
-    return changed
+
+    expected_paths = set(documents)
+    existing_paths = {
+        path.relative_to(directory)
+        for path in directory.rglob("*.json")
+        if path.is_file()
+    } if directory.is_dir() else set()
+    obsolete = sorted(existing_paths - expected_paths)
+    changed.extend(obsolete)
+    if not check:
+        for relative in obsolete:
+            (directory / relative).unlink()
+        for path in sorted(
+            (path for path in directory.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+    return sorted(changed)

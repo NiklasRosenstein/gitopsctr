@@ -5,11 +5,13 @@
 - Typed unit-driver models are authoritative for validation and generated schemas.
 - [DISABLED UNTIL WE ARE IN PRODUCTION] Breaking or narrowing changes to a unit-driver document contract require an API version bump.
 - Backward-compatible additions may update the current driver contract.
-- Never remove a committed historical schema version from `docs/schemas`.
+- [DISABLED UNTIL WE ARE IN PRODUCTION] Never remove a committed historical schema version from `docs/schemas`.
+- Until production, keep only the current Kubernetes-style resource schemas under `docs/schemas/apis/<group>/<version>/`;
+  remove obsolete generated schemas instead of preserving legacy layouts.
 - Regenerate schemas with `mise run schemas` whenever a model changes.
 - Run `mise run check`; CI checks schema freshness and performs a strict MkDocs build.
 
-Core document schemas remain under their document `schema` version. Runtime validation treats `$schema` only as an
+Public document schemas are organized by `apiVersion` and `kind`. Runtime validation treats `$schema` only as an
 untrusted editor hint and must never fetch it.
 
 ## Document formats
