@@ -8,9 +8,10 @@ from pathlib import Path
 import pytest
 import yaml
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
 
 from gitopsctr import cli, schemas
-from gitopsctr.formats import DocumentFormat, load_project_config, write_document
+from gitopsctr.formats import DocumentFormat, DocumentFormatError, load_project_config, write_document
 
 
 def test_yaml_is_the_default_and_project_config_can_select_json(tmp_path: Path):
@@ -21,6 +22,29 @@ def test_yaml_is_the_default_and_project_config_can_select_json(tmp_path: Path):
     assert load_project_config(tmp_path).write_format is DocumentFormat.JSON
     write_document(tmp_path / "configured.json", value, format=DocumentFormat.JSON)
     assert cli.load_json(tmp_path / "configured.json") == value
+
+
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ("writeFormat: toml\n", "toml"),
+        ("writeFormat: yaml\nunknown: true\n", "Additional properties"),
+    ],
+)
+def test_project_config_rejects_values_outside_its_published_schema(
+    tmp_path: Path, contents: str, message: str
+):
+    (tmp_path / "gitopsctr.yaml").write_text(contents)
+    with pytest.raises(DocumentFormatError, match=message):
+        load_project_config(tmp_path)
+
+
+def test_project_config_schema_is_published_and_deterministic():
+    schema = schemas.project_config_schema()
+    Draft202012Validator.check_schema(schema)
+    Draft202012Validator(schema).validate({"$schema": "https://example.invalid/project.json", "writeFormat": "yaml"})
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate({"writeFormat": "yaml", "other": True})
 
 
 def test_new_yaml_resource_envelopes_are_loaded_and_normalized(tmp_path: Path):

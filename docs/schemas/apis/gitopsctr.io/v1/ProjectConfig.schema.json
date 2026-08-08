@@ -1,0 +1,18 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/ProjectConfig.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "writeFormat": {
+      "enum": [
+        "yaml",
+        "json"
+      ]
+    }
+  },
+  "title": "GitOpsCTR project configuration",
+  "type": "object"
+}

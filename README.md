@@ -28,7 +28,7 @@ the current directory. Use `--repository PATH` or `GITOPSCTR_REPOSITORY` to sele
 Important commands include:
 
 - `advance-desired`: materialize the next desired-state commit.
-- `reconcile --plan`: run a speculative plugin plan without applying or publishing a receipt.
+- `reconcile --plan`: run a speculative unit-driver plan without applying or publishing a receipt.
 - `reconcile`: apply one unit and publish its receipt.
 - `converge`: reconcile a dependency closure locally.
 - `promote`: promote a clean environment through its configured change gate.
@@ -41,21 +41,21 @@ Important commands include:
 registry, and deploys it as a Docker container through the Terraform driver. See [`demo/README.md`](demo/README.md)
 for prerequisites, the reconciliation flow, and cleanup instructions.
 
-## Driver plugins
+## Unit drivers
 
-Unit plugins are discovered from the `gitopsctr.drivers` Python entry-point group. An entry point must load
-an instance of `gitopsctr.driver.UnitPlugin` implementing at least `MaterializationCapability` or
-`ReconciliationCapability`. Verification is an independent optional capability. The plugins distributed in this
-package use the same public registry and live under `gitopsctr.contrib.driver`, one module per plugin.
+Unit drivers are discovered from the `gitopsctr.drivers` Python entry-point group. An entry point must load an instance
+of `gitopsctr.driver.UnitDriver` implementing at least `MaterializationCapability` or `ReconciliationCapability`.
+Verification is an independent optional capability. The built-in drivers use the public registry and live under
+`gitopsctr.contrib.drivers`, one module per driver.
 
-The `kubernetes-manifests` plugin renders Helm or plain YAML into the desired Git tree. It supports direct apply,
-materialization-only external delivery, and read-only Argo CD observation. See
-[`docs/kubernetes-manifests.md`](docs/kubernetes-manifests.md) for the desired-tree contract, delivery modes,
-promotion evidence, rollback behavior, and local kind demo.
+The `kubernetes-manifests` unit driver renders Helm or plain YAML into the desired Git tree. It supports direct apply,
+materialization-only external delivery, and read-only Argo CD observation. See the
+[available unit drivers](docs/drivers.md) for all built-ins and the
+[Kubernetes unit driver](docs/drivers/kubernetes-manifests.md) page for delivery modes and rollback behavior.
 
 ## JSON Schemas
 
-Built-in plugins publish Draft 2020-12 schemas for authored units, desired units, raw results, and composed receipts at
+Built-in unit drivers publish Draft 2020-12 schemas for authored units, desired units, raw results, and composed receipts at
 [`https://niklasrosenstein.github.io/gitopsctr/schemas/`](https://niklasrosenstein.github.io/gitopsctr/schemas/).
 Core environment, promotion, materialization, desired-unit, and receipt-envelope schemas are published alongside them.
 

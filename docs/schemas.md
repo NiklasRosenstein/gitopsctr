@@ -6,7 +6,7 @@ publishes authored, desired, result, and composed receipt contracts:
 - `unit`: authored environment input;
 - `desired-unit`: the fully resolved document stored under `deploy/<environment>/units/`;
 - `result`: the raw semantic result returned after applying;
-- `receipt`: the generic receipt envelope composed with that plugin result.
+- `receipt`: the generic receipt envelope composed with that driver result.
 
 Controller resources use `gitopsctr.io/v1`; unit resources use `unit.gitopsctr.io/v1`. The complete
 machine-readable catalog is [`schemas/index.json`](schemas/index.json).
@@ -36,7 +36,8 @@ spec:
 `$schema` helps editors but is never trusted by the runtime: gitopsctr does not fetch it or select validation behavior
 from it. Newly generated desired units, promotions, and receipts always contain a canonical pinned URL.
 
-`latest` aliases are convenient for discovery, but committed specifications should use pinned versions.
+`latest` aliases are convenient for discovery, but committed specifications should use pinned versions. The optional
+project-level [`gitopsctr.yaml` configuration schema`](project-configuration.md) is published in the same core API group.
 
 ## CLI
 

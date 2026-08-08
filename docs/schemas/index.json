@@ -1,6 +1,7 @@
 {
   "apis": {
     "gitopsctr.io/v1/Environment": "apis/gitopsctr.io/v1/Environment.schema.json",
+    "gitopsctr.io/v1/ProjectConfig": "apis/gitopsctr.io/v1/ProjectConfig.schema.json",
     "gitopsctr.io/v1/Promotion": "apis/gitopsctr.io/v1/Promotion.schema.json",
     "gitopsctr.io/v1/Receipt": "apis/gitopsctr.io/v1/Receipt.schema.json",
     "unit.gitopsctr.io/v1/FrontendS3Cloudfront/authored": "apis/unit.gitopsctr.io/v1/FrontendS3Cloudfront/authored.schema.json",

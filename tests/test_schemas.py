@@ -231,8 +231,11 @@ def test_schema_cli_show_export_and_check_work_outside_a_git_repository(tmp_path
 
 def test_schema_cli_can_show_resource_envelopes():
     environment = schemas.show_schema("gitopsctr.io/v1", "Environment")
+    project_config = schemas.show_schema("gitopsctr.io/v1", "ProjectConfig")
     unit = schemas.show_schema("unit.gitopsctr.io/v1/Terraform", "authored")
     receipt = schemas.show_schema("unit.gitopsctr.io/v1", "Terraform/receipt")
     assert environment["properties"]["kind"]["const"] == "Environment"
+    assert project_config["$id"].endswith("/apis/gitopsctr.io/v1/ProjectConfig.schema.json")
+    assert project_config["properties"]["writeFormat"]["enum"] == ["yaml", "json"]
     assert unit["properties"]["kind"]["const"] == "Terraform"
     assert receipt["properties"]["kind"]["const"] == "Receipt"

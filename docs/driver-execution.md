@@ -1,6 +1,6 @@
 # Driver execution
 
-The controller supplies every plugin capability context with a `DriverExecution`. Plugins must use this boundary for
+The controller supplies every unit-driver capability context with a `DriverExecution`. Drivers must use this boundary for
 external commands and human-readable progress instead of printing or spawning subprocesses directly.
 
 ```python
@@ -27,7 +27,7 @@ results:
 - `CommandOutput.TEE` renders and returns output.
 - `CommandOutput.DISCARD` explicitly suppresses output.
 
-The modes are a `StrEnum`; plugin APIs should never pass untyped string modes.
+The modes are a `StrEnum`; driver APIs should never pass untyped string modes.
 
 Commands that return credentials or other secrets should pass `sensitive=True`. Their captured diagnostics remain on
 the raised command error but are not automatically copied into the human transcript.

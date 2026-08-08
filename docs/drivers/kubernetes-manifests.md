@@ -1,4 +1,11 @@
-# Kubernetes manifest materialization
+# Kubernetes manifests unit driver
+
+The `KubernetesManifests` unit driver renders Helm or plain YAML into the
+desired tree and can optionally deliver those manifests to a cluster.
+
+**Kind:** `unit.gitopsctr.io/v1/KubernetesManifests`<br>
+**Version:** `v1`<br>
+**Capabilities:** materialization, planning, reconciliation, verification
 
 `kubernetes-manifests` renders immutable Kubernetes YAML while desired state advances. The rendered bytes and the
 resolved unit JSON form one atomic desired-state component:
@@ -43,8 +50,11 @@ spec:
 Values are resolved after `fromObservation` and `fromPromotion`, so either reference can appear anywhere below
 `materialize.values`. Plain rendering copies matching YAML files with stable paths:
 
-```json
-{"type": "plain", "paths": ["base/*.yaml", "services/**/*.yml"], "allowSecrets": false}
+```yaml
+materialize:
+  type: plain
+  paths: ["base/*.yaml", "services/**/*.yml"]
+  allowSecrets: false
 ```
 
 Core `v1/Secret` objects are rejected by default because Git stores the materialized payload. Set
@@ -57,8 +67,9 @@ Every Kubernetes unit chooses a delivery mode.
 
 ### External
 
-```json
-{"delivery": {"mode": "external"}}
+```yaml
+delivery:
+  mode: external
 ```
 
 Advancement publishes manifests and finishes the unit as `MATERIALIZED`. No external action or receipt occurs. This
@@ -66,22 +77,16 @@ fits Argo CD or Flux setups that already watch `deploy/<environment>` but do not
 
 ### Direct
 
-```json
-{
-  "delivery": {
-    "mode": "direct",
-    "kubeContext": "dev",
-    "prune": false,
-    "wait": [
-      {
-        "resource": "deployment/web",
-        "namespace": "web",
-        "condition": "Available",
-        "timeoutSeconds": 300
-      }
-    ]
-  }
-}
+```yaml
+delivery:
+  mode: direct
+  kubeContext: dev
+  prune: false
+  wait:
+    - resource: deployment/web
+      namespace: web
+      condition: Available
+      timeoutSeconds: 300
 ```
 
 Direct delivery uses server-side apply with a stable environment/unit field manager and never forces conflicts. Waits
@@ -91,20 +96,16 @@ and waits first, then deletes only resources found in the previous successful re
 
 ### Argo CD observed
 
-```json
-{
-  "delivery": {
-    "mode": "external",
-    "observer": {
-      "type": "argocd",
-      "access": "api",
-      "application": "web",
-      "applicationNamespace": "argocd",
-      "argocdContext": "production",
-      "timeoutSeconds": 600
-    }
-  }
-}
+```yaml
+delivery:
+  mode: external
+  observer:
+    type: argocd
+    access: api
+    application: web
+    applicationNamespace: argocd
+    argocdContext: production
+    timeoutSeconds: 600
 ```
 
 Use `access: "api"` for the `argocd` CLI or `access: "kubernetes"` with `kubeContext` to read the Application CR
@@ -115,8 +116,9 @@ Application reports the exact desired commit, `Synced`, and `Healthy`. The contr
 
 Promotion requires receipts by default. An environment containing intentional materialization-only units can opt in:
 
-```json
-{"promotionPolicy": {"minimumEvidence": "materialized"}}
+```yaml
+promotionPolicy:
+  minimumEvidence: materialized
 ```
 
 This accepts `MATERIALIZED` only for units without reconciliation. Any receipt-requiring unit must still be `CLEAN`.

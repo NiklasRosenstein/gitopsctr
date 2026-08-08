@@ -14,6 +14,20 @@ from pathlib import Path
 from typing import Any, cast
 
 import yaml
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
+
+PROJECT_CONFIG_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/ProjectConfig.schema.json",
+    "title": "GitOpsCTR project configuration",
+    "type": "object",
+    "properties": {
+        "$schema": {"type": "string"},
+        "writeFormat": {"enum": ["yaml", "json"]},
+    },
+    "additionalProperties": False,
+}
 
 
 class DocumentFormat(StrEnum):
@@ -54,12 +68,13 @@ def load_project_config(root: Path) -> ProjectConfig:
         return ProjectConfig()
     if not isinstance(value, dict):
         raise DocumentFormatError(f"project config {path} must be a mapping")
-    selected = value.get("writeFormat", value.get("write_format", value.get("format", "yaml")))
-    if isinstance(selected, dict):
-        selected = selected.get("write", "yaml")
-    if not isinstance(selected, str) or selected.lower() not in {"yaml", "yml", "json"}:
-        raise DocumentFormatError(f"project config {path} writeFormat must be yaml or json")
-    return ProjectConfig(DocumentFormat.JSON if selected.lower() == "json" else DocumentFormat.YAML)
+    try:
+        Draft202012Validator(PROJECT_CONFIG_SCHEMA).validate(value)
+    except ValidationError as exc:
+        detail = exc.message
+        raise DocumentFormatError(f"invalid project config {path}: {detail}") from exc
+    selected = value.get("writeFormat", "yaml")
+    return ProjectConfig(DocumentFormat.JSON if selected == "json" else DocumentFormat.YAML)
 
 
 def _ensure_json_value(value: object, path: Path) -> dict[str, Any]:
@@ -115,4 +130,3 @@ def write_document(path: Path, value: dict[str, Any], *, format: DocumentFormat 
         text = yaml.safe_dump(value, sort_keys=False, default_flow_style=False, allow_unicode=False)
     output.write_text(text)
     return output
-

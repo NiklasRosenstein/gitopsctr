@@ -10,11 +10,11 @@ operator can run locally.
 ## Main operations
 
 - `advance-desired` resolves source, observation, and promotion inputs into an immutable desired-state commit.
-- `reconcile --plan` runs a plugin's speculative plan without applying or writing a receipt.
+- `reconcile --plan` runs a unit driver's speculative plan without applying or writing a receipt.
 - `reconcile` applies one desired unit and publishes its typed receipt.
 - `converge` advances and reconciles a dependency closure until every unit is terminal.
 - `promote` and `rollback` publish direct changes or pull-request candidates according to `changeGate`.
-- `verify` asks supported plugins to check external state without changing Git or external state.
+- `verify` asks supported unit drivers to check external state without changing Git or external state.
 
 ## Install
 
@@ -28,5 +28,5 @@ For development, run `mise install`, `mise run sync`, and `mise run check`.
 ## Contracts
 
 Every built-in unit driver publishes schemas for its authored unit, materialized desired unit, applied result, and composed
-receipt. Start with the [JSON Schema catalog](schemas.md), or read about [Kubernetes manifest
-materialization](kubernetes-manifests.md).
+receipt. Start with the [available unit drivers](drivers.md), the [project configuration](project-configuration.md), or the
+[JSON Schema catalog](schemas.md).
