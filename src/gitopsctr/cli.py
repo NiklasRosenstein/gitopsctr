@@ -12,17 +12,18 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cache
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, TextIO
 
 from gitopsctr.contracts import CORE_CONTRACTS, with_schema
 from gitopsctr.document import ContractError, DocumentContract, JsonObject
@@ -136,14 +137,120 @@ class UnitChangeExplanation:
     specification_paths: tuple[str, ...]
 
 
+ANSI_RESET = "\x1b[0m"
+ANSI_ROLES = {
+    "heading": "\x1b[1;36m",
+    "entity": "\x1b[1;36m",
+    "revision": "\x1b[1;33m",
+    "muted": "\x1b[2m",
+    "success": "\x1b[1;32m",
+    "warning": "\x1b[1;33m",
+    "error": "\x1b[1;31m",
+    "focus": "\x1b[1;36m",
+    "label": "\x1b[1m",
+}
+STATUS_ROLES = {
+    "DONE": "success",
+    "CLEAN": "success",
+    "VALID": "success",
+    "KEEP": "success",
+    "UPDATE": "success",
+    "OBSERVE": "success",
+    "MATERIALIZED": "success",
+    "WAIT": "warning",
+    "SKIP": "warning",
+    "RETRY": "warning",
+    "DRY": "warning",
+    "MANUAL": "warning",
+    "DRIFT": "warning",
+    "UNSCOPED": "warning",
+    "APPROVE": "warning",
+    "FAILED": "error",
+    "INVALID": "error",
+    "READY": "focus",
+    "RUN": "focus",
+    "NEXT": "focus",
+    "PROMOTE": "focus",
+    "PIN": "focus",
+    "VERIFY": "focus",
+    "PLAN": "focus",
+    "REVIEW": "focus",
+}
+
+
+def _truthy_environment(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return bool(value) and value not in {"0", "false", "no", "off"}
+
+
+def _is_regular_file(stream: TextIO) -> bool:
+    try:
+        return stat.S_ISREG(os.fstat(stream.fileno()).st_mode)
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def color_enabled(stream: TextIO) -> bool:
+    """Choose ANSI styling without contaminating redirected or machine output."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    if _is_regular_file(stream) or os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    try:
+        if stream.isatty():
+            return True
+    except (AttributeError, OSError, ValueError):
+        pass
+    return _truthy_environment("CI")
+
+
+def style_text(text: str, role: str, stream: TextIO | None = None) -> str:
+    """Apply a portable ANSI role only when the destination supports styling."""
+    output_stream = stream or sys.stderr
+    code = ANSI_ROLES[role]
+    return f"{code}{text}{ANSI_RESET}" if color_enabled(output_stream) else text
+
+
+def style_unit(unit_name: str, stream: TextIO | None = None) -> str:
+    return style_text(unit_name, "entity", stream)
+
+
+def style_branch(ref: str, stream: TextIO | None = None) -> str:
+    return style_text(ref, "entity", stream)
+
+
+def style_environment(environment: str, stream: TextIO | None = None) -> str:
+    return style_text(environment, "entity", stream)
+
+
+def style_units(unit_names: list[str] | tuple[str, ...], stream: TextIO | None = None) -> str:
+    return ", ".join(style_unit(unit_name, stream) for unit_name in unit_names)
+
+
+def status_role(status: str, message: str) -> str:
+    if status.upper() == "RESULT":
+        result = message.split(":", 1)[0].strip().upper()
+        if result == "FAILED":
+            return "error"
+        if result == "DRIFT":
+            return "warning"
+        if result in {"CLEAN", "VALID"}:
+            return "success"
+    return STATUS_ROLES.get(status.upper(), "label")
+
+
 def log_heading(message: str) -> None:
     """Write a visually distinct phase heading without polluting command result stdout."""
-    print(f"\n==> {message}", file=sys.stderr, flush=True)
+    print(f"\n==> {style_text(message, 'heading')}", file=sys.stderr, flush=True)
 
 
 def log_status(status: str, message: str) -> None:
     """Write one consistently aligned deployment progress line."""
-    print(f"    {status:<8} {message}", file=sys.stderr, flush=True)
+    padding = " " * (max(8 - len(status), 0) + 1)
+    rendered_status = style_text(status, status_role(status, message))
+    print(f"    {rendered_status}{padding}{message}", file=sys.stderr, flush=True)
 
 
 def short_revision(revision: str | None) -> str:
@@ -198,14 +305,19 @@ def commit_subject(repository_root: Path, revision: str) -> str | None:
     return subject
 
 
-def describe_revision(revision: str | None) -> str:
+def describe_revision(revision: str | None, stream: TextIO | None = None) -> str:
     """Render a shortened revision with its bounded commit subject when available."""
     shortened = short_revision(revision)
     if revision is None:
         return shortened
     resolved_revision = revision.removeprefix("dry:")
     subject = commit_subject(REPOSITORY_ROOT, resolved_revision)
-    return f"{shortened} ({subject})" if subject else shortened
+    if not subject:
+        return style_text(shortened, "revision", stream)
+    return (
+        f"{style_text(shortened, 'revision', stream)} "
+        f"({style_text(subject, 'muted', stream)})"
+    )
 
 
 def git(*args: str, check: bool = True, input_text: str | None = None, env=None):
@@ -1484,10 +1596,24 @@ def unit_change_explanation(unit_name: str, desired: Path, observed: Path) -> Un
     return classify_unit_change(previous, load_unit(current_path, unit_name), previous_revision)
 
 
-def log_bounded_items(status: str, values: tuple[str, ...], verbose: bool) -> None:
+def style_commit_evidence(value: str, stream: TextIO | None = None) -> str:
+    match = re.match(r"^(?P<revision>[0-9a-f]+)(?: (?P<subject>.*))?$", value)
+    if match is None:
+        return style_text(value, "muted", stream)
+    revision = style_text(match.group("revision"), "revision", stream)
+    subject = match.group("subject")
+    return f"{revision} {style_text(subject, 'muted', stream)}" if subject else revision
+
+
+def log_bounded_items(
+    status: str,
+    values: tuple[str, ...],
+    verbose: bool,
+    formatter: Callable[[str], str] | None = None,
+) -> None:
     limit = len(values) if verbose else 5
     for value in values[:limit]:
-        log_status(status, value)
+        log_status(status, formatter(value) if formatter is not None else value)
     if len(values) > limit:
         log_status(status, f"... and {len(values) - limit} more; use --verbose to show all")
 
@@ -1514,7 +1640,7 @@ def log_unit_change_explanation(
     )
     for cause in explanation.causes:
         log_status("CAUSE", cause)
-    log_bounded_items("COMMIT", explanation.commits, verbose)
+    log_bounded_items("COMMIT", explanation.commits, verbose, style_commit_evidence)
     log_bounded_items("FILE", explanation.files, verbose)
     log_bounded_items("FIELD", explanation.specification_paths, verbose)
 
@@ -1533,14 +1659,14 @@ def log_reconciliation_status(
     observed: Path | None = None,
     verbose: bool = False,
 ) -> None:
-    log_heading(f"Reconciliation status for {environment_name}")
+    log_heading(f"Reconciliation status for {style_environment(environment_name)}")
     for unit_name, status, reason in statuses:
-        log_status(status, f"{unit_name}: {reason}")
+        log_status(status, f"{style_unit(unit_name)}: {reason}")
         if status == "READY" and desired_revision is not None and desired is not None and observed is not None:
             log_unit_change_explanation(unit_name, desired_revision, desired, observed, verbose)
     ready = [unit_name for unit_name, status, _ in statuses if status == "READY"]
     if ready:
-        log_status("NEXT", ", ".join(ready))
+        log_status("NEXT", style_units(ready))
     elif any(status == "WAIT" for _, status, _ in statuses):
         log_status("NEXT", "none ready; waiting for upstream observations")
     elif any(status == "MATERIALIZED" for _, status, _ in statuses):
@@ -1578,7 +1704,8 @@ def log_convergence_plan(
     changed = [row for row in rows if previous_by_unit.get(row[0]) != row[1:] or row[1] == "NEXT"]
     log_heading("Plan" if previous is None else "Plan update")
     for unit_name, status, reason in changed:
-        message = unit_name if status in {"CLEAN", "MATERIALIZED"} else f"{unit_name}: {reason}"
+        styled_name = style_unit(unit_name)
+        message = styled_name if status in {"CLEAN", "MATERIALIZED"} else f"{styled_name}: {reason}"
         log_status(status, message)
 
 
@@ -1601,7 +1728,7 @@ def log_convergence_action(
     driver_value = unit.get("driver")
     driver = driver_value if isinstance(driver_value, str) else "unknown"
     explanation = unit_change_explanation(unit_name, desired, observed)
-    log_heading(f"Next action: {unit_name}")
+    log_heading(f"Next action: {style_unit(unit_name)}")
     log_status("DRIVER", driver)
     if explanation is None:
         log_status("CAUSE", reason)
@@ -1615,12 +1742,12 @@ def log_convergence_action(
         for cause in explanation.causes:
             log_status("CAUSE", cause)
         if commit := bounded_evidence(explanation.commits):
-            log_status("COMMIT", commit)
+            log_status("COMMIT", style_commit_evidence(commit))
         if file := bounded_evidence(explanation.files):
             log_status("FILE", file)
         if field := bounded_evidence(explanation.specification_paths):
             log_status("FIELD", field)
-    log_status("WRITES", f"driver effects; receipt to {observed_ref} on success")
+    log_status("WRITES", f"driver effects; receipt to {style_branch(observed_ref)} on success")
 
 
 def materialize_resolved_unit(
@@ -1721,7 +1848,7 @@ def build_desired_candidate(
     verbose: bool = True,
 ) -> None:
     if verbose:
-        log_heading(f"Resolve desired state for {environment_name}")
+        log_heading(f"Resolve desired state for {style_environment(environment_name)}")
         log_status("SOURCE", f"candidate revision {describe_revision(source_revision)}")
         log_status("DESIRED", "no current state" if not any(current_desired.iterdir()) else "loaded")
         log_status(
@@ -1753,7 +1880,7 @@ def build_desired_candidate(
         else:
             source_resolution = f"inputs unchanged; retain {describe_revision(resolved_source['revision'])}"
         if verbose:
-            log_status("CHECK", f"{unit_name}: {source_resolution}")
+            log_status("CHECK", f"{style_unit(unit_name)}: {source_resolution}")
 
     unresolved = set(prepared)
     unavailable: dict[str, str] = {}
@@ -1805,7 +1932,7 @@ def build_desired_candidate(
                     else "promotion already matches resolved inputs"
                 )
                 if verbose:
-                    log_status("PROMOTE", f"{unit_name}: {promotion_resolution}")
+                    log_status("PROMOTE", f"{style_unit(unit_name)}: {promotion_resolution}")
             if resolution.receipts or resolution.artifacts:
                 observation_resolution = (
                     "new observation changes resolved inputs"
@@ -1813,12 +1940,12 @@ def build_desired_candidate(
                     else "observations already match resolved inputs"
                 )
                 if verbose:
-                    log_status("OBSERVE", f"{unit_name}: {observation_resolution}")
+                    log_status("OBSERVE", f"{style_unit(unit_name)}: {observation_resolution}")
             changed = not previous_unit.is_file() or previous_unit.read_bytes() != candidate_unit.read_bytes()
             if verbose:
                 log_status(
                     "UPDATE" if changed else "KEEP",
-                    f"{unit_name}: {'desired state changed' if changed else 'already resolved'}",
+                    f"{style_unit(unit_name)}: {'desired state changed' if changed else 'already resolved'}",
                 )
             unresolved.remove(unit_name)
             unavailable.pop(unit_name, None)
@@ -1839,7 +1966,7 @@ def build_desired_candidate(
         else:
             resolution = "omit until its inputs are available"
         if verbose:
-            log_status("WAIT", f"{unit_name}: {unavailable[unit_name]}; {resolution}")
+            log_status("WAIT", f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}")
 
 
 def retryable_push_failure(exc: subprocess.CalledProcessError) -> bool:
@@ -2037,13 +2164,13 @@ def advance_desired(
     if require_source_ref and requested_source_revision is None:
         raise OperationError("--require-source-ref applies only to source-tracked environments")
     if verbose:
-        log_heading(f"Advance desired state for {environment}")
+        log_heading(f"Advance desired state for {style_environment(environment)}")
         log_status(
             "START",
             (
-                f"environment {environment} from {describe_revision(requested_source_revision)}"
+                f"environment {style_environment(environment)} from {describe_revision(requested_source_revision)}"
                 if requested_source_revision is not None
-                else f"environment {environment} from its merged promotion"
+                else f"environment {style_environment(environment)} from its merged promotion"
             ),
         )
     if requested_source_revision is None:
@@ -2054,7 +2181,7 @@ def advance_desired(
             materialize_revision(requested_source_revision, probe_root)
             desired_ref, observed_ref = deployment_refs(probe_root, environment, desired_ref, observed_ref)
     if verbose:
-        log_status("REFS", f"desired {desired_ref}; observed {observed_ref}")
+        log_status("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
     for attempt in range(5):
         if attempt and verbose:
             log_status("RETRY", f"desired-state publish attempt {attempt + 1}/5")
@@ -2110,14 +2237,14 @@ def advance_desired(
                 if verbose:
                     log_status(
                         "KEEP",
-                        f"{desired_ref} already resolved at {describe_revision(current_revision)}",
+                        f"{style_branch(desired_ref)} already resolved at {describe_revision(current_revision)}",
                     )
                 if summarize:
                     log_reconciliation_summary(environment, source_root, candidate, observed)
                 return current_revision, False
             if dry:
                 if verbose:
-                    log_status("DRY", f"{desired_ref} would be updated")
+                    log_status("DRY", f"{style_branch(desired_ref)} would be updated")
                 if summarize:
                     log_reconciliation_summary(environment, source_root, candidate, observed)
                 return current_revision, True
@@ -2129,7 +2256,7 @@ def advance_desired(
                     f"Desired {environment} state from {effective_source_revision}",
                 )
                 if verbose:
-                    log_status("UPDATE", f"{desired_ref} advanced to {describe_revision(revision)}")
+                    log_status("UPDATE", f"{style_branch(desired_ref)} advanced to {describe_revision(revision)}")
                 if summarize:
                     log_reconciliation_summary(environment, source_root, candidate, observed)
                 return revision, True
@@ -2177,7 +2304,7 @@ def publish_change_candidate(
             if directory_files(existing_root) != directory_files(candidate):
                 raise OperationError(f"change candidate ref exists with different state: {candidate_ref}")
         candidate_revision = existing_candidate
-        log_status("KEEP", f"reuse existing candidate {candidate_ref}")
+        log_status("KEEP", f"reuse existing candidate {style_branch(candidate_ref)}")
     else:
         candidate_revision = publish_tree(
             candidate_ref,
@@ -2220,7 +2347,9 @@ def write_change_outputs(
 
 def command_promote(args: argparse.Namespace) -> None:
     specification_revision = git("rev-parse", f"{args.specification_revision or 'HEAD'}^{{commit}}").stdout.strip()
-    log_heading(f"Promote {args.from_environment} to {args.to_environment}")
+    log_heading(
+        f"Promote {style_environment(args.from_environment)} to {style_environment(args.to_environment)}"
+    )
     log_status("SPEC", f"reviewed source {describe_revision(specification_revision)}")
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
@@ -2247,7 +2376,7 @@ def command_promote(args: argparse.Namespace) -> None:
         evidence_label = "reconciled" if evidence == "reconciled" else "promotion-complete"
         log_status(
             "SOURCE",
-            f"{source_desired_ref} {describe_revision(source_desired_revision)} is {evidence_label} at "
+            f"{style_branch(source_desired_ref)} {describe_revision(source_desired_revision)} is {evidence_label} at "
             f"{describe_revision(source_observed_revision)}",
         )
 
@@ -2280,7 +2409,7 @@ def command_promote(args: argparse.Namespace) -> None:
             )
             log_status(
                 "INIT",
-                f"created inert {target_desired_ref} at {describe_revision(target_revision)}",
+                f"created inert {style_branch(target_desired_ref)} at {describe_revision(target_revision)}",
             )
         promotion = PromotionContext(
             source_environment=args.from_environment,
@@ -2326,7 +2455,8 @@ def command_promote(args: argparse.Namespace) -> None:
             )
             log_status(
                 "CANDIDATE",
-                f"{candidate_ref} at {describe_revision(change_revision)} targets {target_desired_ref}",
+                f"{style_branch(candidate_ref)} at {describe_revision(change_revision)} targets "
+                f"{style_branch(target_desired_ref)}",
             )
         else:
             if args.candidate_ref:
@@ -2340,7 +2470,7 @@ def command_promote(args: argparse.Namespace) -> None:
             )
             log_status(
                 "UPDATE",
-                f"{target_desired_ref} advanced to {describe_revision(change_revision)}",
+                f"{style_branch(target_desired_ref)} advanced to {describe_revision(change_revision)}",
             )
         print(change_revision)
         write_change_outputs(
@@ -2396,7 +2526,7 @@ def publish_desired_change(
 ) -> tuple[str, ChangeRequestResult | ManualChangeRequest | None]:
     gate = change_gate(REPOSITORY_ROOT, environment)
     if dry:
-        log_status("DRY", f"{target_ref} would receive {title.lower()}")
+        log_status("DRY", f"{style_branch(target_ref)} would receive {title.lower()}")
         return target_revision, None
     if gate == "pullRequest":
         revision, outcome = publish_change_candidate(
@@ -2410,11 +2540,11 @@ def publish_desired_change(
         )
         log_status(
             "CANDIDATE",
-            f"{candidate_ref} at {describe_revision(revision)} targets {target_ref}",
+            f"{style_branch(candidate_ref)} at {describe_revision(revision)} targets {style_branch(target_ref)}",
         )
         return revision, outcome
     revision = publish_tree(target_ref, candidate, target_revision, commit_message)
-    log_status("UPDATE", f"{target_ref} advanced to {describe_revision(revision)}")
+    log_status("UPDATE", f"{style_branch(target_ref)} advanced to {describe_revision(revision)}")
     return revision, None
 
 
@@ -2453,7 +2583,7 @@ def command_rollback(args: argparse.Namespace) -> None:
         args.desired_ref,
         args.observed_ref,
     )
-    log_heading(f"Roll back {args.environment}")
+    log_heading(f"Roll back {style_environment(args.environment)}")
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
         current = temporary / "current"
@@ -2655,18 +2785,18 @@ def command_status(args: argparse.Namespace) -> None:
         else:
             desired_revision = observed_tree(desired_ref, desired)
         observed_revision = observed_tree(observed_ref, observed)
-        log_heading(f"Deployment status for {args.environment}")
+        log_heading(f"Deployment status for {style_environment(args.environment)}")
         log_status(
             "DESIRED",
-            f"{desired_ref} at {describe_revision(desired_revision)}"
+            f"{style_branch(desired_ref)} at {describe_revision(desired_revision)}"
             if desired_revision
-            else f"{desired_ref} does not exist",
+            else f"{style_branch(desired_ref)} does not exist",
         )
         log_status(
             "OBSERVED",
-            f"{observed_ref} at {describe_revision(observed_revision)}"
+            f"{style_branch(observed_ref)} at {describe_revision(observed_revision)}"
             if observed_revision
-            else f"{observed_ref} has no receipts yet",
+            else f"{style_branch(observed_ref)} has no receipts yet",
         )
         specifications = load_environment_specifications(REPOSITORY_ROOT, args.environment)
         statuses = reconciliation_statuses(sorted(specifications), desired, observed)
@@ -2719,22 +2849,25 @@ def command_facts(args: argparse.Namespace) -> None:
             print(json.dumps(result, indent=2, sort_keys=True))
             return
 
-        revision = describe_revision(observed_revision) if observed_revision else "no receipts"
-        print(f"Observed facts for {args.environment} ({observed_ref} at {revision})")
+        revision = describe_revision(observed_revision, sys.stdout) if observed_revision else "no receipts"
+        print(
+            f"Observed facts for {style_environment(args.environment, sys.stdout)} "
+            f"({style_branch(observed_ref, sys.stdout)} at {revision})"
+        )
         for unit_name, facts in units.items():
-            print(f"\n{unit_name}")
+            print(f"\n{style_unit(unit_name, sys.stdout)}")
             print(json.dumps(facts, indent=2, sort_keys=True))
 
 
 def command_verify(args: argparse.Namespace) -> None:
     desired_ref, _ = deployment_refs(REPOSITORY_ROOT, args.environment)
-    log_heading(f"Verify {args.environment}")
+    log_heading(f"Verify {style_environment(args.environment)}")
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
         desired = temporary / "desired"
         desired_revision = resolve_ref(desired_ref)
         materialize_revision(desired_revision, desired)
-        log_status("DESIRED", f"{desired_ref} at {describe_revision(desired_revision)}")
+        log_status("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(desired_revision)}")
 
         unit_paths = sorted(
             path for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}
@@ -2767,7 +2900,7 @@ def command_verify(args: argparse.Namespace) -> None:
 
         drifted: list[str] = []
         for unit_name, driver_name, unit, source in prepared:
-            log_status("VERIFY", f"{unit_name} ({driver_name})")
+            log_status("VERIFY", f"{style_unit(unit_name)} ({driver_name})")
             source_root = temporary / "sources" / unit_name
             materialize_revision(source["revision"], source_root)
             result = VERIFICATION_DRIVERS[driver_name].verify(
@@ -2784,15 +2917,15 @@ def command_verify(args: argparse.Namespace) -> None:
                 )
             )
             if result.status is VerificationStatus.CLEAN:
-                log_status("CLEAN", unit_name)
+                log_status("CLEAN", style_unit(unit_name))
             elif result.status is VerificationStatus.DRIFT:
                 drifted.append(unit_name)
-                log_status("DRIFT", unit_name)
+                log_status("DRIFT", style_unit(unit_name))
             else:
                 raise DriverError(f"{driver_name} returned an invalid verification status: {result.status!r}")
 
     if drifted:
-        log_status("RESULT", f"DRIFT: {', '.join(drifted)}")
+        log_status("RESULT", f"DRIFT: {style_units(drifted)}")
         raise OperationError(f"verification detected drift in: {', '.join(drifted)}")
     log_status("RESULT", "CLEAN")
 
@@ -2980,11 +3113,20 @@ def observation_dependency_graph(specifications: dict[str, dict[str, Any]], scop
 
 def log_dependency_graph(graph: dict[str, list[str]]) -> None:
     for unit_name, dependencies in graph.items():
-        log_status("DEPEND", f"{unit_name}: {', '.join(dependencies) or 'none'}")
+        log_status(
+            "DEPEND",
+            f"{style_unit(unit_name)}: "
+            f"{', '.join(style_unit(dependency) for dependency in dependencies) or 'none'}",
+        )
 
 
-def render_dependency_tree(target: str, graph: dict[str, list[str]]) -> list[str]:
-    lines = [target]
+def render_dependency_tree(
+    target: str,
+    graph: dict[str, list[str]],
+    style_name: Callable[[str], str] | None = None,
+) -> list[str]:
+    render_name = style_name or (lambda name: name)
+    lines = [render_name(target)]
 
     def render(unit_name: str, prefix: str, ancestors: set[str]) -> None:
         dependencies = graph[unit_name]
@@ -2992,7 +3134,7 @@ def render_dependency_tree(target: str, graph: dict[str, list[str]]) -> list[str
             last = index == len(dependencies) - 1
             connector = "└── " if last else "├── "
             cycle = dependency in ancestors
-            lines.append(f"{prefix}{connector}{dependency}{' [cycle]' if cycle else ''}")
+            lines.append(f"{prefix}{connector}{render_name(dependency)}{' [cycle]' if cycle else ''}")
             if not cycle:
                 render(
                     dependency,
@@ -3094,8 +3236,8 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         source_revision = None
     if args.require_source_ref and source_revision is None:
         raise OperationError("--require-source-ref requires --source-revision")
-    log_heading(f"Reconcile {args.unit}")
-    log_status("START", f"environment {args.environment}")
+    log_heading(f"Reconcile {style_unit(args.unit)}")
+    log_status("START", f"environment {style_environment(args.environment)}")
     log_status("MODE", "plan" if args.plan else "apply")
     report = Path(args.report).resolve() if args.report else None
     with tempfile.TemporaryDirectory() as temporary_directory:
@@ -3106,7 +3248,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             required_head = fetch_ref(args.require_source_ref)
             if required_head != source_revision:
                 log_status("SKIP", f"source revision is superseded by {args.require_source_ref}")
-                log_status("DONE", f"{args.unit}: no changes")
+                log_status("DONE", f"{style_unit(args.unit)}: no changes")
                 write_reconcile_outputs(False)
                 return False
         candidate_source_root: Path | None = None
@@ -3122,7 +3264,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         )
         if args.plan or (args.advance and not args.desired_revision):
             require_environment_unit(ref_source_root, args.environment, args.unit)
-        log_status("REFS", f"desired {desired_ref}; observed {observed_ref}")
+        log_status("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
         pre_advance = not args.plan and args.advance and not args.desired_revision
         pre_advanced_revision = ""
         if pre_advance:
@@ -3134,7 +3276,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 args.require_source_ref,
             )
             if advanced is None:
-                log_status("DONE", f"{args.unit}: source revision is no longer eligible")
+                log_status("DONE", f"{style_unit(args.unit)}: source revision is no longer eligible")
                 write_reconcile_outputs(False)
                 return False
             desired_revision = advanced
@@ -3161,17 +3303,17 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             desired_revision = resolve_ref(desired_ref, args.desired_revision)
         if candidate_source_root is None:
             materialize_revision(desired_revision, desired)
-        log_status("DESIRED", f"{desired_ref} at {describe_revision(desired_revision)}")
+        log_status("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(desired_revision)}")
         log_status(
             "OBSERVED",
-            f"{observed_ref} at {describe_revision(observed_revision)}"
+            f"{style_branch(observed_ref)} at {describe_revision(observed_revision)}"
             if observed_revision
-            else f"{observed_ref} has no receipts yet",
+            else f"{style_branch(observed_ref)} has no receipts yet",
         )
         unit_path = unit_document_path(desired, args.unit)
         if not unit_path.is_file():
             log_status("WAIT", "desired inputs are not materialized")
-            log_status("DONE", f"{args.unit}: no changes")
+            log_status("DONE", f"{style_unit(args.unit)}: no changes")
             write_reconcile_outputs(False)
             return False
         unit = load_unit(unit_path, args.unit)
@@ -3183,7 +3325,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             raise OperationError(f"{args.unit} desired state is not fully materialized")
         if not unit_requires_reconciliation(unit):
             log_status("SKIP", "unit is complete after desired-state materialization")
-            log_status("DONE", f"{args.unit}: materialized for external delivery")
+            log_status("DONE", f"{style_unit(args.unit)}: materialized for external delivery")
             write_reconcile_outputs(False, pre_advanced_revision)
             return False
 
@@ -3200,7 +3342,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             if changed and advanced:
                 return advanced
             if advanced:
-                log_status("KEEP", f"{desired_ref} did not change after observation")
+                log_status("KEEP", f"{style_branch(desired_ref)} did not change after observation")
             return ""
 
         unit_blob = file_blob(unit_path)
@@ -3223,7 +3365,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                     advanced_revision = pre_advanced_revision
                 else:
                     advanced_revision = advance_if_requested()
-                log_status("DONE", f"{args.unit}: clean")
+                log_status("DONE", f"{style_unit(args.unit)}: clean")
                 write_reconcile_outputs(False, advanced_revision)
                 return False
 
@@ -3251,7 +3393,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             if planned is not None:
                 raise DriverError(f"{driver_name} planning returned a value; planning evidence belongs in reports")
             log_status("PLAN", f"{driver_name} planning succeeded")
-            log_status("DONE", f"{args.unit}: no remote changes")
+            log_status("DONE", f"{style_unit(args.unit)}: no remote changes")
             write_reconcile_outputs(False)
             return False
         try:
@@ -3299,25 +3441,28 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         )
         log_status(
             "OBSERVE",
-            f"receipt published to {observed_ref} at {describe_revision(revision)}",
+            f"receipt published to {style_branch(observed_ref)} at {describe_revision(revision)}",
         )
         advanced_revision = advance_if_requested() or pre_advanced_revision
         write_reconcile_outputs(True, advanced_revision)
-        log_status("DONE", f"{args.unit}: reconciled successfully")
+        log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully")
         return True
 
 
 def log_ref_advance(advance: RefAdvance) -> None:
-    attribution = f" after {advance.unit}" if advance.unit else ""
+    attribution = f" after {style_unit(advance.unit)}" if advance.unit else ""
     log_status(
         "ADVANCE",
-        f"{advance.ref} {describe_revision(advance.before)} -> {describe_revision(advance.after)}{attribution}",
+        f"{style_branch(advance.ref)} {describe_revision(advance.before)} -> "
+        f"{describe_revision(advance.after)}{attribution}",
     )
 
 
 def require_reconciliation_approval(unit_name: str) -> None:
+    approval = style_text("APPROVE", "warning")
+    padding = " " * (8 - len("APPROVE") + 1)
     print(
-        f"    {'APPROVE':<8} Continue with {unit_name}? [y/N] ",
+        f"    {approval}{padding}Continue with {style_unit(unit_name)}? [y/N] ",
         end="",
         file=sys.stderr,
         flush=True,
@@ -3335,16 +3480,16 @@ def log_compact_convergence_summary(
     result: str,
     unselected: list[tuple[str, str, str]] | None = None,
 ) -> None:
-    log_heading(f"Convergence result for {environment}")
+    log_heading(f"Convergence result for {style_environment(environment)}")
     if result == "CLEAN":
-        driver_summary = f"drivers ran for {', '.join(steps)}" if steps else "no drivers ran"
+        driver_summary = f"drivers ran for {style_units(steps)}" if steps else "no drivers ran"
         ref_summary = f"{len(advances)} ref movement{'s' if len(advances) != 1 else ''}"
         log_status("RESULT", f"CLEAN: {len(scope)}/{len(scope)} units; {driver_summary}; {ref_summary}")
     else:
         log_status("RESULT", result)
     for unit_name, status, reason in unselected or []:
         if status not in {"CLEAN", "MATERIALIZED"}:
-            log_status("UNSCOPED", f"{unit_name}: {status.lower()}; {reason}")
+            log_status("UNSCOPED", f"{style_unit(unit_name)}: {status.lower()}; {reason}")
 
 
 def log_convergence_summary(
@@ -3358,16 +3503,16 @@ def log_convergence_summary(
     result: str,
     unselected: list[tuple[str, str, str]] | None = None,
 ) -> None:
-    log_heading(f"Convergence summary for {environment}")
-    log_status("TARGET", ", ".join(targets))
-    log_status("SCOPE", ", ".join(scope))
-    log_status("STEPS", ", ".join(steps) if steps else "no reconciliation drivers ran")
+    log_heading(f"Convergence summary for {style_environment(environment)}")
+    log_status("TARGET", style_units(targets))
+    log_status("SCOPE", style_units(scope))
+    log_status("STEPS", style_units(steps) if steps else "no reconciliation drivers ran")
     if advances:
         for index, advance in enumerate(advances, 1):
-            attribution = f" ({advance.unit})" if advance.unit else ""
+            attribution = f" ({style_unit(advance.unit)})" if advance.unit else ""
             log_status(
                 "MOVE",
-                f"{index}. {advance.kind} {advance.ref} "
+                f"{index}. {advance.kind} {style_branch(advance.ref)} "
                 f"{describe_revision(advance.before)} -> "
                 f"{describe_revision(advance.after)}{attribution}",
             )
@@ -3383,7 +3528,7 @@ def log_convergence_summary(
     )
     for unit_name, status, reason in unselected or []:
         if status not in {"CLEAN", "MATERIALIZED"}:
-            log_status("UNSCOPED", f"{unit_name}: {status.lower()}; {reason}")
+            log_status("UNSCOPED", f"{style_unit(unit_name)}: {status.lower()}; {reason}")
     log_status("RESULT", result)
 
 
@@ -3417,7 +3562,15 @@ def command_dependencies(args: argparse.Namespace) -> None:
     for index, target in enumerate(targets):
         if index:
             print()
-        print("\n".join(render_dependency_tree(target, graph)))
+        print(
+            "\n".join(
+                render_dependency_tree(
+                    target,
+                    graph,
+                    lambda unit_name: style_unit(unit_name, sys.stdout),
+                )
+            )
+        )
 
 
 def command_converge(args: argparse.Namespace) -> None:
@@ -3426,7 +3579,7 @@ def command_converge(args: argparse.Namespace) -> None:
     source_revision = resolve_advance_source_revision(REPOSITORY_ROOT, args.environment, args.source_revision)
     if args.require_source_ref and source_revision is None:
         raise OperationError("--require-source-ref applies only to source-tracked environments")
-    log_heading(f"Converge {args.environment}")
+    log_heading(f"Converge {style_environment(args.environment)}")
     log_status(
         "SOURCE",
         describe_revision(source_revision) if source_revision else "merged promotion",
@@ -3477,16 +3630,16 @@ def command_converge(args: argparse.Namespace) -> None:
         targets, scope = convergence_scope(specifications, args.unit)
         order = convergence_order(specifications, scope)
         if args.verbose:
-            log_status("REFS", f"desired {desired_ref}; observed {observed_ref}")
-            log_status("TARGET", ", ".join(targets))
-            log_status("SCOPE", ", ".join(scope))
+            log_status("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
+            log_status("TARGET", style_units(targets))
+            log_status("SCOPE", style_units(scope))
             log_dependency_graph(observation_dependency_graph(specifications, scope))
         else:
-            log_status("DESIRED", f"{desired_ref} at {describe_revision(start_desired)}")
-            log_status("OBSERVED", f"{observed_ref} at {describe_revision(start_observed)}")
+            log_status("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(start_desired)}")
+            log_status("OBSERVED", f"{style_branch(observed_ref)} at {describe_revision(start_observed)}")
             if targets != scope:
-                log_status("TARGET", ", ".join(targets))
-                log_status("SCOPE", ", ".join(scope))
+                log_status("TARGET", style_units(targets))
+                log_status("SCOPE", style_units(scope))
 
         advances: list[RefAdvance] = []
         steps: list[str] = []
@@ -3541,7 +3694,7 @@ def command_converge(args: argparse.Namespace) -> None:
                     else:
                         log_status(
                             "DESIRED",
-                            f"{desired_ref} {describe_revision(before_desired)} -> "
+                            f"{style_branch(desired_ref)} {describe_revision(before_desired)} -> "
                             f"{describe_revision(desired_revision)} (advanced)",
                         )
 
@@ -3625,9 +3778,11 @@ def command_converge(args: argparse.Namespace) -> None:
                 if not args.yes:
                     require_reconciliation_approval(unit_name)
                 if args.verbose:
-                    log_heading(f"Convergence step {len(steps) + 1} (limit {max_steps}): {unit_name}")
+                    log_heading(
+                        f"Convergence step {len(steps) + 1} (limit {max_steps}): {style_unit(unit_name)}"
+                    )
                 else:
-                    log_status("RUN", unit_name)
+                    log_status("RUN", style_unit(unit_name))
                 before_observed = last_observed
                 ran = command_reconcile(
                     argparse.Namespace(
@@ -3662,8 +3817,8 @@ def command_converge(args: argparse.Namespace) -> None:
                     else:
                         log_status(
                             "OBSERVED",
-                            f"{observed_ref} {describe_revision(before_observed)} -> "
-                            f"{describe_revision(after_observed)} ({unit_name})",
+                            f"{style_branch(observed_ref)} {describe_revision(before_observed)} -> "
+                            f"{describe_revision(after_observed)} ({style_unit(unit_name)})",
                         )
         except (DriverError, OperationError, subprocess.CalledProcessError) as exc:
             detail = (

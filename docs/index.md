@@ -16,6 +16,10 @@ operator can run locally.
 - `promote` and `rollback` publish direct changes or pull-request candidates according to `changeGate`.
 - `verify` asks supported unit drivers to check external state without changing Git or external state.
 
+Human-readable progress output uses semantic ANSI colors on terminals and in CI logs. It stays plain when redirected
+to a file or captured for automation. Set `NO_COLOR=1` to disable styling or `FORCE_COLOR=1` to enable it explicitly;
+machine-readable output remains uncolored.
+
 ## Install
 
 ```console

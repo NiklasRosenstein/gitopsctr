@@ -37,6 +37,10 @@ Important commands include:
 - `rollback`: publish a forward desired-state commit from historical state.
 - `verify`: ask supported drivers to check external state without writing receipts.
 
+Human-readable progress output uses semantic ANSI colors on terminals and in CI logs. It stays plain when redirected
+to a file or captured for automation. Set `NO_COLOR=1` to disable styling or `FORCE_COLOR=1` to enable it explicitly.
+Machine-readable stdout remains uncolored.
+
 ## Demo
 
 `mise run demo` creates an isolated local Git remote, builds and publishes a real OCI image to a local

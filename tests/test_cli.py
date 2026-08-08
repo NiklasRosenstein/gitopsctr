@@ -680,6 +680,68 @@ def test_progress_helpers_keep_result_stdout_clean(capsys):
     assert output.err == "\n==> Reconcile frontend\n    DONE     frontend: clean\n"
 
 
+class _FakeStream(io.StringIO):
+    def __init__(self, tty: bool):
+        super().__init__()
+        self.tty = tty
+
+    def isatty(self) -> bool:
+        return self.tty
+
+
+def test_color_detection_respects_tty_ci_files_and_overrides(tmp_path, monkeypatch):
+    for name in ("NO_COLOR", "FORCE_COLOR", "CI", "TERM"):
+        monkeypatch.delenv(name, raising=False)
+
+    assert not deploy_release.color_enabled(_FakeStream(False))
+    assert deploy_release.color_enabled(_FakeStream(True))
+
+    monkeypatch.setenv("CI", "true")
+    assert deploy_release.color_enabled(_FakeStream(False))
+    with (tmp_path / "output.log").open("w") as output:
+        assert not deploy_release.color_enabled(output)
+
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    assert not deploy_release.color_enabled(_FakeStream(True))
+    monkeypatch.delenv("NO_COLOR")
+    assert deploy_release.color_enabled(_FakeStream(False))
+
+    monkeypatch.setenv("TERM", "dumb")
+    monkeypatch.delenv("FORCE_COLOR")
+    assert not deploy_release.color_enabled(_FakeStream(False))
+
+
+def test_colored_progress_uses_semantic_roles_and_keeps_stdout_clean(monkeypatch, capsys):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+
+    deploy_release.log_heading("Reconcile frontend")
+    deploy_release.log_status("DONE", f"{deploy_release.style_unit('frontend')}: clean")
+    deploy_release.log_status(
+        "DESIRED",
+        f"{deploy_release.style_branch('deploy/dev')} in "
+        f"{deploy_release.style_environment('dev')}",
+    )
+    deploy_release.log_status("RESULT", "FAILED: reconciliation failed")
+
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "\x1b[1;36mReconcile frontend\x1b[0m" in output.err
+    assert "\x1b[1;32mDONE\x1b[0m" in output.err
+    assert "\x1b[1;31mRESULT\x1b[0m" in output.err
+    assert "\x1b[1;36mfrontend\x1b[0m" in output.err
+    assert "\x1b[1;36mdeploy/dev\x1b[0m" in output.err
+    assert "\x1b[1;36mdev\x1b[0m" in output.err
+
+
+def test_machine_readable_stdout_stays_uncolored_when_color_is_forced(monkeypatch, capsys):
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    print("a" * 40)
+
+    assert capsys.readouterr().out == "a" * 40 + "\n"
+
+
 @pytest.mark.parametrize(
     ("stdout", "returncode", "expected"),
     [
