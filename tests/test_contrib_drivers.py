@@ -10,7 +10,14 @@ import pytest
 
 from gitopsctr import driver as driver_registry
 from gitopsctr.contrib.driver import _oci, frontend_s3_cloudfront, oci_images, terraform, vite_oci_bundle
-from gitopsctr.driver import DriverContext, DriverError, VerificationResult, VerificationStatus
+from gitopsctr.driver import (
+    Driver,
+    DriverContext,
+    DriverError,
+    VerificationCapability,
+    VerificationResult,
+    VerificationStatus,
+)
 
 DIGEST = "sha256:" + "1" * 64
 OTHER_DIGEST = "sha256:" + "2" * 64
@@ -33,6 +40,23 @@ def test_contributed_driver_entry_points_load_one_module_per_driver():
         "gitopsctr.contrib.driver.terraform",
         "gitopsctr.contrib.driver.vite_oci_bundle",
     }
+    assert all(isinstance(plugin, Driver) for plugin in driver_registry.DRIVER_PLUGINS.values())
+
+
+def test_driver_capabilities_are_independent_and_explicit():
+    assert isinstance(terraform.PLUGIN, VerificationCapability)
+    assert not isinstance(oci_images.PLUGIN, VerificationCapability)
+    assert not isinstance(vite_oci_bundle.PLUGIN, VerificationCapability)
+    assert not isinstance(frontend_s3_cloudfront.PLUGIN, VerificationCapability)
+    assert driver_registry.VERIFICATION_DRIVERS == {"terraform": terraform.PLUGIN.verify}
+
+
+def test_driver_base_class_requires_core_operations():
+    class IncompleteDriver(Driver):
+        version = 1
+
+    with pytest.raises(TypeError, match="abstract"):
+        IncompleteDriver()
 
 
 def _oci_context(
@@ -516,10 +540,6 @@ def test_terraform_verification_turns_other_exit_codes_into_driver_errors(tmp_pa
         terraform.verify_terraform(_terraform_context(tmp_path, report))
 
     assert (report / "verify.txt").read_text() == "Error: state lock failed\n"
-
-
-def test_only_terraform_registers_verification_support():
-    assert driver_registry.VERIFICATION_DRIVERS == {"terraform": terraform.verify_terraform}
 
 
 @pytest.mark.parametrize(

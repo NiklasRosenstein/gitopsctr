@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 from typing import TypedDict, cast
 
-from gitopsctr.driver import DriverContext, DriverError, DriverPlugin
+from gitopsctr.driver import Driver, DriverContext, DriverError, DriverResult
 
 from ._common import require_strings, run, select_result_fields
 from ._oci import (
@@ -184,4 +184,17 @@ def apply_oci_images(context: DriverContext) -> OciImagesResult | dict[str, obje
     }
 
 
-PLUGIN = DriverPlugin(version=2, reconcile=apply_oci_images, semantic_result=select_result_fields("artifacts"))
+_SEMANTIC_RESULT = select_result_fields("artifacts")
+
+
+class OciImagesDriver(Driver):
+    version = 2
+
+    def reconcile(self, context: DriverContext) -> OciImagesResult | dict[str, object]:
+        return apply_oci_images(context)
+
+    def semantic_result(self, result: object) -> DriverResult:
+        return _SEMANTIC_RESULT(result)
+
+
+PLUGIN = OciImagesDriver()

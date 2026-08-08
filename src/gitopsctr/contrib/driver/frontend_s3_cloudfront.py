@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import TypedDict, cast
 
-from gitopsctr.driver import DriverContext, DriverError, DriverPlugin, JsonObject
+from gitopsctr.driver import Driver, DriverContext, DriverError, DriverResult, JsonObject
 
 from ._common import require_strings, run, select_result_fields
 from ._oci import (
@@ -229,8 +229,17 @@ def apply_frontend_s3_cloudfront(context: DriverContext) -> FrontendPlanResult |
     }
 
 
-PLUGIN = DriverPlugin(
-    version=1,
-    reconcile=apply_frontend_s3_cloudfront,
-    semantic_result=select_result_fields("published"),
-)
+_SEMANTIC_RESULT = select_result_fields("published")
+
+
+class FrontendS3CloudfrontDriver(Driver):
+    version = 1
+
+    def reconcile(self, context: DriverContext) -> FrontendPlanResult | FrontendResult:
+        return apply_frontend_s3_cloudfront(context)
+
+    def semantic_result(self, result: object) -> DriverResult:
+        return _SEMANTIC_RESULT(result)
+
+
+PLUGIN = FrontendS3CloudfrontDriver()

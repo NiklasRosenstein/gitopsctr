@@ -37,8 +37,9 @@ Important commands include:
 ## Driver plugins
 
 Drivers are discovered from the `gitopsctr.drivers` Python entry-point group. An entry point must load
-a `gitopsctr.driver.DriverPlugin`. The drivers distributed in this package use the same public
-registry and live under `gitopsctr.contrib.driver`.
+an instance of `gitopsctr.driver.Driver`. Optional controller operations are declared through independent
+capability base classes such as `VerificationCapability`. The drivers distributed in this package use the
+same public registry and live under `gitopsctr.contrib.driver`.
 
 ## GitHub Action
 

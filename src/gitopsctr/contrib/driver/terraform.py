@@ -9,7 +9,16 @@ import sys
 from pathlib import Path
 from typing import TypedDict, cast
 
-from gitopsctr.driver import DriverContext, DriverError, DriverPlugin, JsonValue, VerificationResult, VerificationStatus
+from gitopsctr.driver import (
+    Driver,
+    DriverContext,
+    DriverError,
+    DriverResult,
+    JsonValue,
+    VerificationCapability,
+    VerificationResult,
+    VerificationStatus,
+)
 
 from ._common import run, select_result_fields
 
@@ -178,9 +187,20 @@ def verify_terraform(context: DriverContext) -> VerificationResult:
     raise DriverError(output.strip() or f"Terraform verification failed with exit code {result.returncode}")
 
 
-PLUGIN = DriverPlugin(
-    version=2,
-    reconcile=apply_terraform,
-    verify=verify_terraform,
-    semantic_result=select_result_fields("applied", "outputs"),
-)
+_SEMANTIC_RESULT = select_result_fields("applied", "outputs")
+
+
+class TerraformDriver(Driver, VerificationCapability):
+    version = 2
+
+    def reconcile(self, context: DriverContext) -> TerraformPlanResult | TerraformResult:
+        return apply_terraform(context)
+
+    def semantic_result(self, result: object) -> DriverResult:
+        return _SEMANTIC_RESULT(result)
+
+    def verify(self, context: DriverContext) -> VerificationResult:
+        return verify_terraform(context)
+
+
+PLUGIN = TerraformDriver()
