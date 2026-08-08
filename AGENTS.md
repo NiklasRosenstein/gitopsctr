@@ -18,3 +18,9 @@ untrusted editor hint and must never fetch it.
 - A repository may set `writeFormat: yaml` or `writeFormat: json` in `gitopsctr.yaml`.
 - Unit resources use `unit.gitopsctr.io/v1`; controller resources use `gitopsctr.io/v1`.
 - `UnitDriver` is the implementation of a unit kind. Entry points use the full GVK.
+
+## Python interfaces
+
+- Do not return heterogeneous positional tuples whose elements are not self-explanatory at call sites, especially
+  undocumented tuples. Use a `TypedDict` or dataclass with named fields instead, and document any fields or invariants
+  that are not obvious from their names and types.

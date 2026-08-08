@@ -94,9 +94,24 @@ class TerraformResultModel(StrictModel):
     outputs: dict[str, Any]
 
 
+@dataclass(frozen=True, kw_only=True)
+class TerraformRuntime:
+    """Validated values used to invoke Terraform for a unit.
+
+    Checks remain unparsed until reconciliation, where they are validated against
+    the observed Terraform outputs they reference.
+    """
+
+    working_directory: Path
+    environment: dict[str, str]
+    init_args: list[str]
+    observed_output_names: list[str]
+    checks: list[object]
+
+
 def terraform_runtime(
     context: PlanningContext | ReconciliationContext | VerificationContext,
-) -> tuple[Path, dict[str, str], list[str], list[str], list[object]]:
+) -> TerraformRuntime:
     configuration = context.unit.get("terraform")
     if not isinstance(configuration, dict):
         raise DriverError("terraform driver requires a terraform configuration")
@@ -127,7 +142,13 @@ def terraform_runtime(
     terraform_environment = os.environ | {
         f"TF_VAR_{name}": value if isinstance(value, str) else json.dumps(value) for name, value in variables.items()
     }
-    return terraform_root, terraform_environment, backend_args, output_names, cast(list[object], checks)
+    return TerraformRuntime(
+        working_directory=terraform_root,
+        environment=terraform_environment,
+        init_args=backend_args,
+        observed_output_names=output_names,
+        checks=cast(list[object], checks),
+    )
 
 
 class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, VerificationCapability):
@@ -162,7 +183,7 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
         return plan, report
 
     def plan(self, context: PlanningContext) -> None:
-        terraform_root, terraform_environment, backend_args, _, _ = terraform_runtime(context)
+        runtime = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,
             "plan.tfplan",
@@ -176,8 +197,8 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
                 result = context.execution.run(
                     "terraform",
                     *args,
-                    cwd=terraform_root,
-                    env=terraform_environment,
+                    cwd=runtime.working_directory,
+                    env=runtime.environment,
                     output=output,
                 )
             except subprocess.CalledProcessError as exc:
@@ -190,7 +211,7 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
                 report_text.write_text(result.stdout + result.stderr)
             return result
 
-        terraform("init", *backend_args)
+        terraform("init", *runtime.init_args)
         terraform(
             "plan",
             f"-out={plan}",
@@ -203,7 +224,7 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
             terraform("show", "-no-color", str(plan), reported=True)
 
     def reconcile(self, context: ReconciliationContext) -> TerraformResult:
-        terraform_root, terraform_environment, backend_args, output_names, checks = terraform_runtime(context)
+        runtime = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,
             "plan.tfplan",
@@ -223,8 +244,8 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
                 result = context.execution.run(
                     "terraform",
                     *args,
-                    cwd=terraform_root,
-                    env=terraform_environment,
+                    cwd=runtime.working_directory,
+                    env=runtime.environment,
                     output=output,
                 )
             except subprocess.CalledProcessError as exc:
@@ -237,7 +258,7 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
                 report_text.write_text(result.stdout + result.stderr)
             return result
 
-        terraform("init", *backend_args)
+        terraform("init", *runtime.init_args)
         terraform("plan", f"-out={plan}", emit=report_text is None)
         if report_text is not None:
             terraform("show", "-no-color", str(plan), reported=True)
@@ -248,16 +269,19 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
                     "terraform",
                     "output",
                     "-json",
-                    cwd=terraform_root,
-                    env=terraform_environment,
+                    cwd=runtime.working_directory,
+                    env=runtime.environment,
                     output=CommandOutput.CAPTURE,
                 ).stdout
             )
-            outputs = cast(dict[str, JsonValue], {name: raw_outputs[name]["value"] for name in output_names})
+            outputs = cast(
+                dict[str, JsonValue],
+                {name: raw_outputs[name]["value"] for name in runtime.observed_output_names},
+            )
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise DriverError(f"Terraform did not return the expected outputs: {exc}") from exc
 
-        for check in checks:
+        for check in runtime.checks:
             if not isinstance(check, dict) or check.get("type") != "http":
                 raise DriverError("terraform currently supports only HTTP checks")
             output_name = check.get("urlOutput")
@@ -283,7 +307,7 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
         }
 
     def verify(self, context: VerificationContext) -> VerificationResult:
-        terraform_root, terraform_environment, backend_args, _, _ = terraform_runtime(context)
+        runtime = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,
             "verify.tfplan",
@@ -291,7 +315,13 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
             ".verify.tfplan",
         )
 
-        context.execution.run("terraform", "init", *backend_args, cwd=terraform_root, env=terraform_environment)
+        context.execution.run(
+            "terraform",
+            "init",
+            *runtime.init_args,
+            cwd=runtime.working_directory,
+            env=runtime.environment,
+        )
         result = context.execution.run(
             "terraform",
             "plan",
@@ -299,8 +329,8 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
             "-input=false",
             "-no-color",
             f"-out={plan}",
-            cwd=terraform_root,
-            env=terraform_environment,
+            cwd=runtime.working_directory,
+            env=runtime.environment,
             output=CommandOutput.TEE,
             check=False,
         )
