@@ -145,7 +145,7 @@ def test_oci_images_uses_optional_aws_ecr_provider_without_persisting_credential
     monkeypatch.setattr(_oci, "docker_cli_plugins", lambda: plugins)
     monkeypatch.setenv("AWS_PROFILE", "example-profile")
 
-    result = oci_images.apply_oci_images(_oci_context(tmp_path, credential_provider={"type": "aws-ecr"}))
+    result = oci_images.PLUGIN.reconcile(_oci_context(tmp_path, credential_provider={"type": "aws-ecr"}))
 
     aws_command = next(command for command, _ in commands if command[0] == "aws")
     assert aws_command == ("aws", "ecr", "get-login-password", "--region", "eu-west-1")
@@ -179,7 +179,7 @@ def test_oci_images_without_provider_uses_existing_docker_auth(tmp_path, monkeyp
     monkeypatch.setattr(oci_images, "run", unexpected_run)
     monkeypatch.setattr(oci_images, "oci_digest", fake_digest)
 
-    result = oci_images.apply_oci_images(_oci_context(tmp_path))
+    result = oci_images.PLUGIN.reconcile(_oci_context(tmp_path))
 
     assert environments == [None, None]
     assert result["artifacts"]["containers.json"]["artifacts"]["control"]["uri"] == (
@@ -212,7 +212,7 @@ def test_oci_images_rejects_invalid_provider_and_repository_configuration(
     )
 
     with pytest.raises(DriverError, match=message):
-        oci_images.apply_oci_images(
+        oci_images.PLUGIN.reconcile(
             _oci_context(
                 tmp_path,
                 credential_provider=provider,
@@ -236,7 +236,7 @@ def test_oci_images_dry_run_validates_but_does_not_request_credentials(tmp_path,
         lambda *_args, **_kwargs: pytest.fail("dry reconciliation must not inspect registries"),
     )
 
-    assert oci_images.apply_oci_images(_oci_context(tmp_path, credential_provider={"type": "aws-ecr"}, dry=True)) == {}
+    assert oci_images.PLUGIN.reconcile(_oci_context(tmp_path, credential_provider={"type": "aws-ecr"}, dry=True)) == {}
     assert len(commands) == 1
     assert commands[0][:2] == ("docker", "build")
 
@@ -259,7 +259,7 @@ def test_oci_images_recovers_partial_publication_without_rebuilding(tmp_path, mo
     monkeypatch.setattr(oci_images, "run", fake_run)
     monkeypatch.setattr(oci_images, "oci_digest", fake_digest)
 
-    result = oci_images.apply_oci_images(_oci_context(tmp_path))
+    result = oci_images.PLUGIN.reconcile(_oci_context(tmp_path))
 
     assert not any(command[:2] == ("docker", "build") for command in commands)
     assert any(command[:2] == ("docker", "pull") for command in commands)
@@ -277,7 +277,7 @@ def test_oci_images_rejects_disagreeing_repository_digests(tmp_path, monkeypatch
     )
 
     with pytest.raises(DriverError, match="disagree"):
-        oci_images.apply_oci_images(_oci_context(tmp_path))
+        oci_images.PLUGIN.reconcile(_oci_context(tmp_path))
 
 
 def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path, monkeypatch):
@@ -315,7 +315,7 @@ def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path,
         lambda *_args, **_kwargs: pytest.fail("existing artifact must skip all commands"),
     )
 
-    result = vite_oci_bundle.apply_vite_oci_bundle(context)
+    result = vite_oci_bundle.PLUGIN.reconcile(context)
 
     assert result["artifacts"]["frontend.json"]["artifacts"]["bundle"]["uri"] == (
         f"{REGISTRY}/example-application-frontend@{DIGEST}"
@@ -393,9 +393,9 @@ def test_frontend_deploy_overwrites_index_and_verifies_cloudfront(tmp_path, monk
 
     if stale_index:
         with pytest.raises(DriverError, match="did not serve"):
-            frontend_s3_cloudfront.apply_frontend_s3_cloudfront(context)
+            frontend_s3_cloudfront.PLUGIN.reconcile(context)
     else:
-        result = frontend_s3_cloudfront.apply_frontend_s3_cloudfront(context)
+        result = frontend_s3_cloudfront.PLUGIN.reconcile(context)
         assert result["published"]["bundle"] == context.inputs["bundle"]
 
     index_upload = next(
@@ -453,7 +453,7 @@ def test_terraform_dry_run_saves_binary_plan_and_rendered_report(tmp_path, monke
 
     monkeypatch.setattr(terraform, "run", fake_run)
 
-    result = terraform.apply_terraform(_terraform_context(tmp_path, report))
+    result = terraform.PLUGIN.reconcile(_terraform_context(tmp_path, report))
 
     assert result == {"planned": {"sourceRevision": "a" * 40}}
     assert (report / "plan.tfplan").read_bytes() == b"saved plan"
@@ -481,7 +481,7 @@ def test_terraform_report_contains_plan_failure_diagnostics(tmp_path, monkeypatc
     monkeypatch.setattr(terraform, "run", fake_run)
 
     with pytest.raises(subprocess.CalledProcessError):
-        terraform.apply_terraform(_terraform_context(tmp_path, report))
+        terraform.PLUGIN.reconcile(_terraform_context(tmp_path, report))
 
     assert (report / "plan.txt").read_text() == "Error: speculative plan failed\n"
     assert not (report / "plan.tfplan").exists()
@@ -537,7 +537,7 @@ def test_terraform_verification_turns_other_exit_codes_into_driver_errors(tmp_pa
     monkeypatch.setattr(terraform, "run", fake_run)
 
     with pytest.raises(DriverError, match="state lock failed"):
-        terraform.verify_terraform(_terraform_context(tmp_path, report))
+        terraform.PLUGIN.verify(_terraform_context(tmp_path, report))
 
     assert (report / "verify.txt").read_text() == "Error: state lock failed\n"
 

@@ -95,151 +95,145 @@ def runtime_configuration(inputs: JsonObject) -> RuntimeConfiguration:
     return cast(RuntimeConfiguration, configuration)
 
 
-def apply_frontend_s3_cloudfront(context: DriverContext) -> FrontendPlanResult | FrontendResult:
-    require_strings(
-        context.inputs,
-        ("bundle", "bucket", "distributionId", "url"),
-        "frontend-s3-cloudfront inputs",
-    )
-    configuration = runtime_configuration(context.inputs)
-    inputs = cast(FrontendInputs, context.inputs)
-    repository, artifact_digest = parse_oci_uri(inputs["bundle"])
-    publication = context.unit.get("pull", {})
-    if not isinstance(publication, dict):
-        raise DriverError("frontend-s3-cloudfront pull must be an object")
-    registry = repository_registry(repository)
-    credential_provider = resolve_credential_provider(publication.get("credentialProvider"), {registry})
-    runtime_bytes = json.dumps(configuration, indent=2, sort_keys=True).encode() + b"\n"
-    runtime_digest = f"sha256:{hashlib.sha256(runtime_bytes).hexdigest()}"
-    if context.dry:
-        return {"planned": {"bundle": inputs["bundle"], "runtimeConfigHash": runtime_digest}}
-
-    with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-deploy-") as directory:
-        temporary = Path(directory)
-        pulled = temporary / "pulled"
-        distribution = temporary / "distribution"
-        pulled.mkdir()
-        distribution.mkdir()
-        with oras_authentication(credential_provider, {registry}) as registry_config:
-            run(
-                "oras",
-                "pull",
-                *oras_registry_args(registry_config),
-                "--output",
-                str(pulled),
-                inputs["bundle"],
-            )
-        archive = pulled / FRONTEND_ARCHIVE
-        if not archive.is_file():
-            raise DriverError(f"frontend OCI artifact did not contain {FRONTEND_ARCHIVE}")
-        safe_extract_bundle(archive, distribution)
-        runtime_path = distribution / "runtime-config.json"
-        runtime_path.write_bytes(runtime_bytes)
-        index_path = distribution / "index.html"
-        if not index_path.is_file():
-            raise DriverError("frontend OCI artifact did not contain index.html")
-        index_text = index_path.read_text()
-        run("aws", "s3", "sync", str(distribution), f"s3://{inputs['bucket']}", "--delete")
-        # Deterministic bundles give index.html a fixed timestamp, while hashed assets can
-        # change without changing its byte length. Always replace the entry point.
-        run(
-            "aws",
-            "s3",
-            "cp",
-            str(index_path),
-            f"s3://{inputs['bucket']}/index.html",
-            "--cache-control",
-            "no-cache",
-            "--content-type",
-            "text/html",
-        )
-        run(
-            "aws",
-            "s3",
-            "cp",
-            str(runtime_path),
-            f"s3://{inputs['bucket']}/runtime-config.json",
-            "--cache-control",
-            "no-store",
-            "--content-type",
-            "application/json",
-        )
-    invalidation = run(
-        "aws",
-        "cloudfront",
-        "create-invalidation",
-        "--distribution-id",
-        inputs["distributionId"],
-        "--paths",
-        "/*",
-        "--query",
-        "Invalidation.Id",
-        "--output",
-        "text",
-        capture=True,
-    ).stdout.strip()
-    if not invalidation:
-        raise DriverError("CloudFront did not return an invalidation ID")
-    run(
-        "aws",
-        "cloudfront",
-        "wait",
-        "invalidation-completed",
-        "--distribution-id",
-        inputs["distributionId"],
-        "--id",
-        invalidation,
-    )
-    served_index = run(
-        "curl",
-        "--fail",
-        "--show-error",
-        "--silent",
-        "--retry",
-        "6",
-        "--retry-all-errors",
-        "--retry-delay",
-        "5",
-        inputs["url"],
-        capture=True,
-    ).stdout
-    if served_index != index_text:
-        raise DriverError("CloudFront did not serve the frontend index from this deployment")
-    run(
-        "curl",
-        "--fail",
-        "--show-error",
-        "--silent",
-        "--retry",
-        "6",
-        "--retry-all-errors",
-        "--retry-delay",
-        "5",
-        f"{inputs['url']}/runtime-config.json",
-    )
-    return {
-        "published": {
-            "sourceRevision": context.source_revision,
-            "path": context.source_path,
-            "bundle": inputs["bundle"],
-            "artifactDigest": artifact_digest,
-            "runtimeConfigHash": runtime_digest,
-            "url": inputs["url"],
-        }
-    }
-
-
-_SEMANTIC_RESULT = select_result_fields("published")
-
-
 class FrontendS3CloudfrontDriver(Driver):
     version = 1
+    _select_semantic_result = staticmethod(select_result_fields("published"))
 
     def reconcile(self, context: DriverContext) -> FrontendPlanResult | FrontendResult:
-        return apply_frontend_s3_cloudfront(context)
+        require_strings(
+            context.inputs,
+            ("bundle", "bucket", "distributionId", "url"),
+            "frontend-s3-cloudfront inputs",
+        )
+        configuration = runtime_configuration(context.inputs)
+        inputs = cast(FrontendInputs, context.inputs)
+        repository, artifact_digest = parse_oci_uri(inputs["bundle"])
+        publication = context.unit.get("pull", {})
+        if not isinstance(publication, dict):
+            raise DriverError("frontend-s3-cloudfront pull must be an object")
+        registry = repository_registry(repository)
+        credential_provider = resolve_credential_provider(publication.get("credentialProvider"), {registry})
+        runtime_bytes = json.dumps(configuration, indent=2, sort_keys=True).encode() + b"\n"
+        runtime_digest = f"sha256:{hashlib.sha256(runtime_bytes).hexdigest()}"
+        if context.dry:
+            return {"planned": {"bundle": inputs["bundle"], "runtimeConfigHash": runtime_digest}}
+
+        with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-deploy-") as directory:
+            temporary = Path(directory)
+            pulled = temporary / "pulled"
+            distribution = temporary / "distribution"
+            pulled.mkdir()
+            distribution.mkdir()
+            with oras_authentication(credential_provider, {registry}) as registry_config:
+                run(
+                    "oras",
+                    "pull",
+                    *oras_registry_args(registry_config),
+                    "--output",
+                    str(pulled),
+                    inputs["bundle"],
+                )
+            archive = pulled / FRONTEND_ARCHIVE
+            if not archive.is_file():
+                raise DriverError(f"frontend OCI artifact did not contain {FRONTEND_ARCHIVE}")
+            safe_extract_bundle(archive, distribution)
+            runtime_path = distribution / "runtime-config.json"
+            runtime_path.write_bytes(runtime_bytes)
+            index_path = distribution / "index.html"
+            if not index_path.is_file():
+                raise DriverError("frontend OCI artifact did not contain index.html")
+            index_text = index_path.read_text()
+            run("aws", "s3", "sync", str(distribution), f"s3://{inputs['bucket']}", "--delete")
+            # Deterministic bundles give index.html a fixed timestamp, while hashed assets can
+            # change without changing its byte length. Always replace the entry point.
+            run(
+                "aws",
+                "s3",
+                "cp",
+                str(index_path),
+                f"s3://{inputs['bucket']}/index.html",
+                "--cache-control",
+                "no-cache",
+                "--content-type",
+                "text/html",
+            )
+            run(
+                "aws",
+                "s3",
+                "cp",
+                str(runtime_path),
+                f"s3://{inputs['bucket']}/runtime-config.json",
+                "--cache-control",
+                "no-store",
+                "--content-type",
+                "application/json",
+            )
+        invalidation = run(
+            "aws",
+            "cloudfront",
+            "create-invalidation",
+            "--distribution-id",
+            inputs["distributionId"],
+            "--paths",
+            "/*",
+            "--query",
+            "Invalidation.Id",
+            "--output",
+            "text",
+            capture=True,
+        ).stdout.strip()
+        if not invalidation:
+            raise DriverError("CloudFront did not return an invalidation ID")
+        run(
+            "aws",
+            "cloudfront",
+            "wait",
+            "invalidation-completed",
+            "--distribution-id",
+            inputs["distributionId"],
+            "--id",
+            invalidation,
+        )
+        served_index = run(
+            "curl",
+            "--fail",
+            "--show-error",
+            "--silent",
+            "--retry",
+            "6",
+            "--retry-all-errors",
+            "--retry-delay",
+            "5",
+            inputs["url"],
+            capture=True,
+        ).stdout
+        if served_index != index_text:
+            raise DriverError("CloudFront did not serve the frontend index from this deployment")
+        run(
+            "curl",
+            "--fail",
+            "--show-error",
+            "--silent",
+            "--retry",
+            "6",
+            "--retry-all-errors",
+            "--retry-delay",
+            "5",
+            f"{inputs['url']}/runtime-config.json",
+        )
+        return {
+            "published": {
+                "sourceRevision": context.source_revision,
+                "path": context.source_path,
+                "bundle": inputs["bundle"],
+                "artifactDigest": artifact_digest,
+                "runtimeConfigHash": runtime_digest,
+                "url": inputs["url"],
+            }
+        }
 
     def semantic_result(self, result: object) -> DriverResult:
-        return _SEMANTIC_RESULT(result)
+        return self._select_semantic_result(result)
 
 
 PLUGIN = FrontendS3CloudfrontDriver()

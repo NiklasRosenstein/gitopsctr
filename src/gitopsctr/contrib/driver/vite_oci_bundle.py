@@ -95,109 +95,103 @@ def deterministic_archive(source: Path, destination: Path) -> None:
                         raise DriverError(f"frontend bundle contains an unsupported file: {path}")
 
 
-def apply_vite_oci_bundle(context: DriverContext) -> ViteBundlePlanResult | ViteBundleResult:
-    specification = context.unit
-    build = specification.get("build")
-    publication = specification.get("publish")
-    outputs = specification.get("artifacts")
-    if not isinstance(build, dict) or not isinstance(publication, dict):
-        raise DriverError("vite-oci-bundle requires build and publish objects")
-    if build != {"nodeVersion": "24"}:
-        raise DriverError("vite-oci-bundle requires nodeVersion 24")
-    repository = publication.get("repository")
-    if not isinstance(repository, str):
-        raise DriverError("vite-oci-bundle requires a repository")
-    registry = repository_registry(repository)
-    credential_provider = resolve_credential_provider(publication.get("credentialProvider"), {registry})
-    if outputs != ["frontend.json"]:
-        raise DriverError("vite-oci-bundle produces the frontend.json artifact")
-    source = specification.get("source")
-    input_hash = source.get("inputHash") if isinstance(source, dict) else None
-    if not isinstance(input_hash, str) or not OCI_DIGEST_RE.fullmatch(input_hash):
-        raise DriverError("vite-oci-bundle requires a resolved source inputHash")
-    require_strings(specification, ("name", "driver"), "vite-oci-bundle unit")
-    unit_name = cast(str, specification["name"])
-    driver_name = cast(str, specification["driver"])
-    tag = f"input-{input_hash.removeprefix('sha256:')}"
-    frontend_root = context.source_root / context.source_path
-    build_environment = {name: value for name, value in os.environ.items() if not name.startswith("VITE_")}
+class ViteOciBundleDriver(Driver):
+    version = 1
+    _select_semantic_result = staticmethod(select_result_fields("artifacts"))
 
-    def build_archive(archive: Path) -> None:
-        require_node_24()
-        run("npm", "ci", cwd=frontend_root, env=build_environment)
-        run("npm", "run", "build", cwd=frontend_root, env=build_environment)
-        deterministic_archive(frontend_root / "dist", archive)
+    def reconcile(self, context: DriverContext) -> ViteBundlePlanResult | ViteBundleResult:
+        specification = context.unit
+        build = specification.get("build")
+        publication = specification.get("publish")
+        outputs = specification.get("artifacts")
+        if not isinstance(build, dict) or not isinstance(publication, dict):
+            raise DriverError("vite-oci-bundle requires build and publish objects")
+        if build != {"nodeVersion": "24"}:
+            raise DriverError("vite-oci-bundle requires nodeVersion 24")
+        repository = publication.get("repository")
+        if not isinstance(repository, str):
+            raise DriverError("vite-oci-bundle requires a repository")
+        registry = repository_registry(repository)
+        credential_provider = resolve_credential_provider(publication.get("credentialProvider"), {registry})
+        if outputs != ["frontend.json"]:
+            raise DriverError("vite-oci-bundle produces the frontend.json artifact")
+        source = specification.get("source")
+        input_hash = source.get("inputHash") if isinstance(source, dict) else None
+        if not isinstance(input_hash, str) or not OCI_DIGEST_RE.fullmatch(input_hash):
+            raise DriverError("vite-oci-bundle requires a resolved source inputHash")
+        require_strings(specification, ("name", "driver"), "vite-oci-bundle unit")
+        unit_name = cast(str, specification["name"])
+        driver_name = cast(str, specification["driver"])
+        tag = f"input-{input_hash.removeprefix('sha256:')}"
+        frontend_root = context.source_root / context.source_path
+        build_environment = {name: value for name, value in os.environ.items() if not name.startswith("VITE_")}
 
-    if context.dry:
-        with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-") as directory:
-            archive = Path(directory) / FRONTEND_ARCHIVE
-            build_archive(archive)
-            return {
-                "built": {
-                    "sourceRevision": context.source_revision,
-                    "path": context.source_path,
-                    "digest": f"sha256:{hashlib.sha256(archive.read_bytes()).hexdigest()}",
-                }
-            }
+        def build_archive(archive: Path) -> None:
+            require_node_24()
+            run("npm", "ci", cwd=frontend_root, env=build_environment)
+            run("npm", "run", "build", cwd=frontend_root, env=build_environment)
+            deterministic_archive(frontend_root / "dist", archive)
 
-    with oras_authentication(credential_provider, {registry}) as registry_config:
-        digest = oras_digest(repository, tag, registry_config)
-        if digest is None:
+        if context.dry:
             with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-") as directory:
                 archive = Path(directory) / FRONTEND_ARCHIVE
                 build_archive(archive)
-                run(
-                    "oras",
-                    "push",
-                    *oras_registry_args(registry_config),
-                    "--artifact-type",
-                    FRONTEND_ARTIFACT_TYPE,
-                    "--annotation",
-                    f"org.opencontainers.image.revision={context.source_revision}",
-                    "--annotation",
-                    f"dev.gitopsctr.input-hash={input_hash}",
-                    f"{repository}:{tag}",
-                    f"{FRONTEND_ARCHIVE}:{FRONTEND_LAYER_TYPE}",
-                    cwd=Path(directory),
-                )
-                digest = oras_digest(repository, tag, registry_config)
-        if digest is None:
-            raise DriverError(f"OCI registry did not return a digest for {repository}:{tag}")
-
-    return {
-        "artifacts": {
-            "frontend.json": {
-                "schema": 1,
-                "unit": {
-                    "name": unit_name,
-                    "driver": driver_name,
-                    "inputHashVersion": 1,
-                    "inputHash": input_hash,
-                    "sourceRevision": context.source_revision,
-                },
-                "artifacts": {
-                    "bundle": {
-                        "type": "oci-artifact",
-                        "artifactType": FRONTEND_ARTIFACT_TYPE,
-                        "uri": f"{repository}@{digest}",
+                return {
+                    "built": {
+                        "sourceRevision": context.source_revision,
+                        "path": context.source_path,
+                        "digest": f"sha256:{hashlib.sha256(archive.read_bytes()).hexdigest()}",
                     }
-                },
+                }
+
+        with oras_authentication(credential_provider, {registry}) as registry_config:
+            digest = oras_digest(repository, tag, registry_config)
+            if digest is None:
+                with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-") as directory:
+                    archive = Path(directory) / FRONTEND_ARCHIVE
+                    build_archive(archive)
+                    run(
+                        "oras",
+                        "push",
+                        *oras_registry_args(registry_config),
+                        "--artifact-type",
+                        FRONTEND_ARTIFACT_TYPE,
+                        "--annotation",
+                        f"org.opencontainers.image.revision={context.source_revision}",
+                        "--annotation",
+                        f"dev.gitopsctr.input-hash={input_hash}",
+                        f"{repository}:{tag}",
+                        f"{FRONTEND_ARCHIVE}:{FRONTEND_LAYER_TYPE}",
+                        cwd=Path(directory),
+                    )
+                    digest = oras_digest(repository, tag, registry_config)
+            if digest is None:
+                raise DriverError(f"OCI registry did not return a digest for {repository}:{tag}")
+
+        return {
+            "artifacts": {
+                "frontend.json": {
+                    "schema": 1,
+                    "unit": {
+                        "name": unit_name,
+                        "driver": driver_name,
+                        "inputHashVersion": 1,
+                        "inputHash": input_hash,
+                        "sourceRevision": context.source_revision,
+                    },
+                    "artifacts": {
+                        "bundle": {
+                            "type": "oci-artifact",
+                            "artifactType": FRONTEND_ARTIFACT_TYPE,
+                            "uri": f"{repository}@{digest}",
+                        }
+                    },
+                }
             }
         }
-    }
-
-
-_SEMANTIC_RESULT = select_result_fields("artifacts")
-
-
-class ViteOciBundleDriver(Driver):
-    version = 1
-
-    def reconcile(self, context: DriverContext) -> ViteBundlePlanResult | ViteBundleResult:
-        return apply_vite_oci_bundle(context)
 
     def semantic_result(self, result: object) -> DriverResult:
-        return _SEMANTIC_RESULT(result)
+        return self._select_semantic_result(result)
 
 
 PLUGIN = ViteOciBundleDriver()
