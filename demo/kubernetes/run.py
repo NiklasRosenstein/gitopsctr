@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from demo.utils import DemoRepository, RefHeads, docker_platform, remove_docker_images, require_commands, run
+from gitopsctr.cli import color_enabled
 
 Provider = Literal["kind", "minikube"]
 
@@ -82,6 +84,10 @@ def ensure_cluster(provider: Provider) -> None:
 
 def controller(provider: Provider, *args: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
     worktree = repository(provider).worktree
+    environment = None
+    if capture and color_enabled(sys.stderr) and not os.environ.get("NO_COLOR"):
+        environment = os.environ.copy()
+        environment["FORCE_COLOR"] = "1"
     return run(
         sys.executable,
         "-m",
@@ -91,6 +97,7 @@ def controller(provider: Provider, *args: str, capture: bool = False) -> subproc
         *args,
         cwd=worktree,
         capture=capture,
+        env=environment,
     )
 
 

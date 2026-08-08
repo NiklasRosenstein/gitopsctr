@@ -5,7 +5,7 @@ from __future__ import annotations
 import platform
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,8 +15,9 @@ def run(
     cwd: Path | None = None,
     check: bool = True,
     capture: bool = False,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, cwd=cwd, check=check, text=True, capture_output=capture)
+    return subprocess.run(args, cwd=cwd, check=check, text=True, capture_output=capture, env=env)
 
 
 def require_commands(*names: str, installation_hint: str = "run 'mise install'") -> None:

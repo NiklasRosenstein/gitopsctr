@@ -1,4 +1,7 @@
 import shutil
+import subprocess
+from collections.abc import Mapping
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -7,6 +10,26 @@ from demo.docker import run as demo
 from demo.kubernetes import run as kubernetes_demo
 from demo.utils import RefHeads
 from gitopsctr import cli
+
+
+def test_kubernetes_controller_preserves_terminal_color_when_capturing(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(kubernetes_demo, "color_enabled", lambda _stream: True)
+    monkeypatch.setattr(kubernetes_demo, "repository", lambda _provider: SimpleNamespace(worktree=tmp_path))
+
+    def fake_run(*args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(kubernetes_demo, "run", fake_run)
+
+    kubernetes_demo.controller("kind", "converge", capture=True)
+
+    environment = captured["env"]
+    assert isinstance(environment, Mapping)
+    assert environment["FORCE_COLOR"] == "1"
 
 
 def test_demo_repository_exercises_observation_driven_convergence():
