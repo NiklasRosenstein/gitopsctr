@@ -1,14 +1,21 @@
 # Documents and unit drivers
 
-GitOpsCTR accepts both YAML and JSON. YAML is the default write format. A
-repository can choose JSON by adding this optional project file:
+GitOpsCTR accepts both YAML and JSON. Every source tree has a Project resource;
+YAML is the default write format and a repository can select JSON in its spec:
 
 ```yaml
-writeFormat: json
+apiVersion: gitopsctr.io/v1
+kind: Project
+metadata:
+  name: example
+spec:
+  writeFormat: json
 ```
 
 The file is named `gitopsctr.yaml`; generated desired state, promotions, and
-receipts follow its setting. Readers accept either extension.
+receipts follow its setting. Readers accept either extension. See the
+[`Project` resource documentation](project-configuration.md) and its published
+[`Project.schema.json`](schemas/apis/gitopsctr.io/v1/Project.schema.json).
 
 Controller-owned resources use `gitopsctr.io/v1`:
 

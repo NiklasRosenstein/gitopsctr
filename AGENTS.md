@@ -15,7 +15,8 @@ untrusted editor hint and must never fetch it.
 ## Document formats
 
 - YAML is the preferred authoring and generated-state format; JSON remains accepted.
-- A repository may set `writeFormat: yaml` or `writeFormat: json` in `gitopsctr.yaml`.
+- A source repository must contain a `gitopsctr.io/v1` `Project` resource in `gitopsctr.yaml`.
+- Its spec may set `writeFormat: yaml` or `writeFormat: json` and `environmentsPath`.
 - Unit resources use `unit.gitopsctr.io/v1`; controller resources use `gitopsctr.io/v1`.
 - `UnitDriver` is the implementation of a unit kind. Entry points use the full GVK.
 

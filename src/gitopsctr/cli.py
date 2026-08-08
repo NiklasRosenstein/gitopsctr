@@ -51,10 +51,12 @@ from gitopsctr.forges import (
     ensure_change_request,
 )
 from gitopsctr.formats import (
+    PROJECT_CONFIG_NAMES,
     DocumentFormatError,
     document_candidates,
     load_document,
     load_project_config,
+    project_environment_root,
     write_document,
 )
 from gitopsctr.schemas import driver_schema, encoded_schema, export_schemas, resource_schema_url, show_schema
@@ -491,15 +493,9 @@ def load_receipt(path: Path, expected_unit: str | None = None) -> dict[str, Any]
 
 
 def resource_documents_enabled(root: Path) -> bool:
-    """Use envelopes once a project has opted into the new document layout."""
-    if any((root / name).is_file() for name in ("gitopsctr.yaml", "gitopsctr.yml", ".gitopsctr.yaml", ".gitopsctr.yml")):
-        return True
-    for environment_root in (root / "deployment" / "environments").glob("*"):
-        for name in ("environment.yaml", "environment.yml", "environment.json"):
-            path = environment_root / name
-            if path.is_file() and load_json(path).get("apiVersion") is not None:
-                return True
-    return False
+    """Return whether a tree carries repository-level Project configuration."""
+
+    return any((root / name).is_file() for name in PROJECT_CONFIG_NAMES)
 
 
 def unit_document_path(root: Path, unit_name: str, project_root: Path | None = None) -> Path:
@@ -516,10 +512,7 @@ def unit_document_path(root: Path, unit_name: str, project_root: Path | None = N
 
 def strict_resource_documents(path: Path) -> bool:
     for parent in (path.parent, *path.parents):
-        if any(
-            (parent / name).is_file()
-            for name in ("gitopsctr.yaml", "gitopsctr.yml", ".gitopsctr.yaml", ".gitopsctr.yml")
-        ):
+        if any((parent / name).is_file() for name in PROJECT_CONFIG_NAMES):
             return True
     return False
 
@@ -542,11 +535,11 @@ def reference_document_path(root: Path, reference: str) -> Path:
 
 
 def write_unit(path: Path, unit: dict[str, Any], project_root: Path) -> Path:
-    if resource_documents_enabled(project_root):
+    try:
         selected = load_project_config(project_root).write_format
         return write_document(path.with_suffix(selected.suffix), serialize_unit_document(unit), format=selected)
-    write_json(path.with_suffix(".json"), unit)
-    return path.with_suffix(".json")
+    except DocumentFormatError as exc:
+        raise OperationError(str(exc)) from exc
 
 
 def validate_document(contract: DocumentContract, document: object, description: str) -> dict[str, Any]:
@@ -584,9 +577,6 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
 
 def write_preferred_document(path: Path, value: dict[str, Any], project_root: Path) -> Path:
     """Write a generated document using the project's configured format."""
-    if not resource_documents_enabled(project_root):
-        write_json(path.with_suffix(".json"), value)
-        return path.with_suffix(".json")
     try:
         selected = load_project_config(project_root).write_format
         if value.get("source") is not None and value.get("specificationRevision") is not None:
@@ -934,13 +924,16 @@ def resolved_unit_source(
 def load_environment(source_root: Path, environment_name: str) -> dict[str, Any]:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", environment_name):
         raise OperationError(f"invalid environment name: {environment_name!r}")
-    environment_root = source_root / "deployment" / "environments" / environment_name
+    try:
+        environment_root = project_environment_root(source_root, environment_name)
+    except DocumentFormatError as exc:
+        raise OperationError(str(exc)) from exc
     environment_paths = document_candidates(environment_root, "environment")
     if len(environment_paths) != 1:
         raise OperationError(f"expected exactly one environment document for {environment_name}")
     environment_document = load_json(environment_paths[0])
-    if resource_documents_enabled(source_root) and environment_document.get("apiVersion") is None:
-        raise OperationError(f"legacy environment document is not valid in a migrated project: {environment_paths[0]}")
+    if environment_document.get("apiVersion") is None:
+        raise OperationError(f"legacy environment document is not valid in a Project: {environment_paths[0]}")
     environment = normalize_environment_document(environment_document, environment_name)
     if environment.get("name") != environment_name:
         raise OperationError(f"invalid environment specification: {environment_name}")
@@ -1025,7 +1018,10 @@ def deployment_refs(
 
 def load_environment_specifications(source_root: Path, environment_name: str) -> dict[str, dict[str, Any]]:
     load_environment(source_root, environment_name)
-    environment_root = source_root / "deployment" / "environments" / environment_name
+    try:
+        environment_root = project_environment_root(source_root, environment_name)
+    except DocumentFormatError as exc:
+        raise OperationError(str(exc)) from exc
     unit_paths: list[Path] = []
     stems = sorted(
         {path.stem for path in (environment_root / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}}
@@ -1037,7 +1033,7 @@ def load_environment_specifications(source_root: Path, environment_name: str) ->
         unit_paths.extend(candidates)
     if not unit_paths:
         raise OperationError(f"environment has no units: {environment_name}")
-    specifications = {path.stem: normalize_unit_document(load_json(path), path.stem) for path in unit_paths}
+    specifications = {path.stem: load_unit(path, path.stem) for path in unit_paths}
     for unit_name, specification in specifications.items():
         require_unit_specification(specification, unit_name)
     for consumer, specification in specifications.items():
@@ -1406,9 +1402,10 @@ def materialize_resolved_unit(
     if previous_path.is_file():
         previous = load_unit(previous_path, unit_name)
         previous_without_materialization = {
-            name: value for name, value in previous.items() if name != "materialization"
+            name: value for name, value in previous.items() if name not in {"$schema", "materialization"}
         }
-        if previous_without_materialization == resolved:
+        resolved_without_schema = {name: value for name, value in resolved.items() if name != "$schema"}
+        if previous_without_materialization == resolved_without_schema:
             validate_unit_materialization(current_desired, unit_name, previous)
             copy_unit_materialization(current_desired, candidate, unit_name, previous)
             reused = {**resolved, "materialization": previous["materialization"]}

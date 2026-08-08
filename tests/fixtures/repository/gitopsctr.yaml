@@ -1,0 +1,8 @@
+$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Project.schema.json
+apiVersion: gitopsctr.io/v1
+kind: Project
+metadata:
+  name: test-project
+spec:
+  writeFormat: yaml
+  environmentsPath: deployment/environments

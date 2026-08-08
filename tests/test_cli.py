@@ -9,11 +9,11 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import cli as deploy_release
+from tests.conftest import write_test_document
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value))
+    write_test_document(path, value)
 
 
 def test_desired_resolution_logs_unit_and_observation_decision(tmp_path, monkeypatch, capsys):
@@ -108,7 +108,7 @@ def test_desired_candidate_drops_legacy_artifact_catalogue(tmp_path, monkeypatch
 
     deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate)
 
-    assert (candidate / "units/application-images.json").is_file()
+    assert deploy_release.unit_document_path(candidate, "application-images").is_file()
     assert not (candidate / "artifacts").exists()
 
 
@@ -441,15 +441,17 @@ def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path
         promotion=context,
     )
 
-    unit = deploy_release.load_json(candidate / "units/aws-application.json")
-    assert unit["$schema"] == deploy_release.driver_schema("terraform", "desired-unit")["$id"]
+    raw_unit = deploy_release.load_json(candidate / "units/aws-application.json")
+    assert raw_unit["$schema"].endswith("/apis/unit.gitopsctr.io/v1/Terraform/desired.schema.json")
+    unit = deploy_release.load_unit(candidate / "units/aws-application.json", "aws-application")
     assert unit["terraform"]["variables"]["control_image_uri"].endswith("1" * 64)
     assert unit["resolvedInputs"]["promotion"] == {
         "units/aws-application.json": deploy_release.file_blob(promoted_unit)
     }
-    promotion = deploy_release.load_json(candidate / "promotion.json")
-    assert promotion == context.document()
-    assert promotion["$schema"] == deploy_release.CORE_CONTRACTS["promotion"].json_schema()["$id"]
+    raw_promotion = deploy_release.load_json(candidate / "promotion.json")
+    promotion = deploy_release.normalize_promotion_document(raw_promotion)
+    assert promotion == {key: value for key, value in context.document().items() if key != "$schema"}
+    assert raw_promotion["$schema"].endswith("/apis/gitopsctr.io/v1/Promotion.schema.json")
 
 
 def test_promotion_requires_every_source_unit_to_be_clean(tmp_path):

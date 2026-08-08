@@ -1,7 +1,16 @@
 {
-  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/core/v1/environment.schema.json",
-  "schema": 1,
-  "name": "prod",
-  "changeGate": "pullRequest",
-  "promotion": {"allowedSources": ["staging"]}
+  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Environment.schema.json",
+  "apiVersion": "gitopsctr.io/v1",
+  "kind": "Environment",
+  "metadata": {
+    "name": "prod"
+  },
+  "spec": {
+    "changeGate": "pullRequest",
+    "promotion": {
+      "allowedSources": [
+        "staging"
+      ]
+    }
+  }
 }

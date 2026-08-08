@@ -34,7 +34,7 @@ run = "uv run gitopsctr schemas export docs/schemas --check"
 
 [tasks.migrate-documents]
 description = "Preview the one-shot JSON-to-YAML resource migration"
-run = "uv run python tools/migrate_documents.py"
+run = "uv run python tools/migrate_documents.py --project-name gitopsctr"
 
 [tasks.docs]
 run = "uv run mkdocs build --strict"

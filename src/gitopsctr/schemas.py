@@ -10,7 +10,7 @@ from typing import Any, cast
 from gitopsctr.contracts import CORE_CONTRACTS, SCHEMA_ROOT, receipt_schema, schema_url
 from gitopsctr.document import DocumentContract, JsonObject
 from gitopsctr.driver import UNIT_DRIVERS, UnitDriver
-from gitopsctr.formats import PROJECT_CONFIG_SCHEMA
+from gitopsctr.formats import PROJECT_RESOURCE_SCHEMA
 
 DRIVER_KINDS = ("unit", "desired-unit", "result", "receipt")
 CORE_KINDS = tuple(CORE_CONTRACTS)
@@ -171,10 +171,10 @@ def core_resource_schema(kind: str) -> JsonObject:
     )
 
 
-def project_config_schema() -> JsonObject:
-    """Return the schema for the optional repository-level ``gitopsctr.yaml``."""
+def project_resource_schema() -> JsonObject:
+    """Return the schema for the repository-level Project resource."""
 
-    return cast(JsonObject, deepcopy(PROJECT_CONFIG_SCHEMA))
+    return cast(JsonObject, deepcopy(PROJECT_RESOURCE_SCHEMA))
 
 
 def driver_schema(driver: str, kind: str) -> JsonObject:
@@ -206,8 +206,8 @@ def show_schema(scope: str, kind: str) -> JsonObject:
         except KeyError as exc:
             raise ValueError(f"unknown core schema kind: {kind}") from exc
     if scope == "gitopsctr.io/v1":
-        if kind == "ProjectConfig":
-            return project_config_schema()
+        if kind == "Project":
+            return project_resource_schema()
         return core_resource_schema(kind)
     if scope.startswith("unit.gitopsctr.io/v1/"):
         return show_schema("unit.gitopsctr.io/v1", f"{scope.rsplit('/', 1)[1]}/{kind}")
@@ -253,9 +253,9 @@ def schema_documents() -> dict[Path, JsonObject]:
             }
             driver_index["schemas"][kind] = version_path.as_posix()
         index["drivers"][driver] = driver_index
-    for kind in ("Environment", "Promotion", "Receipt", "ProjectConfig"):
+    for kind in ("Environment", "Promotion", "Receipt", "Project"):
         path = Path("apis/gitopsctr.io/v1") / f"{kind}.schema.json"
-        documents[path] = project_config_schema() if kind == "ProjectConfig" else core_resource_schema(kind)
+        documents[path] = project_resource_schema() if kind == "Project" else core_resource_schema(kind)
         index["apis"][f"gitopsctr.io/v1/{kind}"] = path.as_posix()
     for driver, driver_instance in sorted(UNIT_DRIVERS.items()):
         root = Path("apis/unit.gitopsctr.io/v1") / driver_instance.kind

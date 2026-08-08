@@ -1,6 +1,5 @@
 """Reconciliation preserves planning and convergence behavior around clean units."""
 
-import json
 import subprocess
 from argparse import Namespace
 from pathlib import Path
@@ -9,11 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from gitopsctr import cli as deploy_release
+from tests.conftest import write_test_document
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value))
+    write_test_document(path, value)
 
 
 def test_reconcile_parser_exposes_plan_without_a_dry_alias():

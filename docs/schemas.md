@@ -38,13 +38,15 @@ spec:
 `$schema` helps editors but is never trusted by the runtime: gitopsctr does not fetch it or select validation behavior
 from it. Newly generated desired units, promotions, and receipts always contain a canonical pinned URL.
 
-`latest` aliases are convenient for discovery, but committed specifications should use pinned versions. The optional
-project-level [`gitopsctr.yaml` configuration schema`](project-configuration.md) is published in the same core API group.
+`latest` aliases are convenient for discovery, but committed specifications should use pinned versions. The repository-level
+[`Project` resource](project-configuration.md) has a published
+[`Project.schema.json`](schemas/apis/gitopsctr.io/v1/Project.schema.json) in the same core API group.
 
 ## CLI
 
 ```console
 gitopsctr schemas show gitopsctr.io/v1 Environment
+gitopsctr schemas show gitopsctr.io/v1 Project
 gitopsctr schemas show unit.gitopsctr.io/v1/Terraform authored
 gitopsctr schemas show unit.gitopsctr.io/v1/Terraform desired
 gitopsctr schemas show unit.gitopsctr.io/v1/Terraform receipt

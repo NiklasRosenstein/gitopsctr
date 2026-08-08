@@ -10,7 +10,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 
-from gitopsctr import schemas
+from gitopsctr import cli, schemas
 from gitopsctr.contracts import CORE_CONTRACTS, ContractError
 from gitopsctr.driver import UNIT_DRIVERS
 
@@ -21,7 +21,7 @@ DIGEST = "sha256:" + "1" * 64
 
 def authored_examples() -> list[dict]:
     paths = sorted((ROOT / "tests/fixtures").rglob("units/*.json")) + sorted((ROOT / "demo").rglob("units/*.json"))
-    return [{key: value for key, value in json.loads(path.read_text()).items() if key != "schema"} for path in paths]
+    return [cli.normalize_unit_document(json.loads(path.read_text()), path.stem) for path in paths]
 
 
 def desired_example(unit: dict) -> dict:
@@ -176,9 +176,11 @@ def test_generated_schemas_and_examples_validate_from_the_local_catalog():
     for document in published:
         Draft202012Validator.check_schema(document)
     for authored in authored_examples():
-        Draft202012Validator(by_id[authored["$schema"]], registry=registry).validate(authored)
+        authored_resource = cli.serialize_unit_document(authored, profile="authored")
+        Draft202012Validator(by_id[authored_resource["$schema"]], registry=registry).validate(authored_resource)
         desired = desired_example(authored)
-        Draft202012Validator(by_id[desired["$schema"]], registry=registry).validate(desired)
+        desired_resource = cli.serialize_unit_document(desired, profile="desired")
+        Draft202012Validator(by_id[desired_resource["$schema"]], registry=registry).validate(desired_resource)
     for path in sorted((ROOT / "tests/fixtures").rglob("environment.json")):
         environment = {key: value for key, value in json.loads(path.read_text()).items() if key != "schema"}
         Draft202012Validator(by_id[environment["$schema"]], registry=registry).validate(environment)
@@ -209,7 +211,7 @@ def test_core_schemas_are_draft_2020_12_and_environment_examples_validate():
     for contract in CORE_CONTRACTS.values():
         Draft202012Validator.check_schema(contract.json_schema())
     for path in sorted((ROOT / "tests/fixtures").rglob("environment.json")):
-        CORE_CONTRACTS["environment"].validate(json.loads(path.read_text()))
+        CORE_CONTRACTS["environment"].validate(cli.normalize_environment_document(json.loads(path.read_text()), path.parent.name))
 
 
 def test_schema_cli_show_export_and_check_work_outside_a_git_repository(tmp_path):
@@ -239,11 +241,12 @@ def test_schema_cli_show_export_and_check_work_outside_a_git_repository(tmp_path
 
 def test_schema_cli_can_show_resource_envelopes():
     environment = schemas.show_schema("gitopsctr.io/v1", "Environment")
-    project_config = schemas.show_schema("gitopsctr.io/v1", "ProjectConfig")
+    project = schemas.show_schema("gitopsctr.io/v1", "Project")
     unit = schemas.show_schema("unit.gitopsctr.io/v1/Terraform", "authored")
     receipt = schemas.show_schema("unit.gitopsctr.io/v1", "Terraform/receipt")
     assert environment["properties"]["kind"]["const"] == "Environment"
-    assert project_config["$id"].endswith("/apis/gitopsctr.io/v1/ProjectConfig.schema.json")
-    assert project_config["properties"]["writeFormat"]["enum"] == ["yaml", "json"]
+    assert project["$id"].endswith("/apis/gitopsctr.io/v1/Project.schema.json")
+    assert project["properties"]["kind"]["const"] == "Project"
+    assert project["properties"]["spec"]["properties"]["writeFormat"]["enum"] == ["yaml", "json"]
     assert unit["properties"]["kind"]["const"] == "Terraform"
     assert receipt["properties"]["kind"]["const"] == "Receipt"

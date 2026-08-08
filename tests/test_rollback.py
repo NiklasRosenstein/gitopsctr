@@ -7,11 +7,11 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import cli as deploy_release
+from tests.conftest import write_test_document
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value))
+    write_test_document(path, value)
 
 
 def _specification(name: str, producer: str | None = None) -> dict:

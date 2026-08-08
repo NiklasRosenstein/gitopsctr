@@ -1,10 +1,25 @@
 {
-  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/vite-oci-bundle/v1/unit.schema.json",
-  "schema": 1,
-  "name": "frontend-bundle",
-  "driver": "vite-oci-bundle",
-  "source": {"path": "web", "inputs": ["."]},
-  "build": {"nodeVersion": "24"},
-  "publish": {"repository": "registry.example/example/frontend"},
-  "artifacts": ["frontend.json"]
+  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/ViteOciBundle/authored.schema.json",
+  "apiVersion": "unit.gitopsctr.io/v1",
+  "kind": "ViteOciBundle",
+  "metadata": {
+    "name": "frontend-bundle"
+  },
+  "spec": {
+    "artifacts": [
+      "frontend.json"
+    ],
+    "build": {
+      "nodeVersion": "24"
+    },
+    "publish": {
+      "repository": "registry.example/example/frontend"
+    },
+    "source": {
+      "inputs": [
+        "."
+      ],
+      "path": "web"
+    }
+  }
 }

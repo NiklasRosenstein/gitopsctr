@@ -17,7 +17,14 @@ from pathlib import Path
 from typing import Any
 
 from gitopsctr import cli
-from gitopsctr.formats import DocumentFormat, document_candidates, load_document, write_document
+from gitopsctr.formats import (
+    PROJECT_CONFIG_NAMES,
+    DocumentFormat,
+    document_candidates,
+    load_document,
+    load_project_config,
+    write_document,
+)
 
 ROOT = Path.cwd().resolve()
 
@@ -76,6 +83,25 @@ def remove_document(path: Path) -> None:
 def write_yaml(path: Path, document: dict[str, Any]) -> None:
     remove_document(path)
     write_document(path.with_suffix(".yaml"), document, format=DocumentFormat.YAML)
+
+
+def write_project(tree: Path, project_name: str) -> None:
+    for filename in PROJECT_CONFIG_NAMES:
+        path = tree / filename
+        if path.exists():
+            path.unlink()
+    write_document(
+        tree / "gitopsctr.yaml",
+        {
+            "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Project.schema.json",
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Project",
+            "metadata": {"name": project_name},
+            "spec": {"writeFormat": "yaml", "environmentsPath": "deployment/environments"},
+        },
+        format=DocumentFormat.YAML,
+    )
+    load_project_config(tree)
 
 
 def convert_environment(tree: Path, environment_name: str) -> None:
@@ -162,7 +188,7 @@ def update_ref(ref: str, new: str, old: str) -> None:
     git("update-ref", ref, new, old)
 
 
-def migrate(*, apply: bool, push: bool) -> dict[str, str]:
+def migrate(*, project_name: str, apply: bool, push: bool) -> dict[str, str]:
     branch = git("branch", "--show-current")
     if not branch:
         raise RuntimeError("migration requires a checked-out source branch")
@@ -179,7 +205,7 @@ def migrate(*, apply: bool, push: bool) -> dict[str, str]:
         for environment_root in sorted((source_tree / "deployment" / "environments").glob("*")):
             if environment_root.is_dir():
                 convert_environment(source_tree, environment_root.name)
-        (source_tree / "gitopsctr.yaml").write_text("writeFormat: yaml\n")
+        write_project(source_tree, project_name)
         new_source = commit_tree(source_tree, old_source, "Migrate deployment documents to YAML resources")
         results[branch] = new_source
 
@@ -190,7 +216,6 @@ def migrate(*, apply: bool, push: bool) -> dict[str, str]:
             desired_tree = root / f"desired-{environment}"
             materialize(old, desired_tree)
             convert_desired(desired_tree, new_source)
-            (desired_tree / "gitopsctr.yaml").write_text("writeFormat: yaml\n")
             new = commit_tree(desired_tree, old, f"Migrate desired {environment} documents to YAML resources")
             desired_heads[environment] = (old, new)
             desired_trees[environment] = desired_tree
@@ -218,7 +243,6 @@ def migrate(*, apply: bool, push: bool) -> dict[str, str]:
             desired_tree = root / f"desired-{environment}"
             materialize(old, observed_tree)
             convert_observed(observed_tree, desired[1], desired_tree)
-            (observed_tree / "gitopsctr.yaml").write_text("writeFormat: yaml\n")
             new = commit_tree(observed_tree, old, f"Migrate observed {environment} receipts to YAML resources")
             observed_heads[environment] = (old, new)
             observed_trees[environment] = observed_tree
@@ -263,10 +287,11 @@ ROOT = Path(git("rev-parse", "--show-toplevel")).resolve()
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-name", required=True, help="DNS-1123 name for the generated Project resource")
     parser.add_argument("--apply", action="store_true", help="update local refs with migration commits")
     parser.add_argument("--push", action="store_true", help="push migrated refs atomically after --apply")
     args = parser.parse_args()
-    results = migrate(apply=args.apply, push=args.push)
+    results = migrate(project_name=args.project_name, apply=args.apply, push=args.push)
     print(json.dumps(results, indent=2, sort_keys=True))
     if not args.apply:
         print("Preview only. Re-run with --apply to update refs.")

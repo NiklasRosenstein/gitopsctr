@@ -1,20 +1,28 @@
 {
-  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/oci-images/v2/unit.schema.json",
-  "schema": 1,
-  "name": "application-images",
-  "driver": "oci-images",
-  "source": {
-    "path": ".",
-    "inputs": ["pyproject.toml"]
+  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/OciImages/authored.schema.json",
+  "apiVersion": "unit.gitopsctr.io/v1",
+  "kind": "OciImages",
+  "metadata": {
+    "name": "application-images"
   },
-  "build": {
-    "dockerfile": "Dockerfile",
-    "platform": "linux/amd64"
-  },
-  "publish": {
-    "repositories": {
-      "application": "registry.example/example/application"
+  "spec": {
+    "artifacts": [
+      "containers.json"
+    ],
+    "build": {
+      "dockerfile": "Dockerfile",
+      "platform": "linux/amd64"
+    },
+    "publish": {
+      "repositories": {
+        "application": "registry.example/example/application"
+      }
+    },
+    "source": {
+      "inputs": [
+        "pyproject.toml"
+      ],
+      "path": "."
     }
-  },
-  "artifacts": ["containers.json"]
+  }
 }

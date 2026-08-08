@@ -1,33 +1,57 @@
-"""Read and write GitOpsCTR documents in YAML or JSON.
-
-YAML is the default authoring and write format.  A project may pin the write
-format in ``gitopsctr.yaml`` (or ``.gitopsctr.yaml``) with ``writeFormat`` set
-to ``yaml`` or ``json``.  Readers always accept both formats.
-"""
+"""Read GitOpsCTR's Project resource and YAML or JSON documents."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 import yaml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
-PROJECT_CONFIG_SCHEMA: dict[str, Any] = {
+PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/ProjectConfig.schema.json",
-    "title": "GitOpsCTR project configuration",
+    "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Project.schema.json",
+    "title": "Project (gitopsctr.io/v1)",
     "type": "object",
     "properties": {
         "$schema": {"type": "string"},
-        "writeFormat": {"enum": ["yaml", "json"]},
+        "apiVersion": {"const": "gitopsctr.io/v1"},
+        "kind": {"const": "Project"},
+        "metadata": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 253,
+                    "pattern": r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*$",
+                }
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+        "spec": {
+            "type": "object",
+            "properties": {
+                "writeFormat": {"enum": ["yaml", "json"]},
+                "environmentsPath": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+$",
+                },
+            },
+            "additionalProperties": False,
+        },
     },
+    "required": ["apiVersion", "kind", "metadata", "spec"],
     "additionalProperties": False,
 }
+
+PROJECT_CONFIG_NAMES = ("gitopsctr.yaml", "gitopsctr.yml", ".gitopsctr.yaml", ".gitopsctr.yml")
 
 
 class DocumentFormat(StrEnum):
@@ -44,37 +68,60 @@ class DocumentFormatError(ValueError):
 
 
 @dataclass(frozen=True)
-class ProjectConfig:
+class Project:
+    name: str
     write_format: DocumentFormat = DocumentFormat.YAML
+    environments_path: PurePosixPath = PurePosixPath("deployment/environments")
 
 
-def _config_path(root: Path) -> Path | None:
-    for name in ("gitopsctr.yaml", "gitopsctr.yml", ".gitopsctr.yaml", ".gitopsctr.yml"):
-        path = root / name
-        if path.is_file():
-            return path
-    return None
+def project_config_path(root: Path) -> Path:
+    paths = [root / name for name in PROJECT_CONFIG_NAMES if (root / name).is_file()]
+    if not paths:
+        raise DocumentFormatError(f"source tree has no Project configuration: {root / 'gitopsctr.yaml'}")
+    if len(paths) > 1:
+        raise DocumentFormatError("multiple Project configuration files exist: " + ", ".join(map(str, paths)))
+    return paths[0]
 
 
-def load_project_config(root: Path) -> ProjectConfig:
-    path = _config_path(root)
-    if path is None:
-        return ProjectConfig()
+def _validate_project_name(name: str, path: Path) -> None:
+    labels = name.split(".")
+    if any(len(label) > 63 for label in labels):
+        raise DocumentFormatError(f"invalid project config {path}: metadata.name must be a DNS-1123 subdomain")
+
+
+def load_project_config(root: Path) -> Project:
+    path = project_config_path(root)
     try:
         value = yaml.safe_load(path.read_text())
     except (OSError, yaml.YAMLError) as exc:
         raise DocumentFormatError(f"could not read project config {path}: {exc}") from exc
-    if value is None:
-        return ProjectConfig()
     if not isinstance(value, dict):
         raise DocumentFormatError(f"project config {path} must be a mapping")
     try:
-        Draft202012Validator(PROJECT_CONFIG_SCHEMA).validate(value)
+        Draft202012Validator(PROJECT_RESOURCE_SCHEMA).validate(value)
     except ValidationError as exc:
-        detail = exc.message
+        location = ".".join(str(part) for part in exc.absolute_path)
+        detail = f"{location}: {exc.message}" if location else exc.message
         raise DocumentFormatError(f"invalid project config {path}: {detail}") from exc
-    selected = value.get("writeFormat", "yaml")
-    return ProjectConfig(DocumentFormat.JSON if selected == "json" else DocumentFormat.YAML)
+    metadata = cast(dict[str, Any], value["metadata"])
+    specification = cast(dict[str, Any], value["spec"])
+    project_name = cast(str, metadata["name"])
+    _validate_project_name(project_name, path)
+    selected = specification.get("writeFormat", "yaml")
+    environments_path = PurePosixPath(cast(str, specification.get("environmentsPath", "deployment/environments")))
+    if environments_path.is_absolute() or ".." in environments_path.parts:
+        raise DocumentFormatError(f"invalid project config {path}: environmentsPath must stay inside the source tree")
+    return Project(
+        name=project_name,
+        write_format=DocumentFormat.JSON if selected == "json" else DocumentFormat.YAML,
+        environments_path=environments_path,
+    )
+
+
+def project_environment_root(root: Path, environment_name: str) -> Path:
+    """Return the configured directory for an authored environment."""
+
+    return root.joinpath(*load_project_config(root).environments_path.parts, environment_name)
 
 
 def _ensure_json_value(value: object, path: Path) -> dict[str, Any]:

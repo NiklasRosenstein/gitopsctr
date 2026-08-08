@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 import pytest
@@ -6,6 +5,7 @@ import pytest
 from gitopsctr import cli
 from gitopsctr.document import DocumentContract, JsonObject
 from gitopsctr.driver import MaterializationCapability, MaterializationContext, MaterializationResult, UnitDriver
+from tests.conftest import write_test_document
 
 
 class RenderOnlyContract(DocumentContract):
@@ -18,6 +18,8 @@ class RenderOnlyContract(DocumentContract):
 
 
 class RenderOnlyPlugin(UnitDriver, MaterializationCapability):
+    driver_name = "render-only"
+    kind = "RenderOnly"
     version = 1
     unit_contract = RenderOnlyContract()
     desired_unit_contract = RenderOnlyContract()
@@ -37,8 +39,7 @@ class RenderOnlyPlugin(UnitDriver, MaterializationCapability):
 
 
 def write_json(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value))
+    write_test_document(path, value)
 
 
 def install_render_only(monkeypatch: pytest.MonkeyPatch) -> RenderOnlyPlugin:
@@ -46,6 +47,8 @@ def install_render_only(monkeypatch: pytest.MonkeyPatch) -> RenderOnlyPlugin:
     monkeypatch.setitem(cli.UNIT_DRIVERS, "render-only", plugin)
     monkeypatch.setitem(cli.MATERIALIZATION_DRIVERS, "render-only", plugin)
     monkeypatch.setitem(cli.DRIVER_VERSIONS, "render-only", plugin.version)
+    monkeypatch.setitem(cli.DRIVER_GVKS, "render-only", "unit.gitopsctr.io/v1/RenderOnly")
+    monkeypatch.setitem(cli.DRIVER_NAMES_BY_GVK, "unit.gitopsctr.io/v1/RenderOnly", "render-only")
     return plugin
 
 
@@ -111,7 +114,7 @@ def test_advancement_materializes_and_reuses_an_unchanged_payload(tmp_path, monk
     source_tree(source)
 
     first = materialize_candidate(tmp_path, source, tmp_path / "empty", "first")
-    first_unit = cli.load_json(first / "units/rendered.json")
+    first_unit = cli.load_unit(first / "units/rendered.json", "rendered")
 
     assert plugin.calls == 1
     assert (first / "manifests/rendered/rendered.yaml").read_text() == (
@@ -131,7 +134,7 @@ def test_advancement_materializes_and_reuses_an_unchanged_payload(tmp_path, monk
 
     assert plugin.calls == 1
     assert cli.directory_files(second / "manifests/rendered") == cli.directory_files(first / "manifests/rendered")
-    assert cli.load_json(second / "units/rendered.json")["materialization"] == first_unit["materialization"]
+    assert cli.load_unit(second / "units/rendered.json", "rendered")["materialization"] == first_unit["materialization"]
 
 
 def test_materialized_payload_tampering_fails_before_status_or_promotion(tmp_path, monkeypatch):

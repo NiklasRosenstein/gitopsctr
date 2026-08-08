@@ -1,10 +1,19 @@
 {
-  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/frontend-s3-cloudfront/v1/unit.schema.json",
-  "schema": 1,
-  "name": "frontend",
-  "driver": "frontend-s3-cloudfront",
-  "source": {"path": "web"},
-  "inputs": {
-    "bundle": {"fromPromotion": "units/frontend.json", "pointer": "/inputs/bundle"}
+  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/FrontendS3Cloudfront/authored.schema.json",
+  "apiVersion": "unit.gitopsctr.io/v1",
+  "kind": "FrontendS3Cloudfront",
+  "metadata": {
+    "name": "frontend"
+  },
+  "spec": {
+    "inputs": {
+      "bundle": {
+        "fromPromotion": "units/frontend.json",
+        "pointer": "/inputs/bundle"
+      }
+    },
+    "source": {
+      "path": "web"
+    }
   }
 }

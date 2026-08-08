@@ -1,13 +1,23 @@
 {
-  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/terraform/v2/unit.schema.json",
-  "schema": 1,
-  "name": "aws-application",
-  "driver": "terraform",
-  "source": {"path": "infrastructure"},
-  "terraform": {
-    "backend": {"key": "example/dev.tfstate"},
-    "variables": {"environment": "dev"},
-    "observeOutputs": [],
-    "checks": []
+  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json",
+  "apiVersion": "unit.gitopsctr.io/v1",
+  "kind": "Terraform",
+  "metadata": {
+    "name": "aws-application"
+  },
+  "spec": {
+    "source": {
+      "path": "infrastructure"
+    },
+    "terraform": {
+      "backend": {
+        "key": "example/dev.tfstate"
+      },
+      "checks": [],
+      "observeOutputs": [],
+      "variables": {
+        "environment": "dev"
+      }
+    }
   }
 }
