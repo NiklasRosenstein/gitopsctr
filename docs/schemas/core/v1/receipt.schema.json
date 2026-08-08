@@ -84,15 +84,11 @@
       ],
       "default": null
     },
-    "schema": {
-      "const": 1
-    },
     "unit": {
       "type": "string"
     }
   },
   "required": [
-    "schema",
     "unit",
     "driver",
     "desired"

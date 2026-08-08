@@ -98,13 +98,9 @@
         }
       ],
       "default": null
-    },
-    "schema": {
-      "const": 1
     }
   },
   "required": [
-    "schema",
     "name"
   ],
   "title": "EnvironmentDocument",

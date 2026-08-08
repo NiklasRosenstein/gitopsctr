@@ -26,9 +26,6 @@
     "name": {
       "type": "string"
     },
-    "schema": {
-      "const": 1
-    },
     "source": {
       "additionalProperties": false,
       "properties": {
@@ -163,7 +160,6 @@
     }
   },
   "required": [
-    "schema",
     "name",
     "driver",
     "source"
