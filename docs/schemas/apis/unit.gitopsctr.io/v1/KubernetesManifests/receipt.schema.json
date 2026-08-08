@@ -1,0 +1,177 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/KubernetesManifests/receipt.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "apiVersion": {
+      "const": "gitopsctr.io/v1"
+    },
+    "kind": {
+      "const": "Receipt"
+    },
+    "metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "spec": {
+      "additionalProperties": false,
+      "properties": {
+        "desired": {
+          "type": "object"
+        },
+        "resolvedInputs": {
+          "type": "object"
+        },
+        "subject": {
+          "additionalProperties": false,
+          "properties": {
+            "apiVersion": {
+              "const": "unit.gitopsctr.io/v1"
+            },
+            "kind": {
+              "const": "KubernetesManifests"
+            },
+            "name": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "apiVersion",
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "subject",
+        "desired"
+      ],
+      "type": "object"
+    },
+    "status": {
+      "additionalProperties": false,
+      "properties": {
+        "controller": {
+          "type": "object"
+        },
+        "result": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "applied": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "inventory": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "apiVersion": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "namespace": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "apiVersion",
+                          "kind",
+                          "namespace",
+                          "name"
+                        ],
+                        "title": "ResourceIdentityModel",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "manifestDigest": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "manifestDigest",
+                    "inventory"
+                  ],
+                  "title": "AppliedManifestsModel",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "applied"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "observed": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "application": {
+                      "type": "string"
+                    },
+                    "desiredRevision": {
+                      "type": "string"
+                    },
+                    "healthStatus": {
+                      "const": "Healthy"
+                    },
+                    "syncStatus": {
+                      "const": "Synced"
+                    }
+                  },
+                  "required": [
+                    "application",
+                    "desiredRevision",
+                    "syncStatus",
+                    "healthStatus"
+                  ],
+                  "title": "ObservedApplicationModel",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "observed"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": [
+        "controller",
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec",
+    "status"
+  ],
+  "title": "Receipt for KubernetesManifests",
+  "type": "object"
+}

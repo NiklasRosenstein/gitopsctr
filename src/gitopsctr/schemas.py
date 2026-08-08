@@ -7,18 +7,167 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
 
-from gitopsctr.contracts import CORE_CONTRACTS, receipt_schema, schema_url
+from gitopsctr.contracts import CORE_CONTRACTS, SCHEMA_ROOT, receipt_schema, schema_url
 from gitopsctr.document import DocumentContract, JsonObject
-from gitopsctr.driver import UNIT_PLUGINS, UnitPlugin
+from gitopsctr.driver import UNIT_DRIVERS, UNIT_PLUGINS, UnitDriver
 
 DRIVER_KINDS = ("unit", "desired-unit", "result", "receipt")
 CORE_KINDS = tuple(CORE_CONTRACTS)
 
 
-def _driver_schema_id(driver: str, plugin: UnitPlugin, kind: str) -> str:
+def _driver_schema_id(driver: str, plugin: UnitDriver, kind: str) -> str:
     if plugin.schema_base_uri:
         return f"{plugin.schema_base_uri.rstrip('/')}/{kind}.schema.json"
     return f"urn:gitopsctr:schema:driver:{driver}:v{plugin.version}:{kind}"
+
+
+def resource_schema_url(api_version: str, kind: str, profile: str | None = None) -> str:
+    group, version = api_version.rsplit("/", 1)
+    suffix = f"/{profile}" if profile else ""
+    return f"{SCHEMA_ROOT}/apis/{group}/{version}/{kind}{suffix}.schema.json"
+
+
+def _specification_schema(contract: DocumentContract) -> JsonObject:
+    schema = deepcopy(contract.json_schema())
+    properties = cast(dict[str, Any], schema.get("properties", {}))
+    required = [
+        value
+        for value in cast(list[str], schema.get("required", []))
+        if value not in {"$schema", "schema", "name", "driver"}
+    ]
+    for key in ("$schema", "schema", "name", "driver"):
+        properties.pop(key, None)
+    schema["properties"] = properties
+    schema["required"] = cast(Any, required)
+    return schema
+
+
+def _resource_schema(
+    *,
+    schema_id: str,
+    api_version: str,
+    kind: str,
+    spec: JsonObject,
+) -> JsonObject:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": schema_id,
+        "title": f"{kind} ({api_version})",
+        "type": "object",
+        "properties": {
+            "$schema": {"type": "string"},
+            "apiVersion": {"const": api_version},
+            "kind": {"const": kind},
+            "metadata": {
+                "type": "object",
+                "properties": {"name": {"type": "string", "minLength": 1}},
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+            "spec": spec,
+        },
+        "required": ["apiVersion", "kind", "metadata", "spec"],
+        "additionalProperties": False,
+    }
+
+
+def unit_resource_schema(driver: str, profile: str = "authored") -> JsonObject:
+    try:
+        driver_instance = UNIT_DRIVERS[driver]
+    except KeyError as exc:
+        raise ValueError(f"unknown schema driver: {driver}") from exc
+    contract = driver_instance.unit_contract if profile == "authored" else driver_instance.desired_unit_contract
+    kind = driver_instance.kind
+    return _resource_schema(
+        schema_id=resource_schema_url(driver_instance.api_version, kind, profile),
+        api_version=driver_instance.api_version,
+        kind=kind,
+        spec=_specification_schema(contract),
+    )
+
+
+def receipt_resource_schema(driver: str) -> JsonObject:
+    try:
+        driver_instance = UNIT_DRIVERS[driver]
+    except KeyError as exc:
+        raise ValueError(f"unknown schema driver: {driver}") from exc
+    result = deepcopy(driver_instance.result_contract.json_schema())
+    result.pop("$schema", None)
+    result.pop("$id", None)
+    result.pop("title", None)
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": resource_schema_url(driver_instance.api_version, driver_instance.kind, "receipt"),
+        "title": f"Receipt for {driver_instance.kind}",
+        "type": "object",
+        "properties": {
+            "$schema": {"type": "string"},
+            "apiVersion": {"const": "gitopsctr.io/v1"},
+            "kind": {"const": "Receipt"},
+            "metadata": {
+                "type": "object",
+                "properties": {"name": {"type": "string", "minLength": 1}},
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+            "spec": {
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "object",
+                        "properties": {
+                            "apiVersion": {"const": driver_instance.api_version},
+                            "kind": {"const": driver_instance.kind},
+                            "name": {"type": "string", "minLength": 1},
+                        },
+                        "required": ["apiVersion", "kind", "name"],
+                        "additionalProperties": False,
+                    },
+                    "desired": {"type": "object"},
+                    "resolvedInputs": {"type": "object"},
+                },
+                "required": ["subject", "desired"],
+                "additionalProperties": False,
+            },
+            "status": {
+                "type": "object",
+                "properties": {
+                    "controller": {"type": "object"},
+                    "result": result,
+                },
+                "required": ["controller", "result"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["apiVersion", "kind", "metadata", "spec", "status"],
+        "additionalProperties": False,
+    }
+
+
+def core_resource_schema(kind: str) -> JsonObject:
+    if kind == "Environment":
+        specification = _specification_schema(CORE_CONTRACTS["environment"])
+    elif kind == "Promotion":
+        specification = _specification_schema(CORE_CONTRACTS["promotion"])
+    elif kind == "Receipt":
+        specification = {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "object"},
+                "desired": {"type": "object"},
+                "resolvedInputs": {"type": "object"},
+            },
+            "required": ["subject", "desired"],
+            "additionalProperties": False,
+        }
+    else:
+        raise ValueError(f"unknown core resource kind: {kind}")
+    return _resource_schema(
+        schema_id=resource_schema_url("gitopsctr.io/v1", kind),
+        api_version="gitopsctr.io/v1",
+        kind=kind,
+        spec=cast(JsonObject, specification),
+    )
 
 
 def driver_schema(driver: str, kind: str) -> JsonObject:
@@ -54,7 +203,7 @@ def show_schema(scope: str, kind: str) -> JsonObject:
 
 def schema_documents() -> dict[Path, JsonObject]:
     documents: dict[Path, JsonObject] = {}
-    index: dict[str, Any] = {"schema": 1, "core": {}, "drivers": {}}
+    index: dict[str, Any] = {"schema": 1, "core": {}, "drivers": {}, "apis": {}}
     for kind, contract in sorted(CORE_CONTRACTS.items()):
         path = Path("core/v1") / f"{kind}.schema.json"
         documents[path] = contract.json_schema()
@@ -76,6 +225,19 @@ def schema_documents() -> dict[Path, JsonObject]:
             }
             driver_index["schemas"][kind] = version_path.as_posix()
         index["drivers"][driver] = driver_index
+    for kind in ("Environment", "Promotion", "Receipt"):
+        path = Path("apis/gitopsctr.io/v1") / f"{kind}.schema.json"
+        documents[path] = core_resource_schema(kind)
+        index["apis"][f"gitopsctr.io/v1/{kind}"] = path.as_posix()
+    for driver, driver_instance in sorted(UNIT_DRIVERS.items()):
+        root = Path("apis/unit.gitopsctr.io/v1") / driver_instance.kind
+        for profile in ("authored", "desired"):
+            path = root / f"{profile}.schema.json"
+            documents[path] = unit_resource_schema(driver, profile)
+            index["apis"][f"unit.gitopsctr.io/v1/{driver_instance.kind}/{profile}"] = path.as_posix()
+        path = root / "receipt.schema.json"
+        documents[path] = receipt_resource_schema(driver)
+        index["apis"][f"unit.gitopsctr.io/v1/{driver_instance.kind}/receipt"] = path.as_posix()
     documents[Path("index.json")] = cast(JsonObject, index)
     return documents
 

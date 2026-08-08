@@ -25,10 +25,13 @@ from typing import Any
 from gitopsctr.contracts import CORE_CONTRACTS, with_schema
 from gitopsctr.document import ContractError, DocumentContract
 from gitopsctr.driver import (
+    DRIVER_GVKS,
+    DRIVER_NAMES_BY_GVK,
     MATERIALIZATION_PLUGINS,
     PLANNING_PLUGINS,
     PLUGIN_VERSIONS,
     RECONCILIATION_PLUGINS,
+    UNIT_DRIVERS,
     UNIT_PLUGINS,
     VERIFICATION_PLUGINS,
     DriverError,
@@ -48,7 +51,14 @@ from gitopsctr.forges import (
     ManualChangeRequest,
     ensure_change_request,
 )
-from gitopsctr.schemas import driver_schema, encoded_schema, export_schemas, show_schema
+from gitopsctr.formats import (
+    DocumentFormatError,
+    document_candidates,
+    load_document,
+    load_project_config,
+    write_document,
+)
+from gitopsctr.schemas import driver_schema, encoded_schema, export_schemas, resource_schema_url, show_schema
 
 GIT_AUTHOR_NAME = os.environ.get("GITOPSCTR_GIT_AUTHOR_NAME", "gitopsctr")
 GIT_AUTHOR_EMAIL = os.environ.get(
@@ -295,13 +305,219 @@ def command_schemas_export(args: argparse.Namespace) -> None:
 
 
 def load_json(path: Path) -> dict[str, Any]:
+    if not path.is_file() and path.suffix.lower() in {".json", ".yaml", ".yml"}:
+        alternatives = document_candidates(path.parent, path.stem)
+        if alternatives:
+            path = alternatives[0]
     try:
-        value = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        value = load_document(path)
+    except (OSError, DocumentFormatError) as exc:
         raise OperationError(f"could not read {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise OperationError(f"expected a JSON object in {path}")
     return value
+
+
+CORE_API_VERSION = "gitopsctr.io/v1"
+UNIT_API_VERSION = "unit.gitopsctr.io/v1"
+
+
+def normalize_environment_document(document: dict[str, Any], expected_name: str | None = None) -> dict[str, Any]:
+    """Convert a resource envelope to the controller's internal environment shape."""
+    if document.get("apiVersion") is None:
+        return document
+    if document.get("apiVersion") != CORE_API_VERSION or document.get("kind") != "Environment":
+        raise OperationError("environment must use apiVersion gitopsctr.io/v1 and kind Environment")
+    metadata = document.get("metadata")
+    specification = document.get("spec")
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str) or not isinstance(specification, dict):
+        raise OperationError("environment envelope requires metadata.name and a spec mapping")
+    name = metadata["name"]
+    if expected_name is not None and name != expected_name:
+        raise OperationError(f"environment metadata.name must be {expected_name!r}")
+    return {"schema": 1, "name": name, **specification}
+
+
+def normalize_promotion_document(document: dict[str, Any]) -> dict[str, Any]:
+    if document.get("apiVersion") is None:
+        return document
+    if document.get("apiVersion") != CORE_API_VERSION or document.get("kind") != "Promotion":
+        raise OperationError("promotion must use apiVersion gitopsctr.io/v1 and kind Promotion")
+    specification = document.get("spec")
+    if not isinstance(specification, dict):
+        raise OperationError("promotion envelope requires a spec mapping")
+    return {"schema": 1, **specification}
+
+
+def normalize_unit_document(document: dict[str, Any], expected_name: str | None = None) -> dict[str, Any]:
+    """Convert a unit resource envelope to the controller's internal shape."""
+    if document.get("apiVersion") is None:
+        return document
+    api_version = document.get("apiVersion")
+    kind = document.get("kind")
+    metadata = document.get("metadata")
+    specification = document.get("spec")
+    if not isinstance(api_version, str) or not isinstance(kind, str) or not isinstance(metadata, dict):
+        raise OperationError("unit envelope requires apiVersion, kind, and metadata")
+    if api_version != UNIT_API_VERSION:
+        raise OperationError(f"unsupported unit API version: {api_version!r}")
+    driver = DRIVER_NAMES_BY_GVK.get(f"{api_version}/{kind}")
+    if driver is None:
+        raise OperationError(f"no installed unit driver handles {api_version}/{kind}")
+    name = metadata.get("name")
+    if not isinstance(name, str) or (expected_name is not None and name != expected_name):
+        raise OperationError(f"unit metadata.name must be {expected_name or 'a non-empty name'!r}")
+    if not isinstance(specification, dict):
+        raise OperationError(f"unit {name} requires a spec mapping")
+    return {"schema": 1, "name": name, "driver": driver, **specification}
+
+
+def serialize_environment_document(environment: dict[str, Any]) -> dict[str, Any]:
+    name = environment.get("name")
+    if not isinstance(name, str):
+        raise OperationError("environment is missing its name")
+    specification = {key: value for key, value in environment.items() if key not in {"schema", "name", "$schema"}}
+    return {
+        "$schema": resource_schema_url(CORE_API_VERSION, "Environment"),
+        "apiVersion": CORE_API_VERSION,
+        "kind": "Environment",
+        "metadata": {"name": name},
+        "spec": specification,
+    }
+
+
+def serialize_promotion_document(promotion: dict[str, Any]) -> dict[str, Any]:
+    specification = {key: value for key, value in promotion.items() if key not in {"schema", "$schema"}}
+    return {
+        "$schema": resource_schema_url(CORE_API_VERSION, "Promotion"),
+        "apiVersion": CORE_API_VERSION,
+        "kind": "Promotion",
+        "metadata": {"name": str(specification.get("source", {}).get("environment", "promotion"))},
+        "spec": specification,
+    }
+
+
+def serialize_unit_document(
+    unit: dict[str, Any], driver_name: str | None = None, *, profile: str = "desired"
+) -> dict[str, Any]:
+    driver = driver_name or unit.get("driver")
+    if not isinstance(driver, str) or driver not in UNIT_DRIVERS:
+        raise OperationError(f"unit uses an unknown driver: {driver!r}")
+    name = unit.get("name")
+    if not isinstance(name, str):
+        raise OperationError("unit is missing its name")
+    specification = {key: value for key, value in unit.items() if key not in {"schema", "name", "driver", "$schema"}}
+    return {
+        "$schema": resource_schema_url(
+            DRIVER_GVKS[driver].rsplit("/", 1)[0],
+            DRIVER_GVKS[driver].rsplit("/", 1)[1],
+            "authored" if profile == "authored" else "desired",
+        ),
+        "apiVersion": DRIVER_GVKS[driver].rsplit("/", 1)[0],
+        "kind": DRIVER_GVKS[driver].rsplit("/", 1)[1],
+        "metadata": {"name": name},
+        "spec": specification,
+    }
+
+
+def normalize_receipt_document(document: dict[str, Any], expected_unit: str | None = None) -> dict[str, Any]:
+    if document.get("apiVersion") is None:
+        return document
+    if document.get("apiVersion") != CORE_API_VERSION or document.get("kind") != "Receipt":
+        raise OperationError("receipt must use apiVersion gitopsctr.io/v1 and kind Receipt")
+    metadata = document.get("metadata")
+    specification = document.get("spec")
+    status = document.get("status")
+    if not isinstance(metadata, dict) or not isinstance(specification, dict) or not isinstance(status, dict):
+        raise OperationError("receipt envelope requires metadata, spec, and status mappings")
+    name = metadata.get("name")
+    subject = specification.get("subject")
+    if not isinstance(name, str) or (expected_unit is not None and name != expected_unit):
+        raise OperationError(f"receipt metadata.name must be {expected_unit or 'a unit name'}")
+    if not isinstance(subject, dict):
+        raise OperationError("receipt spec.subject is required")
+    api_version = subject.get("apiVersion")
+    kind = subject.get("kind")
+    driver = DRIVER_NAMES_BY_GVK.get(f"{api_version}/{kind}")
+    if driver is None:
+        raise OperationError("receipt subject does not identify an installed unit driver")
+    result = status.get("result", {})
+    if not isinstance(result, dict):
+        raise OperationError("receipt status.result must be a mapping")
+    return {
+        "schema": 1,
+        "unit": name,
+        "driver": driver,
+        "desired": specification.get("desired", {}),
+        "resolvedInputs": specification.get("resolvedInputs", {}),
+        "controller": status.get("controller", {}),
+        **result,
+    }
+
+
+def serialize_receipt_document(receipt: dict[str, Any]) -> dict[str, Any]:
+    driver = receipt.get("driver")
+    unit = receipt.get("unit")
+    if not isinstance(driver, str) or driver not in UNIT_DRIVERS or not isinstance(unit, str):
+        raise OperationError("receipt is missing a known driver or unit")
+    reserved = {"schema", "unit", "driver", "desired", "resolvedInputs", "controller", "$schema"}
+    return {
+        "$schema": resource_schema_url(DRIVER_GVKS[driver].rsplit("/", 1)[0], DRIVER_GVKS[driver].rsplit("/", 1)[1], "receipt"),
+        "apiVersion": CORE_API_VERSION,
+        "kind": "Receipt",
+        "metadata": {"name": unit},
+        "spec": {
+            "subject": {
+                "apiVersion": DRIVER_GVKS[driver].rsplit("/", 1)[0],
+                "kind": DRIVER_GVKS[driver].rsplit("/", 1)[1],
+                "name": unit,
+            },
+            "desired": receipt.get("desired", {}),
+            "resolvedInputs": receipt.get("resolvedInputs", {}),
+        },
+        "status": {
+            "controller": receipt.get("controller", {}),
+            "result": {key: value for key, value in receipt.items() if key not in reserved},
+        },
+    }
+
+
+def load_receipt(path: Path, expected_unit: str | None = None) -> dict[str, Any]:
+    return normalize_receipt_document(load_json(path), expected_unit or path.stem)
+
+
+def resource_documents_enabled(root: Path) -> bool:
+    """Use envelopes once a project has opted into the new document layout."""
+    if any((root / name).is_file() for name in ("gitopsctr.yaml", "gitopsctr.yml", ".gitopsctr.yaml", ".gitopsctr.yml")):
+        return True
+    for environment_root in (root / "deployment" / "environments").glob("*"):
+        for name in ("environment.yaml", "environment.yml", "environment.json"):
+            path = environment_root / name
+            if path.is_file() and load_json(path).get("apiVersion") is not None:
+                return True
+    return False
+
+
+def unit_document_path(root: Path, unit_name: str, project_root: Path | None = None) -> Path:
+    directory = root / "units"
+    candidates = document_candidates(directory, unit_name)
+    if len(candidates) > 1:
+        raise OperationError(f"multiple document formats exist for unit {unit_name}: {', '.join(map(str, candidates))}")
+    if candidates:
+        return candidates[0]
+    if project_root is not None and resource_documents_enabled(project_root):
+        return directory / f"{unit_name}{load_project_config(project_root).write_format.suffix}"
+    return directory / f"{unit_name}.json"
+
+
+def load_unit(path: Path, expected_name: str | None = None) -> dict[str, Any]:
+    return normalize_unit_document(load_json(path), expected_name or path.stem)
+
+
+def write_unit(path: Path, unit: dict[str, Any], project_root: Path) -> Path:
+    if resource_documents_enabled(project_root):
+        selected = load_project_config(project_root).write_format
+        return write_document(path.with_suffix(selected.suffix), serialize_unit_document(unit), format=selected)
+    write_json(path.with_suffix(".json"), unit)
+    return path.with_suffix(".json")
 
 
 def validate_document(contract: DocumentContract, document: object, description: str) -> dict[str, Any]:
@@ -314,6 +530,7 @@ def validate_document(contract: DocumentContract, document: object, description:
 def validate_receipt_document(document: object, description: str) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise OperationError(f"invalid {description}: expected a JSON object")
+    document = normalize_receipt_document(document)
     driver = document.get("driver")
     if driver is None and "$schema" not in document:
         # Pre-contract receipts remain readable; every newly written receipt carries a driver and $schema.
@@ -334,6 +551,22 @@ def validate_receipt_document(document: object, description: str) -> dict[str, A
 def write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def write_preferred_document(path: Path, value: dict[str, Any], project_root: Path) -> Path:
+    """Write a generated document using the project's configured format."""
+    if not resource_documents_enabled(project_root):
+        write_json(path.with_suffix(".json"), value)
+        return path.with_suffix(".json")
+    try:
+        selected = load_project_config(project_root).write_format
+        if value.get("source") is not None and value.get("specificationRevision") is not None:
+            value = serialize_promotion_document(value)
+        elif value.get("unit") is not None and value.get("driver") is not None:
+            value = serialize_receipt_document(value)
+        return write_document(path.with_suffix(selected.suffix), value, format=selected)
+    except DocumentFormatError as exc:
+        raise OperationError(str(exc)) from exc
 
 
 def canonical_json(value: Any) -> bytes:
@@ -482,6 +715,7 @@ def copy_unit_materialization(source: Path, destination: Path, unit_name: str, u
 def require_unit_specification(
     specification: dict[str, Any], expected_name: str | None = None
 ) -> tuple[str, dict[str, Any]]:
+    specification = normalize_unit_document(specification, expected_name)
     name = specification.get("name")
     driver = specification.get("driver")
     source = specification.get("source")
@@ -532,9 +766,9 @@ def prior_unit_source(
     current_desired: Path,
     legacy: dict[str, Any] | None,
 ) -> tuple[str, str] | None:
-    current_path = current_desired / "units" / f"{unit_name}.json"
+    current_path = unit_document_path(current_desired, unit_name)
     if current_path.is_file():
-        source = load_json(current_path).get("source", {})
+        source = load_unit(current_path).get("source", {})
         revision = source.get("revision")
         input_hash = source.get("inputHash")
         if isinstance(revision, str) and isinstance(input_hash, str):
@@ -556,11 +790,11 @@ def file_blob(path: Path) -> str:
 
 
 def current_receipt(observed: Path, candidate_units: Path, unit_name: str) -> dict[str, Any] | None:
-    receipt_path = observed / "units" / f"{unit_name}.json"
-    unit_path = candidate_units / f"{unit_name}.json"
+    receipt_path = unit_document_path(observed, unit_name)
+    unit_path = unit_document_path(candidate_units.parent, unit_name)
     if not receipt_path.is_file() or not unit_path.is_file():
         return None
-    receipt = load_json(receipt_path)
+    receipt = load_receipt(receipt_path, unit_name)
     validate_receipt_document(receipt, f"persisted receipt for {unit_name}")
     if receipt.get("desired", {}).get("unitBlob") != file_blob(unit_path):
         return None
@@ -640,13 +874,13 @@ def resolved_unit_source(
     inputs_changed = prior is None
     if prior is not None:
         prior_revision, prior_hash = prior
-        previous_unit_path = current_desired / "units" / f"{specification['name']}.json"
+        previous_unit_path = unit_document_path(current_desired, specification["name"])
         if (
             specification.get("driver") == "oci-images"
             and "environment" not in specification
             and previous_unit_path.is_file()
         ):
-            previous_environment = load_json(previous_unit_path).get("environment")
+            previous_environment = load_unit(previous_unit_path).get("environment")
             if isinstance(previous_environment, str):
                 legacy_specification = json.loads(json.dumps(specification))
                 legacy_specification["environment"] = previous_environment
@@ -676,7 +910,10 @@ def load_environment(source_root: Path, environment_name: str) -> dict[str, Any]
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", environment_name):
         raise OperationError(f"invalid environment name: {environment_name!r}")
     environment_root = source_root / "deployment" / "environments" / environment_name
-    environment = load_json(environment_root / "environment.json")
+    environment_paths = document_candidates(environment_root, "environment")
+    if len(environment_paths) != 1:
+        raise OperationError(f"expected exactly one environment document for {environment_name}")
+    environment = normalize_environment_document(load_json(environment_paths[0]), environment_name)
     if environment.get("schema") != 1 or environment.get("name") != environment_name:
         raise OperationError(f"invalid environment specification: {environment_name}")
     change_gate = environment.get("changeGate", "none")
@@ -761,10 +998,18 @@ def deployment_refs(
 def load_environment_specifications(source_root: Path, environment_name: str) -> dict[str, dict[str, Any]]:
     load_environment(source_root, environment_name)
     environment_root = source_root / "deployment" / "environments" / environment_name
-    unit_paths = sorted((environment_root / "units").glob("*.json"))
+    unit_paths: list[Path] = []
+    stems = sorted(
+        {path.stem for path in (environment_root / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}}
+    )
+    for stem in stems:
+        candidates = document_candidates(environment_root / "units", stem)
+        if len(candidates) > 1:
+            raise OperationError(f"multiple document formats exist for unit {stem}")
+        unit_paths.extend(candidates)
     if not unit_paths:
         raise OperationError(f"environment has no units: {environment_name}")
-    specifications = {path.stem: load_json(path) for path in unit_paths}
+    specifications = {path.stem: normalize_unit_document(load_json(path), path.stem) for path in unit_paths}
     for unit_name, specification in specifications.items():
         require_unit_specification(specification, unit_name)
     for consumer, specification in specifications.items():
@@ -787,12 +1032,12 @@ def require_environment_unit(source_root: Path, environment_name: str, unit_name
 def reconciliation_statuses(unit_names: list[str], desired: Path, observed: Path) -> list[tuple[str, str, str]]:
     statuses = []
     for unit_name in unit_names:
-        unit_path = desired / "units" / f"{unit_name}.json"
-        receipt_path = observed / "units" / f"{unit_name}.json"
+        unit_path = unit_document_path(desired, unit_name)
+        receipt_path = unit_document_path(observed, unit_name)
         if not unit_path.is_file():
             statuses.append((unit_name, "WAIT", "desired inputs are not materialized"))
             continue
-        unit = load_json(unit_path)
+        unit = load_unit(unit_path, unit_name)
         validate_unit_materialization(desired, unit_name, unit)
         if not unit_requires_reconciliation(unit):
             statuses.append((unit_name, "MATERIALIZED", "desired payload is published for external delivery"))
@@ -800,7 +1045,7 @@ def reconciliation_statuses(unit_names: list[str], desired: Path, observed: Path
         if not receipt_path.is_file():
             statuses.append((unit_name, "READY", "no observation receipt"))
             continue
-        receipt = load_json(receipt_path)
+        receipt = load_receipt(receipt_path, unit_name)
         validate_receipt_document(receipt, f"persisted receipt for {unit_name}")
         if receipt.get("desired", {}).get("unitBlob") == file_blob(unit_path):
             statuses.append((unit_name, "CLEAN", "observation matches desired state"))
@@ -949,11 +1194,11 @@ def classify_unit_change(
 
 
 def unit_change_explanation(unit_name: str, desired: Path, observed: Path) -> UnitChangeExplanation | None:
-    receipt_path = observed / "units" / f"{unit_name}.json"
-    current_path = desired / "units" / f"{unit_name}.json"
+    receipt_path = unit_document_path(observed, unit_name)
+    current_path = unit_document_path(desired, unit_name)
     if not receipt_path.is_file() or not current_path.is_file():
         return None
-    receipt = load_json(receipt_path)
+    receipt = load_receipt(receipt_path, unit_name)
     validate_receipt_document(receipt, f"persisted receipt for {unit_name}")
     previous_revision = receipt.get("desired", {}).get("revision")
     if not isinstance(previous_revision, str):
@@ -967,7 +1212,7 @@ def unit_change_explanation(unit_name: str, desired: Path, observed: Path) -> Un
         return None
     if not isinstance(previous, dict):
         return None
-    return classify_unit_change(previous, load_json(current_path), previous_revision)
+    return classify_unit_change(previous, load_unit(current_path, unit_name), previous_revision)
 
 
 def log_bounded_items(status: str, values: tuple[str, ...], verbose: bool) -> None:
@@ -1083,7 +1328,7 @@ def log_convergence_action(
     observed: Path,
     observed_ref: str,
 ) -> None:
-    unit = load_json(desired / "units" / f"{unit_name}.json")
+    unit = load_unit(unit_document_path(desired, unit_name), unit_name)
     driver_value = unit.get("driver")
     driver = driver_value if isinstance(driver_value, str) else "unknown"
     explanation = unit_change_explanation(unit_name, desired, observed)
@@ -1129,9 +1374,9 @@ def materialize_resolved_unit(
         validate_document(unit_plugin.desired_unit_contract, resolved, f"materialized {plugin_name} unit {unit_name}")
         return resolved
 
-    previous_path = current_desired / "units" / f"{unit_name}.json"
+    previous_path = unit_document_path(current_desired, unit_name)
     if previous_path.is_file():
-        previous = load_json(previous_path)
+        previous = load_unit(previous_path, unit_name)
         previous_without_materialization = {
             name: value for name, value in previous.items() if name != "materialization"
         }
@@ -1219,7 +1464,7 @@ def build_desired_candidate(
     candidate_units = candidate / "units"
     candidate_units.mkdir(parents=True)
     if promotion is not None:
-        write_json(candidate / "promotion.json", promotion.document())
+        write_preferred_document(candidate / "promotion.json", promotion.document(), source_root)
 
     prepared: dict[str, dict[str, Any]] = {}
     for unit_name, specification in specifications.items():
@@ -1230,7 +1475,7 @@ def build_desired_candidate(
             **json.loads(json.dumps(specification)),
             "source": resolved_source,
         }
-        previous_unit = current_desired / "units" / f"{unit_name}.json"
+        previous_unit = unit_document_path(current_desired, unit_name)
         if not previous_unit.is_file():
             source_resolution = "new unit; use candidate revision"
         elif source_changed:
@@ -1272,10 +1517,9 @@ def build_desired_candidate(
                 current_desired,
                 candidate,
             )
-            candidate_unit = candidate_units / f"{unit_name}.json"
-            write_json(candidate_unit, resolved)
-            previous_unit = current_desired / "units" / f"{unit_name}.json"
-            previous = load_json(previous_unit) if previous_unit.is_file() else None
+            candidate_unit = write_unit(candidate_units / f"{unit_name}.json", resolved, source_root)
+            previous_unit = unit_document_path(current_desired, unit_name)
+            previous = load_unit(previous_unit, unit_name) if previous_unit.is_file() else None
             previous_observations = (
                 previous.get("resolvedInputs", {}).get("observed", {}) if previous is not None else {}
             )
@@ -1311,12 +1555,12 @@ def build_desired_candidate(
             break
 
     for unit_name in sorted(unresolved):
-        previous = current_desired / "units" / f"{unit_name}.json"
-        previous_driver = load_json(previous).get("driver") if previous.is_file() else None
+        previous = unit_document_path(current_desired, unit_name)
+        previous_driver = load_unit(previous, unit_name).get("driver") if previous.is_file() else None
         next_driver = prepared[unit_name]["driver"]
         if previous_driver == next_driver:
             shutil.copy2(previous, candidate_units / previous.name)
-            copy_unit_materialization(current_desired, candidate, unit_name, load_json(previous))
+            copy_unit_materialization(current_desired, candidate, unit_name, load_unit(previous, unit_name))
             resolution = "retain previous desired state"
         elif previous_driver is not None:
             resolution = f"omit previous {previous_driver} desired state while transitioning to {next_driver}"
@@ -1338,10 +1582,13 @@ def require_revision(value: Any, description: str) -> str:
 
 
 def load_promotion_context(current_desired: Path, temporary: Path) -> PromotionContext | None:
-    path = current_desired / "promotion.json"
-    if not path.is_file():
+    paths = document_candidates(current_desired, "promotion")
+    if not paths:
         return None
-    document = load_json(path)
+    if len(paths) > 1:
+        raise OperationError("multiple promotion document formats exist")
+    path = paths[0]
+    document = normalize_promotion_document(load_json(path))
     validate_document(CORE_CONTRACTS["promotion"], document, "promotion.json")
     source = document.get("source")
     if not isinstance(source, dict) or set(source) != {
@@ -1383,11 +1630,11 @@ def load_promotion_context(current_desired: Path, temporary: Path) -> PromotionC
 
 
 def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) -> bool:
-    unit_path = desired / "units" / f"{unit_name}.json"
-    receipt_path = observed / "units" / f"{unit_name}.json"
+    unit_path = unit_document_path(desired, unit_name)
+    receipt_path = unit_document_path(observed, unit_name)
     if not unit_path.is_file():
         return False
-    unit = load_json(unit_path)
+    unit = load_unit(unit_path, unit_name)
     try:
         validate_unit_materialization(desired, unit_name, unit)
         if not unit_requires_reconciliation(unit):
@@ -1396,7 +1643,7 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
         return False
     if not receipt_path.is_file():
         return False
-    receipt = load_json(receipt_path)
+    receipt = load_receipt(receipt_path, unit_name)
     try:
         validate_receipt_document(receipt, f"historical receipt for {unit_name}")
     except OperationError:
@@ -1421,11 +1668,11 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
 
 
 def require_clean_source(desired: Path, observed: Path, minimum_evidence: str = "reconciled") -> None:
-    unit_names = sorted(path.stem for path in (desired / "units").glob("*.json"))
+    unit_names = sorted({path.stem for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}})
     if not unit_names:
         raise OperationError("promotion source desired state has no units")
     unresolved = [
-        unit_name for unit_name in unit_names if contains_reference(load_json(desired / "units" / f"{unit_name}.json"))
+        unit_name for unit_name in unit_names if contains_reference(load_unit(unit_document_path(desired, unit_name), unit_name))
     ]
     if unresolved:
         raise OperationError(f"promotion source has unresolved desired units: {', '.join(unresolved)}")
@@ -1463,7 +1710,7 @@ def find_clean_observed_snapshot(
     receipt_units = [
         unit_name
         for unit_name in unit_names
-        if unit_requires_reconciliation(load_json(desired / "units" / f"{unit_name}.json"))
+        if unit_requires_reconciliation(load_unit(unit_document_path(desired, unit_name), unit_name))
     ]
     if not receipt_units:
         return None
@@ -1499,8 +1746,8 @@ def downstream_unit_closure(specifications: dict[str, dict[str, Any]], selected:
 
 
 def promotion_lineage(desired: Path) -> dict[str, Any] | None:
-    path = desired / "promotion.json"
-    return load_json(path) if path.is_file() else None
+    paths = document_candidates(desired, "promotion")
+    return normalize_promotion_document(load_json(paths[0])) if paths else None
 
 
 def advance_desired(
@@ -1742,10 +1989,19 @@ def command_promote(args: argparse.Namespace) -> None:
         gate = change_gate(source_root, args.to_environment)
         if target_revision is None and gate == "pullRequest":
             baseline = temporary / "target-baseline"
-            write_json(
-                baseline / "environment.json",
-                {"schema": 1, "environment": args.to_environment, "state": "unpromoted"},
-            )
+            baseline_environment = {
+                "schema": 1,
+                "name": args.to_environment,
+                "state": "unpromoted",
+            }
+            if resource_documents_enabled(source_root):
+                write_document(
+                    baseline / f"environment{load_project_config(source_root).write_format.suffix}",
+                    serialize_environment_document(baseline_environment),
+                    format=load_project_config(source_root).write_format,
+                )
+            else:
+                write_json(baseline / "environment.json", baseline_environment)
             target_revision = publish_tree(
                 target_desired_ref,
                 baseline,
@@ -1830,7 +2086,8 @@ def command_promote(args: argparse.Namespace) -> None:
         artifact_uris = sorted(
             {
                 value
-                for path in (source_desired / "units").glob("*.json")
+                for path in (source_desired / "units").glob("*")
+                if path.suffix in {".json", ".yaml", ".yml"}
                 for value in nested_strings(load_json(path))
                 if re.search(r"@sha256:[0-9a-f]{64}$", value)
             }
@@ -1900,11 +2157,13 @@ def validate_materialized_desired(
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     specifications = load_environment_specifications(source, environment)
     expected_units = sorted(specifications)
-    desired_units = sorted(path.stem for path in (desired / "units").glob("*.json"))
+    desired_units = sorted(
+        {path.stem for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}}
+    )
     if desired_units != expected_units:
         raise OperationError(f"{description} {short_revision(desired_revision)} is not fully materialized")
     for unit_name in desired_units:
-        unit = load_json(desired / "units" / f"{unit_name}.json")
+        unit = load_unit(unit_document_path(desired, unit_name), unit_name)
         if contains_reference(unit):
             raise OperationError(f"{description} unit {unit_name} contains unresolved inputs")
         driver, _source = require_unit(unit, unit_name)
@@ -2047,18 +2306,22 @@ def command_rollback(args: argparse.Namespace) -> None:
         shutil.copytree(base, candidate)
         if mode == "units":
             for unit_name in materialized_units:
-                historical_unit = load_json(target / "units" / f"{unit_name}.json")
+                historical_path = unit_document_path(target, unit_name)
+                historical_unit = load_unit(historical_path, unit_name)
                 validate_unit_materialization(target, unit_name, historical_unit)
+                candidate_path = unit_document_path(candidate, unit_name)
+                if candidate_path.exists():
+                    candidate_path.unlink()
                 shutil.copy2(
-                    target / "units" / f"{unit_name}.json",
-                    candidate / "units" / f"{unit_name}.json",
+                    historical_path,
+                    candidate_path,
                 )
                 copy_unit_materialization(target, candidate, unit_name, historical_unit)
         for unit_name in materialized_units:
             validate_unit_materialization(
                 candidate,
                 unit_name,
-                load_json(candidate / "units" / f"{unit_name}.json"),
+                load_unit(unit_document_path(candidate, unit_name), unit_name),
             )
         requested_label = "all" if mode == "full" else ", ".join(requested_units)
         materialized_label = ", ".join(materialized_units)
@@ -2157,9 +2420,11 @@ def command_facts(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory() as temporary_directory:
         observed = Path(temporary_directory) / "observed"
         observed_revision = observed_tree(observed_ref, observed)
-        receipts = sorted((observed / "units").glob("*.json"))
+        receipts = sorted(
+            path for path in (observed / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}
+        )
         if args.unit:
-            receipt = observed / "units" / f"{args.unit}.json"
+            receipt = unit_document_path(observed, args.unit)
             if not receipt.is_file():
                 raise OperationError(f"{observed_ref} has no receipt for {args.unit}")
             receipts = [receipt]
@@ -2167,7 +2432,7 @@ def command_facts(args: argparse.Namespace) -> None:
         metadata = {"$schema", "schema", "unit", "driver", "desired", "resolvedInputs", "controller"}
         units = {}
         for path in receipts:
-            receipt = load_json(path)
+            receipt = load_receipt(path, path.stem)
             unit_name = path.stem
             validate_receipt_document(receipt, f"observation receipt units/{path.name}")
             if receipt.get("schema") != 1 or receipt.get("unit") != unit_name:
@@ -2201,7 +2466,9 @@ def command_verify(args: argparse.Namespace) -> None:
         materialize_revision(desired_revision, desired)
         log_status("DESIRED", f"{desired_ref} at {short_revision(desired_revision)}")
 
-        unit_paths = sorted((desired / "units").glob("*.json"))
+        unit_paths = sorted(
+            path for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}
+        )
         available = {path.stem: path for path in unit_paths}
         requested = args.unit or sorted(available)
         invalid = sorted({unit_name for unit_name in requested if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name)})
@@ -2472,8 +2739,8 @@ def publish_receipt_cas(
         with tempfile.TemporaryDirectory() as temporary_directory:
             observed = Path(temporary_directory) / "observed"
             observed_revision = observed_tree(observed_ref, observed)
-            receipt_path = observed / "units" / f"{unit_name}.json"
-            existing_receipt = load_json(receipt_path) if receipt_path.is_file() else None
+            receipt_path = unit_document_path(observed, unit_name)
+            existing_receipt = load_receipt(receipt_path, unit_name) if receipt_path.is_file() else None
             if existing_receipt is not None:
                 validate_receipt_document(existing_receipt, f"persisted receipt for {unit_name}")
             if existing_receipt is not None and existing_receipt.get("desired", {}).get("unitBlob") == receipt.get(
@@ -2491,7 +2758,7 @@ def publish_receipt_cas(
                         f"duplicate {unit_name} receipt for the same desired unit has a different semantic result"
                     )
                 return observed_revision
-            write_json(receipt_path, receipt)
+            write_preferred_document(receipt_path, receipt, REPOSITORY_ROOT)
             try:
                 return publish_tree(
                     observed_ref,
@@ -2604,13 +2871,13 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             if observed_revision
             else f"{observed_ref} has no receipts yet",
         )
-        unit_path = desired / "units" / f"{args.unit}.json"
+        unit_path = unit_document_path(desired, args.unit)
         if not unit_path.is_file():
             log_status("WAIT", "desired inputs are not materialized")
             log_status("DONE", f"{args.unit}: no changes")
             write_reconcile_outputs(False)
             return False
-        unit = load_json(unit_path)
+        unit = load_unit(unit_path, args.unit)
         driver_name, source = require_unit(unit, args.unit)
         validate_unit_materialization(desired, args.unit, unit)
         log_status("DRIVER", driver_name)
@@ -2640,8 +2907,8 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             return ""
 
         unit_blob = file_blob(unit_path)
-        receipt_path = observed / "units" / f"{args.unit}.json"
-        previous_receipt = load_json(receipt_path) if receipt_path.is_file() else None
+        receipt_path = unit_document_path(observed, args.unit)
+        previous_receipt = load_receipt(receipt_path, args.unit) if receipt_path.is_file() else None
         if previous_receipt is not None:
             validate_receipt_document(previous_receipt, f"persisted receipt for {args.unit}")
         if receipt_path.is_file():

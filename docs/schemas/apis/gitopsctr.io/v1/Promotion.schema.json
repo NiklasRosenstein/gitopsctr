@@ -1,0 +1,89 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Promotion.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "apiVersion": {
+      "const": "gitopsctr.io/v1"
+    },
+    "kind": {
+      "const": "Promotion"
+    },
+    "metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "spec": {
+      "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/core/v1/promotion.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "additionalProperties": false,
+          "properties": {
+            "desiredRef": {
+              "type": "string"
+            },
+            "desiredRevision": {
+              "type": "string"
+            },
+            "environment": {
+              "type": "string"
+            },
+            "observedRef": {
+              "type": "string"
+            },
+            "observedRevision": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "environment",
+            "desiredRef",
+            "desiredRevision",
+            "observedRef",
+            "observedRevision"
+          ],
+          "title": "PromotionSource",
+          "type": "object"
+        },
+        "specificationRevision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "specificationRevision"
+      ],
+      "title": "PromotionDocument",
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "title": "Promotion (gitopsctr.io/v1)",
+  "type": "object"
+}

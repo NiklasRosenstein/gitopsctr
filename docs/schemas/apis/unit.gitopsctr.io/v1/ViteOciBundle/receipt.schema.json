@@ -1,0 +1,174 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/ViteOciBundle/receipt.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "apiVersion": {
+      "const": "gitopsctr.io/v1"
+    },
+    "kind": {
+      "const": "Receipt"
+    },
+    "metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "spec": {
+      "additionalProperties": false,
+      "properties": {
+        "desired": {
+          "type": "object"
+        },
+        "resolvedInputs": {
+          "type": "object"
+        },
+        "subject": {
+          "additionalProperties": false,
+          "properties": {
+            "apiVersion": {
+              "const": "unit.gitopsctr.io/v1"
+            },
+            "kind": {
+              "const": "ViteOciBundle"
+            },
+            "name": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "apiVersion",
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "subject",
+        "desired"
+      ],
+      "type": "object"
+    },
+    "status": {
+      "additionalProperties": false,
+      "properties": {
+        "controller": {
+          "type": "object"
+        },
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "artifacts": {
+              "additionalProperties": {
+                "additionalProperties": false,
+                "properties": {
+                  "artifacts": {
+                    "additionalProperties": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "artifactType": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "const": "oci-artifact"
+                        },
+                        "uri": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "artifactType",
+                        "uri"
+                      ],
+                      "title": "BundleArtifactModel",
+                      "type": "object"
+                    },
+                    "propertyNames": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "schema": {
+                    "const": 1
+                  },
+                  "unit": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "driver": {
+                        "type": "string"
+                      },
+                      "inputHash": {
+                        "type": "string"
+                      },
+                      "inputHashVersion": {
+                        "const": 1
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "sourceRevision": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "driver",
+                      "inputHashVersion",
+                      "inputHash",
+                      "sourceRevision"
+                    ],
+                    "title": "ViteArtifactIdentity",
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "schema",
+                  "unit",
+                  "artifacts"
+                ],
+                "title": "FrontendDocumentModel",
+                "type": "object"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "artifacts"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "controller",
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec",
+    "status"
+  ],
+  "title": "Receipt for ViteOciBundle",
+  "type": "object"
+}

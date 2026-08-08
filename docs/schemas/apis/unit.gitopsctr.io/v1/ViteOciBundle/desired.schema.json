@@ -1,0 +1,262 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/ViteOciBundle/desired.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "apiVersion": {
+      "const": "unit.gitopsctr.io/v1"
+    },
+    "kind": {
+      "const": "ViteOciBundle"
+    },
+    "metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "spec": {
+      "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/vite-oci-bundle/v1/desired-unit.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {
+          "anyOf": [
+            {
+              "items": {
+                "const": "frontend.json"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "build": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "nodeVersion": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "nodeVersion"
+              ],
+              "title": "ViteBuild",
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "inputs": {
+          "anyOf": [
+            {
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "materialization": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "$schema": {
+                  "default": null
+                },
+                "digest": {
+                  "type": "string"
+                },
+                "mediaType": {
+                  "type": "string"
+                },
+                "metadata": {
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "mediaType",
+                "digest",
+                "metadata"
+              ],
+              "title": "MaterializationDocument",
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "publish": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "credentialProvider": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "const": "aws-ecr"
+                        }
+                      },
+                      "required": [
+                        "type"
+                      ],
+                      "title": "AwsEcrCredentialProvider",
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "repository": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "repository"
+              ],
+              "title": "VitePublication",
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "resolvedInputs": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "propertyNames": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "source": {
+          "additionalProperties": false,
+          "properties": {
+            "driverVersion": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "inputHash": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "inputs": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "path": {
+              "type": "string"
+            },
+            "revision": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "title": "DesiredSource",
+          "type": "object"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "title": "ViteOciBundleDesiredUnit",
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "title": "ViteOciBundle (unit.gitopsctr.io/v1)",
+  "type": "object"
+}

@@ -9,6 +9,7 @@ theme:
     - navigation.sections
 nav:
   - Overview: index.md
+  - Documents and drivers: documents.md
   - JSON Schemas: schemas.md
   - Driver execution: driver-execution.md
   - Kubernetes manifests: kubernetes-manifests.md

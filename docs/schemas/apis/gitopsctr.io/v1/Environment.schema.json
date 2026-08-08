@@ -1,0 +1,137 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Environment.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "apiVersion": {
+      "const": "gitopsctr.io/v1"
+    },
+    "kind": {
+      "const": "Environment"
+    },
+    "metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "spec": {
+      "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/core/v1/environment.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "changeGate": {
+          "default": "none",
+          "enum": [
+            "pullRequest",
+            "none"
+          ]
+        },
+        "promotion": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "allowedSources": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "allowedSources"
+              ],
+              "title": "EnvironmentPromotion",
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "promotionPolicy": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "minimumEvidence": {
+                  "default": "reconciled",
+                  "enum": [
+                    "reconciled",
+                    "materialized"
+                  ]
+                }
+              },
+              "title": "PromotionPolicy",
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "refs": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "desired": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "observed": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                }
+              },
+              "title": "EnvironmentRefs",
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [],
+      "title": "EnvironmentDocument",
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "title": "Environment (gitopsctr.io/v1)",
+  "type": "object"
+}

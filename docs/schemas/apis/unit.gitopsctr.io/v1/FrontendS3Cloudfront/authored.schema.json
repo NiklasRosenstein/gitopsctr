@@ -1,0 +1,142 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/FrontendS3Cloudfront/authored.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "apiVersion": {
+      "const": "unit.gitopsctr.io/v1"
+    },
+    "kind": {
+      "const": "FrontendS3Cloudfront"
+    },
+    "metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "spec": {
+      "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/frontend-s3-cloudfront/v1/unit.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "inputs": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "bucket": {
+                  "default": null
+                },
+                "bundle": {
+                  "default": null
+                },
+                "distributionId": {
+                  "default": null
+                },
+                "runtimeConfig": {
+                  "default": null
+                },
+                "url": {
+                  "default": null
+                }
+              },
+              "title": "FrontendAuthoredInputs",
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "pull": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "credentialProvider": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "const": "aws-ecr"
+                        }
+                      },
+                      "required": [
+                        "type"
+                      ],
+                      "title": "AwsEcrCredentialProvider",
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                }
+              },
+              "title": "FrontendPull",
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "source": {
+          "additionalProperties": false,
+          "properties": {
+            "inputs": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "title": "AuthoredSource",
+          "type": "object"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "title": "FrontendUnit",
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "title": "FrontendS3Cloudfront (unit.gitopsctr.io/v1)",
+  "type": "object"
+}

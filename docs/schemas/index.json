@@ -1,4 +1,24 @@
 {
+  "apis": {
+    "gitopsctr.io/v1/Environment": "apis/gitopsctr.io/v1/Environment.schema.json",
+    "gitopsctr.io/v1/Promotion": "apis/gitopsctr.io/v1/Promotion.schema.json",
+    "gitopsctr.io/v1/Receipt": "apis/gitopsctr.io/v1/Receipt.schema.json",
+    "unit.gitopsctr.io/v1/FrontendS3Cloudfront/authored": "apis/unit.gitopsctr.io/v1/FrontendS3Cloudfront/authored.schema.json",
+    "unit.gitopsctr.io/v1/FrontendS3Cloudfront/desired": "apis/unit.gitopsctr.io/v1/FrontendS3Cloudfront/desired.schema.json",
+    "unit.gitopsctr.io/v1/FrontendS3Cloudfront/receipt": "apis/unit.gitopsctr.io/v1/FrontendS3Cloudfront/receipt.schema.json",
+    "unit.gitopsctr.io/v1/KubernetesManifests/authored": "apis/unit.gitopsctr.io/v1/KubernetesManifests/authored.schema.json",
+    "unit.gitopsctr.io/v1/KubernetesManifests/desired": "apis/unit.gitopsctr.io/v1/KubernetesManifests/desired.schema.json",
+    "unit.gitopsctr.io/v1/KubernetesManifests/receipt": "apis/unit.gitopsctr.io/v1/KubernetesManifests/receipt.schema.json",
+    "unit.gitopsctr.io/v1/OciImages/authored": "apis/unit.gitopsctr.io/v1/OciImages/authored.schema.json",
+    "unit.gitopsctr.io/v1/OciImages/desired": "apis/unit.gitopsctr.io/v1/OciImages/desired.schema.json",
+    "unit.gitopsctr.io/v1/OciImages/receipt": "apis/unit.gitopsctr.io/v1/OciImages/receipt.schema.json",
+    "unit.gitopsctr.io/v1/Terraform/authored": "apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json",
+    "unit.gitopsctr.io/v1/Terraform/desired": "apis/unit.gitopsctr.io/v1/Terraform/desired.schema.json",
+    "unit.gitopsctr.io/v1/Terraform/receipt": "apis/unit.gitopsctr.io/v1/Terraform/receipt.schema.json",
+    "unit.gitopsctr.io/v1/ViteOciBundle/authored": "apis/unit.gitopsctr.io/v1/ViteOciBundle/authored.schema.json",
+    "unit.gitopsctr.io/v1/ViteOciBundle/desired": "apis/unit.gitopsctr.io/v1/ViteOciBundle/desired.schema.json",
+    "unit.gitopsctr.io/v1/ViteOciBundle/receipt": "apis/unit.gitopsctr.io/v1/ViteOciBundle/receipt.schema.json"
+  },
   "core": {
     "desired-unit": "core/v1/desired-unit.schema.json",
     "environment": "core/v1/environment.schema.json",
