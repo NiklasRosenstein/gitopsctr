@@ -6,7 +6,6 @@ which makes retries idempotent and lets downstream units consume
 `containers.json` through observations.
 
 **Kind:** `unit.gitopsctr.io/v1/OciImages`<br>
-**Version:** `v2`<br>
 **Capabilities:** planning, reconciliation
 
 ## Authored unit
@@ -41,7 +40,6 @@ existing digest when all named repositories agree; disagreement fails loudly.
 
 ## Schemas
 
-- [authored unit](../schemas/drivers/oci-images/v2/unit.schema.json)
-- [desired unit](../schemas/drivers/oci-images/v2/desired-unit.schema.json)
-- [result](../schemas/drivers/oci-images/v2/result.schema.json)
-- [receipt](../schemas/drivers/oci-images/v2/receipt.schema.json)
+- [authored unit](../schemas/apis/unit.gitopsctr.io/v1/OciImages/authored.schema.json)
+- [desired unit](../schemas/apis/unit.gitopsctr.io/v1/OciImages/desired.schema.json)
+- [receipt](../schemas/apis/unit.gitopsctr.io/v1/OciImages/receipt.schema.json)

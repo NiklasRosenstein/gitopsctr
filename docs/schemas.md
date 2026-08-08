@@ -1,15 +1,17 @@
 # JSON Schemas
 
-Typed unit-driver models are the authority for runtime validation and Draft 2020-12 schema generation. Each driver
-publishes authored, desired, result, and composed receipt contracts:
+Typed resource models are the authority for runtime validation and Draft
+2020-12 schema generation. Controller resources use `gitopsctr.io/v1`; unit
+resources use `unit.gitopsctr.io/v1`. Each unit kind publishes schemas for:
 
-- `unit`: authored environment input;
-- `desired-unit`: the fully resolved document stored under `deploy/<environment>/units/`;
-- `result`: the raw semantic result returned after applying;
-- `receipt`: the generic receipt envelope composed with that driver result.
+- `authored`: source input owned by the user;
+- `desired`: the fully resolved resource stored under
+  `deploy/<environment>/units/`;
+- `receipt`: the applied result and controller evidence stored under the
+  observed ref.
 
-Controller resources use `gitopsctr.io/v1`; unit resources use `unit.gitopsctr.io/v1`. The complete
-machine-readable catalog is [`schemas/index.json`](schemas/index.json).
+The complete machine-readable catalog is
+[`schemas/index.json`](schemas/index.json).
 
 ## Use a pinned schema
 
@@ -42,9 +44,10 @@ project-level [`gitopsctr.yaml` configuration schema`](project-configuration.md)
 ## CLI
 
 ```console
-gitopsctr schemas show terraform receipt
 gitopsctr schemas show gitopsctr.io/v1 Environment
 gitopsctr schemas show unit.gitopsctr.io/v1/Terraform authored
+gitopsctr schemas show unit.gitopsctr.io/v1/Terraform desired
+gitopsctr schemas show unit.gitopsctr.io/v1/Terraform receipt
 gitopsctr schemas export docs/schemas
 gitopsctr schemas export docs/schemas --check
 ```

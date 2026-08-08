@@ -6,7 +6,6 @@ artifact. The resulting `frontend.json` document exposes the immutable bundle
 URI to downstream units.
 
 **Kind:** `unit.gitopsctr.io/v1/ViteOciBundle`<br>
-**Version:** `v1`<br>
 **Capabilities:** planning, reconciliation
 
 ## Authored unit
@@ -38,7 +37,6 @@ the immutable artifact and returns its digest and artifact type.
 
 ## Schemas
 
-- [authored unit](../schemas/drivers/vite-oci-bundle/v1/unit.schema.json)
-- [desired unit](../schemas/drivers/vite-oci-bundle/v1/desired-unit.schema.json)
-- [result](../schemas/drivers/vite-oci-bundle/v1/result.schema.json)
-- [receipt](../schemas/drivers/vite-oci-bundle/v1/receipt.schema.json)
+- [authored unit](../schemas/apis/unit.gitopsctr.io/v1/ViteOciBundle/authored.schema.json)
+- [desired unit](../schemas/apis/unit.gitopsctr.io/v1/ViteOciBundle/desired.schema.json)
+- [receipt](../schemas/apis/unit.gitopsctr.io/v1/ViteOciBundle/receipt.schema.json)

@@ -4,7 +4,6 @@ The `KubernetesManifests` unit driver renders Helm or plain YAML into the
 desired tree and can optionally deliver those manifests to a cluster.
 
 **Kind:** `unit.gitopsctr.io/v1/KubernetesManifests`<br>
-**Version:** `v1`<br>
 **Capabilities:** materialization, planning, reconciliation, verification
 
 `kubernetes-manifests` renders immutable Kubernetes YAML while desired state advances. The rendered bytes and the
@@ -138,3 +137,9 @@ mise run kubernetes-demo-clean
 
 `mise run kubernetes-acceptance` starts from empty state, renders and applies a ConfigMap to kind, verifies it through
 the CLI, proves a second convergence moves no Git refs, and always removes the cluster.
+
+## Schemas
+
+- [authored unit](../schemas/apis/unit.gitopsctr.io/v1/KubernetesManifests/authored.schema.json)
+- [desired unit](../schemas/apis/unit.gitopsctr.io/v1/KubernetesManifests/desired.schema.json)
+- [receipt](../schemas/apis/unit.gitopsctr.io/v1/KubernetesManifests/receipt.schema.json)

@@ -6,7 +6,6 @@ runtime configuration document so the deployed frontend can discover its API
 and authentication settings.
 
 **Kind:** `unit.gitopsctr.io/v1/FrontendS3Cloudfront`<br>
-**Version:** `v1`<br>
 **Capabilities:** planning, reconciliation
 
 ## Authored unit
@@ -49,7 +48,6 @@ invalidates CloudFront before returning the published URL and digests.
 
 ## Schemas
 
-- [authored unit](../schemas/drivers/frontend-s3-cloudfront/v1/unit.schema.json)
-- [desired unit](../schemas/drivers/frontend-s3-cloudfront/v1/desired-unit.schema.json)
-- [result](../schemas/drivers/frontend-s3-cloudfront/v1/result.schema.json)
-- [receipt](../schemas/drivers/frontend-s3-cloudfront/v1/receipt.schema.json)
+- [authored unit](../schemas/apis/unit.gitopsctr.io/v1/FrontendS3Cloudfront/authored.schema.json)
+- [desired unit](../schemas/apis/unit.gitopsctr.io/v1/FrontendS3Cloudfront/desired.schema.json)
+- [receipt](../schemas/apis/unit.gitopsctr.io/v1/FrontendS3Cloudfront/receipt.schema.json)

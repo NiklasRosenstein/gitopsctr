@@ -5,7 +5,6 @@ that plan during reconciliation. It can also run HTTP checks against observed
 Terraform outputs and supports a refresh-enabled read-only verification.
 
 **Kind:** `unit.gitopsctr.io/v1/Terraform`<br>
-**Version:** `v2`<br>
 **Capabilities:** planning, reconciliation, verification
 
 ## Authored unit
@@ -45,7 +44,6 @@ read-only plan and reports `CLEAN` or `DRIFT`.
 
 ## Schemas
 
-- [authored unit](../schemas/drivers/terraform/v2/unit.schema.json)
-- [desired unit](../schemas/drivers/terraform/v2/desired-unit.schema.json)
-- [result](../schemas/drivers/terraform/v2/result.schema.json)
-- [receipt](../schemas/drivers/terraform/v2/receipt.schema.json)
+- [authored unit](../schemas/apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json)
+- [desired unit](../schemas/apis/unit.gitopsctr.io/v1/Terraform/desired.schema.json)
+- [receipt](../schemas/apis/unit.gitopsctr.io/v1/Terraform/receipt.schema.json)

@@ -27,6 +27,8 @@ For development, run `mise install`, `mise run sync`, and `mise run check`.
 
 ## Contracts
 
-Every built-in unit driver publishes schemas for its authored unit, materialized desired unit, applied result, and composed
-receipt. Start with the [available unit drivers](drivers.md), the [project configuration](project-configuration.md), or the
+Every built-in unit kind publishes resource schemas for its authored unit,
+materialized desired unit, and receipt. Start with the
+[available unit drivers](drivers.md), the
+[project configuration](project-configuration.md), or the
 [JSON Schema catalog](schemas.md).

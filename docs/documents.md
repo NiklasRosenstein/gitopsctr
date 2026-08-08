@@ -53,15 +53,3 @@ status:
 through full-GVK entry points, for example
 `unit.gitopsctr.io/v1/Terraform`. Capabilities such as planning,
 materialization, reconciliation, and verification remain independent traits.
-
-## Migration
-
-Run the one-shot migration from a clean source-branch checkout:
-
-```console
-python tools/migrate_documents.py --apply
-```
-
-It creates forward commits for the source, `deploy/*`, and `observed/*` local
-branches. Existing history is not rewritten. Use the default preview mode to
-inspect the commits first, and add `--push` only after reviewing them.
