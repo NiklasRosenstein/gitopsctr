@@ -17,6 +17,8 @@ spec:
         fromArtifact:
           unit: demo-image
           name: containers
+          apiVersion: artifact.gitopsctr.io/v1
+          kind: ContainerImages
           pointer: /images/application/uri
     allowSecrets: false
   delivery:

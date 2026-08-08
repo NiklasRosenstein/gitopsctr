@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from gitopsctr import driver as driver_registry
+from gitopsctr import registry as driver_registry
 from gitopsctr.contrib.drivers import (
     _oci,
     frontend_s3_cloudfront,
@@ -27,6 +27,7 @@ from gitopsctr.driver import (
     ReconciliationContext,
     UnitDriver,
     VerificationCapability,
+    VerificationContext,
     VerificationResult,
     VerificationStatus,
 )
@@ -68,17 +69,20 @@ def execution_for(runner) -> DriverExecution:
     return DriverExecution(output=transcript, commands=FakeCommandExecutor(runner))
 
 
-def test_contributed_driver_entry_points_load_one_module_per_driver():
+def test_contributed_api_entry_points_register_resource_kinds_and_drivers():
     configuration = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
-    entry_points = configuration["project"]["entry-points"]["gitopsctr.drivers"]
+    entry_points = configuration["project"]["entry-points"]["gitopsctr.apis"]
 
     assert entry_points == {
-        "unit.gitopsctr.io/v1/FrontendS3Cloudfront": "gitopsctr.contrib.drivers.frontend_s3_cloudfront:DRIVER",
-        "unit.gitopsctr.io/v1/KubernetesManifests": "gitopsctr.contrib.drivers.kubernetes_manifests:DRIVER",
-        "unit.gitopsctr.io/v1/OciImages": "gitopsctr.contrib.drivers.oci_images:DRIVER",
-        "unit.gitopsctr.io/v1/Terraform": "gitopsctr.contrib.drivers.terraform:DRIVER",
-        "unit.gitopsctr.io/v1/ViteOciBundle": "gitopsctr.contrib.drivers.vite_oci_bundle:DRIVER",
+        "artifact.gitopsctr.io/v1/ContainerImages": "gitopsctr.artifacts:CONTAINER_IMAGES",
+        "artifact.gitopsctr.io/v1/FrontendBundle": "gitopsctr.artifacts:FRONTEND_BUNDLE",
+        "unit.gitopsctr.io/v1/FrontendS3Cloudfront": "gitopsctr.contrib.drivers.frontend_s3_cloudfront:API_KIND",
+        "unit.gitopsctr.io/v1/KubernetesManifests": "gitopsctr.contrib.drivers.kubernetes_manifests:API_KIND",
+        "unit.gitopsctr.io/v1/OciImages": "gitopsctr.contrib.drivers.oci_images:API_KIND",
+        "unit.gitopsctr.io/v1/Terraform": "gitopsctr.contrib.drivers.terraform:API_KIND",
+        "unit.gitopsctr.io/v1/ViteOciBundle": "gitopsctr.contrib.drivers.vite_oci_bundle:API_KIND",
     }
+    assert {str(gvk) for gvk in driver_registry.API_KINDS} == set(entry_points)
     assert {plugin.reconcile.__module__ for plugin in driver_registry.RECONCILIATION_DRIVERS.values()} == {
         "gitopsctr.contrib.drivers.frontend_s3_cloudfront",
         "gitopsctr.contrib.drivers.kubernetes_manifests",
@@ -704,7 +708,7 @@ def test_terraform_verification_uses_refresh_enabled_read_only_saved_plan(
 
     reconciliation = replace(_terraform_context(tmp_path, report), execution=execution_for(fake_run))
     result = driver_registry.VERIFICATION_DRIVERS["terraform"].verify(
-        driver_registry.VerificationContext(
+        VerificationContext(
             environment=reconciliation.environment,
             desired_root=reconciliation.desired_root,
             desired_revision=reconciliation.desired_revision,

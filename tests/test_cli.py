@@ -160,7 +160,13 @@ def test_blocked_driver_transition_omits_previous_unit_and_reports_wait(tmp_path
         "source": {"path": "scripts/deployment_drivers.py"},
         "inputs": {
             "bundle": {
-                "fromArtifact": {"unit": "frontend-bundle", "name": "frontend", "pointer": "/bundle/uri"},
+                "fromArtifact": {
+                    "unit": "frontend-bundle",
+                    "name": "frontend",
+                    "apiVersion": "artifact.gitopsctr.io/v1",
+                    "kind": "FrontendBundle",
+                    "pointer": "/bundle/uri",
+                },
             }
         },
     }
@@ -215,7 +221,13 @@ def test_blocked_unit_with_same_driver_retains_previous_desired_state(tmp_path, 
         "source": {"path": "scripts/deployment_drivers.py"},
         "inputs": {
             "bundle": {
-                "fromArtifact": {"unit": "frontend-bundle", "name": "frontend", "pointer": "/bundle/uri"},
+                "fromArtifact": {
+                    "unit": "frontend-bundle",
+                    "name": "frontend",
+                    "apiVersion": "artifact.gitopsctr.io/v1",
+                    "kind": "FrontendBundle",
+                    "pointer": "/bundle/uri",
+                },
             }
         },
     }

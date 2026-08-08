@@ -49,10 +49,10 @@ for prerequisites, the reconciliation flow, and cleanup instructions.
 
 ## Unit drivers
 
-Unit drivers are discovered from the `gitopsctr.drivers` Python entry-point group. An entry point must load an instance
-of `gitopsctr.driver.UnitDriver` implementing at least `MaterializationCapability` or `ReconciliationCapability`.
-Verification is an independent optional capability. The built-in drivers use the public registry and live under
-`gitopsctr.contrib.drivers`, one module per driver.
+API kinds are discovered from the `gitopsctr.apis` Python entry-point group. Every full-GVK entry point loads a typed
+`ApiKind`; unit APIs carry a `UnitDriver` specification implementing at least `MaterializationCapability` or
+`ReconciliationCapability`, while artifact APIs carry their typed resource contract. Verification is an independent
+optional driver capability. The built-in drivers live under `gitopsctr.contrib.drivers`, one module per driver.
 
 The `kubernetes-manifests` unit driver renders Helm or plain YAML into the desired Git tree. It supports direct apply,
 materialization-only external delivery, and read-only Argo CD observation. See the
@@ -61,11 +61,11 @@ materialization-only external delivery, and read-only Argo CD observation. See t
 
 ## JSON Schemas
 
-Built-in unit drivers publish Draft 2020-12 schemas for authored units, desired units, raw results, and composed receipts at
+Built-in APIs publish Draft 2020-12 resource schemas for authored units, desired units, receipts, and artifacts at
 [`https://niklasrosenstein.github.io/gitopsctr/schemas/`](https://niklasrosenstein.github.io/gitopsctr/schemas/).
-Core environment, promotion, materialization, desired-unit, and receipt-envelope schemas are published alongside them.
+Controller resource schemas are published alongside them.
 
-Use `gitopsctr schemas show DRIVER KIND` for one schema and `gitopsctr schemas export DIRECTORY` to generate the complete
+Use `gitopsctr schemas show API_VERSION KIND` for one schema and `gitopsctr schemas export DIRECTORY` to generate the complete
 catalog. Committed YAML specifications should use a pinned `# yaml-language-server: $schema=...` directive; JSON
 specifications should use the same pinned URL in `$schema`. gitopsctr treats both forms as untrusted editor hints and
 never fetches them.

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from gitopsctr.artifacts import ArtifactProducer
 from gitopsctr.document import JsonObject
 from gitopsctr.driver import DriverError, UnitExecutionContext
 from gitopsctr.execution import CommandOutput, DriverExecution
@@ -42,17 +43,17 @@ def artifact_producer_identity(
     *,
     kind: str,
     driver_version: int,
-) -> JsonObject:
+) -> ArtifactProducer:
     require_strings(context.unit, ("name", "driver"), contract)
-    return {
-        "apiVersion": "unit.gitopsctr.io/v1",
-        "kind": kind,
-        "name": cast(str, context.unit["name"]),
-        "driverVersion": driver_version,
-        "inputHashVersion": 1,
-        "inputHash": input_hash,
-        "sourceRevision": context.source_revision,
-    }
+    return ArtifactProducer(
+        apiVersion="unit.gitopsctr.io/v1",
+        kind=kind,
+        name=cast(str, context.unit["name"]),
+        driverVersion=driver_version,
+        inputHashVersion=1,
+        inputHash=input_hash,
+        sourceRevision=context.source_revision,
+    )
 
 
 CredentialProviderValidator = Callable[[str, JsonObject], None]

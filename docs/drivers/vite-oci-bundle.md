@@ -40,6 +40,8 @@ bundle:
   fromArtifact:
     unit: frontend-bundle
     name: frontend
+    apiVersion: artifact.gitopsctr.io/v1
+    kind: FrontendBundle
     pointer: /bundle/uri
 ```
 

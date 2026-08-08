@@ -5,7 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict, cast
 
-from gitopsctr.artifacts import ARTIFACT_API_VERSION, CONTAINER_IMAGES_CONTRACT
+from gitopsctr.artifacts import (
+    ARTIFACT_API_VERSION,
+    CONTAINER_IMAGES,
+    ArtifactMetadata,
+    ArtifactProducer,
+    ContainerImage,
+    ContainerImagesResource,
+)
 from gitopsctr.contracts import (
     AuthoredSource,
     AwsEcrCredentialProvider,
@@ -19,7 +26,6 @@ from gitopsctr.contracts import (
 )
 from gitopsctr.document import JsonObject
 from gitopsctr.driver import (
-    ArtifactDocumentContract,
     DriverError,
     PlanningCapability,
     PlanningContext,
@@ -28,6 +34,7 @@ from gitopsctr.driver import (
     ReconciliationOutput,
     ReconciliationResult,
     UnitDriver,
+    unit_driver_api,
 )
 from gitopsctr.execution import CommandOutput, DriverExecution
 
@@ -109,7 +116,7 @@ class OciRuntime:
     dockerfile: str
     platform: str
     input_hash: str
-    producer: JsonObject
+    producer: ArtifactProducer
     tag: str
     local_image: str
 
@@ -162,14 +169,7 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
         schema_url("drivers/oci-images", version, "desired-unit"),
     )
     result_contract = MashumaroContract(EmptyResultModel, schema_url("drivers/oci-images", version, "result"))
-    artifact_contracts = {
-        "containers": ArtifactDocumentContract(
-            ARTIFACT_API_VERSION,
-            "ContainerImages",
-            CONTAINER_IMAGES_CONTRACT,
-            "application/vnd.gitopsctr.container-images.v1",
-        )
-    }
+    artifact_outputs = {"containers": CONTAINER_IMAGES}
 
     def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject:
         return {"source": {"path": source_path}}
@@ -231,7 +231,7 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
             driver_version=OciImagesDriver.version,
         )
         tag = f"input-{input_hash.removeprefix('sha256:')}"
-        local_image = f"{producer['name']}:{input_hash.removeprefix('sha256:')}"
+        local_image = f"{producer.name}:{input_hash.removeprefix('sha256:')}"
         return OciRuntime(
             resolved_targets,
             repositories,
@@ -334,17 +334,14 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
                     )
                 artifacts[name] = {"uri": local_image}
 
-        return ReconciliationOutput(
-            artifacts=cast(dict[str, JsonObject], {
-                "containers": {
-                    "apiVersion": ARTIFACT_API_VERSION,
-                    "kind": "ContainerImages",
-                    "metadata": {"name": "containers"},
-                    "producer": runtime.producer,
-                    "images": artifacts,
-                }
-            })
+        resource = ContainerImagesResource(
+            apiVersion=ARTIFACT_API_VERSION,
+            kind="ContainerImages",
+            metadata=ArtifactMetadata(name="containers"),
+            producer=runtime.producer,
+            images={name: ContainerImage(uri=image["uri"]) for name, image in artifacts.items()},
         )
+        return ReconciliationOutput(artifacts={"containers": CONTAINER_IMAGES.spec.dump(resource)})
 
     def semantic_result(self, result: object) -> ReconciliationResult:
         if result == {}:
@@ -353,3 +350,4 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
 
 
 DRIVER = OciImagesDriver()
+API_KIND = unit_driver_api(DRIVER)

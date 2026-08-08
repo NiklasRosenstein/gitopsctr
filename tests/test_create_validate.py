@@ -8,7 +8,8 @@ import pytest
 import yaml
 
 from gitopsctr import cli
-from gitopsctr.driver import UNIT_DRIVERS, UnitDriver
+from gitopsctr.driver import UnitDriver
+from gitopsctr.registry import UNIT_DRIVERS
 
 
 def project_document(

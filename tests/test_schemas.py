@@ -12,7 +12,7 @@ from referencing import Registry, Resource
 
 from gitopsctr import cli, schemas
 from gitopsctr.contracts import CORE_CONTRACTS, ContractError
-from gitopsctr.driver import UNIT_DRIVERS
+from gitopsctr.registry import UNIT_DRIVERS
 
 ROOT = Path(__file__).parents[1]
 REVISION = "a" * 40
@@ -130,16 +130,16 @@ def test_result_contracts_and_receipt_resource_schemas(driver):
             "result": result,
         },
     }
-    if plugin.artifact_contracts:
+    if plugin.artifact_outputs:
         receipt["status"]["artifacts"] = {
             name: {
-                "apiVersion": artifact.api_version,
-                "kind": artifact.kind,
+                "apiVersion": artifact_kind.gvk.api_version,
+                "kind": artifact_kind.gvk.kind,
                 "path": f"artifacts/example/{name}.yaml",
                 "digest": DIGEST,
-                "mediaType": f"{artifact.media_type}+yaml",
+                "mediaType": f"{artifact_kind.spec.media_type}+yaml",
             }
-            for name, artifact in plugin.artifact_contracts.items()
+            for name, artifact_kind in plugin.artifact_outputs.items()
         }
 
     receipt_schema = schemas.receipt_resource_schema(driver)

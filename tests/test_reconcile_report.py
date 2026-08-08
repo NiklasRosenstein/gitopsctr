@@ -32,6 +32,8 @@ def test_observation_reference_uses_fallback_only_during_dry_resolution(tmp_path
             "fromArtifact": {
                 "unit": "application-images",
                 "name": "containers",
+                "apiVersion": "artifact.gitopsctr.io/v1",
+                "kind": "ContainerImages",
                 "pointer": "/images/control/uri",
                 "dryFallback": "preview.invalid/control@sha256:" + "0" * 64,
             },
@@ -119,6 +121,8 @@ def test_observation_reference_materializes_artifact_into_consumer(tmp_path):
                 "fromArtifact": {
                     "unit": "application-images",
                     "name": "containers",
+                    "apiVersion": "artifact.gitopsctr.io/v1",
+                    "kind": "ContainerImages",
                     "pointer": "/images/control/uri",
                 },
             }
@@ -132,6 +136,21 @@ def test_observation_reference_materializes_artifact_into_consumer(tmp_path):
     assert resolution.promotions == {}
     assert resolution.receipts == {}
     assert resolution.artifacts == {"application-images/containers": deploy_release.sha256_file(artifact_path)}
+
+    with pytest.raises(deploy_release.ReferenceUnavailable, match="not artifact.gitopsctr.io/v1/FrontendBundle"):
+        deploy_release.resolve_template(
+            {
+                "fromArtifact": {
+                    "unit": "application-images",
+                    "name": "containers",
+                    "apiVersion": "artifact.gitopsctr.io/v1",
+                    "kind": "FrontendBundle",
+                }
+            },
+            candidate,
+            observed,
+            "a" * 40,
+        )
 
 
 def test_receipt_reference_normalizes_resource_receipt_before_applying_pointer(tmp_path):

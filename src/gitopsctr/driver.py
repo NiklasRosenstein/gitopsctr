@@ -10,10 +10,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from importlib.metadata import entry_points
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
+from gitopsctr.api import GVK, ApiKind, api_kinds
+from gitopsctr.artifacts import ArtifactApi, require_artifact_api
 from gitopsctr.document import DocumentContract, JsonObject
 from gitopsctr.execution import DriverExecution, default_driver_execution
 
@@ -22,16 +23,6 @@ type ReconciliationResult = Mapping[str, object]
 
 class DriverError(RuntimeError):
     pass
-
-
-@dataclass(frozen=True)
-class ArtifactDocumentContract:
-    """A logical artifact output and its independently versioned resource contract."""
-
-    api_version: str
-    kind: str
-    contract: DocumentContract
-    media_type: str
 
 
 @dataclass(frozen=True)
@@ -53,7 +44,7 @@ class UnitDriver:
     unit_contract: ClassVar[DocumentContract]
     desired_unit_contract: ClassVar[DocumentContract]
     result_contract: ClassVar[DocumentContract]
-    artifact_contracts: ClassVar[Mapping[str, ArtifactDocumentContract]] = {}
+    artifact_outputs: ClassVar[Mapping[str, ApiKind[ArtifactApi[Any]]]] = {}
 
     def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject | None:
         """Return an authored unit spec body, or ``None`` when scaffolding is unsupported.
@@ -64,6 +55,12 @@ class UnitDriver:
         """
 
         return None
+
+
+def unit_driver_api(driver: UnitDriver) -> ApiKind[UnitDriver]:
+    """Expose a unit driver through the generic API-kind entry-point interface."""
+
+    return ApiKind(GVK(driver.api_version, driver.kind), driver)
 
 
 @dataclass(frozen=True)
@@ -176,129 +173,46 @@ class VerificationCapability(ABC):
 SemanticResultSelector = Callable[[object], ReconciliationResult]
 
 
-def _register_artifact_gvk(
-    contracts: dict[str, ArtifactDocumentContract],
-    artifact: ArtifactDocumentContract,
-) -> None:
-    artifact_gvk = f"{artifact.api_version}/{artifact.kind}"
-    registered = contracts.get(artifact_gvk)
-    if registered is not None and (
-        registered.contract.json_schema() != artifact.contract.json_schema()
-        or registered.media_type != artifact.media_type
-    ):
-        raise DriverError(f"artifact GVK {artifact_gvk!r} has conflicting installed contracts")
-    contracts[artifact_gvk] = artifact
-
-
-def load_unit_drivers() -> dict[str, UnitDriver]:
+def load_unit_drivers(
+    installed_api_kinds: Mapping[GVK, ApiKind[object]] | None = None,
+) -> dict[str, UnitDriver]:
     drivers: dict[str, UnitDriver] = {}
-    artifact_gvks: dict[str, ArtifactDocumentContract] = {}
-    for entry_point in entry_points(group="gitopsctr.drivers"):
-        driver = entry_point.load()
+    installed = api_kinds() if installed_api_kinds is None else installed_api_kinds
+    for api_kind in installed.values():
+        if isinstance(api_kind.spec, ArtifactApi):
+            require_artifact_api(api_kind)
+    for api_kind in installed.values():
+        driver = api_kind.spec
         if not isinstance(driver, UnitDriver):
-            raise DriverError(f"unit driver entry point {entry_point.name!r} did not load a UnitDriver")
+            continue
         if isinstance(driver.version, bool) or not isinstance(driver.version, int) or driver.version < 1:
-            raise DriverError(f"unit driver entry point {entry_point.name!r} has an invalid version")
+            raise DriverError(f"unit driver API {api_kind.gvk!s} has an invalid version")
         if not isinstance(driver, (MaterializationCapability, ReconciliationCapability)):
-            raise DriverError(
-                f"unit driver entry point {entry_point.name!r} has no materialization or reconciliation capability"
-            )
-        expected_gvk = f"{driver.api_version}/{driver.kind}"
-        if entry_point.name != expected_gvk:
-            raise DriverError(
-                f"unit driver entry point {entry_point.name!r} does not match declared API kind {expected_gvk!r}"
-            )
+            raise DriverError(f"unit driver API {api_kind.gvk!s} has no materialization or reconciliation capability")
+        expected_gvk = GVK(driver.api_version, driver.kind)
+        if api_kind.gvk != expected_gvk:
+            raise DriverError(f"unit driver API {api_kind.gvk!s} does not match driver kind {expected_gvk!s}")
         if not driver.driver_name:
-            raise DriverError(f"unit driver entry point {entry_point.name!r} has no driver_name")
+            raise DriverError(f"unit driver API {api_kind.gvk!s} has no driver_name")
         if driver.driver_name in drivers:
             raise DriverError(f"duplicate unit driver entry point: {driver.driver_name}")
         for kind in ("unit", "desired_unit", "result"):
             contract = getattr(driver, f"{kind}_contract", None)
             if not isinstance(contract, DocumentContract):
                 raise DriverError(
-                    f"unit driver entry point {entry_point.name!r} has no {kind.replace('_', '-')} contract"
+                    f"unit driver API {api_kind.gvk!s} has no {kind.replace('_', '-')} contract"
                 )
-        for artifact_name, artifact in driver.artifact_contracts.items():
+        for artifact_name, artifact_kind in driver.artifact_outputs.items():
             if not artifact_name or not artifact_name.replace("-", "").isalnum() or not artifact_name.islower():
+                raise DriverError(f"unit driver API {api_kind.gvk!s} has invalid artifact name {artifact_name!r}")
+            if not isinstance(artifact_kind, ApiKind) or not isinstance(artifact_kind.spec, ArtifactApi):
+                raise DriverError(f"unit driver API {api_kind.gvk!s} has an invalid artifact API reference")
+            if installed.get(artifact_kind.gvk) is not artifact_kind:
                 raise DriverError(
-                    f"unit driver entry point {entry_point.name!r} has invalid artifact name {artifact_name!r}"
+                    f"unit driver API {api_kind.gvk!s} artifact {artifact_name!r} does not reference "
+                    f"the authoritative registration for {artifact_kind.gvk}"
                 )
-            if not isinstance(artifact, ArtifactDocumentContract) or not isinstance(
-                artifact.contract, DocumentContract
-            ):
-                raise DriverError(
-                    f"unit driver entry point {entry_point.name!r} has an invalid artifact contract"
-                )
-            if not all(
-                isinstance(value, str) and value
-                for value in (artifact.api_version, artifact.kind, artifact.media_type)
-            ):
-                raise DriverError(
-                    f"unit driver entry point {entry_point.name!r} has incomplete artifact metadata"
-                )
-            properties = artifact.contract.json_schema().get("properties", {})
-            if (
-                not isinstance(properties, dict)
-                or properties.get("apiVersion", {}).get("const") != artifact.api_version
-                or properties.get("kind", {}).get("const") != artifact.kind
-            ):
-                raise DriverError(
-                    f"unit driver entry point {entry_point.name!r} artifact {artifact_name!r} "
-                    "metadata does not match its resource contract"
-                )
-            _register_artifact_gvk(artifact_gvks, artifact)
-        if driver.artifact_contracts and not isinstance(driver, ReconciliationCapability):
-            raise DriverError(
-                f"unit driver entry point {entry_point.name!r} advertises artifacts without reconciliation"
-            )
+        if driver.artifact_outputs and not isinstance(driver, ReconciliationCapability):
+            raise DriverError(f"unit driver API {api_kind.gvk!s} advertises artifacts without reconciliation")
         drivers[driver.driver_name] = driver
     return drivers
-
-
-UNIT_DRIVERS = load_unit_drivers()
-DRIVER_GVKS = {name: f"{driver.api_version}/{driver.kind}" for name, driver in UNIT_DRIVERS.items()}
-DRIVER_NAMES_BY_GVK = {gvk: name for name, gvk in DRIVER_GVKS.items()}
-DRIVER_VERSIONS = {name: driver.version for name, driver in UNIT_DRIVERS.items()}
-MATERIALIZATION_DRIVERS = {
-    name: driver for name, driver in UNIT_DRIVERS.items() if isinstance(driver, MaterializationCapability)
-}
-RECONCILIATION_DRIVERS = {
-    name: driver for name, driver in UNIT_DRIVERS.items() if isinstance(driver, ReconciliationCapability)
-}
-PLANNING_DRIVERS = {name: driver for name, driver in UNIT_DRIVERS.items() if isinstance(driver, PlanningCapability)}
-VERIFICATION_DRIVERS = {
-    name: driver for name, driver in UNIT_DRIVERS.items() if isinstance(driver, VerificationCapability)
-}
-
-
-def semantic_reconciliation_result(driver_name: str, result: object) -> ReconciliationResult:
-    try:
-        driver = RECONCILIATION_DRIVERS[driver_name]
-    except KeyError as exc:
-        raise DriverError(f"unit driver does not support reconciliation: {driver_name}") from exc
-    artifacts: object = None
-    candidate = result
-    if isinstance(result, Mapping) and "desired" in result and "driver" in result:
-        reserved = {
-            "$schema",
-            "schema",
-            "unit",
-            "driver",
-            "desired",
-            "resolvedInputs",
-            "controller",
-            "artifacts",
-        }
-        candidate = {key: value for key, value in result.items() if key not in reserved}
-        artifacts = result.get("artifacts")
-    semantic = dict(driver.semantic_result(candidate))
-    if isinstance(artifacts, Mapping) and artifacts:
-        semantic["artifacts"] = {
-            name: {
-                key: descriptor[key]
-                for key in ("apiVersion", "kind", "digest")
-                if isinstance(descriptor, Mapping) and key in descriptor
-            }
-            for name, descriptor in artifacts.items()
-        }
-    return semantic

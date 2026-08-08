@@ -89,6 +89,8 @@ def test_kubernetes_demo_is_a_real_image_and_helm_delivery(tmp_path, monkeypatch
     assert specification["materialize"]["values"]["image"]["fromArtifact"] == {
         "unit": "demo-image",
         "name": "containers",
+        "apiVersion": "artifact.gitopsctr.io/v1",
+        "kind": "ContainerImages",
         "pointer": "/images/application/uri",
     }
     assert specification["delivery"] == {

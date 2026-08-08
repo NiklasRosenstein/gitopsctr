@@ -39,6 +39,7 @@ from gitopsctr.driver import (
     VerificationContext,
     VerificationResult,
     VerificationStatus,
+    unit_driver_api,
 )
 from gitopsctr.execution import CommandOutput, DriverExecution
 
@@ -712,3 +713,4 @@ class KubernetesManifestsDriver(
 
 
 DRIVER = KubernetesManifestsDriver()
+API_KIND = unit_driver_api(DRIVER)

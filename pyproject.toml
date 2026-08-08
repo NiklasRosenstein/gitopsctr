@@ -28,12 +28,14 @@ Repository = "https://github.com/NiklasRosenstein/gitopsctr"
 [project.scripts]
 gitopsctr = "gitopsctr.cli:main"
 
-[project.entry-points."gitopsctr.drivers"]
-"unit.gitopsctr.io/v1/FrontendS3Cloudfront" = "gitopsctr.contrib.drivers.frontend_s3_cloudfront:DRIVER"
-"unit.gitopsctr.io/v1/OciImages" = "gitopsctr.contrib.drivers.oci_images:DRIVER"
-"unit.gitopsctr.io/v1/Terraform" = "gitopsctr.contrib.drivers.terraform:DRIVER"
-"unit.gitopsctr.io/v1/ViteOciBundle" = "gitopsctr.contrib.drivers.vite_oci_bundle:DRIVER"
-"unit.gitopsctr.io/v1/KubernetesManifests" = "gitopsctr.contrib.drivers.kubernetes_manifests:DRIVER"
+[project.entry-points."gitopsctr.apis"]
+"artifact.gitopsctr.io/v1/ContainerImages" = "gitopsctr.artifacts:CONTAINER_IMAGES"
+"artifact.gitopsctr.io/v1/FrontendBundle" = "gitopsctr.artifacts:FRONTEND_BUNDLE"
+"unit.gitopsctr.io/v1/FrontendS3Cloudfront" = "gitopsctr.contrib.drivers.frontend_s3_cloudfront:API_KIND"
+"unit.gitopsctr.io/v1/OciImages" = "gitopsctr.contrib.drivers.oci_images:API_KIND"
+"unit.gitopsctr.io/v1/Terraform" = "gitopsctr.contrib.drivers.terraform:API_KIND"
+"unit.gitopsctr.io/v1/ViteOciBundle" = "gitopsctr.contrib.drivers.vite_oci_bundle:API_KIND"
+"unit.gitopsctr.io/v1/KubernetesManifests" = "gitopsctr.contrib.drivers.kubernetes_manifests:API_KIND"
 
 [dependency-groups]
 dev = [

@@ -13,7 +13,7 @@ from mashumaro.config import BaseConfig
 from mashumaro.jsonschema import build_json_schema
 from mashumaro.mixins.dict import DataClassDictMixin
 
-from gitopsctr.document import ContractError, DocumentContract, JsonObject
+from gitopsctr.document import ContractError, DocumentContract, JsonObject, TypedDocumentContract
 
 SCHEMA_ROOT = "https://niklasrosenstein.github.io/gitopsctr/schemas"
 
@@ -36,8 +36,8 @@ class EmptyResultModel(StrictModel):
 
 
 @dataclass(frozen=True)
-class MashumaroContract(DocumentContract):
-    model: type[StrictModel]
+class MashumaroContract[ModelT: StrictModel](TypedDocumentContract[ModelT]):
+    model: type[ModelT]
     schema_id: str
 
     def json_schema(self) -> JsonObject:
@@ -45,10 +45,10 @@ class MashumaroContract(DocumentContract):
         schema["$id"] = self.schema_id
         return schema
 
-    def validate(self, document: object) -> JsonObject:
+    def _candidate(self, document: object) -> JsonObject:
         if not isinstance(document, dict) or not all(isinstance(key, str) for key in document):
             raise ContractError("expected a JSON object")
-        candidate = dict(document)
+        candidate = cast(JsonObject, dict(document))
         # $schema is only a transport hint. Its value never selects a validator or triggers IO.
         schema = self.json_schema()
         # Flat documents from before the resource API carried ``schema: 1``.
@@ -59,12 +59,25 @@ class MashumaroContract(DocumentContract):
             candidate["$schema"] = None
         else:
             candidate.pop("$schema", None)
+        return candidate
+
+    def parse(self, document: object) -> ModelT:
+        candidate = self._candidate(document)
         try:
-            Draft202012Validator(schema).validate(candidate)
-            self.model.from_dict(candidate)
+            Draft202012Validator(self.json_schema()).validate(candidate)
+            return self.model.from_dict(candidate)
         except (ValidationError, TypeError, ValueError) as exc:
             detail = exc.message if isinstance(exc, ValidationError) else str(exc)
             raise ContractError(detail) from exc
+
+    def dump(self, value: ModelT) -> JsonObject:
+        document = cast(JsonObject, value.to_dict())
+        if document.get("$schema") is None:
+            document.pop("$schema", None)
+        return document
+
+    def validate(self, document: object) -> JsonObject:
+        self.parse(document)
         return cast(JsonObject, document)
 
 

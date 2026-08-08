@@ -25,17 +25,11 @@ from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 from typing import Any, TextIO
 
+from gitopsctr.api import GVK, ApiError
+from gitopsctr.artifacts import ArtifactApi, require_artifact_api
 from gitopsctr.contracts import CORE_CONTRACTS, with_schema
 from gitopsctr.document import ContractError, DocumentContract, JsonObject
 from gitopsctr.driver import (
-    DRIVER_GVKS,
-    DRIVER_NAMES_BY_GVK,
-    DRIVER_VERSIONS,
-    MATERIALIZATION_DRIVERS,
-    PLANNING_DRIVERS,
-    RECONCILIATION_DRIVERS,
-    UNIT_DRIVERS,
-    VERIFICATION_DRIVERS,
     DriverError,
     MaterializationContext,
     MaterializationResult,
@@ -45,7 +39,6 @@ from gitopsctr.driver import (
     ReconciliationOutput,
     VerificationContext,
     VerificationStatus,
-    semantic_reconciliation_result,
 )
 from gitopsctr.execution import DriverExecution
 from gitopsctr.forges import (
@@ -64,6 +57,18 @@ from gitopsctr.formats import (
     project_environment_root,
     validate_project_document,
     write_document,
+)
+from gitopsctr.registry import (
+    API_KINDS,
+    DRIVER_GVKS,
+    DRIVER_NAMES_BY_GVK,
+    DRIVER_VERSIONS,
+    MATERIALIZATION_DRIVERS,
+    PLANNING_DRIVERS,
+    RECONCILIATION_DRIVERS,
+    UNIT_DRIVERS,
+    VERIFICATION_DRIVERS,
+    semantic_reconciliation_result,
 )
 from gitopsctr.schemas import driver_schema, encoded_schema, export_schemas, resource_schema_url, show_schema
 
@@ -715,6 +720,17 @@ def validate_document(contract: DocumentContract, document: object, description:
         raise OperationError(f"invalid {description}: {exc}") from exc
 
 
+def parse_artifact_document[ResourceT](
+    artifact_api: ArtifactApi[ResourceT],
+    document: object,
+    description: str,
+) -> ResourceT:
+    try:
+        return artifact_api.parse(document)
+    except ContractError as exc:
+        raise OperationError(f"invalid {description}: {exc}") from exc
+
+
 def validate_receipt_document(document: object, description: str) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise OperationError(f"invalid {description}: expected a JSON object")
@@ -985,7 +1001,7 @@ def write_artifact_documents(
     documents: Mapping[str, JsonObject],
 ) -> dict[str, dict[str, str]]:
     driver = UNIT_DRIVERS[driver_name]
-    expected = set(driver.artifact_contracts)
+    expected = set(driver.artifact_outputs)
     if set(documents) != expected:
         raise DriverError(
             f"{driver_name} returned artifact documents {sorted(documents)}; expected {sorted(expected)}"
@@ -998,17 +1014,18 @@ def write_artifact_documents(
     selected = load_project_config(REPOSITORY_ROOT).write_format
     descriptors: dict[str, dict[str, str]] = {}
     for name, document in documents.items():
-        artifact = driver.artifact_contracts[name]
-        validate_document(artifact.contract, document, f"{driver_name} artifact {name}")
-        schema_id = str(artifact.contract.json_schema()["$id"])
-        serialized = {"$schema": schema_id, **document}
+        artifact_kind = driver.artifact_outputs[name]
+        artifact_api = require_artifact_api(artifact_kind)
+        resource = parse_artifact_document(artifact_api, document, f"{driver_name} artifact {name}")
+        schema_id = str(artifact_api.json_schema()["$id"])
+        serialized = {"$schema": schema_id, **artifact_api.dump(resource)}
         path = write_document(target / f"{name}{selected.suffix}", serialized, format=selected)
         descriptors[name] = {
-            "apiVersion": artifact.api_version,
-            "kind": artifact.kind,
+            "apiVersion": artifact_kind.gvk.api_version,
+            "kind": artifact_kind.gvk.kind,
             "path": path.relative_to(observed).as_posix(),
             "digest": sha256_file(path),
-            "mediaType": f"{artifact.media_type}+{selected.value}",
+            "mediaType": f"{artifact_api.media_type}+{selected.value}",
         }
     return descriptors
 
@@ -1019,10 +1036,10 @@ def validate_artifact_output_identity(
     documents: Mapping[str, JsonObject],
 ) -> None:
     driver = UNIT_DRIVERS[driver_name]
-    if set(documents) != set(driver.artifact_contracts):
+    if set(documents) != set(driver.artifact_outputs):
         raise DriverError(
             f"{driver_name} returned artifact documents {sorted(documents)}; "
-            f"expected {sorted(driver.artifact_contracts)}"
+            f"expected {sorted(driver.artifact_outputs)}"
         )
     if not documents:
         return
@@ -1030,7 +1047,8 @@ def validate_artifact_output_identity(
     if not isinstance(source, dict):
         raise DriverError(f"{driver_name} desired unit has no source identity")
     for name, document in documents.items():
-        validate_document(driver.artifact_contracts[name].contract, document, f"{driver_name} artifact {name}")
+        artifact_api = require_artifact_api(driver.artifact_outputs[name])
+        parse_artifact_document(artifact_api, document, f"{driver_name} artifact {name}")
         metadata = document.get("metadata")
         producer = document.get("producer")
         if isinstance(metadata, dict) and metadata.get("name") != name:
@@ -1061,9 +1079,10 @@ def load_artifact_document(
     driver_name = receipt.get("driver")
     if not isinstance(driver_name, str) or driver_name not in UNIT_DRIVERS:
         raise ReferenceUnavailable("artifact receipt has an unknown driver")
-    contract = UNIT_DRIVERS[driver_name].artifact_contracts.get(artifact_name)
-    if contract is None:
+    artifact_kind = UNIT_DRIVERS[driver_name].artifact_outputs.get(artifact_name)
+    if artifact_kind is None:
         raise ReferenceUnavailable(f"unit does not produce artifact {artifact_name!r}")
+    artifact_api = require_artifact_api(artifact_kind)
     descriptors = receipt.get("artifacts")
     descriptor = descriptors.get(artifact_name) if isinstance(descriptors, dict) else None
     if not isinstance(descriptor, dict):
@@ -1075,9 +1094,12 @@ def load_artifact_document(
     path = observed / recorded_path
     if path != expected_path or not path.is_file():
         raise ReferenceUnavailable(f"artifact {artifact_name!r} does not exist at its required path")
-    if descriptor.get("apiVersion") != contract.api_version or descriptor.get("kind") != contract.kind:
+    if (
+        descriptor.get("apiVersion") != artifact_kind.gvk.api_version
+        or descriptor.get("kind") != artifact_kind.gvk.kind
+    ):
         raise ReferenceUnavailable(f"artifact {artifact_name!r} has the wrong contract identity")
-    expected_media_type = f"{contract.media_type}+{'json' if path.suffix == '.json' else 'yaml'}"
+    expected_media_type = f"{artifact_api.media_type}+{'json' if path.suffix == '.json' else 'yaml'}"
     if descriptor.get("mediaType") != expected_media_type:
         raise ReferenceUnavailable(f"artifact {artifact_name!r} has the wrong media type")
     digest = descriptor.get("digest")
@@ -1086,7 +1108,12 @@ def load_artifact_document(
     document = load_document(path)
     if not isinstance(document, dict):
         raise ReferenceUnavailable(f"artifact {artifact_name!r} is not an object")
-    validate_document(contract.contract, document, f"persisted {driver_name} artifact {artifact_name}")
+    typed_resource = parse_artifact_document(
+        artifact_api,
+        document,
+        f"persisted {driver_name} artifact {artifact_name}",
+    )
+    document = artifact_api.dump(typed_resource)
     producer = document.get("producer")
     metadata = document.get("metadata")
     source = unit.get("source")
@@ -1121,7 +1148,7 @@ def validate_receipt_artifacts(
     if not isinstance(driver_name, str) or driver_name not in UNIT_DRIVERS:
         raise OperationError("desired unit has an unknown driver")
     receipt_driver = receipt.get("driver")
-    expected = set(UNIT_DRIVERS[driver_name].artifact_contracts)
+    expected = set(UNIT_DRIVERS[driver_name].artifact_outputs)
     if receipt_driver != driver_name and (receipt_driver is not None or expected):
         raise OperationError(f"persisted receipt driver is not {driver_name!r}")
     descriptors = receipt.get("artifacts", {})
@@ -1154,6 +1181,40 @@ def current_receipt(observed: Path, candidate_units: Path, unit_name: str) -> di
     return receipt
 
 
+@dataclass(frozen=True)
+class ArtifactReference:
+    unit: str
+    name: str
+    gvk: GVK
+
+
+def parse_artifact_reference(reference: object) -> ArtifactReference:
+    if not isinstance(reference, dict):
+        raise OperationError("invalid fromArtifact reference")
+    unit_name = reference.get("unit")
+    artifact_name = reference.get("name")
+    api_version = reference.get("apiVersion")
+    kind = reference.get("kind")
+    if not isinstance(unit_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name):
+        raise OperationError(f"invalid fromArtifact unit: {unit_name!r}")
+    if not isinstance(artifact_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", artifact_name):
+        raise OperationError(f"invalid fromArtifact name: {artifact_name!r}")
+    if not isinstance(api_version, str) or not isinstance(kind, str):
+        raise OperationError("fromArtifact requires string apiVersion and kind")
+    try:
+        gvk = GVK(api_version, kind)
+    except ValueError as exc:
+        raise OperationError(str(exc)) from exc
+    api_kind = API_KINDS.get(gvk)
+    if api_kind is None:
+        raise OperationError(f"fromArtifact references an unregistered API kind: {gvk}")
+    try:
+        require_artifact_api(api_kind)
+    except ApiError as exc:
+        raise OperationError(f"fromArtifact API kind is not an artifact resource: {gvk}") from exc
+    return ArtifactReference(unit_name, artifact_name, gvk)
+
+
 def resolve_template(
     value: Any,
     candidate: Path,
@@ -1178,7 +1239,9 @@ def resolve_template(
             raise OperationError("invalid receipt, artifact, or promotion reference")
         reference_type = reference_keys.pop()
         reference = candidate_value.get(reference_type)
-        allowed = {"unit", "pointer", "dryFallback"} | ({"name"} if reference_type == "fromArtifact" else set())
+        allowed = {"unit", "pointer", "dryFallback"} | (
+            {"name", "apiVersion", "kind"} if reference_type == "fromArtifact" else set()
+        )
         if not isinstance(reference, dict) or set(reference) - allowed or "unit" not in reference:
             raise OperationError(f"invalid {reference_type} reference")
         referenced_unit = reference.get("unit")
@@ -1209,10 +1272,25 @@ def resolve_template(
                     }
                     document = {key: item for key, item in receipt.items() if key not in reserved}
                 else:
-                    artifact_name = reference.get("name")
-                    if not isinstance(artifact_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", artifact_name):
-                        raise OperationError(f"invalid fromArtifact name: {artifact_name!r}")
+                    artifact_reference = parse_artifact_reference(reference)
+                    artifact_name = artifact_reference.name
                     producer_unit = load_unit(unit_document_path(candidate, referenced_unit), referenced_unit)
+                    producer_driver_name = producer_unit.get("driver")
+                    producer_driver = (
+                        UNIT_DRIVERS.get(producer_driver_name) if isinstance(producer_driver_name, str) else None
+                    )
+                    artifact_kind = (
+                        producer_driver.artifact_outputs.get(artifact_name) if producer_driver is not None else None
+                    )
+                    if artifact_kind is None:
+                        raise ReferenceUnavailable(
+                            f"unit {referenced_unit!r} does not produce artifact {artifact_name!r}"
+                        )
+                    if artifact_kind.gvk != artifact_reference.gvk:
+                        raise ReferenceUnavailable(
+                            f"artifact {referenced_unit}/{artifact_name} is {artifact_kind.gvk}, "
+                            f"not {artifact_reference.gvk}"
+                        )
                     document, digest = load_artifact_document(observed, producer_unit, receipt, artifact_name)
                     artifact_inputs[f"{referenced_unit}/{artifact_name}"] = digest
             return json_pointer(document, pointer)
@@ -1382,6 +1460,7 @@ def load_environment_specifications(source_root: Path, environment_name: str) ->
         unit_paths.extend(candidates)
     if not unit_paths:
         raise OperationError(f"environment has no units: {environment_name}")
+    specification_paths = {path.stem: path for path in unit_paths}
     specifications = {path.stem: load_unit(path, path.stem) for path in unit_paths}
     for unit_name, specification in specifications.items():
         require_unit_specification(specification, unit_name)
@@ -1389,13 +1468,25 @@ def load_environment_specifications(source_root: Path, environment_name: str) ->
         for producer in observation_reference_units(specification):
             if producer in specifications and not unit_requires_reconciliation(specifications[producer]):
                 raise OperationError(f"{consumer} cannot observe materialization-only unit {producer!r}")
-        for producer, artifact_name in artifact_references(specification):
+        try:
+            references = artifact_references(specification, "/spec")
+        except OperationError as exc:
+            path = specification_paths[consumer].relative_to(source_root)
+            raise OperationError(f"{path}: {exc}") from exc
+        for reference in references:
+            producer = reference.unit
+            artifact_name = reference.name
             if producer in specifications:
                 driver_name = specifications[producer].get("driver")
                 driver = UNIT_DRIVERS.get(driver_name) if isinstance(driver_name, str) else None
-                if driver is not None and artifact_name not in driver.artifact_contracts:
+                if driver is not None and artifact_name not in driver.artifact_outputs:
                     raise OperationError(
                         f"{consumer} references unknown artifact {producer}/{artifact_name}"
+                    )
+                elif driver is not None and driver.artifact_outputs[artifact_name].gvk != reference.gvk:
+                    raise OperationError(
+                        f"{consumer} expects artifact {producer}/{artifact_name} to be {reference.gvk}; "
+                        f"producer declares {driver.artifact_outputs[artifact_name].gvk}"
                     )
     return specifications
 
@@ -3022,24 +3113,30 @@ def reference_paths(value: Any, reference_type: str) -> set[str]:
     return paths
 
 
-def artifact_references(value: Any) -> set[tuple[str, str]]:
-    """Collect validated producer and logical-name pairs from artifact references."""
-    references: set[tuple[str, str]] = set()
+def _json_pointer_child(pointer: str, child: str | int) -> str:
+    token = str(child).replace("~", "~0").replace("/", "~1")
+    return f"{pointer}/{token}"
+
+
+def artifact_references(value: Any, pointer: str = "") -> set[ArtifactReference]:
+    """Collect validated and explicitly typed artifact references.
+
+    Invalid references include their JSON Pointer location so callers can identify
+    the offending field in a larger unit document.
+    """
+    references: set[ArtifactReference] = set()
     if isinstance(value, list):
-        for item in value:
-            references.update(artifact_references(item))
+        for index, item in enumerate(value):
+            references.update(artifact_references(item, _json_pointer_child(pointer, index)))
     elif isinstance(value, dict):
         if "fromArtifact" in value:
-            reference = value["fromArtifact"]
-            unit_name = reference.get("unit") if isinstance(reference, dict) else None
-            artifact_name = reference.get("name") if isinstance(reference, dict) else None
-            if not isinstance(unit_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name):
-                raise OperationError(f"invalid fromArtifact unit: {unit_name!r}")
-            if not isinstance(artifact_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", artifact_name):
-                raise OperationError(f"invalid fromArtifact name: {artifact_name!r}")
-            references.add((unit_name, artifact_name))
-        for item in value.values():
-            references.update(artifact_references(item))
+            reference_pointer = _json_pointer_child(pointer, "fromArtifact")
+            try:
+                references.add(parse_artifact_reference(value["fromArtifact"]))
+            except OperationError as exc:
+                raise OperationError(f"{reference_pointer}: {exc}") from exc
+        for name, item in value.items():
+            references.update(artifact_references(item, _json_pointer_child(pointer, name)))
     return references
 
 
@@ -3356,7 +3453,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         if receipt_path.is_file():
             assert previous_receipt is not None
             receipt = previous_receipt
-            skip_clean_unit = not args.plan or bool(UNIT_DRIVERS[driver_name].artifact_contracts)
+            skip_clean_unit = not args.plan or bool(UNIT_DRIVERS[driver_name].artifact_outputs)
             receipt_is_current = receipt.get("desired", {}).get("unitBlob") == unit_blob
             if receipt_is_current:
                 validate_receipt_artifacts(observed, unit, receipt)
@@ -4090,20 +4187,28 @@ def _validate_environment(environment_name: str, collector: ValidationCollector)
                         f"{consumer} cannot observe materialization-only unit {producer!r}",
                     )
         try:
-            artifacts = artifact_references(specification)
+            artifacts = artifact_references(specification, "/spec")
         except OperationError as exc:
             collector.invalid(units_root / consumer, exc)
             continue
-        for producer, artifact_name in artifacts:
+        for reference in artifacts:
+            producer = reference.unit
+            artifact_name = reference.name
             producer_specification = specifications.get(producer)
             if producer_specification is None:
                 continue
             driver_name = producer_specification.get("driver")
             driver = UNIT_DRIVERS.get(driver_name) if isinstance(driver_name, str) else None
-            if driver is not None and artifact_name not in driver.artifact_contracts:
+            if driver is not None and artifact_name not in driver.artifact_outputs:
                 collector.invalid(
                     units_root / consumer,
                     f"{consumer} references unknown artifact {producer}/{artifact_name}",
+                )
+            elif driver is not None and driver.artifact_outputs[artifact_name].gvk != reference.gvk:
+                collector.invalid(
+                    units_root / consumer,
+                    f"{consumer} expects artifact {producer}/{artifact_name} to be {reference.gvk}; "
+                    f"producer declares {driver.artifact_outputs[artifact_name].gvk}",
                 )
 
 

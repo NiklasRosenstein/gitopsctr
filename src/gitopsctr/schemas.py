@@ -7,10 +7,13 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
 
+from gitopsctr.api import GVK
+from gitopsctr.artifacts import ArtifactApi, require_artifact_api
 from gitopsctr.contracts import CORE_CONTRACTS, SCHEMA_ROOT, artifact_descriptors_schema, receipt_schema
 from gitopsctr.document import DocumentContract, JsonObject
-from gitopsctr.driver import UNIT_DRIVERS, UnitDriver
+from gitopsctr.driver import UnitDriver
 from gitopsctr.formats import PROJECT_RESOURCE_SCHEMA
+from gitopsctr.registry import API_KINDS, UNIT_DRIVERS
 
 
 def _driver_schema_id(driver: str, plugin: UnitDriver, kind: str) -> str:
@@ -101,11 +104,15 @@ def receipt_resource_schema(driver: str) -> JsonObject:
         "result": result,
     }
     status_required = ["controller", "result"]
-    if driver_instance.artifact_contracts:
+    if driver_instance.artifact_outputs:
         status_properties["artifacts"] = artifact_descriptors_schema(
             {
-                name: (artifact.api_version, artifact.kind, artifact.media_type)
-                for name, artifact in driver_instance.artifact_contracts.items()
+                name: (
+                    artifact_kind.gvk.api_version,
+                    artifact_kind.gvk.kind,
+                    require_artifact_api(artifact_kind).media_type,
+                )
+                for name, artifact_kind in driver_instance.artifact_outputs.items()
             }
         )
         status_required.append("artifacts")
@@ -203,8 +210,12 @@ def driver_schema(driver: str, kind: str) -> JsonObject:
             plugin.version,
             plugin.result_contract,
             {
-                name: (artifact.api_version, artifact.kind, artifact.media_type)
-                for name, artifact in plugin.artifact_contracts.items()
+                name: (
+                    artifact_kind.gvk.api_version,
+                    artifact_kind.gvk.kind,
+                    require_artifact_api(artifact_kind).media_type,
+                )
+                for name, artifact_kind in plugin.artifact_outputs.items()
             },
         )
     else:
@@ -222,10 +233,9 @@ def show_schema(scope: str, kind: str) -> JsonObject:
         if kind == "Project":
             return project_resource_schema()
         return core_resource_schema(kind)
-    for plugin in UNIT_DRIVERS.values():
-        for artifact in plugin.artifact_contracts.values():
-            if artifact.api_version == scope and artifact.kind == kind:
-                return artifact.contract.json_schema()
+    api_kind = API_KINDS.get(GVK(scope, kind)) if "/" in scope else None
+    if api_kind is not None and isinstance(api_kind.spec, ArtifactApi):
+        return require_artifact_api(api_kind).json_schema()
     if scope.startswith("unit.gitopsctr.io/v1/"):
         return show_schema("unit.gitopsctr.io/v1", f"{scope.rsplit('/', 1)[1]}/{kind}")
     if scope == "unit.gitopsctr.io/v1":
@@ -253,16 +263,13 @@ def schema_documents() -> dict[Path, JsonObject]:
         path = Path("apis/gitopsctr.io/v1") / f"{kind}.schema.json"
         documents[path] = project_resource_schema() if kind == "Project" else core_resource_schema(kind)
         index["apis"][f"gitopsctr.io/v1/{kind}"] = path.as_posix()
-    artifact_contracts = {
-        (artifact.api_version, artifact.kind): artifact
-        for plugin in UNIT_DRIVERS.values()
-        for artifact in plugin.artifact_contracts.values()
-    }
-    for (api_version, kind), artifact in sorted(artifact_contracts.items()):
-        group, version = api_version.rsplit("/", 1)
-        path = Path("apis") / group / version / f"{kind}.schema.json"
-        documents[path] = artifact.contract.json_schema()
-        index["apis"][f"{api_version}/{kind}"] = path.as_posix()
+    for gvk, api_kind in sorted(API_KINDS.items()):
+        if not isinstance(api_kind.spec, ArtifactApi):
+            continue
+        group, version = gvk.api_version.rsplit("/", 1)
+        path = Path("apis") / group / version / f"{gvk.kind}.schema.json"
+        documents[path] = require_artifact_api(api_kind).json_schema()
+        index["apis"][str(gvk)] = path.as_posix()
     for driver, driver_instance in sorted(UNIT_DRIVERS.items()):
         root = Path("apis/unit.gitopsctr.io/v1") / driver_instance.kind
         for profile in ("authored", "desired"):

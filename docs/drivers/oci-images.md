@@ -57,6 +57,8 @@ image:
   fromArtifact:
     unit: application-images
     name: containers
+    apiVersion: artifact.gitopsctr.io/v1
+    kind: ContainerImages
     pointer: /images/application/uri
 ```
 

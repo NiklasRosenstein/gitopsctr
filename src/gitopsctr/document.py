@@ -23,3 +23,15 @@ class DocumentContract(ABC):
     @abstractmethod
     def json_schema(self) -> JsonObject:
         """Return this contract's Draft 2020-12 JSON Schema."""
+
+
+class TypedDocumentContract[T](DocumentContract):
+    """A contract that validates documents into a well-typed Python value."""
+
+    @abstractmethod
+    def parse(self, document: object) -> T:
+        """Validate and deserialize an untrusted document."""
+
+    @abstractmethod
+    def dump(self, value: T) -> JsonObject:
+        """Serialize a typed value into its public document representation."""

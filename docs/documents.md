@@ -88,10 +88,19 @@ artifact resource, or the promoted desired unit respectively:
 receiptValue:
   fromReceipt: {unit: infrastructure, pointer: /outputs/url}
 image:
-  fromArtifact: {unit: application-images, name: containers, pointer: /images/application/uri}
+  fromArtifact:
+    unit: application-images
+    name: containers
+    apiVersion: artifact.gitopsctr.io/v1
+    kind: ContainerImages
+    pointer: /images/application/uri
 promotedValue:
   fromPromotion: {unit: infrastructure, pointer: /terraform/variables/environment}
 ```
+
+`fromArtifact` pins the producer output's expected `apiVersion` and `kind`. The controller verifies that type against
+the producer driver's declared output, the receipt descriptor, and the registered API kind before parsing the complete
+artifact resource and applying the pointer. The resolved consumer resource is then validated by its desired-unit type.
 
 Each reference may include `dryFallback`. A receipt or artifact is usable only while it matches the producer's current
 desired unit; artifacts are additionally checked against their descriptor, digest, identity, and registered contract.
@@ -113,7 +122,11 @@ status:
   result: {}
 ```
 
-`UnitDriver` is the implementation of a unit kind. Drivers are discovered
-through full-GVK entry points, for example
-`unit.gitopsctr.io/v1/Terraform`. Capabilities such as planning,
-materialization, reconciliation, and verification remain independent traits.
+All extensible resource kinds are discovered through full-GVK `gitopsctr.apis`
+entry points, for example `unit.gitopsctr.io/v1/Terraform` and
+`artifact.gitopsctr.io/v1/ContainerImages`. Each entry point returns a typed
+`ApiKind`. A unit API's specification is its `UnitDriver`; capabilities such as
+planning, materialization, reconciliation, and verification remain independent
+traits. Artifact API specifications own typed parsing and schema generation,
+independently of the drivers that produce them. The artifact document media
+type is part of that Artifact API specification; the GVK carries identity only.

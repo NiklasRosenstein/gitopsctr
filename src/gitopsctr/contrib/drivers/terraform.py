@@ -32,6 +32,7 @@ from gitopsctr.driver import (
     VerificationContext,
     VerificationResult,
     VerificationStatus,
+    unit_driver_api,
 )
 from gitopsctr.execution import CommandOutput, CommandResult
 
@@ -358,3 +359,4 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
 
 
 DRIVER = TerraformDriver()
+API_KIND = unit_driver_api(DRIVER)

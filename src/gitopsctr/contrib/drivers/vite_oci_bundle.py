@@ -11,7 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from gitopsctr.artifacts import ARTIFACT_API_VERSION, FRONTEND_BUNDLE_CONTRACT
+from gitopsctr.artifacts import (
+    ARTIFACT_API_VERSION,
+    FRONTEND_BUNDLE,
+    ArtifactMetadata,
+    ArtifactProducer,
+    FrontendBundle,
+    FrontendBundleResource,
+)
 from gitopsctr.contracts import (
     AuthoredSource,
     AwsEcrCredentialProvider,
@@ -25,7 +32,6 @@ from gitopsctr.contracts import (
 )
 from gitopsctr.document import JsonObject
 from gitopsctr.driver import (
-    ArtifactDocumentContract,
     DriverError,
     PlanningCapability,
     PlanningContext,
@@ -35,6 +41,7 @@ from gitopsctr.driver import (
     ReconciliationResult,
     UnitDriver,
     UnitExecutionContext,
+    unit_driver_api,
 )
 from gitopsctr.execution import CommandOutput, DriverExecution
 
@@ -92,7 +99,7 @@ class ViteRuntime:
     registry: str
     credential_provider: ResolvedCredentialProvider | None
     input_hash: str
-    producer: JsonObject
+    producer: ArtifactProducer
     tag: str
     frontend_root: Path
     build_environment: dict[str, str]
@@ -143,14 +150,7 @@ class ViteOciBundleDriver(UnitDriver, PlanningCapability, ReconciliationCapabili
         schema_url("drivers/vite-oci-bundle", version, "desired-unit"),
     )
     result_contract = MashumaroContract(EmptyResultModel, schema_url("drivers/vite-oci-bundle", version, "result"))
-    artifact_contracts = {
-        "frontend": ArtifactDocumentContract(
-            ARTIFACT_API_VERSION,
-            "FrontendBundle",
-            FRONTEND_BUNDLE_CONTRACT,
-            "application/vnd.gitopsctr.frontend-bundle.v1",
-        )
-    }
+    artifact_outputs = {"frontend": FRONTEND_BUNDLE}
 
     def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject:
         return {"source": {"path": source_path}}
@@ -231,20 +231,17 @@ class ViteOciBundleDriver(UnitDriver, PlanningCapability, ReconciliationCapabili
             if digest is None:
                 raise DriverError(f"OCI registry did not return a digest for {runtime.repository}:{runtime.tag}")
 
-        return ReconciliationOutput(
-            artifacts={
-                "frontend": {
-                    "apiVersion": ARTIFACT_API_VERSION,
-                    "kind": "FrontendBundle",
-                    "metadata": {"name": "frontend"},
-                    "producer": runtime.producer,
-                    "bundle": {
-                        "artifactType": FRONTEND_ARTIFACT_TYPE,
-                        "uri": f"{runtime.repository}@{digest}",
-                    },
-                }
-            }
+        resource = FrontendBundleResource(
+            apiVersion=ARTIFACT_API_VERSION,
+            kind="FrontendBundle",
+            metadata=ArtifactMetadata(name="frontend"),
+            producer=runtime.producer,
+            bundle=FrontendBundle(
+                artifactType=FRONTEND_ARTIFACT_TYPE,
+                uri=f"{runtime.repository}@{digest}",
+            ),
         )
+        return ReconciliationOutput(artifacts={"frontend": FRONTEND_BUNDLE.spec.dump(resource)})
 
     def semantic_result(self, result: object) -> ReconciliationResult:
         if result == {}:
@@ -253,3 +250,4 @@ class ViteOciBundleDriver(UnitDriver, PlanningCapability, ReconciliationCapabili
 
 
 DRIVER = ViteOciBundleDriver()
+API_KIND = unit_driver_api(DRIVER)

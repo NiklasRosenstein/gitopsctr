@@ -31,6 +31,7 @@ from gitopsctr.driver import (
     ReconciliationResult,
     UnitDriver,
     UnitExecutionContext,
+    unit_driver_api,
 )
 from gitopsctr.execution import CommandOutput
 
@@ -367,3 +368,4 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
 
 
 DRIVER = FrontendS3CloudfrontDriver()
+API_KIND = unit_driver_api(DRIVER)

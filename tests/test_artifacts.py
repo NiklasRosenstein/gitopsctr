@@ -4,15 +4,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
+from gitopsctr import api as api_registry
 from gitopsctr import cli
-from gitopsctr import driver as driver_registry
-from gitopsctr.driver import ArtifactDocumentContract, DriverError
+from gitopsctr import registry as driver_registry
+from gitopsctr.api import GVK, ApiError, ApiKind
+from gitopsctr.artifacts import CONTAINER_IMAGES, ArtifactApi, ContainerImagesResource, require_artifact_api
+from gitopsctr.contracts import MashumaroContract
+from gitopsctr.driver import (
+    DriverError,
+    ReconciliationCapability,
+    ReconciliationContext,
+    ReconciliationOutput,
+    ReconciliationResult,
+    UnitDriver,
+    unit_driver_api,
+)
 
 
 def project(root: Path, write_format: str) -> None:
@@ -127,23 +141,153 @@ def test_artifact_resource_name_mismatch_warns_without_rejecting(
     assert "resource name 'release-images'" in warning
 
 
-def test_artifact_gvk_rejects_conflicting_installed_contracts() -> None:
-    contract = cli.UNIT_DRIVERS["oci-images"].artifact_contracts["containers"]
-    registry: dict[str, ArtifactDocumentContract] = {}
+def test_artifact_api_parses_to_its_registered_resource_type() -> None:
+    resource = CONTAINER_IMAGES.spec.parse(container_images())
 
-    driver_registry._register_artifact_gvk(registry, contract)
-    driver_registry._register_artifact_gvk(registry, contract)
+    assert isinstance(resource, ContainerImagesResource)
+    assert resource.images["application"].uri.endswith("c" * 64)
 
-    with pytest.raises(DriverError, match="conflicting installed contracts"):
-        driver_registry._register_artifact_gvk(
-            registry,
-            ArtifactDocumentContract(
-                contract.api_version,
-                contract.kind,
-                contract.contract,
-                "application/vnd.example.conflict",
-            ),
+
+def test_api_registry_rejects_duplicate_gvk_registrations(monkeypatch: pytest.MonkeyPatch) -> None:
+    entry_point = SimpleNamespace(name=str(CONTAINER_IMAGES.gvk), load=lambda: CONTAINER_IMAGES)
+    monkeypatch.setattr(api_registry, "entry_points", lambda *, group: [entry_point, entry_point])
+
+    with pytest.raises(ApiError, match="duplicate API kind entry point"):
+        api_registry.load_api_kinds()
+
+
+def test_artifact_api_registration_requires_its_canonical_schema_identity() -> None:
+    invalid = ApiKind(
+        CONTAINER_IMAGES.gvk,
+        ArtifactApi(
+            MashumaroContract(ContainerImagesResource, "https://example.invalid/wrong.schema.json"),
+            CONTAINER_IMAGES.spec.media_type,
+        ),
+    )
+
+    with pytest.raises(ApiError, match="metadata does not match"):
+        require_artifact_api(invalid)
+
+
+def test_driver_artifact_output_uses_the_authoritative_api_registration() -> None:
+    output = cli.UNIT_DRIVERS["oci-images"].artifact_outputs["containers"]
+
+    assert output is CONTAINER_IMAGES
+    assert driver_registry.API_KINDS[output.gvk] is output
+
+
+def test_multiple_drivers_share_one_authoritative_artifact_api() -> None:
+    contracts = cli.UNIT_DRIVERS["oci-images"]
+
+    class SharedArtifactDriver(UnitDriver, ReconciliationCapability):
+        version = 1
+        unit_contract = contracts.unit_contract
+        desired_unit_contract = contracts.desired_unit_contract
+        result_contract = contracts.result_contract
+        artifact_outputs = {"images": CONTAINER_IMAGES}
+
+        def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
+            raise NotImplementedError
+
+        def semantic_result(self, result: object) -> ReconciliationResult:
+            return {}
+
+    class FirstDriver(SharedArtifactDriver):
+        api_version = "example.test/v1"
+        kind = "First"
+        driver_name = "first"
+
+    class SecondDriver(SharedArtifactDriver):
+        api_version = "example.test/v1"
+        kind = "Second"
+        driver_name = "second"
+
+    first = unit_driver_api(FirstDriver())
+    second = unit_driver_api(SecondDriver())
+    installed = {
+        CONTAINER_IMAGES.gvk: CONTAINER_IMAGES,
+        first.gvk: first,
+        second.gvk: second,
+    }
+
+    loaded = driver_registry.load_unit_drivers(installed)
+
+    assert set(loaded) == {"first", "second"}
+    assert loaded["first"].artifact_outputs["images"] is CONTAINER_IMAGES
+    assert loaded["second"].artifact_outputs["images"] is CONTAINER_IMAGES
+
+
+def test_driver_rejects_non_authoritative_artifact_api_handle() -> None:
+    contracts = cli.UNIT_DRIVERS["oci-images"]
+    duplicate = ApiKind(CONTAINER_IMAGES.gvk, CONTAINER_IMAGES.spec)
+
+    class InvalidDriver(UnitDriver, ReconciliationCapability):
+        api_version = "example.test/v1"
+        kind = "Invalid"
+        driver_name = "invalid"
+        version = 1
+        unit_contract = contracts.unit_contract
+        desired_unit_contract = contracts.desired_unit_contract
+        result_contract = contracts.result_contract
+        artifact_outputs = {"images": duplicate}
+
+        def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
+            raise NotImplementedError
+
+        def semantic_result(self, result: object) -> ReconciliationResult:
+            return {}
+
+    invalid = ApiKind(GVK(InvalidDriver.api_version, InvalidDriver.kind), InvalidDriver())
+    installed = {CONTAINER_IMAGES.gvk: CONTAINER_IMAGES, invalid.gvk: invalid}
+
+    with pytest.raises(DriverError, match="authoritative registration"):
+        driver_registry.load_unit_drivers(installed)
+
+
+def test_artifact_reference_requires_an_explicit_registered_type() -> None:
+    with pytest.raises(cli.OperationError, match="requires string apiVersion and kind"):
+        cli.parse_artifact_reference({"unit": "images", "name": "containers"})
+
+    reference = cli.parse_artifact_reference(
+        {
+            "unit": "images",
+            "name": "containers",
+            "apiVersion": "artifact.gitopsctr.io/v1",
+            "kind": "ContainerImages",
+        }
+    )
+    assert reference.gvk == CONTAINER_IMAGES.gvk
+
+    with pytest.raises(cli.OperationError, match="unregistered API kind"):
+        cli.parse_artifact_reference(
+            {
+                "unit": "images",
+                "name": "containers",
+                "apiVersion": "example.test/v1",
+                "kind": "Images",
+            }
         )
+
+
+def test_artifact_reference_validation_identifies_unit_file_and_field(tmp_path: Path) -> None:
+    template = Path(__file__).parents[1] / "demo" / "kubernetes" / "repository"
+    shutil.copytree(template, tmp_path, dirs_exist_ok=True)
+    unit_path = tmp_path / "deployment" / "environments" / "dev" / "units" / "web.yaml"
+    unit = yaml.safe_load(unit_path.read_text())
+    reference = unit["spec"]["materialize"]["values"]["image"]["fromArtifact"]
+    del reference["apiVersion"]
+    del reference["kind"]
+    unit_path.write_text(yaml.safe_dump(unit, sort_keys=False))
+
+    with pytest.raises(
+        cli.OperationError,
+        match=(
+            r"deployment/environments/dev/units/web\.yaml: "
+            r"/spec/materialize/values/image/fromArtifact: "
+            r"fromArtifact requires string apiVersion and kind"
+        ),
+    ):
+        cli.load_environment_specifications(tmp_path, "dev")
 
 
 def test_artifact_validation_rejects_tampering_and_extra_files(
