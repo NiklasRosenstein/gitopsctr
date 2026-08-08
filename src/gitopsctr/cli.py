@@ -481,7 +481,10 @@ def serialize_receipt_document(receipt: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_receipt(path: Path, expected_unit: str | None = None) -> dict[str, Any]:
-    return normalize_receipt_document(load_json(path), expected_unit or path.stem)
+    document = load_json(path)
+    if strict_resource_documents(path) and document.get("apiVersion") is None:
+        raise OperationError(f"legacy receipt document is not valid in a migrated project: {path}")
+    return normalize_receipt_document(document, expected_unit or path.stem)
 
 
 def resource_documents_enabled(root: Path) -> bool:
@@ -508,8 +511,21 @@ def unit_document_path(root: Path, unit_name: str, project_root: Path | None = N
     return directory / f"{unit_name}.json"
 
 
+def strict_resource_documents(path: Path) -> bool:
+    for parent in (path.parent, *path.parents):
+        if any(
+            (parent / name).is_file()
+            for name in ("gitopsctr.yaml", "gitopsctr.yml", ".gitopsctr.yaml", ".gitopsctr.yml")
+        ):
+            return True
+    return False
+
+
 def load_unit(path: Path, expected_name: str | None = None) -> dict[str, Any]:
-    return normalize_unit_document(load_json(path), expected_name or path.stem)
+    document = load_json(path)
+    if strict_resource_documents(path) and document.get("apiVersion") is None:
+        raise OperationError(f"legacy unit document is not valid in a migrated project: {path}")
+    return normalize_unit_document(document, expected_name or path.stem)
 
 
 def reference_document_path(root: Path, reference: str) -> Path:
@@ -923,7 +939,10 @@ def load_environment(source_root: Path, environment_name: str) -> dict[str, Any]
     environment_paths = document_candidates(environment_root, "environment")
     if len(environment_paths) != 1:
         raise OperationError(f"expected exactly one environment document for {environment_name}")
-    environment = normalize_environment_document(load_json(environment_paths[0]), environment_name)
+    environment_document = load_json(environment_paths[0])
+    if resource_documents_enabled(source_root) and environment_document.get("apiVersion") is None:
+        raise OperationError(f"legacy environment document is not valid in a migrated project: {environment_paths[0]}")
+    environment = normalize_environment_document(environment_document, environment_name)
     if environment.get("schema") != 1 or environment.get("name") != environment_name:
         raise OperationError(f"invalid environment specification: {environment_name}")
     change_gate = environment.get("changeGate", "none")
