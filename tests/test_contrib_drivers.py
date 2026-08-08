@@ -19,6 +19,8 @@ from gitopsctr.contrib.driver import (
 )
 from gitopsctr.driver import (
     DriverError,
+    PlanningCapability,
+    PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
     UnitPlugin,
@@ -54,6 +56,7 @@ def test_contributed_driver_entry_points_load_one_module_per_driver():
 
 
 def test_driver_capabilities_are_independent_and_explicit():
+    assert all(isinstance(plugin, PlanningCapability) for plugin in driver_registry.PLANNING_PLUGINS.values())
     assert isinstance(terraform.PLUGIN, VerificationCapability)
     assert isinstance(kubernetes_manifests.PLUGIN, VerificationCapability)
     assert not isinstance(oci_images.PLUGIN, VerificationCapability)
@@ -78,7 +81,6 @@ def _oci_context(
     *,
     credential_provider: object = None,
     repositories: dict[str, str] | None = None,
-    dry: bool = False,
 ) -> ReconciliationContext:
     publication: dict[str, object] = {
         "repositories": repositories
@@ -105,7 +107,20 @@ def _oci_context(
             "artifacts": ["containers.json"],
         },
         inputs={},
-        dry=dry,
+    )
+
+
+def _planning_context(context: ReconciliationContext) -> PlanningContext:
+    return PlanningContext(
+        environment=context.environment,
+        desired_root=context.desired_root,
+        desired_revision=context.desired_revision,
+        source_root=context.source_root,
+        source_revision=context.source_revision,
+        source_path=context.source_path,
+        unit=context.unit,
+        inputs=context.inputs,
+        report=context.report,
     )
 
 
@@ -234,12 +249,11 @@ def test_oci_images_rejects_invalid_provider_and_repository_configuration(
                 tmp_path,
                 credential_provider=provider,
                 repositories=repositories,
-                dry=True,
             )
         )
 
 
-def test_oci_images_dry_run_validates_but_does_not_request_credentials(tmp_path, monkeypatch):
+def test_oci_images_plan_builds_without_requesting_credentials(tmp_path, monkeypatch):
     commands: list[tuple[str, ...]] = []
 
     def fake_run(*args, **_kwargs):
@@ -250,10 +264,11 @@ def test_oci_images_dry_run_validates_but_does_not_request_credentials(tmp_path,
     monkeypatch.setattr(
         oci_images,
         "oci_digest",
-        lambda *_args, **_kwargs: pytest.fail("dry reconciliation must not inspect registries"),
+        lambda *_args, **_kwargs: pytest.fail("planning must not inspect registries"),
     )
 
-    assert oci_images.PLUGIN.reconcile(_oci_context(tmp_path, credential_provider={"type": "aws-ecr"}, dry=True)) == {}
+    context = _planning_context(_oci_context(tmp_path, credential_provider={"type": "aws-ecr"}))
+    assert oci_images.PLUGIN.plan(context) is None
     assert commands == [
         (
             "docker",
@@ -474,7 +489,6 @@ def _terraform_context(
             }
         },
         inputs={},
-        dry=True,
         report=report,
     )
 
@@ -489,7 +503,7 @@ def test_terraform_accepts_driver_neutral_backend_configuration(tmp_path, monkey
     monkeypatch.setattr(terraform, "run", fake_run)
     state = tmp_path / "state/demo.tfstate"
 
-    terraform.PLUGIN.reconcile(_terraform_context(tmp_path, tmp_path / "report", {"path": str(state)}))
+    terraform.PLUGIN.plan(_planning_context(_terraform_context(tmp_path, tmp_path / "report", {"path": str(state)})))
 
     init = next(command for command in commands if command[1] == "init")
     assert init == ("terraform", "init", f"-backend-config=path={state}")
@@ -497,10 +511,12 @@ def test_terraform_accepts_driver_neutral_backend_configuration(tmp_path, monkey
 
 def test_terraform_rejects_structured_backend_values(tmp_path):
     with pytest.raises(DriverError, match="strings, numbers, or booleans"):
-        terraform.PLUGIN.reconcile(_terraform_context(tmp_path, tmp_path / "report", {"path": ["not", "a", "scalar"]}))
+        terraform.PLUGIN.plan(
+            _planning_context(_terraform_context(tmp_path, tmp_path / "report", {"path": ["not", "a", "scalar"]}))
+        )
 
 
-def test_terraform_dry_run_saves_binary_plan_and_rendered_report(tmp_path, monkeypatch):
+def test_terraform_plan_saves_binary_plan_and_rendered_report(tmp_path, monkeypatch):
     report = tmp_path / "report"
     commands: list[tuple[str, ...]] = []
 
@@ -516,9 +532,9 @@ def test_terraform_dry_run_saves_binary_plan_and_rendered_report(tmp_path, monke
 
     monkeypatch.setattr(terraform, "run", fake_run)
 
-    result = terraform.PLUGIN.reconcile(_terraform_context(tmp_path, report))
+    result = terraform.PLUGIN.plan(_planning_context(_terraform_context(tmp_path, report)))
 
-    assert result == {"planned": {"sourceRevision": "a" * 40}}
+    assert result is None
     assert (report / "plan.tfplan").read_bytes() == b"saved plan"
     assert (report / "plan.txt").read_text() == ("Plan: 1 to add, 0 to change, 0 to destroy.\n")
     plan_command = next(command for command in commands if command[1] == "plan")
@@ -544,7 +560,7 @@ def test_terraform_report_contains_plan_failure_diagnostics(tmp_path, monkeypatc
     monkeypatch.setattr(terraform, "run", fake_run)
 
     with pytest.raises(subprocess.CalledProcessError):
-        terraform.PLUGIN.reconcile(_terraform_context(tmp_path, report))
+        terraform.PLUGIN.plan(_planning_context(_terraform_context(tmp_path, report)))
 
     assert (report / "plan.txt").read_text() == "Error: speculative plan failed\n"
     assert not (report / "plan.tfplan").exists()

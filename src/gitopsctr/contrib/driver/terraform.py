@@ -12,6 +12,8 @@ from typing import TypedDict, cast
 from gitopsctr.driver import (
     DriverError,
     JsonValue,
+    PlanningCapability,
+    PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
     ReconciliationResult,
@@ -25,14 +27,6 @@ from gitopsctr.driver import (
 from ._common import run, select_result_fields
 
 
-class PlannedTerraform(TypedDict):
-    sourceRevision: str
-
-
-class TerraformPlanResult(TypedDict):
-    planned: PlannedTerraform
-
-
 class AppliedTerraform(TypedDict):
     sourceRevision: str
     path: str
@@ -44,7 +38,7 @@ class TerraformResult(TypedDict):
 
 
 def terraform_runtime(
-    context: ReconciliationContext | VerificationContext,
+    context: PlanningContext | ReconciliationContext | VerificationContext,
 ) -> tuple[Path, dict[str, str], list[str], list[str], list[object]]:
     configuration = context.unit.get("terraform")
     if not isinstance(configuration, dict):
@@ -79,13 +73,13 @@ def terraform_runtime(
     return terraform_root, terraform_environment, backend_args, output_names, cast(list[object], checks)
 
 
-class TerraformPlugin(UnitPlugin, ReconciliationCapability, VerificationCapability):
+class TerraformPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability, VerificationCapability):
     version = 2
     _select_semantic_result = staticmethod(select_result_fields("applied", "outputs"))
 
     @staticmethod
     def _prepare_plan_artifacts(
-        context: ReconciliationContext | VerificationContext,
+        context: PlanningContext | ReconciliationContext | VerificationContext,
         plan_name: str,
         report_name: str,
         local_plan_name: str,
@@ -100,7 +94,46 @@ class TerraformPlugin(UnitPlugin, ReconciliationCapability, VerificationCapabili
                 previous.unlink()
         return plan, report
 
-    def reconcile(self, context: ReconciliationContext) -> TerraformPlanResult | TerraformResult:
+    def plan(self, context: PlanningContext) -> None:
+        terraform_root, terraform_environment, backend_args, _, _ = terraform_runtime(context)
+        plan, report_text = self._prepare_plan_artifacts(
+            context,
+            "plan.tfplan",
+            "plan.txt",
+            ".reconcile.tfplan",
+        )
+
+        def terraform(*args: str, reported: bool = False) -> subprocess.CompletedProcess[str]:
+            if report_text is None:
+                return run("terraform", *args, cwd=terraform_root, env=terraform_environment)
+            try:
+                result = run("terraform", *args, cwd=terraform_root, env=terraform_environment, capture=True)
+            except subprocess.CalledProcessError as exc:
+                output = "".join(part for part in (exc.stdout, exc.stderr) if part)
+                if output:
+                    print(output, end="" if output.endswith("\n") else "\n", file=sys.stderr)
+                report_text.write_text(output or f"terraform {' '.join(args)} failed\n")
+                raise
+            output = "".join(part for part in (result.stdout, result.stderr) if part)
+            if output:
+                print(output, end="" if output.endswith("\n") else "\n", file=sys.stderr)
+            if reported:
+                report_text.write_text(output)
+            return result
+
+        terraform("init", *backend_args)
+        terraform(
+            "plan",
+            f"-out={plan}",
+            "-refresh=false",
+            "-lock=false",
+            "-input=false",
+            "-no-color",
+        )
+        if report_text is not None:
+            terraform("show", "-no-color", str(plan), reported=True)
+
+    def reconcile(self, context: ReconciliationContext) -> TerraformResult:
         terraform_root, terraform_environment, backend_args, output_names, checks = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,
@@ -132,14 +165,9 @@ class TerraformPlugin(UnitPlugin, ReconciliationCapability, VerificationCapabili
             return result
 
         terraform("init", *backend_args)
-        plan_args = ["plan", f"-out={plan}"]
-        if context.dry:
-            plan_args.extend(("-refresh=false", "-lock=false", "-input=false", "-no-color"))
-        terraform(*plan_args, emit=report_text is None)
+        terraform("plan", f"-out={plan}", emit=report_text is None)
         if report_text is not None:
             terraform("show", "-no-color", str(plan), reported=True)
-        if context.dry:
-            return {"planned": {"sourceRevision": context.source_revision}}
         terraform("apply", "-auto-approve", str(plan))
         try:
             raw_outputs = json.loads(

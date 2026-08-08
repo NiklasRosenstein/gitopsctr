@@ -9,6 +9,7 @@ from gitopsctr.contrib.driver import kubernetes_manifests as kubernetes
 from gitopsctr.driver import (
     DriverError,
     MaterializationContext,
+    PlanningContext,
     ReconciliationContext,
     VerificationContext,
     VerificationStatus,
@@ -73,8 +74,6 @@ def reconciliation_context(
     tmp_path: Path,
     desired_unit: dict,
     previous_receipt: dict | None = None,
-    *,
-    dry: bool = False,
 ) -> ReconciliationContext:
     payload = tmp_path / "desired/manifests/web"
     payload.mkdir(parents=True, exist_ok=True)
@@ -89,7 +88,20 @@ def reconciliation_context(
         unit=desired_unit,
         inputs={},
         previous_receipt=previous_receipt,
-        dry=dry,
+    )
+
+
+def planning_context(tmp_path: Path, desired_unit: dict) -> PlanningContext:
+    reconcile = reconciliation_context(tmp_path, desired_unit)
+    return PlanningContext(
+        environment=reconcile.environment,
+        desired_root=reconcile.desired_root,
+        desired_revision=reconcile.desired_revision,
+        source_root=reconcile.source_root,
+        source_revision=reconcile.source_revision,
+        source_path=reconcile.source_path,
+        unit=reconcile.unit,
+        inputs=reconcile.inputs,
     )
 
 
@@ -239,13 +251,13 @@ def test_direct_delivery_applies_waits_then_prunes_previous_inventory(tmp_path, 
     assert calls[2][1]["input_text"] == ("apiVersion: v1\nkind: Service\nmetadata:\n  name: old\n  namespace: web\n")
 
 
-def test_direct_dry_run_has_no_kubectl_effects(tmp_path, monkeypatch):
+def test_direct_plan_has_no_kubectl_effects(tmp_path, monkeypatch):
     desired_unit = unit(delivery={"mode": "direct", "kubeContext": "dev"})
     monkeypatch.setattr(kubernetes, "run", lambda *_args, **_kwargs: pytest.fail("kubectl must not run"))
 
-    result = kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit, dry=True))
+    result = kubernetes.PLUGIN.plan(planning_context(tmp_path, desired_unit))
 
-    assert result["applied"]["manifestDigest"] == DIGEST
+    assert result is None
 
 
 @pytest.mark.parametrize(

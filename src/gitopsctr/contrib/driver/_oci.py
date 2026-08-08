@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, cast
 
-from gitopsctr.driver import DriverError, JsonObject, ReconciliationContext
+from gitopsctr.driver import DriverError, JsonObject, UnitExecutionContext
 
 from ._common import require_strings, run
 
@@ -43,7 +43,7 @@ class ArtifactUnitIdentity(TypedDict):
     sourceRevision: str
 
 
-def artifact_unit_identity(context: ReconciliationContext, input_hash: str, contract: str) -> ArtifactUnitIdentity:
+def artifact_unit_identity(context: UnitExecutionContext, input_hash: str, contract: str) -> ArtifactUnitIdentity:
     require_strings(context.unit, ("name", "driver"), contract)
     return {
         "name": cast(str, context.unit["name"]),

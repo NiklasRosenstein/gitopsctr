@@ -23,6 +23,7 @@ from typing import Any
 
 from gitopsctr.driver import (
     MATERIALIZATION_PLUGINS,
+    PLANNING_PLUGINS,
     PLUGIN_VERSIONS,
     RECONCILIATION_PLUGINS,
     UNIT_PLUGINS,
@@ -30,6 +31,7 @@ from gitopsctr.driver import (
     DriverError,
     MaterializationContext,
     MaterializationResult,
+    PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
     VerificationContext,
@@ -2438,8 +2440,8 @@ def command_reconcile(args: argparse.Namespace) -> bool:
     elif args.source_revision is not None:
         if promoted_environment:
             raise OperationError(f"promotion-tracked environment {args.environment} does not accept --source-revision")
-        if not args.dry:
-            raise OperationError("--source-revision requires --advance or --dry")
+        if not args.plan:
+            raise OperationError("--source-revision requires --advance or --plan")
         source_revision = git("rev-parse", f"{args.source_revision}^{{commit}}").stdout.strip()
     else:
         source_revision = None
@@ -2447,13 +2449,13 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         raise OperationError("--require-source-ref requires --source-revision")
     log_heading(f"Reconcile {args.unit}")
     log_status("START", f"environment {args.environment}")
-    log_status("MODE", "dry run" if args.dry else "apply")
+    log_status("MODE", "plan" if args.plan else "apply")
     report = Path(args.report).resolve() if args.report else None
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
         desired = temporary / "desired"
         observed = temporary / "observed"
-        if not args.dry and args.require_source_ref:
+        if not args.plan and args.require_source_ref:
             required_head = fetch_ref(args.require_source_ref)
             if required_head != source_revision:
                 log_status("SKIP", f"source revision is superseded by {args.require_source_ref}")
@@ -2461,7 +2463,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 write_reconcile_outputs(False)
                 return False
         candidate_source_root: Path | None = None
-        if source_revision and args.dry:
+        if source_revision and args.plan:
             candidate_source_root = temporary / "candidate-source"
             materialize_revision(source_revision, candidate_source_root)
         ref_source_root = candidate_source_root or REPOSITORY_ROOT
@@ -2471,10 +2473,10 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             args.desired_ref,
             args.observed_ref,
         )
-        if args.dry or (args.advance and not args.desired_revision):
+        if args.plan or (args.advance and not args.desired_revision):
             require_environment_unit(ref_source_root, args.environment, args.unit)
         log_status("REFS", f"desired {desired_ref}; observed {observed_ref}")
-        pre_advance = not args.dry and args.advance and not args.desired_revision
+        pre_advance = not args.plan and args.advance and not args.desired_revision
         pre_advanced_revision = ""
         if pre_advance:
             advanced, changed = advance_desired(
@@ -2493,7 +2495,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 pre_advanced_revision = advanced
             log_status("PIN", f"reconcile advanced desired state at {short_revision(advanced)}")
         observed_revision = observed_tree(observed_ref, observed)
-        if args.dry and candidate_source_root is not None:
+        if args.plan and candidate_source_root is not None:
             assert source_revision is not None
             current_desired = temporary / "current-desired"
             observed_tree(desired_ref, current_desired)
@@ -2560,14 +2562,14 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         if receipt_path.is_file():
             assert previous_receipt is not None
             receipt = previous_receipt
-            skip_clean_unit = not args.dry or bool(unit.get("artifacts"))
+            skip_clean_unit = not args.plan or bool(unit.get("artifacts"))
             if (
                 not getattr(args, "reapply", False)
                 and skip_clean_unit
                 and receipt.get("desired", {}).get("unitBlob") == unit_blob
             ):
                 log_status("KEEP", "observation already matches desired state")
-                if args.dry:
+                if args.plan:
                     advanced_revision = ""
                 elif pre_advance:
                     advanced_revision = pre_advanced_revision
@@ -2577,33 +2579,40 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 write_reconcile_outputs(False, advanced_revision)
                 return False
 
-        log_status("RUN", f"execute {driver_name} reconciliation")
+        log_status("RUN", f"execute {driver_name} {'planning' if args.plan else 'reconciliation'}")
         source_root = temporary / "source"
         materialize_revision(source["revision"], source_root)
+        execution = {
+            "environment": args.environment,
+            "desired_root": desired,
+            "desired_revision": desired_revision,
+            "source_root": source_root,
+            "source_revision": source["revision"],
+            "source_path": source["path"],
+            "unit": unit,
+            "inputs": unit.get("inputs", {}),
+            "report": report,
+        }
+        if args.plan:
+            try:
+                planner = PLANNING_PLUGINS[driver_name]
+            except KeyError as exc:
+                raise OperationError(f"{args.unit} uses {driver_name}, which does not support planning") from exc
+            planner.plan(PlanningContext(**execution))
+            log_status("PLAN", f"{driver_name} planning succeeded")
+            log_status("DONE", f"{args.unit}: no remote changes")
+            write_reconcile_outputs(False)
+            return False
         try:
             plugin = RECONCILIATION_PLUGINS[driver_name]
         except KeyError as exc:
             raise OperationError(f"{args.unit} uses {driver_name}, which does not support reconciliation") from exc
         result = plugin.reconcile(
             ReconciliationContext(
-                environment=args.environment,
-                desired_root=desired,
-                desired_revision=desired_revision,
-                source_root=source_root,
-                source_revision=source["revision"],
-                source_path=source["path"],
-                unit=unit,
-                inputs=unit.get("inputs", {}),
+                **execution,
                 previous_receipt=previous_receipt,
-                dry=args.dry,
-                report=report,
             )
         )
-        if args.dry:
-            log_status("DRY", f"{driver_name} reconciliation succeeded")
-            log_status("DONE", f"{args.unit}: no remote changes")
-            write_reconcile_outputs(False)
-            return False
         reserved = {
             "schema",
             "unit",
@@ -2968,7 +2977,7 @@ def command_converge(args: argparse.Namespace) -> None:
                         desired_ref=desired_ref,
                         desired_revision=desired_revision,
                         observed_ref=observed_ref,
-                        dry=False,
+                        plan=False,
                         report=None,
                         source_revision=None,
                         advance=False,
@@ -3149,14 +3158,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="exact desired commit; defaults to the current desired ref head",
     )
     reconcile.add_argument("--observed-ref", help="override the environment's observed ref")
-    reconcile.add_argument("--dry", action="store_true")
+    reconcile.add_argument("--plan", action="store_true")
     reconcile.add_argument(
         "--report",
         help="directory where the selected driver may write its report artifacts",
     )
     reconcile.add_argument(
         "--source-revision",
-        help="source commit used for dry resolution or post-reconcile advancement",
+        help="source commit used for plan resolution or post-reconcile advancement",
     )
     reconcile.add_argument("--environment", required=True)
     reconcile.add_argument("--advance", action="store_true")

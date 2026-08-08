@@ -20,7 +20,21 @@ require_boolean() {
 
 require_boolean advance "${ADVANCE}"
 require_boolean dry "${DRY}"
+require_boolean plan "${PLAN}"
 require_boolean reapply "${REAPPLY}"
+
+if [[ "${PLAN}" == "true" && "${OPERATION}" != "reconcile" ]]; then
+  echo "plan is only valid for operation reconcile" >&2
+  exit 2
+fi
+if [[ "${DRY}" == "true" && "${OPERATION}" != "prepare" && "${OPERATION}" != "advance" && "${OPERATION}" != "rollback" ]]; then
+  echo "dry is only valid for operations prepare, advance, and rollback" >&2
+  exit 2
+fi
+if [[ "${PLAN}" == "true" && "${DRY}" == "true" ]]; then
+  echo "plan and dry are mutually exclusive" >&2
+  exit 2
+fi
 
 working_directory="$(cd "${WORKING_DIRECTORY}" && pwd)"
 args=(--repository "${working_directory}")
@@ -97,7 +111,7 @@ case "${OPERATION}" in
     [[ -n "${REQUIRE_SOURCE_REF}" ]] && args+=(--require-source-ref "${REQUIRE_SOURCE_REF}")
     [[ -n "${REPORT}" ]] && args+=(--report "${REPORT}")
     [[ "${ADVANCE}" == "true" ]] && args+=(--advance)
-    [[ "${DRY}" == "true" ]] && args+=(--dry)
+    [[ "${PLAN}" == "true" ]] && args+=(--plan)
     [[ "${REAPPLY}" == "true" ]] && args+=(--reapply)
     ;;
   advance)

@@ -6,15 +6,19 @@ import hashlib
 import json
 import tarfile
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TypedDict, cast
 
 from gitopsctr.driver import (
     DriverError,
     JsonObject,
+    PlanningCapability,
+    PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
     ReconciliationResult,
+    UnitExecutionContext,
     UnitPlugin,
 )
 
@@ -22,6 +26,7 @@ from ._common import require_strings, run, select_result_fields
 from ._oci import (
     FRONTEND_ARCHIVE,
     OCI_DIGEST_RE,
+    ResolvedCredentialProvider,
     oras_authentication,
     oras_registry_args,
     repository_registry,
@@ -49,15 +54,6 @@ class FrontendInputs(TypedDict):
     runtimeConfig: RuntimeConfiguration
 
 
-class PlannedFrontend(TypedDict):
-    bundle: str
-    runtimeConfigHash: str
-
-
-class FrontendPlanResult(TypedDict):
-    planned: PlannedFrontend
-
-
 class PublishedFrontend(TypedDict):
     sourceRevision: str
     path: str
@@ -69,6 +65,16 @@ class PublishedFrontend(TypedDict):
 
 class FrontendResult(TypedDict):
     published: PublishedFrontend
+
+
+@dataclass(frozen=True)
+class FrontendRuntime:
+    inputs: FrontendInputs
+    repository: str
+    artifact_digest: str
+    credential_provider: ResolvedCredentialProvider | None
+    runtime_bytes: bytes
+    runtime_digest: str
 
 
 def parse_oci_uri(uri: str) -> tuple[str, str]:
@@ -102,11 +108,12 @@ def runtime_configuration(inputs: JsonObject) -> RuntimeConfiguration:
     return cast(RuntimeConfiguration, configuration)
 
 
-class FrontendS3CloudfrontPlugin(UnitPlugin, ReconciliationCapability):
+class FrontendS3CloudfrontPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability):
     version = 1
     _select_semantic_result = staticmethod(select_result_fields("published"))
 
-    def reconcile(self, context: ReconciliationContext) -> FrontendPlanResult | FrontendResult:
+    @staticmethod
+    def _runtime(context: UnitExecutionContext) -> FrontendRuntime:
         require_strings(
             context.inputs,
             ("bundle", "bucket", "distributionId", "url"),
@@ -121,9 +128,21 @@ class FrontendS3CloudfrontPlugin(UnitPlugin, ReconciliationCapability):
         registry = repository_registry(repository)
         credential_provider = resolve_credential_provider(publication.get("credentialProvider"), {registry})
         runtime_bytes = json.dumps(configuration, indent=2, sort_keys=True).encode() + b"\n"
-        runtime_digest = f"sha256:{hashlib.sha256(runtime_bytes).hexdigest()}"
-        if context.dry:
-            return {"planned": {"bundle": inputs["bundle"], "runtimeConfigHash": runtime_digest}}
+        return FrontendRuntime(
+            inputs=inputs,
+            repository=repository,
+            artifact_digest=artifact_digest,
+            credential_provider=credential_provider,
+            runtime_bytes=runtime_bytes,
+            runtime_digest=f"sha256:{hashlib.sha256(runtime_bytes).hexdigest()}",
+        )
+
+    def plan(self, context: PlanningContext) -> None:
+        self._runtime(context)
+
+    def reconcile(self, context: ReconciliationContext) -> FrontendResult:
+        runtime = self._runtime(context)
+        inputs = runtime.inputs
 
         with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-deploy-") as directory:
             temporary = Path(directory)
@@ -131,7 +150,10 @@ class FrontendS3CloudfrontPlugin(UnitPlugin, ReconciliationCapability):
             distribution = temporary / "distribution"
             pulled.mkdir()
             distribution.mkdir()
-            with oras_authentication(credential_provider, {registry}) as registry_config:
+            with oras_authentication(
+                runtime.credential_provider,
+                {repository_registry(runtime.repository)},
+            ) as registry_config:
                 run(
                     "oras",
                     "pull",
@@ -145,7 +167,7 @@ class FrontendS3CloudfrontPlugin(UnitPlugin, ReconciliationCapability):
                 raise DriverError(f"frontend OCI artifact did not contain {FRONTEND_ARCHIVE}")
             safe_extract_bundle(archive, distribution)
             runtime_path = distribution / "runtime-config.json"
-            runtime_path.write_bytes(runtime_bytes)
+            runtime_path.write_bytes(runtime.runtime_bytes)
             index_path = distribution / "index.html"
             if not index_path.is_file():
                 raise DriverError("frontend OCI artifact did not contain index.html")
@@ -228,8 +250,8 @@ class FrontendS3CloudfrontPlugin(UnitPlugin, ReconciliationCapability):
                 "sourceRevision": context.source_revision,
                 "path": context.source_path,
                 "bundle": inputs["bundle"],
-                "artifactDigest": artifact_digest,
-                "runtimeConfigHash": runtime_digest,
+                "artifactDigest": runtime.artifact_digest,
+                "runtimeConfigHash": runtime.runtime_digest,
                 "url": inputs["url"],
             }
         }

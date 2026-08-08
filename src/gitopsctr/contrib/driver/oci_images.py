@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import subprocess
+from dataclasses import dataclass
 from typing import TypedDict, cast
 
 from gitopsctr.driver import (
     DriverError,
+    PlanningCapability,
+    PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
     ReconciliationResult,
@@ -17,6 +20,7 @@ from ._common import require_strings, run, select_result_fields
 from ._oci import (
     OCI_DIGEST_RE,
     ArtifactUnitIdentity,
+    ResolvedCredentialProvider,
     artifact_unit_identity,
     registry_authentication,
     repository_registry,
@@ -37,6 +41,19 @@ class ContainersDocument(TypedDict):
 
 class OciImagesResult(TypedDict):
     artifacts: dict[str, ContainersDocument]
+
+
+@dataclass(frozen=True)
+class OciRuntime:
+    repositories: dict[str, str]
+    registries: set[str]
+    credential_provider: ResolvedCredentialProvider | None
+    dockerfile: str
+    platform: str
+    input_hash: str
+    unit_identity: ArtifactUnitIdentity
+    tag: str
+    local_image: str
 
 
 def oci_digest(repository: str, tag: str, docker_environment: dict[str, str] | None = None) -> str | None:
@@ -73,11 +90,12 @@ def oci_digest(repository: str, tag: str, docker_environment: dict[str, str] | N
     raise DriverError(error or f"could not inspect {reference}")
 
 
-class OciImagesPlugin(UnitPlugin, ReconciliationCapability):
+class OciImagesPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability):
     version = 2
     _select_semantic_result = staticmethod(select_result_fields("artifacts"))
 
-    def reconcile(self, context: ReconciliationContext) -> OciImagesResult | dict[str, object]:
+    @staticmethod
+    def _runtime(context: PlanningContext | ReconciliationContext) -> OciRuntime:
         specification = context.unit
         build = specification.get("build")
         publication = specification.get("publish")
@@ -107,26 +125,46 @@ class OciImagesPlugin(UnitPlugin, ReconciliationCapability):
         unit_identity = artifact_unit_identity(context, input_hash, "oci-images unit")
         tag = f"input-{input_hash.removeprefix('sha256:')}"
         local_image = f"{unit_identity['name']}:{input_hash.removeprefix('sha256:')}"
+        return OciRuntime(
+            repositories,
+            registries,
+            credential_provider,
+            dockerfile,
+            platform,
+            input_hash,
+            unit_identity,
+            tag,
+            local_image,
+        )
+
+    @staticmethod
+    def _build_image(context: PlanningContext | ReconciliationContext, runtime: OciRuntime) -> None:
+        run(
+            "docker",
+            "build",
+            "--platform",
+            runtime.platform,
+            "--provenance=false",
+            "--file",
+            str(context.source_root / runtime.dockerfile),
+            "--tag",
+            runtime.local_image,
+            str(context.source_root),
+        )
+
+    def plan(self, context: PlanningContext) -> None:
+        self._build_image(context, self._runtime(context))
+
+    def reconcile(self, context: ReconciliationContext) -> OciImagesResult:
+        runtime = self._runtime(context)
+        repositories = runtime.repositories
+        tag = runtime.tag
+        local_image = runtime.local_image
 
         def build_image() -> None:
-            run(
-                "docker",
-                "build",
-                "--platform",
-                platform,
-                "--provenance=false",
-                "--file",
-                str(context.source_root / dockerfile),
-                "--tag",
-                local_image,
-                str(context.source_root),
-            )
+            self._build_image(context, runtime)
 
-        if context.dry:
-            build_image()
-            return {}
-
-        with registry_authentication(credential_provider, registries) as docker_environment:
+        with registry_authentication(runtime.credential_provider, runtime.registries) as docker_environment:
             existing = {
                 name: oci_digest(repository, tag, docker_environment) for name, repository in repositories.items()
             }
@@ -168,7 +206,7 @@ class OciImagesPlugin(UnitPlugin, ReconciliationCapability):
             "artifacts": {
                 "containers.json": {
                     "schema": 1,
-                    "unit": unit_identity,
+                    "unit": runtime.unit_identity,
                     "artifacts": artifacts,
                 }
             }

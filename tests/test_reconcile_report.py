@@ -1,4 +1,4 @@
-"""Reconciliation preserves dry-run and convergence behavior around clean units."""
+"""Reconciliation preserves planning and convergence behavior around clean units."""
 
 import json
 import subprocess
@@ -14,6 +14,15 @@ from gitopsctr import cli as deploy_release
 def _write_json(path: Path, value: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value))
+
+
+def test_reconcile_parser_exposes_plan_without_a_dry_alias():
+    parser = deploy_release.build_parser()
+
+    args = parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--plan"])
+    assert args.plan is True
+    with pytest.raises(SystemExit):
+        parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--dry"])
 
 
 def test_observation_reference_uses_fallback_only_during_dry_resolution(tmp_path):
@@ -104,7 +113,7 @@ def test_unknown_unit_fails_before_advancing_desired_state(monkeypatch):
                 desired_ref="deploy/dev",
                 desired_revision=None,
                 observed_ref="observed/dev",
-                dry=False,
+                plan=False,
                 report=None,
                 source_revision="HEAD",
                 advance=True,
@@ -145,7 +154,7 @@ def test_known_unmaterialized_unit_remains_a_successful_wait(monkeypatch):
             desired_ref="deploy/dev",
             desired_revision=None,
             observed_ref="observed/dev",
-            dry=False,
+            plan=False,
             report=None,
             source_revision=None,
             advance=False,
@@ -156,7 +165,7 @@ def test_known_unmaterialized_unit_remains_a_successful_wait(monkeypatch):
     assert outputs == [(False, "")]
 
 
-def test_dry_reconcile_executes_clean_unit_and_passes_report(tmp_path, monkeypatch):
+def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monkeypatch):
     report = tmp_path / "report"
     calls = []
 
@@ -192,9 +201,9 @@ def test_dry_reconcile_executes_clean_unit_and_passes_report(tmp_path, monkeypat
     monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
     monkeypatch.setattr(deploy_release, "file_blob", lambda _path: "same-unit")
     monkeypatch.setitem(
-        deploy_release.RECONCILIATION_PLUGINS,
+        deploy_release.PLANNING_PLUGINS,
         "terraform",
-        SimpleNamespace(reconcile=lambda context: calls.append(context) or {}),
+        SimpleNamespace(plan=lambda context: calls.append(context)),
     )
 
     deploy_release.command_reconcile(
@@ -204,7 +213,7 @@ def test_dry_reconcile_executes_clean_unit_and_passes_report(tmp_path, monkeypat
             desired_ref="deploy/dev",
             desired_revision=None,
             observed_ref="observed/dev",
-            dry=True,
+            plan=True,
             report=str(report),
             source_revision=None,
             advance=False,
@@ -213,7 +222,6 @@ def test_dry_reconcile_executes_clean_unit_and_passes_report(tmp_path, monkeypat
     )
 
     assert len(calls) == 1
-    assert calls[0].dry is True
     assert calls[0].report == report
 
 
@@ -274,7 +282,7 @@ def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_p
             desired_ref="deploy/dev",
             desired_revision="c" * 40,
             observed_ref="observed/dev",
-            dry=False,
+            plan=False,
             report=None,
             source_revision="HEAD",
             advance=True,
@@ -355,7 +363,7 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
             desired_ref="deploy/dev",
             desired_revision=None,
             observed_ref="observed/dev",
-            dry=False,
+            plan=False,
             report=None,
             source_revision="HEAD",
             advance=True,
@@ -394,7 +402,7 @@ def test_superseded_source_stops_before_reconciliation(monkeypatch):
             desired_ref="deploy/dev",
             desired_revision=None,
             observed_ref="observed/dev",
-            dry=False,
+            plan=False,
             report=None,
             source_revision="HEAD",
             advance=True,

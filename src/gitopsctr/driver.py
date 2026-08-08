@@ -43,7 +43,7 @@ class MaterializationResult:
 
 
 @dataclass(frozen=True)
-class ReconciliationContext:
+class UnitExecutionContext:
     environment: str
     desired_root: Path
     desired_revision: str
@@ -52,9 +52,17 @@ class ReconciliationContext:
     source_path: str
     unit: JsonObject
     inputs: JsonObject
-    previous_receipt: JsonObject | None = None
-    dry: bool = False
     report: Path | None = None
+
+
+@dataclass(frozen=True)
+class PlanningContext(UnitExecutionContext):
+    pass
+
+
+@dataclass(frozen=True)
+class ReconciliationContext(UnitExecutionContext):
+    previous_receipt: JsonObject | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,14 @@ class MaterializationCapability(ABC):
     @abstractmethod
     def materialize(self, context: MaterializationContext) -> MaterializationResult:
         """Write materialized files below ``output_root`` and describe them."""
+
+
+class PlanningCapability(ABC):
+    """Perform speculative, non-publishing work for a deployment unit."""
+
+    @abstractmethod
+    def plan(self, context: PlanningContext) -> None:
+        """Validate and plan the unit without changing remote deployment state."""
 
 
 class ReconciliationCapability(ABC):
@@ -143,6 +159,7 @@ MATERIALIZATION_PLUGINS = {
 RECONCILIATION_PLUGINS = {
     name: plugin for name, plugin in UNIT_PLUGINS.items() if isinstance(plugin, ReconciliationCapability)
 }
+PLANNING_PLUGINS = {name: plugin for name, plugin in UNIT_PLUGINS.items() if isinstance(plugin, PlanningCapability)}
 VERIFICATION_PLUGINS = {
     name: plugin for name, plugin in UNIT_PLUGINS.items() if isinstance(plugin, VerificationCapability)
 }

@@ -86,7 +86,11 @@ inputs:
     required: false
     default: "false"
   dry:
-    description: Resolve, reconcile, or validate rollback without publishing state
+    description: Preview controller writes for prepare, advance, or rollback
+    required: false
+    default: "false"
+  plan:
+    description: Run reconcile planning without applying or publishing a receipt
     required: false
     default: "false"
   reapply:
@@ -174,6 +178,7 @@ runs:
         GITOPSCTR_GIT_AUTHOR_NAME: ${{ inputs.git-author-name }}
         OBSERVED_REF: ${{ inputs.observed-ref }}
         OPERATION: ${{ inputs.operation }}
+        PLAN: ${{ inputs.plan }}
         REAPPLY: ${{ inputs.reapply }}
         REPORT: ${{ inputs.report }}
         REQUIRE_SOURCE_REF: ${{ inputs.require-source-ref }}

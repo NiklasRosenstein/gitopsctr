@@ -18,6 +18,8 @@ from gitopsctr.driver import (
     MaterializationCapability,
     MaterializationContext,
     MaterializationResult,
+    PlanningCapability,
+    PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
     ReconciliationResult,
@@ -286,6 +288,7 @@ def argo_application_status(document: dict[str, Any]) -> tuple[str, str, str]:
 class KubernetesManifestsPlugin(
     UnitPlugin,
     MaterializationCapability,
+    PlanningCapability,
     ReconciliationCapability,
     VerificationCapability,
 ):
@@ -360,6 +363,16 @@ class KubernetesManifestsPlugin(
         delivery = delivery_configuration(unit)
         return delivery["mode"] == "direct" or argo_observer(delivery) is not None
 
+    def plan(self, context: PlanningContext) -> None:
+        delivery = delivery_configuration(context.unit)
+        observer = argo_observer(delivery)
+        if observer is not None:
+            self._observe_argo(context, observer, wait=True)
+            return
+        if delivery["mode"] != "direct":
+            raise DriverError("external Kubernetes delivery without an observer does not support planning")
+        materialization_descriptor(context.unit)
+
     def reconcile(self, context: ReconciliationContext) -> KubernetesResult | ArgoResult:
         delivery = delivery_configuration(context.unit)
         observer = argo_observer(delivery)
@@ -369,8 +382,6 @@ class KubernetesManifestsPlugin(
             raise DriverError("external Kubernetes delivery without an observer does not reconcile")
 
         digest, inventory = materialization_descriptor(context.unit)
-        if context.dry:
-            return {"applied": {"manifestDigest": digest, "inventory": inventory}}
         context_name = require_string(delivery.get("kubeContext"), "direct delivery kubeContext")
         prune = cast(bool, delivery.get("prune", False))
         waits = cast(list[object], delivery.get("wait", []))
@@ -483,7 +494,7 @@ class KubernetesManifestsPlugin(
 
     @staticmethod
     def _observe_argo(
-        context: ReconciliationContext | VerificationContext,
+        context: PlanningContext | ReconciliationContext | VerificationContext,
         observer: dict[str, Any],
         *,
         wait: bool,

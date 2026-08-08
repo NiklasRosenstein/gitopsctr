@@ -48,6 +48,7 @@ def _action_environment(tmp_path: Path, **overrides: str) -> dict[str, str]:
         "GITHUB_OUTPUT": str(tmp_path / "github-output"),
         "OBSERVED_REF": "",
         "OPERATION": "",
+        "PLAN": "false",
         "PATH": f"{binary_directory}:{os.environ['PATH']}",
         "REAPPLY": "false",
         "REPORT": "",
@@ -197,6 +198,7 @@ def test_reconcile_action_maps_typed_inputs_to_cli_arguments(tmp_path: Path) -> 
         SOURCE_REVISION="s" * 40,
         REQUIRE_SOURCE_REF="main",
         ADVANCE="true",
+        PLAN="true",
         REAPPLY="true",
         REPORT="reports/application",
     )
@@ -219,6 +221,7 @@ def test_reconcile_action_maps_typed_inputs_to_cli_arguments(tmp_path: Path) -> 
         "--report",
         "reports/application",
         "--advance",
+        "--plan",
         "--reapply",
     ]
 
@@ -323,6 +326,9 @@ def test_promote_action_defaults_to_the_workflow_revision(tmp_path: Path) -> Non
         ({"OPERATION": "reconcile", "ENVIRONMENT": "dev"}, "unit is required"),
         ({"OPERATION": "unknown"}, "operation must be"),
         ({"OPERATION": "advance", "ENVIRONMENT": "dev", "DRY": "sometimes"}, "dry must be"),
+        ({"OPERATION": "advance", "ENVIRONMENT": "dev", "PLAN": "sometimes"}, "plan must be"),
+        ({"OPERATION": "advance", "ENVIRONMENT": "dev", "PLAN": "true"}, "plan is only valid"),
+        ({"OPERATION": "reconcile", "ENVIRONMENT": "dev", "UNIT": "app", "DRY": "true"}, "dry is only valid"),
         (
             {
                 "OPERATION": "prepare",

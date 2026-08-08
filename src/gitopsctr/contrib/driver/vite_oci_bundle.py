@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import gzip
-import hashlib
 import os
 import re
 import tarfile
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
 
 from gitopsctr.driver import (
     DriverError,
+    PlanningCapability,
+    PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
     ReconciliationResult,
+    UnitExecutionContext,
     UnitPlugin,
 )
 
@@ -24,6 +27,7 @@ from ._oci import (
     FRONTEND_ARCHIVE,
     OCI_DIGEST_RE,
     ArtifactUnitIdentity,
+    ResolvedCredentialProvider,
     artifact_unit_identity,
     oras_authentication,
     oras_digest,
@@ -34,16 +38,6 @@ from ._oci import (
 
 FRONTEND_ARTIFACT_TYPE = "application/vnd.gitopsctr.frontend.v1"
 FRONTEND_LAYER_TYPE = "application/vnd.gitopsctr.frontend.layer.v1.tar+gzip"
-
-
-class BuiltBundle(TypedDict):
-    sourceRevision: str
-    path: str
-    digest: str
-
-
-class ViteBundlePlanResult(TypedDict):
-    built: BuiltBundle
 
 
 class BundleArtifact(TypedDict):
@@ -60,6 +54,18 @@ class FrontendDocument(TypedDict):
 
 class ViteBundleResult(TypedDict):
     artifacts: dict[str, FrontendDocument]
+
+
+@dataclass(frozen=True)
+class ViteRuntime:
+    repository: str
+    registry: str
+    credential_provider: ResolvedCredentialProvider | None
+    input_hash: str
+    unit_identity: ArtifactUnitIdentity
+    tag: str
+    frontend_root: Path
+    build_environment: dict[str, str]
 
 
 def require_node_24() -> None:
@@ -95,11 +101,12 @@ def deterministic_archive(source: Path, destination: Path) -> None:
                         raise DriverError(f"frontend bundle contains an unsupported file: {path}")
 
 
-class ViteOciBundlePlugin(UnitPlugin, ReconciliationCapability):
+class ViteOciBundlePlugin(UnitPlugin, PlanningCapability, ReconciliationCapability):
     version = 1
     _select_semantic_result = staticmethod(select_result_fields("artifacts"))
 
-    def reconcile(self, context: ReconciliationContext) -> ViteBundlePlanResult | ViteBundleResult:
+    @staticmethod
+    def _runtime(context: UnitExecutionContext) -> ViteRuntime:
         specification = context.unit
         build = specification.get("build")
         publication = specification.get("publish")
@@ -121,33 +128,38 @@ class ViteOciBundlePlugin(UnitPlugin, ReconciliationCapability):
             raise DriverError("vite-oci-bundle requires a resolved source inputHash")
         unit_identity = artifact_unit_identity(context, input_hash, "vite-oci-bundle unit")
         tag = f"input-{input_hash.removeprefix('sha256:')}"
-        frontend_root = context.source_root / context.source_path
-        build_environment = {name: value for name, value in os.environ.items() if not name.startswith("VITE_")}
+        return ViteRuntime(
+            repository=repository,
+            registry=registry,
+            credential_provider=credential_provider,
+            input_hash=input_hash,
+            unit_identity=unit_identity,
+            tag=tag,
+            frontend_root=context.source_root / context.source_path,
+            build_environment={name: value for name, value in os.environ.items() if not name.startswith("VITE_")},
+        )
 
-        def build_archive(archive: Path) -> None:
-            require_node_24()
-            run("npm", "ci", cwd=frontend_root, env=build_environment)
-            run("npm", "run", "build", cwd=frontend_root, env=build_environment)
-            deterministic_archive(frontend_root / "dist", archive)
+    @staticmethod
+    def _build_archive(runtime: ViteRuntime, archive: Path) -> None:
+        require_node_24()
+        run("npm", "ci", cwd=runtime.frontend_root, env=runtime.build_environment)
+        run("npm", "run", "build", cwd=runtime.frontend_root, env=runtime.build_environment)
+        deterministic_archive(runtime.frontend_root / "dist", archive)
 
-        if context.dry:
-            with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-") as directory:
-                archive = Path(directory) / FRONTEND_ARCHIVE
-                build_archive(archive)
-                return {
-                    "built": {
-                        "sourceRevision": context.source_revision,
-                        "path": context.source_path,
-                        "digest": f"sha256:{hashlib.sha256(archive.read_bytes()).hexdigest()}",
-                    }
-                }
+    def plan(self, context: PlanningContext) -> None:
+        runtime = self._runtime(context)
+        with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-") as directory:
+            self._build_archive(runtime, Path(directory) / FRONTEND_ARCHIVE)
 
-        with oras_authentication(credential_provider, {registry}) as registry_config:
-            digest = oras_digest(repository, tag, registry_config)
+    def reconcile(self, context: ReconciliationContext) -> ViteBundleResult:
+        runtime = self._runtime(context)
+
+        with oras_authentication(runtime.credential_provider, {runtime.registry}) as registry_config:
+            digest = oras_digest(runtime.repository, runtime.tag, registry_config)
             if digest is None:
                 with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-") as directory:
                     archive = Path(directory) / FRONTEND_ARCHIVE
-                    build_archive(archive)
+                    self._build_archive(runtime, archive)
                     run(
                         "oras",
                         "push",
@@ -157,25 +169,25 @@ class ViteOciBundlePlugin(UnitPlugin, ReconciliationCapability):
                         "--annotation",
                         f"org.opencontainers.image.revision={context.source_revision}",
                         "--annotation",
-                        f"dev.gitopsctr.input-hash={input_hash}",
-                        f"{repository}:{tag}",
+                        f"dev.gitopsctr.input-hash={runtime.input_hash}",
+                        f"{runtime.repository}:{runtime.tag}",
                         f"{FRONTEND_ARCHIVE}:{FRONTEND_LAYER_TYPE}",
                         cwd=Path(directory),
                     )
-                    digest = oras_digest(repository, tag, registry_config)
+                    digest = oras_digest(runtime.repository, runtime.tag, registry_config)
             if digest is None:
-                raise DriverError(f"OCI registry did not return a digest for {repository}:{tag}")
+                raise DriverError(f"OCI registry did not return a digest for {runtime.repository}:{runtime.tag}")
 
         return {
             "artifacts": {
                 "frontend.json": {
                     "schema": 1,
-                    "unit": unit_identity,
+                    "unit": runtime.unit_identity,
                     "artifacts": {
                         "bundle": {
                             "type": "oci-artifact",
                             "artifactType": FRONTEND_ARTIFACT_TYPE,
-                            "uri": f"{repository}@{digest}",
+                            "uri": f"{runtime.repository}@{digest}",
                         }
                     },
                 }
