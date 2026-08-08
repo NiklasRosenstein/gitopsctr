@@ -1,5 +1,6 @@
 """Reconciliation preserves planning and convergence behavior around clean units."""
 
+import json
 import subprocess
 from argparse import Namespace
 from pathlib import Path
@@ -87,6 +88,102 @@ def test_observation_reference_materializes_artifact_into_consumer(tmp_path):
     assert observed_inputs == {
         "units/application-images.json": deploy_release.file_blob(observed / "units/application-images.json")
     }
+
+
+def test_observation_reference_normalizes_resource_receipt_before_applying_pointer(tmp_path):
+    candidate = tmp_path / "candidate"
+    observed = tmp_path / "observed"
+    producer = candidate / "units/application-images.yaml"
+    producer.parent.mkdir(parents=True)
+    producer.write_text("name: application-images\n")
+    receipt_path = observed / "units/application-images.yaml"
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text(
+        json.dumps(
+            deploy_release.serialize_receipt_document(
+                {
+                    "unit": "application-images",
+                    "driver": "oci-images",
+                    "desired": {"revision": "d" * 40, "unitBlob": deploy_release.file_blob(producer)},
+                    "resolvedInputs": {},
+                    "controller": {
+                        "version": "0.1.0",
+                        "revision": "a" * 40,
+                        "observed_at": "2026-08-08T00:00:00Z",
+                    },
+                    "artifacts": {
+                        "containers.json": {
+                            "schema": 1,
+                            "unit": {
+                                "name": "application-images",
+                                "driver": "oci-images",
+                                "inputHashVersion": 1,
+                                "inputHash": "sha256:" + "1" * 64,
+                                "sourceRevision": "a" * 40,
+                            },
+                            "artifacts": {
+                                "control": {
+                                    "type": "oci-image",
+                                    "uri": "registry.example/control@sha256:" + "1" * 64,
+                                }
+                            },
+                        }
+                    },
+                }
+            )
+        )
+    )
+
+    resolved, promotion_inputs, observed_inputs = deploy_release.resolve_template(
+        {
+            "image": {
+                "fromObservation": "units/application-images.yaml",
+                "pointer": "/artifacts/containers.json/artifacts/control/uri",
+            }
+        },
+        candidate,
+        observed,
+        "b" * 40,
+    )
+
+    assert resolved == {"image": "registry.example/control@sha256:" + "1" * 64}
+    assert promotion_inputs == {}
+    assert observed_inputs == {"units/application-images.yaml": deploy_release.file_blob(receipt_path)}
+
+
+def test_promotion_reference_normalizes_resource_unit_before_applying_pointer(tmp_path):
+    promotion = tmp_path / "promotion"
+    source_unit = promotion / "units/aws-application.yaml"
+    source_unit.parent.mkdir(parents=True)
+    source_unit.write_text(
+        json.dumps(
+            deploy_release.serialize_unit_document(
+                {
+                    "name": "aws-application",
+                    "driver": "terraform",
+                    "source": {"path": "infra"},
+                    "terraform": {"variables": {"control_image_uri": "registry.example/control@sha256:" + "1" * 64}},
+                }
+            )
+        )
+    )
+
+    resolved, promotion_inputs, observed_inputs = deploy_release.resolve_template(
+        {
+            "image": {
+                "fromPromotion": "units/aws-application.yaml",
+                "pointer": "/terraform/variables/control_image_uri",
+            }
+        },
+        tmp_path / "candidate",
+        tmp_path / "observed",
+        None,
+        promotion=promotion,
+    )
+
+    assert resolved == {"image": "registry.example/control@sha256:" + "1" * 64}
+    assert promotion_inputs == {"units/aws-application.yaml": deploy_release.file_blob(source_unit)}
+    assert observed_inputs == {}
 
 
 def test_unknown_unit_fails_before_advancing_desired_state(monkeypatch):

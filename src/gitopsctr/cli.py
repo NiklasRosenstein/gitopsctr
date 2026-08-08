@@ -851,6 +851,7 @@ def resolve_template(
             raise OperationError(f"invalid {reference_type} path: {reference!r}")
         if not isinstance(pointer, str):
             raise OperationError(f"invalid JSON pointer for {reference!r}")
+        referenced_unit = Path(reference).stem
         try:
             if reference_type == "fromPromotion":
                 if promotion is None:
@@ -860,15 +861,19 @@ def resolve_template(
             else:
                 if observed_revision is None:
                     raise ReferenceUnavailable(f"observation does not exist: {reference}")
-                unit_name = Path(reference).stem
-                if current_receipt(observed, candidate / "units", unit_name) is None:
+                if current_receipt(observed, candidate / "units", referenced_unit) is None:
                     raise ReferenceUnavailable(f"observation is stale: {reference}")
                 path = reference_document_path(observed, reference)
                 fingerprints = observed_inputs
             if not path.is_file():
                 raise ReferenceUnavailable(f"referenced file does not exist: {reference}")
             fingerprints[reference] = file_blob(path)
-            return json_pointer(load_json(path), pointer)
+            document = (
+                load_unit(path, referenced_unit)
+                if reference_type == "fromPromotion"
+                else load_receipt(path, referenced_unit)
+            )
+            return json_pointer(document, pointer)
         except ReferenceUnavailable:
             if dry and "dryFallback" in candidate_value:
                 return resolve(candidate_value["dryFallback"])
@@ -2511,7 +2516,7 @@ def command_verify(args: argparse.Namespace) -> None:
 
         prepared: list[tuple[str, str, dict[str, Any], dict[str, str]]] = []
         for unit_name in selected:
-            unit = load_json(available[unit_name])
+            unit = load_unit(available[unit_name], unit_name)
             driver_name, source = require_unit(unit, unit_name)
             validate_unit_materialization(desired, unit_name, unit)
             if contains_reference(unit):

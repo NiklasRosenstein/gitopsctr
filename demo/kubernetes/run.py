@@ -143,7 +143,8 @@ def verify_resource(provider: Provider) -> None:
     ).stdout.strip()
     if response != EXPECTED_RESPONSE:
         raise RuntimeError(f"unexpected application response: {response!r}")
-    controller(provider, "verify", "--environment", "dev")
+    print(f"Application check passed: {response}", flush=True)
+    controller(provider, "verify", "--environment", "dev", "--unit", "web")
 
 
 def converge(provider: Provider, *, expect_clean: bool = False) -> None:

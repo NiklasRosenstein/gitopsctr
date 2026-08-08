@@ -52,7 +52,10 @@ def _install_desired_state(monkeypatch, units: list[dict[str, object]]) -> list[
         output.mkdir(parents=True, exist_ok=True)
         if revision == DESIRED_REVISION:
             for unit in units:
-                _write_json(output / "units" / f"{unit['name']}.json", unit)
+                _write_json(
+                    output / "units" / f"{unit['name']}.json",
+                    deploy_release.serialize_unit_document(unit),
+                )
 
     monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
     for name in ("observed_tree", "publish_receipt_cas", "write_json"):
