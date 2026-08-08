@@ -39,8 +39,9 @@ from gitopsctr.driver import (
     VerificationResult,
     VerificationStatus,
 )
+from gitopsctr.execution import CommandOutput, DriverExecution
 
-from ._common import run, select_result_fields
+from ._common import select_result_fields
 
 
 class ResourceIdentity(TypedDict):
@@ -374,11 +375,11 @@ def argo_observer(delivery: dict[str, Any]) -> dict[str, Any] | None:
     return observer
 
 
-def read_argo_application(observer: dict[str, Any]) -> dict[str, Any]:
+def read_argo_application(execution: DriverExecution, observer: dict[str, Any]) -> dict[str, Any]:
     application = cast(str, observer["application"])
     namespace = cast(str, observer["applicationNamespace"])
     if observer["access"] == "api":
-        result = run(
+        result = execution.run(
             "argocd",
             "app",
             "get",
@@ -389,10 +390,10 @@ def read_argo_application(observer: dict[str, Any]) -> dict[str, Any]:
             cast(str, observer["argocdContext"]),
             "--output",
             "json",
-            capture=True,
+            output=CommandOutput.CAPTURE,
         )
     else:
-        result = run(
+        result = execution.run(
             *kubectl_prefix(cast(str, observer["kubeContext"])),
             "--namespace",
             namespace,
@@ -401,7 +402,7 @@ def read_argo_application(observer: dict[str, Any]) -> dict[str, Any]:
             application,
             "--output",
             "json",
-            capture=True,
+            output=CommandOutput.CAPTURE,
         )
     try:
         document = json.loads(result.stdout)
@@ -471,13 +472,13 @@ class KubernetesManifestsPlugin(
             release_name = require_string(configuration.get("releaseName"), "Helm releaseName")
             namespace = require_string(configuration.get("namespace"), "Helm namespace")
             values = require_object(configuration.get("values", {}), "Helm values")
-            version = run("helm", "version", "--short", capture=True).stdout.strip()
+            version = context.execution.run("helm", "version", "--short", output=CommandOutput.CAPTURE).stdout.strip()
             if not version:
                 raise DriverError("Helm did not report its version")
             with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as values_file:
                 yaml.safe_dump(values, values_file, sort_keys=True)
                 values_file.flush()
-                rendered = run(
+                rendered = context.execution.run(
                     "helm",
                     "template",
                     release_name,
@@ -487,7 +488,7 @@ class KubernetesManifestsPlugin(
                     "--include-crds",
                     "--values",
                     values_file.name,
-                    capture=True,
+                    output=CommandOutput.CAPTURE,
                 ).stdout
             if not rendered.strip():
                 raise DriverError("Helm rendered an empty manifest payload")
@@ -540,7 +541,7 @@ class KubernetesManifestsPlugin(
         prune = cast(bool, delivery.get("prune", False))
         waits = cast(list[object], delivery.get("wait", []))
         manager = field_manager(context.environment, context.unit.get("name"))
-        run(
+        context.execution.run(
             *kubectl_prefix(context_name),
             "apply",
             "--server-side",
@@ -555,7 +556,7 @@ class KubernetesManifestsPlugin(
             condition = require_string(wait["condition"], "Kubernetes readiness wait condition")
             timeout = wait["timeoutSeconds"]
             assert isinstance(timeout, int) and not isinstance(timeout, bool)
-            run(
+            context.execution.run(
                 *kubectl_prefix(context_name),
                 "--namespace",
                 namespace,
@@ -601,7 +602,7 @@ class KubernetesManifestsPlugin(
                 {"apiVersion": api_version, "kind": kind, "metadata": metadata},
                 sort_keys=True,
             )
-            run(
+            context.execution.run(
                 *kubectl_prefix(context_name),
                 "delete",
                 "--ignore-not-found",
@@ -618,7 +619,7 @@ class KubernetesManifestsPlugin(
         delivery = delivery_configuration(context.unit)
         observer = argo_observer(delivery)
         if observer is not None:
-            document = read_argo_application(observer)
+            document = read_argo_application(context.execution, observer)
             revision, sync_status, health_status = argo_application_status(document)
             status = (
                 VerificationStatus.CLEAN
@@ -629,14 +630,14 @@ class KubernetesManifestsPlugin(
         if delivery["mode"] != "direct":
             raise DriverError("external Kubernetes delivery without an observer cannot be verified")
         context_name = require_string(delivery.get("kubeContext"), "direct delivery kubeContext")
-        result = run(
+        result = context.execution.run(
             *kubectl_prefix(context_name),
             "diff",
             "--server-side",
             f"--field-manager={field_manager(context.environment, context.unit.get('name'))}",
             "--filename",
             str(context.desired_root / "manifests" / cast(str, context.unit["name"])),
-            capture=True,
+            output=CommandOutput.CAPTURE,
             check=False,
         )
         if result.returncode == 0:
@@ -655,7 +656,7 @@ class KubernetesManifestsPlugin(
     ) -> ArgoResult:
         deadline = time.monotonic() + cast(int, observer.get("timeoutSeconds", 600))
         while True:
-            document = read_argo_application(observer)
+            document = read_argo_application(context.execution, observer)
             revision, sync_status, health_status = argo_application_status(document)
             ready = revision == context.desired_revision and sync_status == "Synced" and health_status == "Healthy"
             if ready:

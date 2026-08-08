@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypedDict, cast
@@ -33,8 +32,9 @@ from gitopsctr.driver import (
     VerificationResult,
     VerificationStatus,
 )
+from gitopsctr.execution import CommandOutput, CommandResult
 
-from ._common import run, select_result_fields
+from ._common import select_result_fields
 
 
 class AppliedTerraform(TypedDict):
@@ -169,22 +169,24 @@ class TerraformPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability, 
             ".reconcile.tfplan",
         )
 
-        def terraform(*args: str, reported: bool = False) -> subprocess.CompletedProcess[str]:
-            if report_text is None:
-                return run("terraform", *args, cwd=terraform_root, env=terraform_environment)
+        def terraform(*args: str, reported: bool = False) -> CommandResult:
+            output = CommandOutput.STREAM if report_text is None else CommandOutput.TEE
             try:
-                result = run("terraform", *args, cwd=terraform_root, env=terraform_environment, capture=True)
+                result = context.execution.run(
+                    "terraform",
+                    *args,
+                    cwd=terraform_root,
+                    env=terraform_environment,
+                    output=output,
+                )
             except subprocess.CalledProcessError as exc:
-                output = "".join(part for part in (exc.stdout, exc.stderr) if part)
-                if output:
-                    print(output, end="" if output.endswith("\n") else "\n", file=sys.stderr)
-                report_text.write_text(output or f"terraform {' '.join(args)} failed\n")
+                failure = "".join(part for part in (exc.stdout, exc.stderr) if part)
+                if report_text is not None:
+                    report_text.write_text(failure or f"terraform {' '.join(args)} failed\n")
                 raise
-            output = "".join(part for part in (result.stdout, result.stderr) if part)
-            if output:
-                print(output, end="" if output.endswith("\n") else "\n", file=sys.stderr)
             if reported:
-                report_text.write_text(output)
+                assert report_text is not None
+                report_text.write_text(result.stdout + result.stderr)
             return result
 
         terraform("init", *backend_args)
@@ -212,22 +214,26 @@ class TerraformPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability, 
             *args: str,
             reported: bool = False,
             emit: bool = True,
-        ) -> subprocess.CompletedProcess[str]:
-            if report_text is None:
-                return run("terraform", *args, cwd=terraform_root, env=terraform_environment)
+        ) -> CommandResult:
+            output = CommandOutput.STREAM
+            if report_text is not None:
+                output = CommandOutput.TEE if emit else CommandOutput.CAPTURE
             try:
-                result = run("terraform", *args, cwd=terraform_root, env=terraform_environment, capture=True)
+                result = context.execution.run(
+                    "terraform",
+                    *args,
+                    cwd=terraform_root,
+                    env=terraform_environment,
+                    output=output,
+                )
             except subprocess.CalledProcessError as exc:
-                output = "".join(part for part in (exc.stdout, exc.stderr) if part)
-                if output:
-                    print(output, end="" if output.endswith("\n") else "\n", file=sys.stderr)
-                report_text.write_text(output or f"terraform {' '.join(args)} failed\n")
+                failure = "".join(part for part in (exc.stdout, exc.stderr) if part)
+                if report_text is not None:
+                    report_text.write_text(failure or f"terraform {' '.join(args)} failed\n")
                 raise
-            output = "".join(part for part in (result.stdout, result.stderr) if part)
-            if output and emit:
-                print(output, end="" if output.endswith("\n") else "\n", file=sys.stderr)
             if reported:
-                report_text.write_text(output)
+                assert report_text is not None
+                report_text.write_text(result.stdout + result.stderr)
             return result
 
         terraform("init", *backend_args)
@@ -237,7 +243,14 @@ class TerraformPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability, 
         terraform("apply", "-auto-approve", str(plan))
         try:
             raw_outputs = json.loads(
-                run("terraform", "output", "-json", cwd=terraform_root, env=terraform_environment, capture=True).stdout
+                context.execution.run(
+                    "terraform",
+                    "output",
+                    "-json",
+                    cwd=terraform_root,
+                    env=terraform_environment,
+                    output=CommandOutput.CAPTURE,
+                ).stdout
             )
             outputs = cast(dict[str, JsonValue], {name: raw_outputs[name]["value"] for name in output_names})
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -250,7 +263,7 @@ class TerraformPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability, 
             path = check.get("path", "")
             if output_name not in outputs or not isinstance(path, str):
                 raise DriverError("terraform HTTP check has invalid urlOutput or path")
-            run(
+            context.execution.run(
                 "curl",
                 "--fail",
                 "--show-error",
@@ -277,8 +290,8 @@ class TerraformPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability, 
             ".verify.tfplan",
         )
 
-        run("terraform", "init", *backend_args, cwd=terraform_root, env=terraform_environment)
-        result = run(
+        context.execution.run("terraform", "init", *backend_args, cwd=terraform_root, env=terraform_environment)
+        result = context.execution.run(
             "terraform",
             "plan",
             "-detailed-exitcode",
@@ -287,12 +300,10 @@ class TerraformPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability, 
             f"-out={plan}",
             cwd=terraform_root,
             env=terraform_environment,
-            capture=True,
+            output=CommandOutput.TEE,
             check=False,
         )
         output = "".join(part for part in (result.stdout, result.stderr) if part)
-        if output:
-            print(output, end="" if output.endswith("\n") else "\n", file=sys.stderr)
         if report_text is not None:
             report_text.write_text(output)
 

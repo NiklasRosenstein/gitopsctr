@@ -31,8 +31,9 @@ from gitopsctr.driver import (
     UnitExecutionContext,
     UnitPlugin,
 )
+from gitopsctr.execution import CommandOutput, DriverExecution
 
-from ._common import run, select_result_fields
+from ._common import select_result_fields
 from ._oci import (
     FRONTEND_ARCHIVE,
     OCI_DIGEST_RE,
@@ -142,8 +143,8 @@ class ViteRuntime:
     build_environment: dict[str, str]
 
 
-def require_node_24() -> None:
-    version = run("node", "--version", capture=True).stdout.strip()
+def require_node_24(execution: DriverExecution) -> None:
+    version = execution.run("node", "--version", output=CommandOutput.CAPTURE).stdout.strip()
     if re.fullmatch(r"v24\.[0-9]+\.[0-9]+", version) is None:
         raise DriverError(f"vite-oci-bundle requires Node 24, got {version!r}")
 
@@ -221,27 +222,27 @@ class ViteOciBundlePlugin(UnitPlugin, PlanningCapability, ReconciliationCapabili
         )
 
     @staticmethod
-    def _build_archive(runtime: ViteRuntime, archive: Path) -> None:
-        require_node_24()
-        run("npm", "ci", cwd=runtime.frontend_root, env=runtime.build_environment)
-        run("npm", "run", "build", cwd=runtime.frontend_root, env=runtime.build_environment)
+    def _build_archive(context: UnitExecutionContext, runtime: ViteRuntime, archive: Path) -> None:
+        require_node_24(context.execution)
+        context.execution.run("npm", "ci", cwd=runtime.frontend_root, env=runtime.build_environment)
+        context.execution.run("npm", "run", "build", cwd=runtime.frontend_root, env=runtime.build_environment)
         deterministic_archive(runtime.frontend_root / "dist", archive)
 
     def plan(self, context: PlanningContext) -> None:
         runtime = self._runtime(context)
         with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-") as directory:
-            self._build_archive(runtime, Path(directory) / FRONTEND_ARCHIVE)
+            self._build_archive(context, runtime, Path(directory) / FRONTEND_ARCHIVE)
 
     def reconcile(self, context: ReconciliationContext) -> ViteBundleResult:
         runtime = self._runtime(context)
 
-        with oras_authentication(runtime.credential_provider, {runtime.registry}) as registry_config:
-            digest = oras_digest(runtime.repository, runtime.tag, registry_config)
+        with oras_authentication(context.execution, runtime.credential_provider, {runtime.registry}) as registry_config:
+            digest = oras_digest(context.execution, runtime.repository, runtime.tag, registry_config)
             if digest is None:
                 with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-") as directory:
                     archive = Path(directory) / FRONTEND_ARCHIVE
-                    self._build_archive(runtime, archive)
-                    run(
+                    self._build_archive(context, runtime, archive)
+                    context.execution.run(
                         "oras",
                         "push",
                         *oras_registry_args(registry_config),
@@ -255,7 +256,7 @@ class ViteOciBundlePlugin(UnitPlugin, PlanningCapability, ReconciliationCapabili
                         f"{FRONTEND_ARCHIVE}:{FRONTEND_LAYER_TYPE}",
                         cwd=Path(directory),
                     )
-                    digest = oras_digest(runtime.repository, runtime.tag, registry_config)
+                    digest = oras_digest(context.execution, runtime.repository, runtime.tag, registry_config)
             if digest is None:
                 raise DriverError(f"OCI registry did not return a digest for {runtime.repository}:{runtime.tag}")
 

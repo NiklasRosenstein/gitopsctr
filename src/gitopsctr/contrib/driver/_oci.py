@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
-import sys
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -15,8 +13,9 @@ from typing import TypedDict, cast
 
 from gitopsctr.document import JsonObject
 from gitopsctr.driver import DriverError, UnitExecutionContext
+from gitopsctr.execution import CommandOutput, DriverExecution
 
-from ._common import require_strings, run
+from ._common import require_strings
 
 OCI_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 FRONTEND_ARCHIVE = "frontend-bundle.tar.gz"
@@ -56,7 +55,7 @@ def artifact_unit_identity(context: UnitExecutionContext, input_hash: str, contr
 
 
 CredentialProviderValidator = Callable[[str, JsonObject], None]
-CredentialProviderLoader = Callable[[str, JsonObject], RegistryCredentials]
+CredentialProviderLoader = Callable[[DriverExecution, str, JsonObject], RegistryCredentials]
 
 
 @dataclass(frozen=True)
@@ -69,10 +68,6 @@ class CredentialProvider:
 class ResolvedCredentialProvider:
     provider: CredentialProvider
     configuration: JsonObject
-
-
-def driver_status(status: str, message: str) -> None:
-    print(f"    {status:<7} {message}", file=sys.stderr, flush=True)
 
 
 def repository_registry(repository: str) -> str:
@@ -95,7 +90,7 @@ def validate_aws_ecr_provider(registry: str, configuration: JsonObject) -> None:
         raise DriverError(f"aws-ecr requires a private ECR registry, got {registry!r}")
 
 
-def aws_ecr_credentials(registry: str, configuration: JsonObject) -> RegistryCredentials:
+def aws_ecr_credentials(execution: DriverExecution, registry: str, configuration: JsonObject) -> RegistryCredentials:
     validate_aws_ecr_provider(registry, configuration)
     match = PRIVATE_ECR_REGISTRY_RE.fullmatch(registry)
     assert match is not None
@@ -108,8 +103,16 @@ def aws_ecr_credentials(registry: str, configuration: JsonObject) -> RegistryCre
         credential_source = "AWS environment credentials"
     else:
         credential_source = "AWS default credential chain"
-    driver_status("AUTH", f"{registry}: aws-ecr via {credential_source} (region {region})")
-    password = run("aws", "ecr", "get-login-password", "--region", region, capture=True).stdout
+    execution.write(f"AUTH {registry}: aws-ecr via {credential_source} (region {region})")
+    password = execution.run(
+        "aws",
+        "ecr",
+        "get-login-password",
+        "--region",
+        region,
+        output=CommandOutput.CAPTURE,
+        sensitive=True,
+    ).stdout
     if not password:
         raise DriverError(f"aws-ecr returned an empty password for {registry}")
     return RegistryCredentials(username="AWS", password=password)
@@ -144,12 +147,13 @@ def docker_cli_plugins() -> Path | None:
 
 @contextmanager
 def registry_authentication(
+    execution: DriverExecution,
     provider: ResolvedCredentialProvider | None,
     registries: set[str],
 ) -> Iterator[dict[str, str] | None]:
     if provider is None:
         for registry in sorted(registries):
-            driver_status("AUTH", f"{registry}: existing Docker credentials or anonymous access")
+            execution.write(f"AUTH {registry}: existing Docker credentials or anonymous access")
         yield None
         return
     with tempfile.TemporaryDirectory(prefix="gitopsctr-docker-") as docker_config:
@@ -157,12 +161,12 @@ def registry_authentication(
             (Path(docker_config) / "cli-plugins").symlink_to(plugins, target_is_directory=True)
         docker_environment = os.environ | {"DOCKER_CONFIG": docker_config}
         for registry in sorted(registries):
-            credentials = provider.provider.load(registry, provider.configuration)
-            driver_status(
-                "LOGIN",
-                f"{registry}: Docker login as {credentials.username} via password stdin (isolated temporary config)",
+            credentials = provider.provider.load(execution, registry, provider.configuration)
+            execution.write(
+                f"LOGIN {registry}: Docker login as {credentials.username} via password stdin "
+                "(isolated temporary config)"
             )
-            run(
+            execution.run(
                 "docker",
                 "login",
                 "--username",
@@ -171,29 +175,30 @@ def registry_authentication(
                 registry,
                 env=docker_environment,
                 input_text=credentials.password,
+                sensitive=True,
             )
         yield docker_environment
 
 
 @contextmanager
 def oras_authentication(
+    execution: DriverExecution,
     provider: ResolvedCredentialProvider | None,
     registries: set[str],
 ) -> Iterator[Path | None]:
     if provider is None:
         for registry in sorted(registries):
-            driver_status("AUTH", f"{registry}: existing ORAS credentials or anonymous access")
+            execution.write(f"AUTH {registry}: existing ORAS credentials or anonymous access")
         yield None
         return
     with tempfile.TemporaryDirectory(prefix="gitopsctr-oras-") as directory:
         registry_config = Path(directory) / "config.json"
         for registry in sorted(registries):
-            credentials = provider.provider.load(registry, provider.configuration)
-            driver_status(
-                "LOGIN",
-                f"{registry}: ORAS login as {credentials.username} via password stdin (isolated temporary config)",
+            credentials = provider.provider.load(execution, registry, provider.configuration)
+            execution.write(
+                f"LOGIN {registry}: ORAS login as {credentials.username} via password stdin (isolated temporary config)"
             )
-            run(
+            execution.run(
                 "oras",
                 "login",
                 "--registry-config",
@@ -203,6 +208,7 @@ def oras_authentication(
                 "--password-stdin",
                 registry,
                 input_text=credentials.password,
+                sensitive=True,
             )
         yield registry_config
 
@@ -211,13 +217,20 @@ def oras_registry_args(registry_config: Path | None) -> list[str]:
     return ["--registry-config", str(registry_config)] if registry_config else []
 
 
-def oras_digest(repository: str, tag: str, registry_config: Path | None = None) -> str | None:
+def oras_digest(
+    execution: DriverExecution,
+    repository: str,
+    tag: str,
+    registry_config: Path | None = None,
+) -> str | None:
     reference = f"{repository}:{tag}"
-    result = subprocess.run(
-        ["oras", "resolve", *oras_registry_args(registry_config), reference],
+    result = execution.run(
+        "oras",
+        "resolve",
+        *oras_registry_args(registry_config),
+        reference,
         check=False,
-        capture_output=True,
-        text=True,
+        output=CommandOutput.CAPTURE,
     )
     digest = result.stdout.strip()
     if result.returncode == 0:

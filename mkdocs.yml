@@ -10,6 +10,7 @@ theme:
 nav:
   - Overview: index.md
   - JSON Schemas: schemas.md
+  - Driver execution: driver-execution.md
   - Kubernetes manifests: kubernetes-manifests.md
 markdown_extensions:
   - admonition

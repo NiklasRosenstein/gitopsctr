@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict, cast
 
@@ -25,8 +24,9 @@ from gitopsctr.driver import (
     ReconciliationResult,
     UnitPlugin,
 )
+from gitopsctr.execution import CommandOutput, DriverExecution
 
-from ._common import require_strings, run, select_result_fields
+from ._common import require_strings, select_result_fields
 from ._oci import (
     OCI_DIGEST_RE,
     ArtifactUnitIdentity,
@@ -131,21 +131,23 @@ class OciRuntime:
     local_image: str
 
 
-def oci_digest(repository: str, tag: str, docker_environment: dict[str, str] | None = None) -> str | None:
+def oci_digest(
+    execution: DriverExecution,
+    repository: str,
+    tag: str,
+    docker_environment: dict[str, str] | None = None,
+) -> str | None:
     reference = f"{repository}:{tag}"
-    result = subprocess.run(
-        [
-            "docker",
-            "buildx",
-            "imagetools",
-            "inspect",
-            "--format",
-            "{{.Manifest.Digest}}",
-            reference,
-        ],
+    result = execution.run(
+        "docker",
+        "buildx",
+        "imagetools",
+        "inspect",
+        "--format",
+        "{{.Manifest.Digest}}",
+        reference,
         check=False,
-        capture_output=True,
-        text=True,
+        output=CommandOutput.CAPTURE,
         env=docker_environment,
     )
     digest = result.stdout.strip()
@@ -221,7 +223,7 @@ class OciImagesPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability):
 
     @staticmethod
     def _build_image(context: PlanningContext | ReconciliationContext, runtime: OciRuntime) -> None:
-        run(
+        context.execution.run(
             "docker",
             "build",
             "--platform",
@@ -246,14 +248,19 @@ class OciImagesPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability):
         def build_image() -> None:
             self._build_image(context, runtime)
 
-        with registry_authentication(runtime.credential_provider, runtime.registries) as docker_environment:
+        with registry_authentication(
+            context.execution,
+            runtime.credential_provider,
+            runtime.registries,
+        ) as docker_environment:
             existing = {
-                name: oci_digest(repository, tag, docker_environment) for name, repository in repositories.items()
+                name: oci_digest(context.execution, repository, tag, docker_environment)
+                for name, repository in repositories.items()
             }
             if not any(existing.values()):
                 legacy_tag = f"git-{context.source_revision}"
                 existing = {
-                    name: oci_digest(repository, legacy_tag, docker_environment)
+                    name: oci_digest(context.execution, repository, legacy_tag, docker_environment)
                     for name, repository in repositories.items()
                 }
             published_digests = {digest for digest in existing.values() if digest is not None}
@@ -264,8 +271,8 @@ class OciImagesPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability):
                 if available:
                     name, digest = available[0]
                     source_image = f"{repositories[name]}@{digest}"
-                    run("docker", "pull", source_image, env=docker_environment)
-                    run("docker", "tag", source_image, local_image)
+                    context.execution.run("docker", "pull", source_image, env=docker_environment)
+                    context.execution.run("docker", "tag", source_image, local_image)
                 else:
                     build_image()
 
@@ -274,9 +281,9 @@ class OciImagesPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability):
                 digest = existing[name]
                 if digest is None:
                     target = f"{repository}:{tag}"
-                    run("docker", "tag", local_image, target)
-                    run("docker", "push", target, env=docker_environment)
-                    digest = oci_digest(repository, tag, docker_environment)
+                    context.execution.run("docker", "tag", local_image, target)
+                    context.execution.run("docker", "push", target, env=docker_environment)
+                    digest = oci_digest(context.execution, repository, tag, docker_environment)
                 if digest is None:
                     raise DriverError(f"OCI registry did not return a digest for {repository}:{tag}")
                 artifacts[name] = {"type": "oci-image", "uri": f"{repository}@{digest}"}

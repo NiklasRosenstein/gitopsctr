@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from gitopsctr.document import DocumentContract, JsonObject
+from gitopsctr.execution import DriverExecution, default_driver_execution
 
 type ReconciliationResult = Mapping[str, object]
 
@@ -37,6 +38,7 @@ class MaterializationContext:
     source_path: str
     unit: JsonObject
     output_root: Path
+    execution: DriverExecution = field(default_factory=default_driver_execution)
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class UnitExecutionContext:
     unit: JsonObject
     inputs: JsonObject
     report: Path | None = None
+    execution: DriverExecution = field(default_factory=default_driver_execution)
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,7 @@ class VerificationContext:
     unit: JsonObject
     inputs: JsonObject
     report: Path | None = None
+    execution: DriverExecution = field(default_factory=default_driver_execution)
 
 
 class MaterializationCapability(ABC):

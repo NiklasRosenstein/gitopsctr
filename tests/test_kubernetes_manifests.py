@@ -1,6 +1,8 @@
 import json
 import shutil
 import subprocess
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,9 +16,41 @@ from gitopsctr.driver import (
     VerificationContext,
     VerificationStatus,
 )
+from gitopsctr.execution import CommandOutput, DriverExecution, TextDriverOutput
 
 DIGEST = "sha256:" + "1" * 64
 REVISION = "a" * 40
+
+
+class FakeCommandExecutor:
+    def __init__(self, runner):
+        self.runner = runner
+
+    def run(
+        self,
+        args,
+        *,
+        cwd=None,
+        env=None,
+        input_text=None,
+        output=CommandOutput.STREAM,
+        check=True,
+        sensitive=False,
+    ):
+        return self.runner(
+            *args,
+            cwd=cwd,
+            env=env,
+            input_text=input_text,
+            output=output,
+            check=check,
+            sensitive=sensitive,
+        )
+
+
+def execution_for(runner) -> DriverExecution:
+    transcript = TextDriverOutput(sys.stderr)
+    return DriverExecution(output=transcript, commands=FakeCommandExecutor(runner))
 
 
 def manifest(kind: str = "ConfigMap", name: str = "web", namespace: str = "web") -> str:
@@ -57,10 +91,10 @@ def unit(
     }
 
 
-def materialization_context(tmp_path: Path, desired_unit: dict) -> MaterializationContext:
+def materialization_context(tmp_path: Path, desired_unit: dict, runner=None) -> MaterializationContext:
     output = tmp_path / "output"
     output.mkdir()
-    return MaterializationContext(
+    context = MaterializationContext(
         environment="dev",
         source_root=tmp_path / "source",
         source_revision=REVISION,
@@ -68,17 +102,19 @@ def materialization_context(tmp_path: Path, desired_unit: dict) -> Materializati
         unit=desired_unit,
         output_root=output,
     )
+    return replace(context, execution=execution_for(runner)) if runner is not None else context
 
 
 def reconciliation_context(
     tmp_path: Path,
     desired_unit: dict,
     previous_receipt: dict | None = None,
+    runner=None,
 ) -> ReconciliationContext:
     payload = tmp_path / "desired/manifests/web"
     payload.mkdir(parents=True, exist_ok=True)
     (payload / "manifest.yaml").write_text(manifest())
-    return ReconciliationContext(
+    context = ReconciliationContext(
         environment="dev",
         desired_root=tmp_path / "desired",
         desired_revision=REVISION,
@@ -89,10 +125,11 @@ def reconciliation_context(
         inputs={},
         previous_receipt=previous_receipt,
     )
+    return replace(context, execution=execution_for(runner)) if runner is not None else context
 
 
-def planning_context(tmp_path: Path, desired_unit: dict) -> PlanningContext:
-    reconcile = reconciliation_context(tmp_path, desired_unit)
+def planning_context(tmp_path: Path, desired_unit: dict, runner=None) -> PlanningContext:
+    reconcile = reconciliation_context(tmp_path, desired_unit, runner=runner)
     return PlanningContext(
         environment=reconcile.environment,
         desired_root=reconcile.desired_root,
@@ -102,11 +139,12 @@ def planning_context(tmp_path: Path, desired_unit: dict) -> PlanningContext:
         source_path=reconcile.source_path,
         unit=reconcile.unit,
         inputs=reconcile.inputs,
+        execution=reconcile.execution,
     )
 
 
-def verification_context(tmp_path: Path, desired_unit: dict) -> VerificationContext:
-    reconcile = reconciliation_context(tmp_path, desired_unit)
+def verification_context(tmp_path: Path, desired_unit: dict, runner=None) -> VerificationContext:
+    reconcile = reconciliation_context(tmp_path, desired_unit, runner=runner)
     return VerificationContext(
         environment=reconcile.environment,
         desired_root=reconcile.desired_root,
@@ -116,6 +154,7 @@ def verification_context(tmp_path: Path, desired_unit: dict) -> VerificationCont
         source_path=reconcile.source_path,
         unit=reconcile.unit,
         inputs={},
+        execution=reconcile.execution,
     )
 
 
@@ -156,7 +195,6 @@ def test_helm_materialization_records_installed_version_and_resolved_values(tmp_
         assert values_path.read_text() == "image:\n  tag: observed\n"
         return completed(args, stdout=manifest())
 
-    monkeypatch.setattr(kubernetes, "run", run)
     desired_unit = unit(
         renderer={
             "type": "helm",
@@ -167,7 +205,7 @@ def test_helm_materialization_records_installed_version_and_resolved_values(tmp_
         }
     )
 
-    result = kubernetes.PLUGIN.materialize(materialization_context(tmp_path, desired_unit))
+    result = kubernetes.PLUGIN.materialize(materialization_context(tmp_path, desired_unit, run))
 
     assert (tmp_path / "output/manifest.yaml").read_text() == manifest()
     assert result.metadata["renderer"] == "helm"
@@ -221,13 +259,12 @@ def test_direct_delivery_applies_waits_then_prunes_previous_inventory(tmp_path, 
         }
     )
     calls = []
-    monkeypatch.setattr(
-        kubernetes,
-        "run",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or completed(args),
-    )
 
-    result = kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit, previous))
+    def runner(*args, **kwargs):
+        calls.append((args, kwargs))
+        return completed(args)
+
+    result = kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit, previous, runner))
 
     assert result["applied"]["manifestDigest"] == DIGEST
     assert [call[0][3] for call in calls] == ["apply", "--namespace", "delete"]
@@ -253,9 +290,11 @@ def test_direct_delivery_applies_waits_then_prunes_previous_inventory(tmp_path, 
 
 def test_direct_plan_has_no_kubectl_effects(tmp_path, monkeypatch):
     desired_unit = unit(delivery={"mode": "direct", "kubeContext": "dev"})
-    monkeypatch.setattr(kubernetes, "run", lambda *_args, **_kwargs: pytest.fail("kubectl must not run"))
 
-    result = kubernetes.PLUGIN.plan(planning_context(tmp_path, desired_unit))
+    def runner(*_args, **_kwargs):
+        pytest.fail("kubectl must not run")
+
+    result = kubernetes.PLUGIN.plan(planning_context(tmp_path, desired_unit, runner))
 
     assert result is None
 
@@ -267,15 +306,15 @@ def test_direct_plan_has_no_kubectl_effects(tmp_path, monkeypatch):
 def test_direct_verification_uses_kubectl_diff(exit_code, status, tmp_path, monkeypatch):
     desired_unit = unit(delivery={"mode": "direct", "kubeContext": "dev"})
     calls = []
-    monkeypatch.setattr(
-        kubernetes,
-        "run",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or completed(args, returncode=exit_code),
-    )
 
-    assert kubernetes.PLUGIN.verify(verification_context(tmp_path, desired_unit)).status is status
+    def runner(*args, **kwargs):
+        calls.append((args, kwargs))
+        return completed(args, returncode=exit_code)
+
+    assert kubernetes.PLUGIN.verify(verification_context(tmp_path, desired_unit, runner)).status is status
     assert calls[0][0][3:6] == ("diff", "--server-side", "--field-manager=gitopsctr-dev-web")
-    assert calls[0][1] == {"capture": True, "check": False}
+    assert calls[0][1]["output"] is CommandOutput.CAPTURE
+    assert calls[0][1]["check"] is False
 
 
 def argo_unit(access: str = "api") -> dict:
@@ -305,13 +344,12 @@ def application(revision=REVISION, sync="Synced", health="Healthy", *, multi_sou
 def test_argo_observation_supports_both_read_only_transports(access, tmp_path, monkeypatch):
     desired_unit = argo_unit(access)
     calls = []
-    monkeypatch.setattr(
-        kubernetes,
-        "run",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or completed(args, stdout=json.dumps(application())),
-    )
 
-    result = kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit))
+    def runner(*args, **kwargs):
+        calls.append((args, kwargs))
+        return completed(args, stdout=json.dumps(application()))
+
+    result = kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
 
     assert result == {
         "observed": {
@@ -328,40 +366,38 @@ def test_argo_observation_supports_both_read_only_transports(access, tmp_path, m
 
 def test_argo_wrong_revision_times_out_without_a_receipt(tmp_path, monkeypatch):
     desired_unit = argo_unit()
-    monkeypatch.setattr(
-        kubernetes,
-        "run",
-        lambda *args, **_kwargs: completed(args, stdout=json.dumps(application("b" * 40))),
-    )
+
+    def runner(*args, **_kwargs):
+        return completed(args, stdout=json.dumps(application("b" * 40)))
+
     monotonic = iter([0, 31])
     monkeypatch.setattr(kubernetes.time, "monotonic", lambda: next(monotonic))
     monkeypatch.setattr(kubernetes.time, "sleep", lambda _seconds: None)
 
     with pytest.raises(DriverError, match="timed out"):
-        kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit))
+        kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
 
 
 def test_argo_degraded_and_multi_source_applications_fail(tmp_path, monkeypatch):
     desired_unit = argo_unit()
     responses = iter([application(health="Degraded"), application(multi_source=True)])
-    monkeypatch.setattr(
-        kubernetes,
-        "run",
-        lambda *args, **_kwargs: completed(args, stdout=json.dumps(next(responses))),
-    )
+
+    def runner(*args, **_kwargs):
+        return completed(args, stdout=json.dumps(next(responses)))
 
     with pytest.raises(DriverError, match="health is Degraded"):
-        kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit))
+        kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
     with pytest.raises(DriverError, match="single-source"):
-        kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit))
+        kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
 
 
 def test_argo_verification_reports_status_mismatch_as_drift(tmp_path, monkeypatch):
     desired_unit = argo_unit()
-    monkeypatch.setattr(
-        kubernetes,
-        "run",
-        lambda *args, **_kwargs: completed(args, stdout=json.dumps(application(sync="OutOfSync"))),
-    )
 
-    assert kubernetes.PLUGIN.verify(verification_context(tmp_path, desired_unit)).status is VerificationStatus.DRIFT
+    def runner(*args, **_kwargs):
+        return completed(args, stdout=json.dumps(application(sync="OutOfSync")))
+
+    assert (
+        kubernetes.PLUGIN.verify(verification_context(tmp_path, desired_unit, runner)).status
+        is VerificationStatus.DRIFT
+    )

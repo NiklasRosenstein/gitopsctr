@@ -1,9 +1,11 @@
 """Deployment drivers own their optional report artifacts."""
 
 import subprocess
+import sys
 import tarfile
 import tomllib
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -28,10 +30,42 @@ from gitopsctr.driver import (
     VerificationResult,
     VerificationStatus,
 )
+from gitopsctr.execution import CommandOutput, DriverExecution, TextDriverOutput
 
 DIGEST = "sha256:" + "1" * 64
 OTHER_DIGEST = "sha256:" + "2" * 64
 REGISTRY = "482956200750.dkr.ecr.eu-west-1.amazonaws.com"
+
+
+class FakeCommandExecutor:
+    def __init__(self, runner):
+        self.runner = runner
+
+    def run(
+        self,
+        args,
+        *,
+        cwd=None,
+        env=None,
+        input_text=None,
+        output=CommandOutput.STREAM,
+        check=True,
+        sensitive=False,
+    ):
+        return self.runner(
+            *args,
+            cwd=cwd,
+            env=env,
+            input_text=input_text,
+            output=output,
+            check=check,
+            sensitive=sensitive,
+        )
+
+
+def execution_for(runner) -> DriverExecution:
+    transcript = TextDriverOutput(sys.stderr)
+    return DriverExecution(output=transcript, commands=FakeCommandExecutor(runner))
 
 
 def test_contributed_driver_entry_points_load_one_module_per_driver():
@@ -121,6 +155,7 @@ def _planning_context(context: ReconciliationContext) -> PlanningContext:
         unit=context.unit,
         inputs=context.inputs,
         report=context.report,
+        execution=context.execution,
     )
 
 
@@ -132,24 +167,20 @@ def test_oci_digest_distinguishes_missing_manifest_from_registry_failure(monkeyp
             subprocess.CompletedProcess((), 1, "", "unauthorized: authentication required"),
         )
     )
-    monkeypatch.setattr(oci_images.subprocess, "run", lambda *_args, **_kwargs: next(responses))
+    execution = execution_for(lambda *_args, **_kwargs: next(responses))
 
     repository = "registry.example.com/team/application"
-    assert oci_images.oci_digest(repository, "current") == DIGEST
-    assert oci_images.oci_digest(repository, "missing") is None
+    assert oci_images.oci_digest(execution, repository, "current") == DIGEST
+    assert oci_images.oci_digest(execution, repository, "missing") is None
     with pytest.raises(DriverError, match="unauthorized"):
-        oci_images.oci_digest(repository, "private")
+        oci_images.oci_digest(execution, repository, "private")
 
 
 def test_oci_digest_rejects_malformed_success(monkeypatch):
-    monkeypatch.setattr(
-        oci_images.subprocess,
-        "run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess((), 0, "latest\n", ""),
-    )
+    execution = execution_for(lambda *_args, **_kwargs: subprocess.CompletedProcess((), 0, "latest\n", ""))
 
     with pytest.raises(DriverError, match="invalid digest"):
-        oci_images.oci_digest("registry.example.com/team/application", "latest")
+        oci_images.oci_digest(execution, "registry.example.com/team/application", "latest")
 
 
 def test_oci_images_uses_optional_aws_ecr_provider_without_persisting_credentials(tmp_path, monkeypatch, capsys):
@@ -165,19 +196,21 @@ def test_oci_images_uses_optional_aws_ecr_provider_without_persisting_credential
 
     inspect_environments: list[dict[str, str] | None] = []
 
-    def fake_digest(_repository, _tag, docker_environment=None):
+    def fake_digest(_execution, _repository, _tag, docker_environment=None):
         inspect_environments.append(docker_environment)
         isolated_plugins = Path(docker_environment["DOCKER_CONFIG"]) / "cli-plugins"
         assert isolated_plugins.resolve() == plugins.resolve()
         return DIGEST
 
-    monkeypatch.setattr(oci_images, "run", fake_run)
     monkeypatch.setattr(oci_images, "oci_digest", fake_digest)
-    monkeypatch.setattr(_oci, "run", fake_run)
     monkeypatch.setattr(_oci, "docker_cli_plugins", lambda: plugins)
     monkeypatch.setenv("AWS_PROFILE", "example-profile")
 
-    result = oci_images.PLUGIN.reconcile(_oci_context(tmp_path, credential_provider={"type": "aws-ecr"}))
+    context = replace(
+        _oci_context(tmp_path, credential_provider={"type": "aws-ecr"}),
+        execution=execution_for(fake_run),
+    )
+    result = oci_images.PLUGIN.reconcile(context)
 
     aws_command = next(command for command, _ in commands if command[0] == "aws")
     assert aws_command == ("aws", "ecr", "get-login-password", "--region", "eu-west-1")
@@ -193,8 +226,8 @@ def test_oci_images_uses_optional_aws_ecr_provider_without_persisting_credential
     assert all(environment["DOCKER_CONFIG"] == docker_config for environment in inspect_environments)
     assert "short-lived-password" not in repr(result)
     status = capsys.readouterr().err
-    assert f"AUTH    {REGISTRY}: aws-ecr via AWS profile 'example-profile' (region eu-west-1)" in status
-    assert (f"LOGIN   {REGISTRY}: Docker login as AWS via password stdin (isolated temporary config)") in status
+    assert f"| AUTH {REGISTRY}: aws-ecr via AWS profile 'example-profile' (region eu-west-1)" in status
+    assert (f"| LOGIN {REGISTRY}: Docker login as AWS via password stdin (isolated temporary config)") in status
     assert "short-lived-password" not in status
 
 
@@ -204,20 +237,19 @@ def test_oci_images_without_provider_uses_existing_docker_auth(tmp_path, monkeyp
 
     environments: list[dict[str, str] | None] = []
 
-    def fake_digest(_repository, _tag, docker_environment=None):
+    def fake_digest(_execution, _repository, _tag, docker_environment=None):
         environments.append(docker_environment)
         return DIGEST
 
-    monkeypatch.setattr(oci_images, "run", unexpected_run)
     monkeypatch.setattr(oci_images, "oci_digest", fake_digest)
 
-    result = oci_images.PLUGIN.reconcile(_oci_context(tmp_path))
+    result = oci_images.PLUGIN.reconcile(replace(_oci_context(tmp_path), execution=execution_for(unexpected_run)))
 
     assert environments == [None, None]
     assert result["artifacts"]["containers.json"]["artifacts"]["control"]["uri"] == (
         f"{REGISTRY}/example-application-control@{DIGEST}"
     )
-    assert f"AUTH    {REGISTRY}: existing Docker credentials or anonymous access" in capsys.readouterr().err
+    assert f"| AUTH {REGISTRY}: existing Docker credentials or anonymous access" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -237,18 +269,19 @@ def test_oci_images_without_provider_uses_existing_docker_auth(tmp_path, monkeyp
 def test_oci_images_rejects_invalid_provider_and_repository_configuration(
     tmp_path, monkeypatch, provider, repositories, message
 ):
-    monkeypatch.setattr(
-        oci_images,
-        "run",
-        lambda *_args, **_kwargs: pytest.fail("invalid configuration must fail before commands run"),
+    no_commands = execution_for(
+        lambda *_args, **_kwargs: pytest.fail("invalid configuration must fail before commands run")
     )
 
     with pytest.raises(DriverError, match=message):
         oci_images.PLUGIN.reconcile(
-            _oci_context(
-                tmp_path,
-                credential_provider=provider,
-                repositories=repositories,
+            replace(
+                _oci_context(
+                    tmp_path,
+                    credential_provider=provider,
+                    repositories=repositories,
+                ),
+                execution=no_commands,
             )
         )
 
@@ -260,14 +293,18 @@ def test_oci_images_plan_builds_without_requesting_credentials(tmp_path, monkeyp
         commands.append(args)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr(oci_images, "run", fake_run)
     monkeypatch.setattr(
         oci_images,
         "oci_digest",
         lambda *_args, **_kwargs: pytest.fail("planning must not inspect registries"),
     )
 
-    context = _planning_context(_oci_context(tmp_path, credential_provider={"type": "aws-ecr"}))
+    context = _planning_context(
+        replace(
+            _oci_context(tmp_path, credential_provider={"type": "aws-ecr"}),
+            execution=execution_for(fake_run),
+        )
+    )
     assert oci_images.PLUGIN.plan(context) is None
     assert commands == [
         (
@@ -293,17 +330,16 @@ def test_oci_images_recovers_partial_publication_without_rebuilding(tmp_path, mo
         commands.append(args)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    def fake_digest(repository, tag, _docker_environment=None):
+    def fake_digest(_execution, repository, tag, _docker_environment=None):
         key = (repository, tag)
         calls[key] = calls.get(key, 0) + 1
         if repository.endswith("-control"):
             return DIGEST
         return DIGEST if calls[key] > 1 else None
 
-    monkeypatch.setattr(oci_images, "run", fake_run)
     monkeypatch.setattr(oci_images, "oci_digest", fake_digest)
 
-    result = oci_images.PLUGIN.reconcile(_oci_context(tmp_path))
+    result = oci_images.PLUGIN.reconcile(replace(_oci_context(tmp_path), execution=execution_for(fake_run)))
 
     assert not any(command[:2] == ("docker", "build") for command in commands)
     assert any(command[:2] == ("docker", "pull") for command in commands)
@@ -313,15 +349,16 @@ def test_oci_images_recovers_partial_publication_without_rebuilding(tmp_path, mo
 
 
 def test_oci_images_rejects_disagreeing_repository_digests(tmp_path, monkeypatch):
-    monkeypatch.setattr(oci_images, "run", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         oci_images,
         "oci_digest",
-        lambda repository, *_args, **_kwargs: DIGEST if repository.endswith("-control") else OTHER_DIGEST,
+        lambda _execution, repository, *_args, **_kwargs: DIGEST if repository.endswith("-control") else OTHER_DIGEST,
     )
 
     with pytest.raises(DriverError, match="disagree"):
-        oci_images.PLUGIN.reconcile(_oci_context(tmp_path))
+        oci_images.PLUGIN.reconcile(
+            replace(_oci_context(tmp_path), execution=execution_for(lambda *_args, **_kwargs: None))
+        )
 
 
 def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path, monkeypatch):
@@ -356,10 +393,9 @@ def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path,
         yield None
 
     monkeypatch.setattr(vite_oci_bundle, "oras_authentication", fake_authentication)
-    monkeypatch.setattr(
-        vite_oci_bundle,
-        "run",
-        lambda *_args, **_kwargs: pytest.fail("existing artifact must skip all commands"),
+    context = replace(
+        context,
+        execution=execution_for(lambda *_args, **_kwargs: pytest.fail("existing artifact must skip all commands")),
     )
 
     result = vite_oci_bundle.PLUGIN.reconcile(context)
@@ -415,7 +451,6 @@ def test_frontend_deploy_overwrites_index_and_verifies_cloudfront(tmp_path, monk
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(frontend_s3_cloudfront, "oras_authentication", fake_authentication)
-    monkeypatch.setattr(frontend_s3_cloudfront, "run", fake_run)
     context = ReconciliationContext(
         environment="dev",
         desired_root=tmp_path,
@@ -439,6 +474,7 @@ def test_frontend_deploy_overwrites_index_and_verifies_cloudfront(tmp_path, monk
                 },
             },
         },
+        execution=execution_for(fake_run),
     )
 
     if stale_index:
@@ -500,10 +536,13 @@ def test_terraform_accepts_driver_neutral_backend_configuration(tmp_path, monkey
         commands.append(args)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr(terraform, "run", fake_run)
     state = tmp_path / "state/demo.tfstate"
 
-    terraform.PLUGIN.plan(_planning_context(_terraform_context(tmp_path, tmp_path / "report", {"path": str(state)})))
+    reconciliation = replace(
+        _terraform_context(tmp_path, tmp_path / "report", {"path": str(state)}),
+        execution=execution_for(fake_run),
+    )
+    terraform.PLUGIN.plan(_planning_context(reconciliation))
 
     init = next(command for command in commands if command[1] == "init")
     assert init == ("terraform", "init", f"-backend-config=path={state}")
@@ -530,9 +569,8 @@ def test_terraform_plan_saves_binary_plan_and_rendered_report(tmp_path, monkeypa
             return subprocess.CompletedProcess(args, 0, "Plan: 1 to add, 0 to change, 0 to destroy.\n", "")
         return subprocess.CompletedProcess(args, 0, "initialized\n", "")
 
-    monkeypatch.setattr(terraform, "run", fake_run)
-
-    result = terraform.PLUGIN.plan(_planning_context(_terraform_context(tmp_path, report)))
+    reconciliation = replace(_terraform_context(tmp_path, report), execution=execution_for(fake_run))
+    result = terraform.PLUGIN.plan(_planning_context(reconciliation))
 
     assert result is None
     assert (report / "plan.tfplan").read_bytes() == b"saved plan"
@@ -557,10 +595,9 @@ def test_terraform_report_contains_plan_failure_diagnostics(tmp_path, monkeypatc
             )
         return subprocess.CompletedProcess(args, 0, "initialized\n", "")
 
-    monkeypatch.setattr(terraform, "run", fake_run)
-
     with pytest.raises(subprocess.CalledProcessError):
-        terraform.PLUGIN.plan(_planning_context(_terraform_context(tmp_path, report)))
+        reconciliation = replace(_terraform_context(tmp_path, report), execution=execution_for(fake_run))
+        terraform.PLUGIN.plan(_planning_context(reconciliation))
 
     assert (report / "plan.txt").read_text() == "Error: speculative plan failed\n"
     assert not (report / "plan.tfplan").exists()
@@ -587,9 +624,7 @@ def test_terraform_verification_uses_refresh_enabled_read_only_saved_plan(
             return subprocess.CompletedProcess(args, exit_code, "verification output\n", "")
         return subprocess.CompletedProcess(args, 0, "initialized\n", "")
 
-    monkeypatch.setattr(terraform, "run", fake_run)
-
-    reconciliation = _terraform_context(tmp_path, report)
+    reconciliation = replace(_terraform_context(tmp_path, report), execution=execution_for(fake_run))
     result = driver_registry.VERIFICATION_PLUGINS["terraform"].verify(
         driver_registry.VerificationContext(
             environment=reconciliation.environment,
@@ -601,6 +636,7 @@ def test_terraform_verification_uses_refresh_enabled_read_only_saved_plan(
             unit=reconciliation.unit,
             inputs=reconciliation.inputs,
             report=reconciliation.report,
+            execution=reconciliation.execution,
         )
     )
 
@@ -613,7 +649,7 @@ def test_terraform_verification_uses_refresh_enabled_read_only_saved_plan(
     assert "-no-color" in plan_command
     assert not any(value.startswith("-refresh=") for value in plan_command)
     assert "-lock=false" not in plan_command
-    assert plan_kwargs["capture"] is True
+    assert plan_kwargs["output"] is CommandOutput.TEE
     assert plan_kwargs["check"] is False
     assert not any(command[1] == "apply" for command, _ in commands)
 
@@ -626,10 +662,8 @@ def test_terraform_verification_turns_other_exit_codes_into_driver_errors(tmp_pa
             return subprocess.CompletedProcess(args, 1, "", "Error: state lock failed\n")
         return subprocess.CompletedProcess(args, 0, "initialized\n", "")
 
-    monkeypatch.setattr(terraform, "run", fake_run)
-
     with pytest.raises(DriverError, match="state lock failed"):
-        terraform.PLUGIN.verify(_terraform_context(tmp_path, report))
+        terraform.PLUGIN.verify(replace(_terraform_context(tmp_path, report), execution=execution_for(fake_run)))
 
     assert (report / "verify.txt").read_text() == "Error: state lock failed\n"
 

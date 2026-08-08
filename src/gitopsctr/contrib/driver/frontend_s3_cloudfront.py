@@ -31,8 +31,9 @@ from gitopsctr.driver import (
     UnitExecutionContext,
     UnitPlugin,
 )
+from gitopsctr.execution import CommandOutput
 
-from ._common import require_strings, run, select_result_fields
+from ._common import require_strings, select_result_fields
 from ._oci import (
     FRONTEND_ARCHIVE,
     OCI_DIGEST_RE,
@@ -248,10 +249,11 @@ class FrontendS3CloudfrontPlugin(UnitPlugin, PlanningCapability, ReconciliationC
             pulled.mkdir()
             distribution.mkdir()
             with oras_authentication(
+                context.execution,
                 runtime.credential_provider,
                 {repository_registry(runtime.repository)},
             ) as registry_config:
-                run(
+                context.execution.run(
                     "oras",
                     "pull",
                     *oras_registry_args(registry_config),
@@ -269,10 +271,10 @@ class FrontendS3CloudfrontPlugin(UnitPlugin, PlanningCapability, ReconciliationC
             if not index_path.is_file():
                 raise DriverError("frontend OCI artifact did not contain index.html")
             index_text = index_path.read_text()
-            run("aws", "s3", "sync", str(distribution), f"s3://{inputs['bucket']}", "--delete")
+            context.execution.run("aws", "s3", "sync", str(distribution), f"s3://{inputs['bucket']}", "--delete")
             # Deterministic bundles give index.html a fixed timestamp, while hashed assets can
             # change without changing its byte length. Always replace the entry point.
-            run(
+            context.execution.run(
                 "aws",
                 "s3",
                 "cp",
@@ -283,7 +285,7 @@ class FrontendS3CloudfrontPlugin(UnitPlugin, PlanningCapability, ReconciliationC
                 "--content-type",
                 "text/html",
             )
-            run(
+            context.execution.run(
                 "aws",
                 "s3",
                 "cp",
@@ -294,7 +296,7 @@ class FrontendS3CloudfrontPlugin(UnitPlugin, PlanningCapability, ReconciliationC
                 "--content-type",
                 "application/json",
             )
-        invalidation = run(
+        invalidation = context.execution.run(
             "aws",
             "cloudfront",
             "create-invalidation",
@@ -306,11 +308,11 @@ class FrontendS3CloudfrontPlugin(UnitPlugin, PlanningCapability, ReconciliationC
             "Invalidation.Id",
             "--output",
             "text",
-            capture=True,
+            output=CommandOutput.CAPTURE,
         ).stdout.strip()
         if not invalidation:
             raise DriverError("CloudFront did not return an invalidation ID")
-        run(
+        context.execution.run(
             "aws",
             "cloudfront",
             "wait",
@@ -331,14 +333,14 @@ class FrontendS3CloudfrontPlugin(UnitPlugin, PlanningCapability, ReconciliationC
             "--retry-delay",
             "5",
         )
-        served_index = run(
+        served_index = context.execution.run(
             *curl_args,
             inputs["url"],
-            capture=True,
+            output=CommandOutput.CAPTURE,
         ).stdout
         if served_index != index_text:
             raise DriverError("CloudFront did not serve the frontend index from this deployment")
-        run(
+        context.execution.run(
             *curl_args,
             f"{inputs['url']}/runtime-config.json",
         )

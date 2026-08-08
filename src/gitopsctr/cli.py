@@ -41,6 +41,7 @@ from gitopsctr.driver import (
     VerificationStatus,
     semantic_reconciliation_result,
 )
+from gitopsctr.execution import DriverExecution
 from gitopsctr.forges import (
     ChangeRequestResult,
     ChangeRequestSpec,
@@ -1162,6 +1163,7 @@ def materialize_resolved_unit(
                 source_path=source_path,
                 unit=resolved,
                 output_root=output_root,
+                execution=DriverExecution.console(),
             )
         )
         if not isinstance(result, MaterializationResult):
@@ -2241,6 +2243,7 @@ def command_verify(args: argparse.Namespace) -> None:
                     source_path=source["path"],
                     unit=unit,
                     inputs=unit.get("inputs", {}),
+                    execution=DriverExecution.console(),
                 )
             )
             if result.status is VerificationStatus.CLEAN:
@@ -2664,7 +2667,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         log_status("RUN", f"execute {driver_name} {'planning' if args.plan else 'reconciliation'}")
         source_root = temporary / "source"
         materialize_revision(source["revision"], source_root)
-        execution = {
+        execution: dict[str, Any] = {
             "environment": args.environment,
             "desired_root": desired,
             "desired_revision": desired_revision,
@@ -2674,6 +2677,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             "unit": unit,
             "inputs": unit.get("inputs", {}),
             "report": report,
+            "execution": DriverExecution.console(),
         }
         if args.plan:
             try:
