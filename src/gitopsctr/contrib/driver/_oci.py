@@ -11,11 +11,11 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, cast
 
-from gitopsctr.driver import DriverError, JsonObject
+from gitopsctr.driver import DriverContext, DriverError, JsonObject
 
-from ._common import run
+from ._common import require_strings, run
 
 OCI_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 FRONTEND_ARCHIVE = "frontend-bundle.tar.gz"
@@ -33,6 +33,25 @@ PRIVATE_ECR_REGISTRY_RE = re.compile(
 class RegistryCredentials:
     username: str
     password: str
+
+
+class ArtifactUnitIdentity(TypedDict):
+    name: str
+    driver: str
+    inputHashVersion: int
+    inputHash: str
+    sourceRevision: str
+
+
+def artifact_unit_identity(context: DriverContext, input_hash: str, contract: str) -> ArtifactUnitIdentity:
+    require_strings(context.unit, ("name", "driver"), contract)
+    return {
+        "name": cast(str, context.unit["name"]),
+        "driver": cast(str, context.unit["driver"]),
+        "inputHashVersion": 1,
+        "inputHash": input_hash,
+        "sourceRevision": context.source_revision,
+    }
 
 
 CredentialProviderValidator = Callable[[str, JsonObject], None]

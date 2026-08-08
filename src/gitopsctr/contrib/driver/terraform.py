@@ -73,18 +73,31 @@ class TerraformDriver(Driver, VerificationCapability):
     version = 2
     _select_semantic_result = staticmethod(select_result_fields("applied", "outputs"))
 
+    @staticmethod
+    def _prepare_plan_artifacts(
+        context: DriverContext,
+        plan_name: str,
+        report_name: str,
+        local_plan_name: str,
+    ) -> tuple[Path, Path | None]:
+        if context.report is None:
+            return context.source_root / local_plan_name, None
+        context.report.mkdir(parents=True, exist_ok=True)
+        plan = context.report / plan_name
+        report = context.report / report_name
+        for previous in (plan, report):
+            if previous.exists():
+                previous.unlink()
+        return plan, report
+
     def reconcile(self, context: DriverContext) -> TerraformPlanResult | TerraformResult:
         terraform_root, terraform_environment, backend_key, output_names, checks = terraform_runtime(context)
-        report_text: Path | None = None
-        if context.report is not None:
-            context.report.mkdir(parents=True, exist_ok=True)
-            plan = context.report / "plan.tfplan"
-            report_text = context.report / "plan.txt"
-            for previous in (plan, report_text):
-                if previous.exists():
-                    previous.unlink()
-        else:
-            plan = context.source_root / ".reconcile.tfplan"
+        plan, report_text = self._prepare_plan_artifacts(
+            context,
+            "plan.tfplan",
+            "plan.txt",
+            ".reconcile.tfplan",
+        )
 
         def terraform(
             *args: str,
@@ -153,16 +166,12 @@ class TerraformDriver(Driver, VerificationCapability):
 
     def verify(self, context: DriverContext) -> VerificationResult:
         terraform_root, terraform_environment, backend_key, _, _ = terraform_runtime(context)
-        report_text: Path | None = None
-        if context.report is not None:
-            context.report.mkdir(parents=True, exist_ok=True)
-            plan = context.report / "verify.tfplan"
-            report_text = context.report / "verify.txt"
-            for previous in (plan, report_text):
-                if previous.exists():
-                    previous.unlink()
-        else:
-            plan = context.source_root / ".verify.tfplan"
+        plan, report_text = self._prepare_plan_artifacts(
+            context,
+            "verify.tfplan",
+            "verify.txt",
+            ".verify.tfplan",
+        )
 
         run("terraform", "init", f"-backend-config=key={backend_key}", cwd=terraform_root, env=terraform_environment)
         result = run(

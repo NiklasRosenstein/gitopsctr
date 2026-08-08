@@ -9,14 +9,16 @@ import re
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import TypedDict
 
 from gitopsctr.driver import Driver, DriverContext, DriverError, DriverResult
 
-from ._common import require_strings, run, select_result_fields
+from ._common import run, select_result_fields
 from ._oci import (
     FRONTEND_ARCHIVE,
     OCI_DIGEST_RE,
+    ArtifactUnitIdentity,
+    artifact_unit_identity,
     oras_authentication,
     oras_digest,
     oras_registry_args,
@@ -38,14 +40,6 @@ class ViteBundlePlanResult(TypedDict):
     built: BuiltBundle
 
 
-class UnitIdentity(TypedDict):
-    name: str
-    driver: str
-    inputHashVersion: int
-    inputHash: str
-    sourceRevision: str
-
-
 class BundleArtifact(TypedDict):
     type: str
     artifactType: str
@@ -54,7 +48,7 @@ class BundleArtifact(TypedDict):
 
 class FrontendDocument(TypedDict):
     schema: int
-    unit: UnitIdentity
+    unit: ArtifactUnitIdentity
     artifacts: dict[str, BundleArtifact]
 
 
@@ -119,9 +113,7 @@ class ViteOciBundleDriver(Driver):
         input_hash = source.get("inputHash") if isinstance(source, dict) else None
         if not isinstance(input_hash, str) or not OCI_DIGEST_RE.fullmatch(input_hash):
             raise DriverError("vite-oci-bundle requires a resolved source inputHash")
-        require_strings(specification, ("name", "driver"), "vite-oci-bundle unit")
-        unit_name = cast(str, specification["name"])
-        driver_name = cast(str, specification["driver"])
+        unit_identity = artifact_unit_identity(context, input_hash, "vite-oci-bundle unit")
         tag = f"input-{input_hash.removeprefix('sha256:')}"
         frontend_root = context.source_root / context.source_path
         build_environment = {name: value for name, value in os.environ.items() if not name.startswith("VITE_")}
@@ -172,13 +164,7 @@ class ViteOciBundleDriver(Driver):
             "artifacts": {
                 "frontend.json": {
                     "schema": 1,
-                    "unit": {
-                        "name": unit_name,
-                        "driver": driver_name,
-                        "inputHashVersion": 1,
-                        "inputHash": input_hash,
-                        "sourceRevision": context.source_revision,
-                    },
+                    "unit": unit_identity,
                     "artifacts": {
                         "bundle": {
                             "type": "oci-artifact",

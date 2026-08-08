@@ -237,8 +237,20 @@ def test_oci_images_dry_run_validates_but_does_not_request_credentials(tmp_path,
     )
 
     assert oci_images.PLUGIN.reconcile(_oci_context(tmp_path, credential_provider={"type": "aws-ecr"}, dry=True)) == {}
-    assert len(commands) == 1
-    assert commands[0][:2] == ("docker", "build")
+    assert commands == [
+        (
+            "docker",
+            "build",
+            "--platform",
+            "linux/amd64",
+            "--provenance=false",
+            "--file",
+            str(tmp_path / "Dockerfile"),
+            "--tag",
+            f"application-images:{'b' * 64}",
+            str(tmp_path),
+        )
+    ]
 
 
 def test_oci_images_recovers_partial_publication_without_rebuilding(tmp_path, monkeypatch):

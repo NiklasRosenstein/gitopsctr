@@ -10,6 +10,8 @@ from gitopsctr.driver import Driver, DriverContext, DriverError, DriverResult
 from ._common import require_strings, run, select_result_fields
 from ._oci import (
     OCI_DIGEST_RE,
+    ArtifactUnitIdentity,
+    artifact_unit_identity,
     registry_authentication,
     repository_registry,
     resolve_credential_provider,
@@ -21,17 +23,9 @@ class OciImageArtifact(TypedDict):
     uri: str
 
 
-class UnitIdentity(TypedDict):
-    name: str
-    driver: str
-    inputHashVersion: int
-    inputHash: str
-    sourceRevision: str
-
-
 class ContainersDocument(TypedDict):
     schema: int
-    unit: UnitIdentity
+    unit: ArtifactUnitIdentity
     artifacts: dict[str, OciImageArtifact]
 
 
@@ -104,12 +98,11 @@ class OciImagesDriver(Driver):
         input_hash = source.get("inputHash") if isinstance(source, dict) else None
         if not isinstance(input_hash, str) or not OCI_DIGEST_RE.fullmatch(input_hash):
             raise DriverError("oci-images requires a resolved source inputHash")
-        require_strings(specification, ("name", "driver"), "oci-images unit")
-        unit_name = cast(str, specification["name"])
-        driver_name = cast(str, specification["driver"])
+        unit_identity = artifact_unit_identity(context, input_hash, "oci-images unit")
         tag = f"input-{input_hash.removeprefix('sha256:')}"
-        local_image = f"{unit_name}:{input_hash.removeprefix('sha256:')}"
-        if context.dry:
+        local_image = f"{unit_identity['name']}:{input_hash.removeprefix('sha256:')}"
+
+        def build_image() -> None:
             run(
                 "docker",
                 "build",
@@ -122,6 +115,9 @@ class OciImagesDriver(Driver):
                 local_image,
                 str(context.source_root),
             )
+
+        if context.dry:
+            build_image()
             return {}
 
         with registry_authentication(credential_provider, registries) as docker_environment:
@@ -145,18 +141,7 @@ class OciImagesDriver(Driver):
                     run("docker", "pull", source_image, env=docker_environment)
                     run("docker", "tag", source_image, local_image)
                 else:
-                    run(
-                        "docker",
-                        "build",
-                        "--platform",
-                        platform,
-                        "--provenance=false",
-                        "--file",
-                        str(context.source_root / dockerfile),
-                        "--tag",
-                        local_image,
-                        str(context.source_root),
-                    )
+                    build_image()
 
             artifacts: dict[str, OciImageArtifact] = {}
             for name, repository in repositories.items():
@@ -177,13 +162,7 @@ class OciImagesDriver(Driver):
             "artifacts": {
                 "containers.json": {
                     "schema": 1,
-                    "unit": {
-                        "name": unit_name,
-                        "driver": driver_name,
-                        "inputHashVersion": 1,
-                        "inputHash": input_hash,
-                        "sourceRevision": context.source_revision,
-                    },
+                    "unit": unit_identity,
                     "artifacts": artifacts,
                 }
             }

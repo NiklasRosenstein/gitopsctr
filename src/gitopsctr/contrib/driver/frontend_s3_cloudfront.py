@@ -194,7 +194,7 @@ class FrontendS3CloudfrontDriver(Driver):
             "--id",
             invalidation,
         )
-        served_index = run(
+        curl_args = (
             "curl",
             "--fail",
             "--show-error",
@@ -204,21 +204,16 @@ class FrontendS3CloudfrontDriver(Driver):
             "--retry-all-errors",
             "--retry-delay",
             "5",
+        )
+        served_index = run(
+            *curl_args,
             inputs["url"],
             capture=True,
         ).stdout
         if served_index != index_text:
             raise DriverError("CloudFront did not serve the frontend index from this deployment")
         run(
-            "curl",
-            "--fail",
-            "--show-error",
-            "--silent",
-            "--retry",
-            "6",
-            "--retry-all-errors",
-            "--retry-delay",
-            "5",
+            *curl_args,
             f"{inputs['url']}/runtime-config.json",
         )
         return {
