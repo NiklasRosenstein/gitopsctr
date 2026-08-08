@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Any
+from typing import TypedDict, cast
 
 from gitopsctr.driver import DriverContext, DriverError, DriverPlugin
 
@@ -14,6 +14,29 @@ from ._oci import (
     repository_registry,
     resolve_credential_provider,
 )
+
+
+class OciImageArtifact(TypedDict):
+    type: str
+    uri: str
+
+
+class UnitIdentity(TypedDict):
+    name: str
+    driver: str
+    inputHashVersion: int
+    inputHash: str
+    sourceRevision: str
+
+
+class ContainersDocument(TypedDict):
+    schema: int
+    unit: UnitIdentity
+    artifacts: dict[str, OciImageArtifact]
+
+
+class OciImagesResult(TypedDict):
+    artifacts: dict[str, ContainersDocument]
 
 
 def oci_digest(repository: str, tag: str, docker_environment: dict[str, str] | None = None) -> str | None:
@@ -50,7 +73,7 @@ def oci_digest(repository: str, tag: str, docker_environment: dict[str, str] | N
     raise DriverError(error or f"could not inspect {reference}")
 
 
-def apply_oci_images(context: DriverContext) -> dict[str, Any]:
+def apply_oci_images(context: DriverContext) -> OciImagesResult | dict[str, object]:
     specification = context.unit
     build = specification.get("build")
     publication = specification.get("publish")
@@ -63,18 +86,25 @@ def apply_oci_images(context: DriverContext) -> dict[str, Any]:
     if not isinstance(repositories, dict) or not repositories:
         raise DriverError("oci-images requires named repositories")
     require_strings(repositories, tuple(repositories), "oci-images repositories")
+    repositories = cast(dict[str, str], repositories)
     registries = {repository_registry(repository) for repository in repositories.values()}
     credential_provider = resolve_credential_provider(publication.get("credentialProvider"), registries)
     if not all(isinstance(value, str) and value for value in (dockerfile, platform)):
         raise DriverError("oci-images requires dockerfile and platform")
+    dockerfile = cast(str, dockerfile)
+    platform = cast(str, platform)
     if outputs != ["containers.json"]:
         raise DriverError("oci-images currently produces the containers.json artifact")
 
-    input_hash = specification.get("source", {}).get("inputHash")
+    source = specification.get("source")
+    input_hash = source.get("inputHash") if isinstance(source, dict) else None
     if not isinstance(input_hash, str) or not OCI_DIGEST_RE.fullmatch(input_hash):
         raise DriverError("oci-images requires a resolved source inputHash")
+    require_strings(specification, ("name", "driver"), "oci-images unit")
+    unit_name = cast(str, specification["name"])
+    driver_name = cast(str, specification["driver"])
     tag = f"input-{input_hash.removeprefix('sha256:')}"
-    local_image = f"{specification['name']}:{input_hash.removeprefix('sha256:')}"
+    local_image = f"{unit_name}:{input_hash.removeprefix('sha256:')}"
     if context.dry:
         run(
             "docker",
@@ -122,7 +152,7 @@ def apply_oci_images(context: DriverContext) -> dict[str, Any]:
                     str(context.source_root),
                 )
 
-        artifacts: dict[str, dict[str, str]] = {}
+        artifacts: dict[str, OciImageArtifact] = {}
         for name, repository in repositories.items():
             digest = existing[name]
             if digest is None:
@@ -142,8 +172,8 @@ def apply_oci_images(context: DriverContext) -> dict[str, Any]:
             "containers.json": {
                 "schema": 1,
                 "unit": {
-                    "name": specification["name"],
-                    "driver": specification["driver"],
+                    "name": unit_name,
+                    "driver": driver_name,
                     "inputHashVersion": 1,
                     "inputHash": input_hash,
                     "sourceRevision": context.source_revision,

@@ -7,9 +7,9 @@ import json
 import tarfile
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TypedDict, cast
 
-from gitopsctr.driver import DriverContext, DriverError, DriverPlugin
+from gitopsctr.driver import DriverContext, DriverError, DriverPlugin, JsonObject
 
 from ._common import require_strings, run, select_result_fields
 from ._oci import (
@@ -20,6 +20,48 @@ from ._oci import (
     repository_registry,
     resolve_credential_provider,
 )
+
+
+class RuntimeAuth(TypedDict):
+    mode: str
+    issuer: str
+    clientId: str
+
+
+class RuntimeConfiguration(TypedDict):
+    schema: int
+    apiBase: str
+    auth: RuntimeAuth
+
+
+class FrontendInputs(TypedDict):
+    bundle: str
+    bucket: str
+    distributionId: str
+    url: str
+    runtimeConfig: RuntimeConfiguration
+
+
+class PlannedFrontend(TypedDict):
+    bundle: str
+    runtimeConfigHash: str
+
+
+class FrontendPlanResult(TypedDict):
+    planned: PlannedFrontend
+
+
+class PublishedFrontend(TypedDict):
+    sourceRevision: str
+    path: str
+    bundle: str
+    artifactDigest: str
+    runtimeConfigHash: str
+    url: str
+
+
+class FrontendResult(TypedDict):
+    published: PublishedFrontend
 
 
 def parse_oci_uri(uri: str) -> tuple[str, str]:
@@ -39,7 +81,7 @@ def safe_extract_bundle(archive_path: Path, destination: Path) -> None:
         archive.extractall(destination, filter="data")
 
 
-def runtime_configuration(inputs: dict[str, Any]) -> dict[str, Any]:
+def runtime_configuration(inputs: JsonObject) -> RuntimeConfiguration:
     configuration = inputs.get("runtimeConfig")
     if not isinstance(configuration, dict) or set(configuration) != {"schema", "apiBase", "auth"}:
         raise DriverError("frontend-s3-cloudfront requires an exact runtimeConfig object")
@@ -50,17 +92,18 @@ def runtime_configuration(inputs: dict[str, Any]) -> dict[str, Any]:
     require_strings(auth, ("mode", "issuer", "clientId"), "frontend runtimeConfig auth")
     if auth["mode"] != "cognito" or set(auth) != {"mode", "issuer", "clientId"}:
         raise DriverError("hosted frontend authentication must use the Cognito contract")
-    return configuration
+    return cast(RuntimeConfiguration, configuration)
 
 
-def apply_frontend_s3_cloudfront(context: DriverContext) -> dict[str, Any]:
+def apply_frontend_s3_cloudfront(context: DriverContext) -> FrontendPlanResult | FrontendResult:
     require_strings(
         context.inputs,
         ("bundle", "bucket", "distributionId", "url"),
         "frontend-s3-cloudfront inputs",
     )
     configuration = runtime_configuration(context.inputs)
-    repository, artifact_digest = parse_oci_uri(context.inputs["bundle"])
+    inputs = cast(FrontendInputs, context.inputs)
+    repository, artifact_digest = parse_oci_uri(inputs["bundle"])
     publication = context.unit.get("pull", {})
     if not isinstance(publication, dict):
         raise DriverError("frontend-s3-cloudfront pull must be an object")
@@ -69,7 +112,7 @@ def apply_frontend_s3_cloudfront(context: DriverContext) -> dict[str, Any]:
     runtime_bytes = json.dumps(configuration, indent=2, sort_keys=True).encode() + b"\n"
     runtime_digest = f"sha256:{hashlib.sha256(runtime_bytes).hexdigest()}"
     if context.dry:
-        return {"planned": {"bundle": context.inputs["bundle"], "runtimeConfigHash": runtime_digest}}
+        return {"planned": {"bundle": inputs["bundle"], "runtimeConfigHash": runtime_digest}}
 
     with tempfile.TemporaryDirectory(prefix="gitopsctr-frontend-deploy-") as directory:
         temporary = Path(directory)
@@ -84,7 +127,7 @@ def apply_frontend_s3_cloudfront(context: DriverContext) -> dict[str, Any]:
                 *oras_registry_args(registry_config),
                 "--output",
                 str(pulled),
-                context.inputs["bundle"],
+                inputs["bundle"],
             )
         archive = pulled / FRONTEND_ARCHIVE
         if not archive.is_file():
@@ -96,7 +139,7 @@ def apply_frontend_s3_cloudfront(context: DriverContext) -> dict[str, Any]:
         if not index_path.is_file():
             raise DriverError("frontend OCI artifact did not contain index.html")
         index_text = index_path.read_text()
-        run("aws", "s3", "sync", str(distribution), f"s3://{context.inputs['bucket']}", "--delete")
+        run("aws", "s3", "sync", str(distribution), f"s3://{inputs['bucket']}", "--delete")
         # Deterministic bundles give index.html a fixed timestamp, while hashed assets can
         # change without changing its byte length. Always replace the entry point.
         run(
@@ -104,7 +147,7 @@ def apply_frontend_s3_cloudfront(context: DriverContext) -> dict[str, Any]:
             "s3",
             "cp",
             str(index_path),
-            f"s3://{context.inputs['bucket']}/index.html",
+            f"s3://{inputs['bucket']}/index.html",
             "--cache-control",
             "no-cache",
             "--content-type",
@@ -115,7 +158,7 @@ def apply_frontend_s3_cloudfront(context: DriverContext) -> dict[str, Any]:
             "s3",
             "cp",
             str(runtime_path),
-            f"s3://{context.inputs['bucket']}/runtime-config.json",
+            f"s3://{inputs['bucket']}/runtime-config.json",
             "--cache-control",
             "no-store",
             "--content-type",
@@ -126,7 +169,7 @@ def apply_frontend_s3_cloudfront(context: DriverContext) -> dict[str, Any]:
         "cloudfront",
         "create-invalidation",
         "--distribution-id",
-        context.inputs["distributionId"],
+        inputs["distributionId"],
         "--paths",
         "/*",
         "--query",
@@ -143,7 +186,7 @@ def apply_frontend_s3_cloudfront(context: DriverContext) -> dict[str, Any]:
         "wait",
         "invalidation-completed",
         "--distribution-id",
-        context.inputs["distributionId"],
+        inputs["distributionId"],
         "--id",
         invalidation,
     )
@@ -157,7 +200,7 @@ def apply_frontend_s3_cloudfront(context: DriverContext) -> dict[str, Any]:
         "--retry-all-errors",
         "--retry-delay",
         "5",
-        context.inputs["url"],
+        inputs["url"],
         capture=True,
     ).stdout
     if served_index != index_text:
@@ -172,16 +215,16 @@ def apply_frontend_s3_cloudfront(context: DriverContext) -> dict[str, Any]:
         "--retry-all-errors",
         "--retry-delay",
         "5",
-        f"{context.inputs['url']}/runtime-config.json",
+        f"{inputs['url']}/runtime-config.json",
     )
     return {
         "published": {
             "sourceRevision": context.source_revision,
             "path": context.source_path,
-            "bundle": context.inputs["bundle"],
+            "bundle": inputs["bundle"],
             "artifactDigest": artifact_digest,
             "runtimeConfigHash": runtime_digest,
-            "url": context.inputs["url"],
+            "url": inputs["url"],
         }
     }
 

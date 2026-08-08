@@ -7,16 +7,34 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TypedDict, cast
 
-from gitopsctr.driver import DriverContext, DriverError, DriverPlugin, VerificationResult, VerificationStatus
+from gitopsctr.driver import DriverContext, DriverError, DriverPlugin, JsonValue, VerificationResult, VerificationStatus
 
 from ._common import run, select_result_fields
 
 
+class PlannedTerraform(TypedDict):
+    sourceRevision: str
+
+
+class TerraformPlanResult(TypedDict):
+    planned: PlannedTerraform
+
+
+class AppliedTerraform(TypedDict):
+    sourceRevision: str
+    path: str
+
+
+class TerraformResult(TypedDict):
+    applied: AppliedTerraform
+    outputs: dict[str, JsonValue]
+
+
 def terraform_runtime(
     context: DriverContext,
-) -> tuple[Path, dict[str, str], str, list[str], list[Any]]:
+) -> tuple[Path, dict[str, str], str, list[str], list[object]]:
     configuration = context.unit.get("terraform")
     if not isinstance(configuration, dict):
         raise DriverError("terraform driver requires a terraform configuration")
@@ -31,6 +49,7 @@ def terraform_runtime(
         raise DriverError("terraform backend requires a key")
     if not isinstance(output_names, list) or not all(isinstance(name, str) for name in output_names):
         raise DriverError("terraform observeOutputs must be a list of names")
+    output_names = cast(list[str], output_names)
     if not isinstance(checks, list):
         raise DriverError("terraform checks must be a list")
 
@@ -38,10 +57,10 @@ def terraform_runtime(
     terraform_environment = os.environ | {
         f"TF_VAR_{name}": value if isinstance(value, str) else json.dumps(value) for name, value in variables.items()
     }
-    return terraform_root, terraform_environment, backend_key, output_names, checks
+    return terraform_root, terraform_environment, backend_key, output_names, cast(list[object], checks)
 
 
-def apply_terraform(context: DriverContext) -> dict[str, Any]:
+def apply_terraform(context: DriverContext) -> TerraformPlanResult | TerraformResult:
     terraform_root, terraform_environment, backend_key, output_names, checks = terraform_runtime(context)
     report_text: Path | None = None
     if context.report is not None:
@@ -90,7 +109,7 @@ def apply_terraform(context: DriverContext) -> dict[str, Any]:
         raw_outputs = json.loads(
             run("terraform", "output", "-json", cwd=terraform_root, env=terraform_environment, capture=True).stdout
         )
-        outputs = {name: raw_outputs[name]["value"] for name in output_names}
+        outputs = cast(dict[str, JsonValue], {name: raw_outputs[name]["value"] for name in output_names})
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise DriverError(f"Terraform did not return the expected outputs: {exc}") from exc
 

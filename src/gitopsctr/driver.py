@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib.metadata import entry_points
 from pathlib import Path
-from typing import Any
+
+type JsonScalar = None | bool | int | float | str
+type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
+type JsonObject = dict[str, JsonValue]
+type DriverResult = Mapping[str, object]
 
 
 class DriverError(RuntimeError):
@@ -19,13 +23,13 @@ class DriverContext:
     source_root: Path
     source_revision: str
     source_path: str
-    unit: dict[str, Any]
-    inputs: dict[str, Any]
+    unit: JsonObject
+    inputs: JsonObject
     dry: bool = False
     report: Path | None = None
 
 
-Driver = Callable[[DriverContext], dict[str, Any]]
+Driver = Callable[[DriverContext], DriverResult]
 
 
 class VerificationStatus(StrEnum):
@@ -39,7 +43,7 @@ class VerificationResult:
 
 
 VerificationDriver = Callable[[DriverContext], VerificationResult]
-SemanticResultSelector = Callable[[dict[str, Any]], dict[str, Any]]
+SemanticResultSelector = Callable[[object], DriverResult]
 
 
 @dataclass(frozen=True)
@@ -72,7 +76,7 @@ RECONCILIATION_DRIVERS = {name: plugin.reconcile for name, plugin in DRIVER_PLUG
 VERIFICATION_DRIVERS = {name: plugin.verify for name, plugin in DRIVER_PLUGINS.items() if plugin.verify is not None}
 
 
-def semantic_driver_result(driver: str, result: dict[str, Any]) -> dict[str, Any]:
+def semantic_driver_result(driver: str, result: object) -> DriverResult:
     try:
         plugin = DRIVER_PLUGINS[driver]
     except KeyError as exc:

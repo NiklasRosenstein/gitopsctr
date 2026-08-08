@@ -12,12 +12,12 @@ from gitopsctr.driver import DriverContext, VerificationResult, VerificationStat
 DESIRED_REVISION = "d" * 40
 
 
-def _write_json(path: Path, value: dict) -> None:
+def _write_json(path: Path, value: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value))
 
 
-def _unit(name: str, driver: str, revision: str) -> dict:
+def _unit(name: str, driver: str, revision: str) -> dict[str, object]:
     return {
         "schema": 1,
         "name": name,
@@ -31,7 +31,7 @@ def _unit(name: str, driver: str, revision: str) -> dict:
     }
 
 
-def _install_desired_state(monkeypatch, units: list[dict]) -> list[str]:
+def _install_desired_state(monkeypatch, units: list[dict[str, object]]) -> list[str]:
     materialized: list[str] = []
 
     def deployment_refs(source_root, environment, desired=None, observed=None):
@@ -169,7 +169,7 @@ def test_verify_rejects_unmaterialized_desired_units_before_running_driver(monke
 def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, driver_runs):
     unit = _unit("infrastructure", "terraform", "a" * 40)
     calls: list[str] = []
-    publications: list[dict] = []
+    publications: list[dict[str, object]] = []
     outputs: list[tuple[bool, str]] = []
 
     monkeypatch.setattr(deploy_release, "load_environment", lambda *_args: {"schema": 1})

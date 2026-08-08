@@ -9,11 +9,11 @@ import re
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TypedDict, cast
 
 from gitopsctr.driver import DriverContext, DriverError, DriverPlugin
 
-from ._common import run, select_result_fields
+from ._common import require_strings, run, select_result_fields
 from ._oci import (
     FRONTEND_ARCHIVE,
     OCI_DIGEST_RE,
@@ -26,6 +26,42 @@ from ._oci import (
 
 FRONTEND_ARTIFACT_TYPE = "application/vnd.gitopsctr.frontend.v1"
 FRONTEND_LAYER_TYPE = "application/vnd.gitopsctr.frontend.layer.v1.tar+gzip"
+
+
+class BuiltBundle(TypedDict):
+    sourceRevision: str
+    path: str
+    digest: str
+
+
+class ViteBundlePlanResult(TypedDict):
+    built: BuiltBundle
+
+
+class UnitIdentity(TypedDict):
+    name: str
+    driver: str
+    inputHashVersion: int
+    inputHash: str
+    sourceRevision: str
+
+
+class BundleArtifact(TypedDict):
+    type: str
+    artifactType: str
+    uri: str
+
+
+class FrontendDocument(TypedDict):
+    schema: int
+    unit: UnitIdentity
+    artifacts: dict[str, BundleArtifact]
+
+
+class ViteBundleResult(TypedDict):
+    artifacts: dict[str, FrontendDocument]
+
+
 def require_node_24() -> None:
     version = run("node", "--version", capture=True).stdout.strip()
     if re.fullmatch(r"v24\.[0-9]+\.[0-9]+", version) is None:
@@ -59,7 +95,7 @@ def deterministic_archive(source: Path, destination: Path) -> None:
                         raise DriverError(f"frontend bundle contains an unsupported file: {path}")
 
 
-def apply_vite_oci_bundle(context: DriverContext) -> dict[str, Any]:
+def apply_vite_oci_bundle(context: DriverContext) -> ViteBundlePlanResult | ViteBundleResult:
     specification = context.unit
     build = specification.get("build")
     publication = specification.get("publish")
@@ -75,9 +111,13 @@ def apply_vite_oci_bundle(context: DriverContext) -> dict[str, Any]:
     credential_provider = resolve_credential_provider(publication.get("credentialProvider"), {registry})
     if outputs != ["frontend.json"]:
         raise DriverError("vite-oci-bundle produces the frontend.json artifact")
-    input_hash = specification.get("source", {}).get("inputHash")
+    source = specification.get("source")
+    input_hash = source.get("inputHash") if isinstance(source, dict) else None
     if not isinstance(input_hash, str) or not OCI_DIGEST_RE.fullmatch(input_hash):
         raise DriverError("vite-oci-bundle requires a resolved source inputHash")
+    require_strings(specification, ("name", "driver"), "vite-oci-bundle unit")
+    unit_name = cast(str, specification["name"])
+    driver_name = cast(str, specification["driver"])
     tag = f"input-{input_hash.removeprefix('sha256:')}"
     frontend_root = context.source_root / context.source_path
     build_environment = {name: value for name, value in os.environ.items() if not name.startswith("VITE_")}
@@ -129,8 +169,8 @@ def apply_vite_oci_bundle(context: DriverContext) -> dict[str, Any]:
             "frontend.json": {
                 "schema": 1,
                 "unit": {
-                    "name": specification["name"],
-                    "driver": specification["driver"],
+                    "name": unit_name,
+                    "driver": driver_name,
                     "inputHashVersion": 1,
                     "inputHash": input_hash,
                     "sourceRevision": context.source_revision,

@@ -11,9 +11,9 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import cast
 
-from gitopsctr.driver import DriverError
+from gitopsctr.driver import DriverError, JsonObject
 
 from ._common import run
 
@@ -35,14 +35,20 @@ class RegistryCredentials:
     password: str
 
 
-CredentialProviderValidator = Callable[[str, dict[str, Any]], None]
-CredentialProviderLoader = Callable[[str, dict[str, Any]], RegistryCredentials]
+CredentialProviderValidator = Callable[[str, JsonObject], None]
+CredentialProviderLoader = Callable[[str, JsonObject], RegistryCredentials]
 
 
 @dataclass(frozen=True)
 class CredentialProvider:
     validate: CredentialProviderValidator
     load: CredentialProviderLoader
+
+
+@dataclass(frozen=True)
+class ResolvedCredentialProvider:
+    provider: CredentialProvider
+    configuration: JsonObject
 
 
 def driver_status(status: str, message: str) -> None:
@@ -61,7 +67,7 @@ def repository_registry(repository: str) -> str:
     return registry
 
 
-def validate_aws_ecr_provider(registry: str, configuration: dict[str, Any]) -> None:
+def validate_aws_ecr_provider(registry: str, configuration: JsonObject) -> None:
     unsupported = set(configuration) - {"type"}
     if unsupported:
         raise DriverError(f"aws-ecr credentialProvider has unsupported fields: {', '.join(sorted(unsupported))}")
@@ -69,7 +75,7 @@ def validate_aws_ecr_provider(registry: str, configuration: dict[str, Any]) -> N
         raise DriverError(f"aws-ecr requires a private ECR registry, got {registry!r}")
 
 
-def aws_ecr_credentials(registry: str, configuration: dict[str, Any]) -> RegistryCredentials:
+def aws_ecr_credentials(registry: str, configuration: JsonObject) -> RegistryCredentials:
     validate_aws_ecr_provider(registry, configuration)
     match = PRIVATE_ECR_REGISTRY_RE.fullmatch(registry)
     assert match is not None
@@ -94,9 +100,7 @@ CREDENTIAL_PROVIDERS: dict[str, CredentialProvider] = {
 }
 
 
-def resolve_credential_provider(
-    configuration: Any, registries: set[str]
-) -> tuple[CredentialProvider, dict[str, Any]] | None:
+def resolve_credential_provider(configuration: object, registries: set[str]) -> ResolvedCredentialProvider | None:
     if configuration is None:
         return None
     if not isinstance(configuration, dict):
@@ -104,10 +108,11 @@ def resolve_credential_provider(
     provider_type = configuration.get("type")
     if not isinstance(provider_type, str) or provider_type not in CREDENTIAL_PROVIDERS:
         raise DriverError(f"oci-images uses an unknown credential provider: {provider_type!r}")
+    configuration = cast(JsonObject, configuration)
     provider = CREDENTIAL_PROVIDERS[provider_type]
     for registry in registries:
         provider.validate(registry, configuration)
-    return provider, configuration
+    return ResolvedCredentialProvider(provider, configuration)
 
 
 def docker_cli_plugins() -> Path | None:
@@ -119,7 +124,7 @@ def docker_cli_plugins() -> Path | None:
 
 @contextmanager
 def registry_authentication(
-    provider: tuple[CredentialProvider, dict[str, Any]] | None,
+    provider: ResolvedCredentialProvider | None,
     registries: set[str],
 ) -> Iterator[dict[str, str] | None]:
     if provider is None:
@@ -127,13 +132,12 @@ def registry_authentication(
             driver_status("AUTH", f"{registry}: existing Docker credentials or anonymous access")
         yield None
         return
-    credential_provider, configuration = provider
     with tempfile.TemporaryDirectory(prefix="gitopsctr-docker-") as docker_config:
         if plugins := docker_cli_plugins():
             (Path(docker_config) / "cli-plugins").symlink_to(plugins, target_is_directory=True)
         docker_environment = os.environ | {"DOCKER_CONFIG": docker_config}
         for registry in sorted(registries):
-            credentials = credential_provider.load(registry, configuration)
+            credentials = provider.provider.load(registry, provider.configuration)
             driver_status(
                 "LOGIN",
                 f"{registry}: Docker login as {credentials.username} via password stdin (isolated temporary config)",
@@ -153,7 +157,7 @@ def registry_authentication(
 
 @contextmanager
 def oras_authentication(
-    provider: tuple[CredentialProvider, dict[str, Any]] | None,
+    provider: ResolvedCredentialProvider | None,
     registries: set[str],
 ) -> Iterator[Path | None]:
     if provider is None:
@@ -161,11 +165,10 @@ def oras_authentication(
             driver_status("AUTH", f"{registry}: existing ORAS credentials or anonymous access")
         yield None
         return
-    credential_provider, configuration = provider
     with tempfile.TemporaryDirectory(prefix="gitopsctr-oras-") as directory:
         registry_config = Path(directory) / "config.json"
         for registry in sorted(registries):
-            credentials = credential_provider.load(registry, configuration)
+            credentials = provider.provider.load(registry, provider.configuration)
             driver_status(
                 "LOGIN",
                 f"{registry}: ORAS login as {credentials.username} via password stdin (isolated temporary config)",

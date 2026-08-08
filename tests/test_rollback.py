@@ -9,7 +9,7 @@ import pytest
 from gitopsctr import cli as deploy_release
 
 
-def _write_json(path: Path, value: dict) -> None:
+def _write_json(path: Path, value: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value))
 

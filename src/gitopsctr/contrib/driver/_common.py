@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from gitopsctr.driver import DriverError, SemanticResultSelector
+from gitopsctr.driver import DriverError, DriverResult, JsonObject, SemanticResultSelector
 
 
 def run(
@@ -32,15 +33,15 @@ def run(
     return subprocess.run(args, **kwargs)
 
 
-def require_strings(values: dict[str, Any], names: tuple[str, ...], contract: str) -> None:
+def require_strings(values: JsonObject, names: tuple[str, ...], contract: str) -> None:
     missing = [name for name in names if not isinstance(values.get(name), str) or not values[name]]
     if missing:
         raise DriverError(f"{contract} is missing string values: {', '.join(missing)}")
 
 
 def select_result_fields(*names: str) -> SemanticResultSelector:
-    def select(result: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(result, dict):
+    def select(result: object) -> DriverResult:
+        if not isinstance(result, Mapping):
             raise DriverError("driver result must be an object")
         missing = [name for name in names if name not in result]
         if missing:
