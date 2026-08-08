@@ -471,9 +471,7 @@ def test_terraform_accepts_driver_neutral_backend_configuration(tmp_path, monkey
 
 def test_terraform_rejects_structured_backend_values(tmp_path):
     with pytest.raises(DriverError, match="strings, numbers, or booleans"):
-        terraform.PLUGIN.reconcile(
-            _terraform_context(tmp_path, tmp_path / "report", {"path": ["not", "a", "scalar"]})
-        )
+        terraform.PLUGIN.reconcile(_terraform_context(tmp_path, tmp_path / "report", {"path": ["not", "a", "scalar"]}))
 
 
 def test_terraform_dry_run_saves_binary_plan_and_rendered_report(tmp_path, monkeypatch):
