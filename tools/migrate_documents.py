@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -36,10 +37,28 @@ def git(*args: str, check: bool = True, input_text: str | None = None, env: dict
         input=input_text,
         text=True,
         capture_output=True,
-        check=check,
+        check=False,
         env=env,
     )
+    if check and result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "no error output"
+        command = shlex.join(["git", *args])
+        raise RuntimeError(f"{command} failed with exit status {result.returncode}:\n{detail}")
     return result.stdout.strip()
+
+
+def git_is_ancestor(ancestor: str, descendant: str) -> bool:
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode not in {0, 1}:
+        detail = result.stderr.strip() or result.stdout.strip() or "no error output"
+        raise RuntimeError(f"git merge-base failed with exit status {result.returncode}:\n{detail}")
+    return result.returncode == 0
 
 
 def commit_tree(directory: Path, parent: str, message: str) -> str:
@@ -65,7 +84,9 @@ def commit_tree(directory: Path, parent: str, message: str) -> str:
 
 def materialize(revision: str, directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    archive = subprocess.run(["git", "archive", "--format=tar", revision], cwd=ROOT, check=True, stdout=subprocess.PIPE).stdout
+    archive = subprocess.run(
+        ["git", "archive", "--format=tar", revision], cwd=ROOT, check=True, stdout=subprocess.PIPE
+    ).stdout
     import tarfile
 
     with tempfile.TemporaryFile() as stream:
@@ -188,6 +209,28 @@ def update_ref(ref: str, new: str, old: str) -> None:
     git("update-ref", ref, new, old)
 
 
+def validate_remote_refs(remote: str, refs: list[str]) -> None:
+    """Fetch and ensure migrating each existing ref would remain a fast-forward push."""
+    git("fetch", "--prune", remote)
+    stale: list[str] = []
+    for ref in refs:
+        short = ref.removeprefix("refs/heads/")
+        remote_ref = f"refs/remotes/{remote}/{short}"
+        remote_revision = git("rev-parse", "--verify", "--quiet", remote_ref, check=False)
+        if not remote_revision:
+            continue
+        local_revision = git("rev-parse", ref)
+        if not git_is_ancestor(remote_revision, local_revision):
+            behind, ahead = git("rev-list", "--left-right", "--count", f"{remote_ref}...{ref}").split()
+            stale.append(f"{short} (remote-only commits: {behind}, local-only commits: {ahead})")
+    if stale:
+        details = "\n".join(f"  - {item}" for item in stale)
+        raise RuntimeError(
+            "migration requires local refs that can fast-forward their remote counterparts; "
+            "synchronize these refs and retry:\n" + details
+        )
+
+
 def migrate(*, project_name: str, apply: bool, push: bool) -> dict[str, str]:
     branch = git("branch", "--show-current")
     if not branch:
@@ -195,7 +238,20 @@ def migrate(*, project_name: str, apply: bool, push: bool) -> dict[str, str]:
     if git("status", "--porcelain"):
         raise RuntimeError("migration requires a clean working tree")
 
+    if push and not apply:
+        raise RuntimeError("--push requires --apply")
+
     source_ref = f"refs/heads/{branch}"
+    desired_refs = [ref for ref, _revision in local_refs("deploy/")]
+    observed_refs = [ref for ref, _revision in local_refs("observed/")]
+    remote: str | None = None
+    if push:
+        remotes = git("remote").splitlines()
+        if not remotes:
+            raise RuntimeError("--push requires a Git remote")
+        remote = remotes[0]
+        validate_remote_refs(remote, [source_ref, *desired_refs, *observed_refs])
+
     old_source = git("rev-parse", source_ref)
     results: dict[str, str] = {}
     with tempfile.TemporaryDirectory(prefix="gitopsctr-migration-") as temporary:
@@ -275,10 +331,13 @@ def migrate(*, project_name: str, apply: bool, push: bool) -> dict[str, str]:
             update_ref(ref, results[ref], old)
         for ref, old in local_refs("observed/"):
             update_ref(ref, results[ref], old)
+        # update-ref moves the checked-out branch without updating its index or
+        # working tree. The precondition above guarantees this cannot overwrite
+        # pre-existing work, and leaves the checkout at the commit just created.
+        git("reset", "--hard", results[branch])
         if push:
-            remote = git("remote").splitlines()[0] if git("remote") else None
-            if remote:
-                git("push", "--atomic", remote, *[f"{ref}:{ref}" for ref in results])
+            assert remote is not None
+            git("push", "--atomic", remote, *[f"{ref}:{ref}" for ref in results])
     return results
 
 
