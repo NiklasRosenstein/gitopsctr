@@ -14,8 +14,11 @@
       "platform": "linux/amd64"
     },
     "publish": {
-      "repositories": {
-        "application": "registry.example/example/application"
+      "targets": {
+        "application": {
+          "type": "registry",
+          "repository": "registry.example/example/application"
+        }
       }
     },
     "source": {

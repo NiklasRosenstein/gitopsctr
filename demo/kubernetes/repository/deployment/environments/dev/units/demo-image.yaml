@@ -11,6 +11,8 @@ spec:
     dockerfile: Dockerfile
     platform: __DOCKER_PLATFORM__
   publish:
-    repositories:
-      application: __REGISTRY__/gitopsctr-demo/app
+    targets:
+      application:
+        type: kind
+        cluster: __CLUSTER_NAME__
   artifacts: [containers.json]

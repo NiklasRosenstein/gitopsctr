@@ -13,9 +13,16 @@ spec:
     namespace: default
     values:
       message: rendered and reconciled
+      image:
+        fromObservation: units/demo-image.yaml
+        pointer: /artifacts/containers.json/artifacts/application/uri
     allowSecrets: false
   delivery:
     mode: direct
-    kubeContext: kind-gitopsctr-kubernetes-demo
+    kubeContext: __KUBE_CONTEXT__
     prune: false
-    wait: []
+    wait:
+      - resource: deployment/gitopsctr-kubernetes-demo
+        namespace: default
+        condition: Available
+        timeoutSeconds: 120

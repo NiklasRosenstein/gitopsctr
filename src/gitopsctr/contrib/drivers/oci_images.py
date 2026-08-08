@@ -27,7 +27,7 @@ from gitopsctr.driver import (
 )
 from gitopsctr.execution import CommandOutput, DriverExecution
 
-from ._common import require_strings, select_result_fields
+from ._common import select_result_fields
 from ._oci import (
     OCI_DIGEST_RE,
     ArtifactUnitIdentity,
@@ -61,8 +61,29 @@ class OciBuild(StrictModel):
 
 
 @dataclass(frozen=True, kw_only=True)
+class RegistryTarget(StrictModel):
+    type: Literal["registry"]
+    repository: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class KindTarget(StrictModel):
+    type: Literal["kind"]
+    cluster: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class MinikubeTarget(StrictModel):
+    type: Literal["minikube"]
+    profile: str
+
+
+PublicationTarget = RegistryTarget | KindTarget | MinikubeTarget
+
+
+@dataclass(frozen=True, kw_only=True)
 class OciPublication(StrictModel):
-    repositories: dict[str, str]
+    targets: dict[str, PublicationTarget]
     credentialProvider: AwsEcrCredentialProvider | None = None
 
 
@@ -119,6 +140,7 @@ class OciImagesResultModel(StrictModel):
 
 @dataclass(frozen=True)
 class OciRuntime:
+    targets: dict[str, dict[str, str]]
     repositories: dict[str, str]
     registries: set[str]
     credential_provider: ResolvedCredentialProvider | None
@@ -170,7 +192,7 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
     api_version = "unit.gitopsctr.io/v1"
     kind = "OciImages"
     driver_name = "oci-images"
-    version = 2
+    version = 1
     schema_base_uri = schema_url("drivers/oci-images", version, "").removesuffix(".schema.json")
     unit_contract = MashumaroContract(OciImagesUnit, schema_url("drivers/oci-images", version, "unit"))
     desired_unit_contract = MashumaroContract(
@@ -191,14 +213,39 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
         outputs = specification.get("artifacts")
         if not isinstance(build, dict) or not isinstance(publication, dict):
             raise DriverError("oci-images requires build and publish objects")
-        repositories = publication.get("repositories")
+        targets = publication.get("targets")
         dockerfile = build.get("dockerfile")
         platform = build.get("platform")
-        if not isinstance(repositories, dict) or not repositories:
-            raise DriverError("oci-images requires named repositories")
-        require_strings(repositories, tuple(repositories), "oci-images repositories")
-        repositories = cast(dict[str, str], repositories)
+        if not isinstance(targets, dict) or not targets:
+            raise DriverError("oci-images requires named publication targets")
+        resolved_targets: dict[str, dict[str, str]] = {}
+        repositories: dict[str, str] = {}
+        for name, target in targets.items():
+            if not isinstance(name, str) or not name or not isinstance(target, dict):
+                raise DriverError("oci-images publication targets must be named objects")
+            target_type = target.get("type")
+            if target_type == "registry":
+                repository = target.get("repository")
+                if not isinstance(repository, str) or not repository:
+                    raise DriverError(f"oci-images registry target {name!r} requires repository")
+                repository_registry(repository)
+                repositories[name] = repository
+                resolved_targets[name] = {"type": "registry", "repository": repository}
+            elif target_type == "kind":
+                cluster = target.get("cluster")
+                if not isinstance(cluster, str) or not cluster:
+                    raise DriverError(f"oci-images kind target {name!r} requires cluster")
+                resolved_targets[name] = {"type": "kind", "cluster": cluster}
+            elif target_type == "minikube":
+                profile = target.get("profile")
+                if not isinstance(profile, str) or not profile:
+                    raise DriverError(f"oci-images minikube target {name!r} requires profile")
+                resolved_targets[name] = {"type": "minikube", "profile": profile}
+            else:
+                raise DriverError(f"oci-images target {name!r} has unknown type: {target_type!r}")
         registries = {repository_registry(repository) for repository in repositories.values()}
+        if publication.get("credentialProvider") is not None and not registries:
+            raise DriverError("oci-images credentialProvider requires at least one registry target")
         credential_provider = resolve_credential_provider(publication.get("credentialProvider"), registries)
         if not all(isinstance(value, str) and value for value in (dockerfile, platform)):
             raise DriverError("oci-images requires dockerfile and platform")
@@ -215,6 +262,7 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
         tag = f"input-{input_hash.removeprefix('sha256:')}"
         local_image = f"{unit_identity['name']}:{input_hash.removeprefix('sha256:')}"
         return OciRuntime(
+            resolved_targets,
             repositories,
             registries,
             credential_provider,
@@ -247,11 +295,16 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
     def reconcile(self, context: ReconciliationContext) -> OciImagesResult:
         runtime = self._runtime(context)
         repositories = runtime.repositories
+        targets = runtime.targets
         tag = runtime.tag
         local_image = runtime.local_image
+        local_targets = {name: target for name, target in targets.items() if target["type"] != "registry"}
+        image_available = False
 
         def build_image() -> None:
+            nonlocal image_available
             self._build_image(context, runtime)
+            image_available = True
 
         with registry_authentication(
             context.execution,
@@ -271,13 +324,14 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
             published_digests = {digest for digest in existing.values() if digest is not None}
             if len(published_digests) > 1:
                 raise DriverError("published repositories disagree on the artifact digest")
-            if any(digest is None for digest in existing.values()):
+            if any(digest is None for digest in existing.values()) or local_targets:
                 available = [(name, digest) for name, digest in existing.items() if digest is not None]
                 if available:
                     name, digest = available[0]
                     source_image = f"{repositories[name]}@{digest}"
                     context.execution.run("docker", "pull", source_image, env=docker_environment)
                     context.execution.run("docker", "tag", source_image, local_image)
+                    image_available = True
                 else:
                     build_image()
 
@@ -285,6 +339,8 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
             for name, repository in repositories.items():
                 digest = existing[name]
                 if digest is None:
+                    if not image_available:
+                        build_image()
                     target = f"{repository}:{tag}"
                     context.execution.run("docker", "tag", local_image, target)
                     context.execution.run("docker", "push", target, env=docker_environment)
@@ -295,6 +351,17 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
 
             if len({artifact["uri"].rsplit("@", 1)[1] for artifact in artifacts.values()}) > 1:
                 raise DriverError("published repositories disagree on the artifact digest")
+
+            for name, target in local_targets.items():
+                if not image_available:
+                    build_image()
+                if target["type"] == "kind":
+                    context.execution.run("kind", "load", "docker-image", local_image, "--name", target["cluster"])
+                else:
+                    context.execution.run(
+                        "minikube", "--profile", target["profile"], "image", "load", local_image, "--daemon"
+                    )
+                artifacts[name] = {"type": "oci-image", "uri": local_image}
 
         return {
             "artifacts": {

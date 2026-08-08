@@ -124,19 +124,23 @@ This accepts `MATERIALIZED` only for units without reconciliation. Any receipt-r
 An all-materialized environment needs no observed ref. Promotion renders a fresh target payload from the target
 specification and promoted inputs; rollback restores the selected historical desired payload verbatim.
 
-## Local kind acceptance
+## Local Kubernetes acceptance
 
-The repository includes a real Helm/direct-delivery demo. Docker must be running; mise provides the remaining tools.
+The repository includes a real image-build and Helm/direct-delivery demo. Docker must be running; mise provides the
+remaining tools. Select kind or minikube explicitly:
 
 ```console
 mise install
 mise run sync
-mise run kubernetes-demo
-mise run kubernetes-demo-clean
+mise run kubernetes-demo -- kind
+mise run kubernetes-demo-clean -- kind
+mise run kubernetes-demo -- minikube
+mise run kubernetes-demo-clean -- minikube
 ```
 
-`mise run kubernetes-acceptance` starts from empty state, renders and applies a ConfigMap to kind, verifies it through
-the CLI, proves a second convergence moves no Git refs, and always removes the cluster.
+`mise run kubernetes-acceptance -- PROVIDER` starts from empty state, exports the built image to the selected cluster,
+renders and applies the workload, verifies the running application through the CLI, proves a second convergence moves
+no Git refs, and always removes the cluster.
 
 ## Schemas
 

@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitopsctr-kubernetes-demo
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gitopsctr-kubernetes-demo
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gitopsctr-kubernetes-demo
+    spec:
+      containers:
+        - name: web
+          image: {{ .Values.image | quote }}
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http

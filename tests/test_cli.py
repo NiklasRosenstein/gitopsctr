@@ -258,7 +258,7 @@ def test_removing_producer_environment_preserves_existing_input_hash(tmp_path):
         "driver": "oci-images",
         "source": {"path": ".", "inputs": ["Dockerfile"]},
         "build": {"dockerfile": "Dockerfile", "platform": "linux/amd64"},
-        "publish": {"repositories": {"control": "registry.example.com/control"}},
+        "publish": {"targets": {"control": {"type": "registry", "repository": "registry.example.com/control"}}},
         "artifacts": ["containers.json"],
     }
     legacy_specification = {**specification, "environment": "dev"}

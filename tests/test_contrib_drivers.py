@@ -115,12 +115,19 @@ def _oci_context(
     *,
     credential_provider: object = None,
     repositories: dict[str, str] | None = None,
+    targets: dict[str, object] | None = None,
 ) -> ReconciliationContext:
     publication: dict[str, object] = {
-        "repositories": repositories
+        "targets": targets
         or {
-            "control": f"{REGISTRY}/example-application-control",
-            "worker": f"{REGISTRY}/example-application-worker",
+            name: {"type": "registry", "repository": repository}
+            for name, repository in (
+                repositories
+                or {
+                    "control": f"{REGISTRY}/example-application-control",
+                    "worker": f"{REGISTRY}/example-application-worker",
+                }
+            ).items()
         }
     }
     if credential_provider is not None:
@@ -253,22 +260,32 @@ def test_oci_images_without_provider_uses_existing_docker_auth(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize(
-    ("provider", "repositories", "message"),
+    ("provider", "targets", "message"),
     (
         ({"type": "unknown"}, None, "unknown credential provider"),
         ({"type": "aws-ecr", "profile": "example-profile"}, None, "unsupported fields"),
         (
             {"type": "aws-ecr"},
-            {"control": "registry.example.com/team/control"},
+            {"control": {"type": "registry", "repository": "registry.example.com/team/control"}},
             "private ECR registry",
         ),
-        (None, {"control": "team/control"}, "not registry-qualified"),
-        (None, {"control": f"{REGISTRY}/team/control:latest"}, "tag-free"),
+        (None, {"control": {"type": "registry", "repository": "team/control"}}, "not registry-qualified"),
+        (
+            None,
+            {"control": {"type": "registry", "repository": f"{REGISTRY}/team/control:latest"}},
+            "tag-free",
+        ),
+        (None, {"control": {"type": "kind", "cluster": ""}}, "requires cluster"),
+        (None, {"control": {"type": "minikube"}}, "requires profile"),
+        (None, {"control": {"type": "unknown"}}, "unknown type"),
+        (
+            {"type": "aws-ecr"},
+            {"control": {"type": "kind", "cluster": "dev"}},
+            "requires at least one registry",
+        ),
     ),
 )
-def test_oci_images_rejects_invalid_provider_and_repository_configuration(
-    tmp_path, monkeypatch, provider, repositories, message
-):
+def test_oci_images_rejects_invalid_publication_target_configuration(tmp_path, monkeypatch, provider, targets, message):
     no_commands = execution_for(
         lambda *_args, **_kwargs: pytest.fail("invalid configuration must fail before commands run")
     )
@@ -279,7 +296,7 @@ def test_oci_images_rejects_invalid_provider_and_repository_configuration(
                 _oci_context(
                     tmp_path,
                     credential_provider=provider,
-                    repositories=repositories,
+                    targets=targets,
                 ),
                 execution=no_commands,
             )
@@ -359,6 +376,70 @@ def test_oci_images_rejects_disagreeing_repository_digests(tmp_path, monkeypatch
         oci_images.DRIVER.reconcile(
             replace(_oci_context(tmp_path), execution=execution_for(lambda *_args, **_kwargs: None))
         )
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_load"),
+    (
+        (
+            {"type": "kind", "cluster": "example-kind"},
+            ("kind", "load", "docker-image", f"application-images:{'b' * 64}", "--name", "example-kind"),
+        ),
+        (
+            {"type": "minikube", "profile": "example-minikube"},
+            (
+                "minikube",
+                "--profile",
+                "example-minikube",
+                "image",
+                "load",
+                f"application-images:{'b' * 64}",
+                "--daemon",
+            ),
+        ),
+    ),
+)
+def test_oci_images_builds_once_and_exports_to_local_cluster(tmp_path, target, expected_load):
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(*args, **_kwargs):
+        commands.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    context = replace(
+        _oci_context(tmp_path, targets={"application": target}),
+        execution=execution_for(fake_run),
+    )
+    result = oci_images.DRIVER.reconcile(context)
+
+    assert len([command for command in commands if command[:2] == ("docker", "build")]) == 1
+    assert commands[-1] == expected_load
+    assert result["artifacts"]["containers.json"]["artifacts"]["application"] == {
+        "type": "oci-image",
+        "uri": f"application-images:{'b' * 64}",
+    }
+
+
+def test_oci_images_reuses_registry_image_when_exporting_to_cluster(tmp_path, monkeypatch):
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(*args, **_kwargs):
+        commands.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(oci_images, "oci_digest", lambda *_args, **_kwargs: DIGEST)
+    targets = {
+        "registry": {"type": "registry", "repository": f"{REGISTRY}/example-application"},
+        "cluster": {"type": "kind", "cluster": "example"},
+    }
+    result = oci_images.DRIVER.reconcile(
+        replace(_oci_context(tmp_path, targets=targets), execution=execution_for(fake_run))
+    )
+
+    assert not any(command[:2] == ("docker", "build") for command in commands)
+    assert any(command[:2] == ("docker", "pull") for command in commands)
+    assert commands[-1][:3] == ("kind", "load", "docker-image")
+    assert result["artifacts"]["containers.json"]["artifacts"]["registry"]["uri"].endswith(f"@{DIGEST}")
 
 
 def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path, monkeypatch):

@@ -1,27 +1,12 @@
-import importlib.util
 import shutil
-import sys
-from pathlib import Path
 
 import pytest
 import yaml
 
+from demo.docker import run as demo
+from demo.kubernetes import run as kubernetes_demo
+from demo.utils import RefHeads
 from gitopsctr import cli
-
-DEMO_ROOT = Path(__file__).parents[1] / "demo"
-SPEC = importlib.util.spec_from_file_location("gitopsctr_demo_runner", DEMO_ROOT / "run.py")
-assert SPEC is not None and SPEC.loader is not None
-demo = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = demo
-SPEC.loader.exec_module(demo)
-
-KUBERNETES_SPEC = importlib.util.spec_from_file_location(
-    "gitopsctr_kubernetes_demo_runner", DEMO_ROOT / "kubernetes/run.py"
-)
-assert KUBERNETES_SPEC is not None and KUBERNETES_SPEC.loader is not None
-kubernetes_demo = importlib.util.module_from_spec(KUBERNETES_SPEC)
-sys.modules[KUBERNETES_SPEC.name] = kubernetes_demo
-KUBERNETES_SPEC.loader.exec_module(kubernetes_demo)
 
 
 def test_demo_repository_exercises_observation_driven_convergence():
@@ -47,14 +32,17 @@ def test_demo_runner_materializes_local_runtime_configuration(tmp_path, monkeypa
     image = yaml.safe_load((worktree / "deployment/environments/dev/units/demo-image.yaml").read_text())
     service = yaml.safe_load((worktree / "deployment/environments/dev/units/demo-service.yaml").read_text())
     assert image["spec"]["build"]["platform"] == "linux/arm64"
-    assert image["spec"]["publish"]["repositories"]["application"] == "localhost:5001/gitopsctr-demo/app"
+    assert image["spec"]["publish"]["targets"]["application"] == {
+        "type": "registry",
+        "repository": "localhost:5001/gitopsctr-demo/app",
+    }
     assert service["spec"]["terraform"]["backend"]["path"] == str(state)
     assert service["spec"]["terraform"]["variables"]["host_port"] == 18081
 
 
 def test_demo_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):
     events: list[object] = []
-    heads = iter((("desired", "observed"), ("desired", "observed")))
+    heads = iter((RefHeads("desired", "observed"), RefHeads("desired", "observed")))
     monkeypatch.setattr(demo, "clean", lambda registry: events.append(("clean", registry)))
     monkeypatch.setattr(
         demo,
@@ -75,7 +63,7 @@ def test_demo_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):
 
 def test_demo_acceptance_cleans_after_a_failed_invariant(monkeypatch):
     cleaned: list[str] = []
-    heads = iter((("desired-1", "observed"), ("desired-2", "observed")))
+    heads = iter((RefHeads("desired-1", "observed"), RefHeads("desired-2", "observed")))
     monkeypatch.setattr(demo, "clean", cleaned.append)
     monkeypatch.setattr(demo, "converge", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(demo, "deployment_heads", lambda: next(heads))
@@ -86,46 +74,70 @@ def test_demo_acceptance_cleans_after_a_failed_invariant(monkeypatch):
     assert cleaned == ["localhost:5001", "localhost:5001"]
 
 
-def test_kubernetes_demo_is_a_real_helm_direct_delivery_unit():
-    specifications = cli.load_environment_specifications(kubernetes_demo.TEMPLATE, "dev")
+@pytest.mark.parametrize("provider", ("kind", "minikube"))
+def test_kubernetes_demo_is_a_real_image_and_helm_delivery(tmp_path, monkeypatch, provider):
+    worktree = tmp_path / provider / "repository"
+    shutil.copytree(kubernetes_demo.TEMPLATE, worktree)
+    monkeypatch.setattr(kubernetes_demo, "docker_platform", lambda: "linux/amd64")
+    kubernetes_demo.configure_template(provider, worktree)
+    specifications = cli.load_environment_specifications(worktree, "dev")
     specification = specifications["web"]
 
+    assert cli.convergence_order(specifications, ["demo-image", "web"]) == ["demo-image", "web"]
     assert specification["source"]["inputs"] == ["**/*"]
     assert specification["materialize"]["type"] == "helm"
+    assert specification["materialize"]["values"]["image"]["fromObservation"] == "units/demo-image.yaml"
     assert specification["delivery"] == {
         "mode": "direct",
-        "kubeContext": kubernetes_demo.KUBE_CONTEXT,
+        "kubeContext": kubernetes_demo.kube_context(provider),
         "prune": False,
-        "wait": [],
+        "wait": [
+            {
+                "resource": "deployment/gitopsctr-kubernetes-demo",
+                "namespace": "default",
+                "condition": "Available",
+                "timeoutSeconds": 120,
+            }
+        ],
+    }
+    image_target = specifications["demo-image"]["publish"]["targets"]["application"]
+    assert image_target == {
+        "type": provider,
+        "cluster" if provider == "kind" else "profile": kubernetes_demo.CLUSTER_NAME,
     }
 
 
 def test_kubernetes_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):
     events: list[object] = []
-    heads = iter((("desired", "observed"), ("desired", "observed")))
-    monkeypatch.setattr(kubernetes_demo, "clean", lambda: events.append("clean"))
-    monkeypatch.setattr(kubernetes_demo, "start", lambda: events.append("start"))
+    heads = iter((RefHeads("desired", "observed"), RefHeads("desired", "observed")))
+    monkeypatch.setattr(kubernetes_demo, "clean", lambda provider: events.append(("clean", provider)))
+    monkeypatch.setattr(kubernetes_demo, "start", lambda provider: events.append(("start", provider)))
     monkeypatch.setattr(
         kubernetes_demo,
         "converge",
-        lambda **kwargs: events.append(("converge", kwargs)),
+        lambda provider, **kwargs: events.append(("converge", provider, kwargs)),
     )
-    monkeypatch.setattr(kubernetes_demo, "deployment_heads", lambda: next(heads))
+    monkeypatch.setattr(kubernetes_demo, "deployment_heads", lambda _provider: next(heads))
 
-    kubernetes_demo.acceptance()
+    kubernetes_demo.acceptance("kind")
 
-    assert events == ["clean", "start", ("converge", {"expect_clean": True}), "clean"]
+    assert events == [
+        ("clean", "kind"),
+        ("start", "kind"),
+        ("converge", "kind", {"expect_clean": True}),
+        ("clean", "kind"),
+    ]
 
 
 def test_kubernetes_acceptance_cleans_after_a_failed_invariant(monkeypatch):
     events: list[object] = []
-    heads = iter((("desired-1", "observed"), ("desired-2", "observed")))
-    monkeypatch.setattr(kubernetes_demo, "clean", lambda: events.append("clean"))
-    monkeypatch.setattr(kubernetes_demo, "start", lambda: None)
-    monkeypatch.setattr(kubernetes_demo, "converge", lambda **_kwargs: None)
-    monkeypatch.setattr(kubernetes_demo, "deployment_heads", lambda: next(heads))
+    heads = iter((RefHeads("desired-1", "observed"), RefHeads("desired-2", "observed")))
+    monkeypatch.setattr(kubernetes_demo, "clean", lambda provider: events.append(("clean", provider)))
+    monkeypatch.setattr(kubernetes_demo, "start", lambda _provider: None)
+    monkeypatch.setattr(kubernetes_demo, "converge", lambda _provider, **_kwargs: None)
+    monkeypatch.setattr(kubernetes_demo, "deployment_heads", lambda _provider: next(heads))
 
     with pytest.raises(RuntimeError, match="moved desired or observed refs"):
-        kubernetes_demo.acceptance()
+        kubernetes_demo.acceptance("minikube")
 
-    assert events == ["clean", "clean"]
+    assert events == [("clean", "minikube"), ("clean", "minikube")]

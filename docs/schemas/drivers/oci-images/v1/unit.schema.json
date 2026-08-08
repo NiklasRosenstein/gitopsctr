@@ -1,0 +1,202 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/oci-images/v1/unit.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "default": null
+    },
+    "artifacts": {
+      "anyOf": [
+        {
+          "items": {
+            "const": "containers.json"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "build": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "dockerfile": {
+              "type": "string"
+            },
+            "platform": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "dockerfile",
+            "platform"
+          ],
+          "title": "OciBuild",
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "driver": {
+      "const": "oci-images"
+    },
+    "environment": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "name": {
+      "type": "string"
+    },
+    "publish": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "credentialProvider": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "type": {
+                      "const": "aws-ecr"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ],
+                  "title": "AwsEcrCredentialProvider",
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "targets": {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "repository": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "const": "registry"
+                      }
+                    },
+                    "required": [
+                      "type",
+                      "repository"
+                    ],
+                    "title": "RegistryTarget",
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "cluster": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "const": "kind"
+                      }
+                    },
+                    "required": [
+                      "type",
+                      "cluster"
+                    ],
+                    "title": "KindTarget",
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "profile": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "const": "minikube"
+                      }
+                    },
+                    "required": [
+                      "type",
+                      "profile"
+                    ],
+                    "title": "MinikubeTarget",
+                    "type": "object"
+                  }
+                ]
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "targets"
+          ],
+          "title": "OciPublication",
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "inputs": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Input paths or glob patterns resolved relative to source.path."
+        },
+        "path": {
+          "description": "Repository-relative path resolved from the root of the selected source revision.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "AuthoredSource",
+      "type": "object"
+    }
+  },
+  "required": [
+    "name",
+    "driver",
+    "source"
+  ],
+  "title": "OciImagesUnit",
+  "type": "object"
+}

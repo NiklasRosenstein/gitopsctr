@@ -40,7 +40,7 @@ Important commands include:
 ## Demo
 
 `mise run demo` creates an isolated local Git remote, builds and publishes a real OCI image to a local
-registry, and deploys it as a Docker container through the Terraform driver. See [`demo/README.md`](demo/README.md)
+registry, and deploys it as a Docker container through the Terraform driver. See [`demo/docker`](demo/docker/)
 for prerequisites, the reconciliation flow, and cleanup instructions.
 
 ## Unit drivers

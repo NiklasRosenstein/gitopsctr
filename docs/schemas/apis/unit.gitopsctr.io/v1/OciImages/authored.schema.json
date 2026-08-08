@@ -26,7 +26,7 @@
       "type": "object"
     },
     "spec": {
-      "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/oci-images/v2/unit.schema.json",
+      "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/oci-images/v1/unit.schema.json",
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
@@ -106,9 +106,61 @@
                   ],
                   "default": null
                 },
-                "repositories": {
+                "targets": {
                   "additionalProperties": {
-                    "type": "string"
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "repository": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "const": "registry"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "repository"
+                        ],
+                        "title": "RegistryTarget",
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "cluster": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "const": "kind"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "cluster"
+                        ],
+                        "title": "KindTarget",
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "profile": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "const": "minikube"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "profile"
+                        ],
+                        "title": "MinikubeTarget",
+                        "type": "object"
+                      }
+                    ]
                   },
                   "propertyNames": {
                     "type": "string"
@@ -117,7 +169,7 @@
                 }
               },
               "required": [
-                "repositories"
+                "targets"
               ],
               "title": "OciPublication",
               "type": "object"

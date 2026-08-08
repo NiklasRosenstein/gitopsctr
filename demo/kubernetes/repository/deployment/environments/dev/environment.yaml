@@ -3,4 +3,5 @@ apiVersion: gitopsctr.io/v1
 kind: Environment
 metadata:
   name: dev
-spec: {}
+spec:
+  {}

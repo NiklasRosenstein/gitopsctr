@@ -1,0 +1,85 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/oci-images/v1/result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifacts": {
+      "additionalProperties": {
+        "additionalProperties": false,
+        "properties": {
+          "artifacts": {
+            "additionalProperties": {
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "const": "oci-image"
+                },
+                "uri": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "uri"
+              ],
+              "title": "OciImageArtifactModel",
+              "type": "object"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "schema": {
+            "const": 1
+          },
+          "unit": {
+            "additionalProperties": false,
+            "properties": {
+              "driver": {
+                "type": "string"
+              },
+              "inputHash": {
+                "type": "string"
+              },
+              "inputHashVersion": {
+                "const": 1
+              },
+              "name": {
+                "type": "string"
+              },
+              "sourceRevision": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "driver",
+              "inputHashVersion",
+              "inputHash",
+              "sourceRevision"
+            ],
+            "title": "ArtifactIdentityModel",
+            "type": "object"
+          }
+        },
+        "required": [
+          "schema",
+          "unit",
+          "artifacts"
+        ],
+        "title": "ContainersDocumentModel",
+        "type": "object"
+      },
+      "propertyNames": {
+        "type": "string"
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "artifacts"
+  ],
+  "title": "OciImagesResultModel",
+  "type": "object"
+}

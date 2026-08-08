@@ -48,12 +48,12 @@
     },
     "oci-images": {
       "schemas": {
-        "desired-unit": "drivers/oci-images/v2/desired-unit.schema.json",
-        "receipt": "drivers/oci-images/v2/receipt.schema.json",
-        "result": "drivers/oci-images/v2/result.schema.json",
-        "unit": "drivers/oci-images/v2/unit.schema.json"
+        "desired-unit": "drivers/oci-images/v1/desired-unit.schema.json",
+        "receipt": "drivers/oci-images/v1/receipt.schema.json",
+        "result": "drivers/oci-images/v1/result.schema.json",
+        "unit": "drivers/oci-images/v1/unit.schema.json"
       },
-      "version": 2
+      "version": 1
     },
     "terraform": {
       "schemas": {

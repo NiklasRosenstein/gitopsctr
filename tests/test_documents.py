@@ -44,10 +44,7 @@ def test_yaml_uses_language_server_schema_directive_while_json_keeps_schema_prop
     yaml_path = write_document(tmp_path / "resource.yaml", value)
     json_path = write_document(tmp_path / "resource.json", value)
 
-    assert yaml_path.read_text() == (
-        f"# yaml-language-server: $schema={schema}\n"
-        "name: example\n"
-    )
+    assert yaml_path.read_text() == (f"# yaml-language-server: $schema={schema}\nname: example\n")
     assert yaml.safe_load(yaml_path.read_text()) == {"name": "example"}
     assert json.loads(json_path.read_text()) == value
     assert value == {"$schema": schema, "name": "example"}
@@ -64,9 +61,7 @@ def test_yaml_uses_language_server_schema_directive_while_json_keeps_schema_prop
         (project_document().replace("kind: Project", "kind: Configuration"), "Project"),
     ],
 )
-def test_project_config_rejects_values_outside_its_published_schema(
-    tmp_path: Path, contents: str, message: str
-):
+def test_project_config_rejects_values_outside_its_published_schema(tmp_path: Path, contents: str, message: str):
     (tmp_path / "gitopsctr.yaml").write_text(contents)
     with pytest.raises(DocumentFormatError, match=message):
         load_project_config(tmp_path)
@@ -110,9 +105,7 @@ def test_project_configures_the_authored_environment_root(tmp_path: Path):
     environment_root = tmp_path / "config/environments/dev"
     units_root = environment_root / "units"
     units_root.mkdir(parents=True)
-    (tmp_path / "gitopsctr.yaml").write_text(
-        project_document(spec="{environmentsPath: config/environments}")
-    )
+    (tmp_path / "gitopsctr.yaml").write_text(project_document(spec="{environmentsPath: config/environments}"))
     (environment_root / "environment.yaml").write_text(
         "apiVersion: gitopsctr.io/v1\nkind: Environment\nmetadata: {name: dev}\nspec: {}\n"
     )
@@ -178,12 +171,13 @@ def test_yaml_demo_documents_validate_against_published_resource_schemas():
     by_id = {document["$id"]: document for document in documents.values() if "$id" in document}
     paths = [
         root / "gitopsctr.yaml",
-        root / "demo/repository/gitopsctr.yaml",
+        root / "demo/docker/repository/gitopsctr.yaml",
         root / "demo/kubernetes/repository/gitopsctr.yaml",
-        root / "demo/repository/deployment/environments/dev/environment.yaml",
-        root / "demo/repository/deployment/environments/dev/units/demo-image.yaml",
-        root / "demo/repository/deployment/environments/dev/units/demo-service.yaml",
+        root / "demo/docker/repository/deployment/environments/dev/environment.yaml",
+        root / "demo/docker/repository/deployment/environments/dev/units/demo-image.yaml",
+        root / "demo/docker/repository/deployment/environments/dev/units/demo-service.yaml",
         root / "demo/kubernetes/repository/deployment/environments/dev/environment.yaml",
+        root / "demo/kubernetes/repository/deployment/environments/dev/units/demo-image.yaml",
         root / "demo/kubernetes/repository/deployment/environments/dev/units/web.yaml",
     ]
     for path in paths:
@@ -231,7 +225,9 @@ def test_migration_script_converts_a_source_branch_in_one_forward_commit(tmp_pat
     )
 
     def show(path: str) -> str:
-        return subprocess.run(["git", "show", f"HEAD:{path}"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout
+        return subprocess.run(
+            ["git", "show", f"HEAD:{path}"], cwd=tmp_path, check=True, capture_output=True, text=True
+        ).stdout
 
     project = yaml.safe_load(show("gitopsctr.yaml"))
     assert project["apiVersion"] == "gitopsctr.io/v1"
@@ -241,7 +237,90 @@ def test_migration_script_converts_a_source_branch_in_one_forward_commit(tmp_pat
         subprocess.run(["git", "show", "HEAD:deployment/environments/dev/environment.json"], cwd=tmp_path, check=True)
     assert "apiVersion: gitopsctr.io/v1" in show("deployment/environments/dev/environment.yaml")
     with pytest.raises(subprocess.CalledProcessError):
-        subprocess.run(["git", "show", "HEAD:deployment/environments/dev/units/infrastructure.json"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "show", "HEAD:deployment/environments/dev/units/infrastructure.json"], cwd=tmp_path, check=True
+        )
     migrated = yaml.safe_load(show("deployment/environments/dev/units/infrastructure.yaml"))
     assert migrated["apiVersion"] == "unit.gitopsctr.io/v1"
     assert migrated["kind"] == "Terraform"
+    assert (
+        subprocess.run(
+            ["git", "status", "--porcelain"], cwd=tmp_path, check=True, capture_output=True, text=True
+        ).stdout
+        == ""
+    )
+    assert not (environment_root / "environment.json").exists()
+    assert (environment_root / "environment.yaml").exists()
+    assert not (units_root / "infrastructure.json").exists()
+    assert (units_root / "infrastructure.yaml").exists()
+
+
+def test_migration_script_rejects_stale_local_refs_before_applying(tmp_path: Path):
+    repository = tmp_path / "repository"
+    remote = tmp_path / "remote.git"
+    repository.mkdir()
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=repository, check=True)
+    (repository / "deployment/environments/dev/units").mkdir(parents=True)
+    (repository / "deployment/environments/dev/environment.json").write_text(json.dumps({"schema": 1, "name": "dev"}))
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-m", "legacy"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "branch", "deploy/dev"], cwd=repository, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "push", "-u", "origin", "main", "deploy/dev"], cwd=repository, check=True, capture_output=True
+    )
+
+    deploy_revision = subprocess.run(
+        ["git", "rev-parse", "deploy/dev"], cwd=repository, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "rev-parse", f"{deploy_revision}^{{tree}}"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    remote_revision = subprocess.run(
+        ["git", "commit-tree", tree, "-p", deploy_revision, "-m", "remote deployment"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "push", "origin", f"{remote_revision}:refs/heads/deploy/dev"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+
+    original_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    script = Path(__file__).parents[1] / "tools/migrate_documents.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--project-name", "test-project", "--apply", "--push"],
+        cwd=repository,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "deploy/dev (remote-only commits: 1, local-only commits: 0)" in result.stderr
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        == original_head
+    )
+    assert (
+        subprocess.run(
+            ["git", "status", "--porcelain"], cwd=repository, check=True, capture_output=True, text=True
+        ).stdout
+        == ""
+    )

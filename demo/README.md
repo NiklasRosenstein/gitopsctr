@@ -1,55 +1,7 @@
-# Local demo
+# Demos
 
-This demo exercises the real reconciliation path without cloud credentials:
+- [`docker`](docker/) builds an OCI image, publishes it to a local registry, and deploys it with Terraform and Docker.
+- [`kubernetes`](kubernetes/) builds an OCI image, loads it directly into an explicitly selected kind or minikube
+  cluster, renders a Helm chart, and deploys and verifies the application.
 
-1. `demo-image` builds a small HTTP server image and publishes it to a local OCI registry.
-2. Its receipt records the immutable image digest on `observed/dev`.
-3. `demo-service` consumes that digest through `fromObservation`.
-4. Terraform uses the Docker provider to pull the digest and run it on `http://127.0.0.1:18080`.
-
-The runner creates an isolated source repository and bare Git remote under `.demo-state/`. It never writes
-deployment refs to the `gitopsctr` repository or its remote.
-
-## Run it
-
-You need Docker running locally. Mise supplies Python, uv, Terraform, ORAS, and the other project tools.
-
-```console
-mise install
-mise run sync
-mise run demo
-```
-
-Run `mise run demo` again to demonstrate a clean convergence. Use `mise run demo-reset` after changing the
-template or to rebuild from scratch.
-
-Inspect the effects with:
-
-```console
-curl http://127.0.0.1:18080
-docker ps --filter name=gitopsctr-demo
-git -C .demo-state/repository log --all --oneline --decorate
-```
-
-Remove the demo's named containers, cached images, local Git remote, receipts, and Terraform state with:
-
-```console
-mise run demo-clean
-```
-
-CI runs the same end-to-end acceptance flow available locally. It deploys from an empty state, requires a second
-convergence to run no drivers and move no refs, and always cleans up:
-
-```console
-mise run demo-acceptance
-```
-
-The separate [`kubernetes`](kubernetes/) demo renders a real Helm chart, commits the resulting payload, applies it to
-a kind cluster, and verifies it with `kubectl diff`. Run `mise run kubernetes-acceptance` for its full CI flow. See the
-[Kubernetes unit driver documentation](../docs/drivers/kubernetes-manifests.md) for configuration and cleanup details.
-
-## Why this is not the test fixture
-
-`tests/fixtures/repository` is deliberately synthetic: controller tests use it globally and must not require
-Docker, Terraform, network access, or mutable external state. The demo mirrors its specification shape but is a
-separate runnable repository with real source files and effects.
+Both runners create isolated source repositories and Git remotes outside the gitopsctr repository's own refs.

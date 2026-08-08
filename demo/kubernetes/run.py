@@ -1,4 +1,4 @@
-"""Run the isolated Helm and kind acceptance demonstration."""
+"""Run the isolated Helm demo against an explicitly selected local Kubernetes provider."""
 
 from __future__ import annotations
 
@@ -7,109 +7,148 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Literal, cast
+
+from demo.utils import DemoRepository, RefHeads, docker_platform, remove_docker_images, require_commands, run
+
+Provider = Literal["kind", "minikube"]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = Path(__file__).parent / "repository"
 STATE_ROOT = PROJECT_ROOT / ".kubernetes-demo-state"
-WORKTREE = STATE_ROOT / "repository"
-REMOTE = STATE_ROOT / "origin.git"
 CLUSTER_NAME = "gitopsctr-kubernetes-demo"
-KUBE_CONTEXT = f"kind-{CLUSTER_NAME}"
 RESOURCE_NAME = "gitopsctr-kubernetes-demo"
+EXPECTED_RESPONSE = "Hello from a gitopsctr-managed Kubernetes container!"
 
 
-def run(
-    *args: str,
-    cwd: Path | None = None,
-    check: bool = True,
-    capture: bool = False,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, cwd=cwd, check=check, text=True, capture_output=capture)
+def kube_context(provider: Provider) -> str:
+    return f"kind-{CLUSTER_NAME}" if provider == "kind" else CLUSTER_NAME
 
 
-def require_commands() -> None:
-    missing = [name for name in ("git", "helm", "kind", "kubectl") if shutil.which(name) is None]
-    if missing:
-        raise RuntimeError(f"missing required commands: {', '.join(missing)}; run 'mise install'")
+def repository(provider: Provider) -> DemoRepository:
+    provider_state = STATE_ROOT / provider
+    return DemoRepository(
+        template=TEMPLATE,
+        state_root=provider_state,
+        worktree=provider_state / "repository",
+        remote=provider_state / "origin.git",
+        identity=f"gitopsctr Kubernetes {provider} demo",
+    )
 
 
-def prepare_repository() -> None:
-    if WORKTREE.is_dir():
-        return
-    STATE_ROOT.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(TEMPLATE, WORKTREE)
-    run("git", "init", "--bare", str(REMOTE))
-    run("git", "init", "--initial-branch=main", cwd=WORKTREE)
-    run("git", "config", "user.name", "gitopsctr Kubernetes demo", cwd=WORKTREE)
-    run("git", "config", "user.email", "demo@localhost", cwd=WORKTREE)
-    run("git", "add", ".", cwd=WORKTREE)
-    run("git", "commit", "-m", "Initialize Kubernetes demo", cwd=WORKTREE)
-    run("git", "remote", "add", "origin", str(REMOTE), cwd=WORKTREE)
-    run("git", "push", "--set-upstream", "origin", "main", cwd=WORKTREE)
+def configure_template(provider: Provider, worktree: Path) -> None:
+    replacements = {
+        "__CLUSTER_NAME__": CLUSTER_NAME,
+        "__DOCKER_PLATFORM__": docker_platform(),
+        "__KUBE_CONTEXT__": kube_context(provider),
+    }
+    for path in worktree.rglob("*"):
+        if not path.is_file():
+            continue
+        content = path.read_text()
+        if provider == "minikube":
+            content = content.replace("type: kind\n        cluster:", "type: minikube\n        profile:")
+        for old, new in replacements.items():
+            content = content.replace(old, new)
+        path.write_text(content)
 
 
-def clean() -> None:
-    if shutil.which("kind") is not None:
+def prepare_repository(provider: Provider) -> None:
+    demo_repository = repository(provider)
+    demo_repository.prepare(lambda: configure_template(provider, demo_repository.worktree))
+
+
+def clean(provider: Provider) -> None:
+    if provider == "kind" and shutil.which("kind") is not None:
         run("kind", "delete", "cluster", "--name", CLUSTER_NAME, check=False)
-    if STATE_ROOT.exists():
-        shutil.rmtree(STATE_ROOT)
-    print("Kubernetes demo cluster and state removed.")
+    elif provider == "minikube" and shutil.which("minikube") is not None:
+        run("minikube", "delete", "--profile", CLUSTER_NAME, check=False)
+    if shutil.which("docker") is not None:
+        remove_docker_images("demo-image:*")
+    repository(provider).clean()
+    print(f"Kubernetes {provider} demo cluster and state removed.")
 
 
-def ensure_cluster() -> None:
-    clusters = run("kind", "get", "clusters", capture=True).stdout.splitlines()
-    if CLUSTER_NAME not in clusters:
-        run("kind", "create", "cluster", "--name", CLUSTER_NAME, "--wait", "120s")
+def ensure_cluster(provider: Provider) -> None:
+    if provider == "kind":
+        clusters = run("kind", "get", "clusters", capture=True).stdout.splitlines()
+        if CLUSTER_NAME not in clusters:
+            run("kind", "create", "cluster", "--name", CLUSTER_NAME, "--wait", "120s")
+        return
+    status = run("minikube", "status", "--profile", CLUSTER_NAME, check=False, capture=True)
+    if status.returncode != 0:
+        run("minikube", "start", "--profile", CLUSTER_NAME, "--driver", "docker", "--wait", "all")
 
 
-def controller(*args: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
+def controller(provider: Provider, *args: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    worktree = repository(provider).worktree
     return run(
         sys.executable,
         "-m",
         "gitopsctr",
         "--repository",
-        str(WORKTREE),
+        str(worktree),
         *args,
-        cwd=WORKTREE,
+        cwd=worktree,
         capture=capture,
     )
 
 
-def deployment_heads() -> tuple[str, str]:
-    def head(ref: str) -> str:
-        return run(
-            "git",
-            "--git-dir",
-            str(REMOTE),
-            "rev-parse",
-            f"refs/heads/{ref}",
-            capture=True,
-        ).stdout.strip()
-
-    return head("deploy/dev"), head("observed/dev")
+def deployment_heads(provider: Provider) -> RefHeads:
+    return repository(provider).heads()
 
 
-def verify_resource() -> None:
-    message = run(
+def verify_resource(provider: Provider) -> None:
+    context = kube_context(provider)
+    run(
         "kubectl",
         "--context",
-        KUBE_CONTEXT,
+        context,
+        "--namespace",
+        "default",
+        "rollout",
+        "status",
+        f"deployment/{RESOURCE_NAME}",
+        "--timeout=120s",
+    )
+    image = run(
+        "kubectl",
+        "--context",
+        context,
         "--namespace",
         "default",
         "get",
-        "configmap",
+        "deployment",
         RESOURCE_NAME,
         "--output",
-        "jsonpath={.data.message}",
+        "jsonpath={.spec.template.spec.containers[0].image}",
         capture=True,
     ).stdout
-    if message != "rendered and reconciled":
-        raise RuntimeError(f"unexpected ConfigMap value: {message!r}")
-    controller("verify", "--environment", "dev")
+    if not image.startswith("demo-image:"):
+        raise RuntimeError(f"unexpected deployed image: {image!r}")
+    response = run(
+        "kubectl",
+        "--context",
+        context,
+        "--namespace",
+        "default",
+        "exec",
+        f"deployment/{RESOURCE_NAME}",
+        "--",
+        "wget",
+        "--quiet",
+        "--output-document=-",
+        "http://127.0.0.1:8080/",
+        capture=True,
+    ).stdout.strip()
+    if response != EXPECTED_RESPONSE:
+        raise RuntimeError(f"unexpected application response: {response!r}")
+    controller(provider, "verify", "--environment", "dev")
 
 
-def converge(*, expect_clean: bool = False) -> None:
+def converge(provider: Provider, *, expect_clean: bool = False) -> None:
     result = controller(
+        provider,
         "converge",
         "--environment",
         "dev",
@@ -123,43 +162,45 @@ def converge(*, expect_clean: bool = False) -> None:
         print(output, end="" if output.endswith("\n") else "\n")
         if "no drivers ran; 0 ref movements" not in output:
             raise RuntimeError("second Kubernetes convergence was not clean")
-    verify_resource()
+    verify_resource(provider)
 
 
-def start() -> None:
-    require_commands()
-    prepare_repository()
-    ensure_cluster()
-    converge()
-    print(f"Kubernetes demo is applied in context {KUBE_CONTEXT}.")
-    print("Run 'mise run kubernetes-demo-clean' to remove all effects.")
+def start(provider: Provider) -> None:
+    require_commands("docker", "git", "helm", provider, "kubectl")
+    ensure_cluster(provider)
+    prepare_repository(provider)
+    converge(provider)
+    print(f"Kubernetes demo is running in context {kube_context(provider)}.")
+    print(f"Run 'mise run kubernetes-demo-clean -- {provider}' to remove all effects.")
 
 
-def acceptance() -> None:
-    clean()
+def acceptance(provider: Provider) -> None:
+    clean(provider)
     try:
-        start()
-        first_heads = deployment_heads()
-        converge(expect_clean=True)
-        second_heads = deployment_heads()
+        start(provider)
+        first_heads = deployment_heads(provider)
+        converge(provider, expect_clean=True)
+        second_heads = deployment_heads(provider)
         if second_heads != first_heads:
             raise RuntimeError("clean Kubernetes convergence moved desired or observed refs")
-        print(f"Acceptance passed: deploy/dev={second_heads[0][:12]} observed/dev={second_heads[1][:12]}")
+        print(f"Acceptance passed: deploy/dev={second_heads.desired[:12]} observed/dev={second_heads.observed[:12]}")
     finally:
-        clean()
+        clean(provider)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("run", "clean", "acceptance"), nargs="?", default="run")
+    parser.add_argument("operation", choices=("run", "clean", "acceptance"))
+    parser.add_argument("provider", choices=("kind", "minikube"), help="local cluster provider (required)")
     args = parser.parse_args()
+    provider = cast(Provider, args.provider)
     try:
         if args.operation == "clean":
-            clean()
+            clean(provider)
         elif args.operation == "acceptance":
-            acceptance()
+            acceptance(provider)
         else:
-            start()
+            start(provider)
     except (RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"Kubernetes demo failed: {exc}", file=sys.stderr)
         return 1

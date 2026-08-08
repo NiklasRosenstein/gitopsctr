@@ -1,9 +1,8 @@
 # OCI images unit driver
 
-The OCI images driver builds one or more Docker images and publishes immutable
-digests to named OCI repositories. The same input hash produces the same tag,
-which makes retries idempotent and lets downstream units consume
-`containers.json` through observations.
+The OCI images driver builds a Docker image once and exports it to one or more named targets. Registry targets
+publish immutable digests; kind and minikube targets load the deterministic local tag directly into a cluster. The
+resulting `containers.json` lets downstream units consume either reference through observations.
 
 **Kind:** `unit.gitopsctr.io/v1/OciImages`<br>
 **Capabilities:** planning, reconciliation
@@ -24,19 +23,36 @@ spec:
     dockerfile: Dockerfile
     platform: linux/amd64
   publish:
-    repositories:
-      application: registry.example/application
+    targets:
+      application:
+        type: registry
+        repository: registry.example/application
   artifacts: [containers.json]
 ```
 
-`build.dockerfile` is resolved from the source checkout and `platform` is
-passed to Docker. `publish.repositories` maps stable artifact names to OCI
-repositories. The optional `publish.credentialProvider` currently supports
-`{type: aws-ecr}`. The driver emits `containers.json`, containing immutable
-image URIs and the source/input identity.
+`build.dockerfile` is resolved from the source checkout and `platform` is passed to Docker. `publish.targets` maps
+stable artifact names to typed delivery targets. The optional `publish.credentialProvider` currently supports
+`{type: aws-ecr}` for registry targets.
 
-Planning builds the image but does not publish it. Reconciliation reuses an
-existing digest when all named repositories agree; disagreement fails loudly.
+Local cluster targets use the kind cluster name or minikube profile:
+
+```yaml
+publish:
+  targets:
+    development:
+      type: kind
+      cluster: local
+    integration:
+      type: minikube
+      profile: integration
+```
+
+The driver builds once per reconciliation. It reuses a matching registry image when possible, then pushes registry
+targets and loads local targets. Registry artifacts contain digest-pinned URIs; local artifacts contain the
+input-hash-tagged image name loaded into the selected cluster.
+
+Planning builds the image but does not export it. Reconciliation requires all existing registry targets to agree on
+the digest; disagreement fails loudly.
 
 ## Schemas
 

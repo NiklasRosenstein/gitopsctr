@@ -3,6 +3,7 @@ actionlint = "latest"
 oras = "latest"
 helm = "latest"
 kind = "latest"
+minikube = "latest"
 kubectl = "latest"
 python = "3.12"
 terraform = "latest"
@@ -51,28 +52,28 @@ run = "uv build"
 
 [tasks.demo]
 description = "Run the real local Docker/Terraform demo"
-run = "uv run python demo/run.py run"
+run = "uv run python -m demo.docker.run run"
 
 [tasks.demo-reset]
 description = "Recreate and run the local demo from scratch"
-run = "uv run python demo/run.py reset"
+run = "uv run python -m demo.docker.run reset"
 
 [tasks.demo-clean]
 description = "Remove the local demo resources and state"
-run = "uv run python demo/run.py clean"
+run = "uv run python -m demo.docker.run clean"
 
 [tasks.demo-acceptance]
 description = "Deploy, prove clean convergence, and clean the real local demo"
-run = "uv run python demo/run.py acceptance"
+run = "uv run python -m demo.docker.run acceptance"
 
 [tasks.kubernetes-demo]
-description = "Render and deploy the Helm demo to a local kind cluster"
-run = "uv run python demo/kubernetes/run.py run"
+description = "Build and deploy the demo to an explicitly selected kind or minikube cluster"
+run = "uv run python -m demo.kubernetes.run run"
 
 [tasks.kubernetes-demo-clean]
-description = "Remove the Kubernetes demo cluster and state"
-run = "uv run python demo/kubernetes/run.py clean"
+description = "Remove the explicitly selected Kubernetes demo cluster and state"
+run = "uv run python -m demo.kubernetes.run clean"
 
 [tasks.kubernetes-acceptance]
-description = "Render, deploy, verify, prove clean convergence, and clean the kind demo"
-run = "uv run python demo/kubernetes/run.py acceptance"
+description = "Build, deploy, verify, prove clean convergence, and clean the selected Kubernetes demo"
+run = "uv run python -m demo.kubernetes.run acceptance"

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -13,48 +12,17 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TEMPLATE = PROJECT_ROOT / "demo" / "repository"
-STATE_ROOT = PROJECT_ROOT / ".demo-state"
+from demo.utils import DemoRepository, RefHeads, docker_platform, remove_docker_images, require_commands, run
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TEMPLATE = Path(__file__).parent / "repository"
+STATE_ROOT = PROJECT_ROOT / ".docker-demo-state"
 WORKTREE = STATE_ROOT / "repository"
 REMOTE = STATE_ROOT / "origin.git"
 TERRAFORM_STATE = STATE_ROOT / "terraform.tfstate"
 REGISTRY_NAME = "gitopsctr-demo-registry"
 APP_NAME = "gitopsctr-demo-app"
-
-
-def run(
-    *args: str,
-    cwd: Path | None = None,
-    check: bool = True,
-    capture: bool = False,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        args,
-        cwd=cwd,
-        check=check,
-        text=True,
-        capture_output=capture,
-    )
-
-
-def require_command(name: str) -> None:
-    if shutil.which(name) is None:
-        raise RuntimeError(f"{name} is required; run 'mise install' and ensure Docker is installed")
-
-
-def docker_platform() -> str:
-    architecture = run("docker", "info", "--format", "{{.Architecture}}", capture=True).stdout.strip()
-    platforms = {
-        "amd64": "linux/amd64",
-        "x86_64": "linux/amd64",
-        "arm64": "linux/arm64",
-        "aarch64": "linux/arm64",
-    }
-    try:
-        return platforms[architecture]
-    except KeyError as exc:
-        raise RuntimeError(f"unsupported Docker architecture: {architecture or platform.machine()}") from exc
+REPOSITORY = DemoRepository(TEMPLATE, STATE_ROOT, WORKTREE, REMOTE, "gitopsctr Docker demo")
 
 
 def configure_template(registry: str, app_port: int) -> None:
@@ -75,19 +43,7 @@ def configure_template(registry: str, app_port: int) -> None:
 
 
 def prepare_repository(registry: str, app_port: int) -> None:
-    if WORKTREE.is_dir():
-        return
-    STATE_ROOT.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(TEMPLATE, WORKTREE)
-    configure_template(registry, app_port)
-    run("git", "init", "--bare", str(REMOTE))
-    run("git", "init", "--initial-branch=main", cwd=WORKTREE)
-    run("git", "config", "user.name", "gitopsctr demo", cwd=WORKTREE)
-    run("git", "config", "user.email", "demo@localhost", cwd=WORKTREE)
-    run("git", "add", ".", cwd=WORKTREE)
-    run("git", "commit", "-m", "Initialize gitopsctr demo", cwd=WORKTREE)
-    run("git", "remote", "add", "origin", str(REMOTE), cwd=WORKTREE)
-    run("git", "push", "--set-upstream", "origin", "main", cwd=WORKTREE)
+    REPOSITORY.prepare(lambda: configure_template(registry, app_port))
 
 
 def wait_for_registry(port: int) -> None:
@@ -132,22 +88,7 @@ def verify_application(port: int) -> str:
 
 
 def remove_demo_images(registry: str) -> None:
-    references = ("demo-image:*", f"{registry}/gitopsctr-demo/app*")
-    image_ids: set[str] = set()
-    for reference in references:
-        result = run(
-            "docker",
-            "image",
-            "ls",
-            "--quiet",
-            "--filter",
-            f"reference={reference}",
-            check=False,
-            capture=True,
-        )
-        image_ids.update(result.stdout.split())
-    if image_ids:
-        run("docker", "image", "rm", "--force", *sorted(image_ids))
+    remove_docker_images("demo-image:*", f"{registry}/gitopsctr-demo/app*")
 
 
 def clean(registry: str) -> None:
@@ -157,29 +98,23 @@ def clean(registry: str) -> None:
             if existing.returncode == 0:
                 run("docker", "container", "rm", "--force", name)
         remove_demo_images(registry)
-    if STATE_ROOT.exists():
-        shutil.rmtree(STATE_ROOT)
+    REPOSITORY.clean()
     print("Demo resources and state removed.")
 
 
-def deployment_heads() -> tuple[str, str]:
-    def head(ref: str) -> str:
-        return run(
-            "git",
-            "--git-dir",
-            str(REMOTE),
-            "rev-parse",
-            f"refs/heads/{ref}",
-            capture=True,
-        ).stdout.strip()
-
-    return head("deploy/dev"), head("observed/dev")
+def deployment_heads() -> RefHeads:
+    return REPOSITORY.heads()
 
 
 def converge(registry_port: int, app_port: int, *, expect_clean: bool = False) -> None:
     registry = f"localhost:{registry_port}"
-    for command in ("docker", "git", "terraform", "curl"):
-        require_command(command)
+    require_commands(
+        "docker",
+        "git",
+        "terraform",
+        "curl",
+        installation_hint="run 'mise install' and ensure Docker is installed",
+    )
     prepare_repository(registry, app_port)
     ensure_registry(registry_port)
     result = run(
@@ -219,7 +154,7 @@ def acceptance(registry_port: int, app_port: int) -> None:
         second_heads = deployment_heads()
         if second_heads != first_heads:
             raise RuntimeError("clean convergence moved desired or observed refs")
-        print(f"Acceptance passed: deploy/dev={second_heads[0][:12]} observed/dev={second_heads[1][:12]}")
+        print(f"Acceptance passed: deploy/dev={second_heads.desired[:12]} observed/dev={second_heads.observed[:12]}")
     finally:
         clean(registry)
 
