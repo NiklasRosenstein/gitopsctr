@@ -1,4 +1,9 @@
-"""Unit plugin contracts and entry-point discovery."""
+"""Unit driver contracts and entry-point discovery.
+
+A unit is a resource instance; a :class:`UnitDriver` implements the resource
+kind and advertises the capabilities it supports.  ``Plugin`` remains a
+packaging/discovery term, not the runtime domain model.
+"""
 
 from __future__ import annotations
 
@@ -20,9 +25,12 @@ class DriverError(RuntimeError):
     pass
 
 
-class UnitPlugin:
-    """A versioned deployment-unit plugin discovered through an entry point."""
+class UnitDriver:
+    """A versioned implementation of one unit API kind."""
 
+    api_version: ClassVar[str] = "unit.gitopsctr.io/v1"
+    kind: ClassVar[str]
+    driver_name: ClassVar[str]
     version: ClassVar[int] = 0
     schema_base_uri: ClassVar[str | None] = None
     unit_contract: ClassVar[DocumentContract]
@@ -140,47 +148,68 @@ class VerificationCapability(ABC):
 SemanticResultSelector = Callable[[object], ReconciliationResult]
 
 
-def load_unit_plugins() -> dict[str, UnitPlugin]:
-    plugins: dict[str, UnitPlugin] = {}
+def load_unit_drivers() -> dict[str, UnitDriver]:
+    drivers: dict[str, UnitDriver] = {}
     for entry_point in entry_points(group="gitopsctr.drivers"):
-        if entry_point.name in plugins:
-            raise DriverError(f"duplicate unit plugin entry point: {entry_point.name}")
-        plugin = entry_point.load()
-        if not isinstance(plugin, UnitPlugin):
-            raise DriverError(f"unit plugin entry point {entry_point.name!r} did not load a UnitPlugin")
-        if isinstance(plugin.version, bool) or not isinstance(plugin.version, int) or plugin.version < 1:
-            raise DriverError(f"unit plugin entry point {entry_point.name!r} has an invalid version")
-        if not isinstance(plugin, (MaterializationCapability, ReconciliationCapability)):
+        driver = entry_point.load()
+        if not isinstance(driver, UnitDriver):
+            raise DriverError(f"unit driver entry point {entry_point.name!r} did not load a UnitDriver")
+        if isinstance(driver.version, bool) or not isinstance(driver.version, int) or driver.version < 1:
+            raise DriverError(f"unit driver entry point {entry_point.name!r} has an invalid version")
+        if not isinstance(driver, (MaterializationCapability, ReconciliationCapability)):
             raise DriverError(
-                f"unit plugin entry point {entry_point.name!r} has no materialization or reconciliation capability"
+                f"unit driver entry point {entry_point.name!r} has no materialization or reconciliation capability"
             )
+        expected_gvk = f"{driver.api_version}/{driver.kind}"
+        if entry_point.name != expected_gvk:
+            raise DriverError(
+                f"unit driver entry point {entry_point.name!r} does not match declared API kind {expected_gvk!r}"
+            )
+        if not driver.driver_name:
+            raise DriverError(f"unit driver entry point {entry_point.name!r} has no driver_name")
+        if driver.driver_name in drivers:
+            raise DriverError(f"duplicate unit driver entry point: {driver.driver_name}")
         for kind in ("unit", "desired_unit", "result"):
-            contract = getattr(plugin, f"{kind}_contract", None)
+            contract = getattr(driver, f"{kind}_contract", None)
             if not isinstance(contract, DocumentContract):
                 raise DriverError(
-                    f"unit plugin entry point {entry_point.name!r} has no {kind.replace('_', '-')} contract"
+                    f"unit driver entry point {entry_point.name!r} has no {kind.replace('_', '-')} contract"
                 )
-        plugins[entry_point.name] = plugin
-    return plugins
+        drivers[driver.driver_name] = driver
+    return drivers
 
 
-UNIT_PLUGINS = load_unit_plugins()
-PLUGIN_VERSIONS = {name: plugin.version for name, plugin in UNIT_PLUGINS.items()}
-MATERIALIZATION_PLUGINS = {
-    name: plugin for name, plugin in UNIT_PLUGINS.items() if isinstance(plugin, MaterializationCapability)
+UNIT_DRIVERS = load_unit_drivers()
+DRIVER_GVKS = {name: f"{driver.api_version}/{driver.kind}" for name, driver in UNIT_DRIVERS.items()}
+DRIVER_NAMES_BY_GVK = {gvk: name for name, gvk in DRIVER_GVKS.items()}
+DRIVER_VERSIONS = {name: driver.version for name, driver in UNIT_DRIVERS.items()}
+MATERIALIZATION_DRIVERS = {
+    name: driver for name, driver in UNIT_DRIVERS.items() if isinstance(driver, MaterializationCapability)
 }
-RECONCILIATION_PLUGINS = {
-    name: plugin for name, plugin in UNIT_PLUGINS.items() if isinstance(plugin, ReconciliationCapability)
+RECONCILIATION_DRIVERS = {
+    name: driver for name, driver in UNIT_DRIVERS.items() if isinstance(driver, ReconciliationCapability)
 }
-PLANNING_PLUGINS = {name: plugin for name, plugin in UNIT_PLUGINS.items() if isinstance(plugin, PlanningCapability)}
-VERIFICATION_PLUGINS = {
-    name: plugin for name, plugin in UNIT_PLUGINS.items() if isinstance(plugin, VerificationCapability)
+PLANNING_DRIVERS = {name: driver for name, driver in UNIT_DRIVERS.items() if isinstance(driver, PlanningCapability)}
+VERIFICATION_DRIVERS = {
+    name: driver for name, driver in UNIT_DRIVERS.items() if isinstance(driver, VerificationCapability)
 }
 
 
-def semantic_reconciliation_result(plugin_name: str, result: object) -> ReconciliationResult:
+def semantic_reconciliation_result(driver_name: str, result: object) -> ReconciliationResult:
     try:
-        plugin = RECONCILIATION_PLUGINS[plugin_name]
+        driver = RECONCILIATION_DRIVERS[driver_name]
     except KeyError as exc:
-        raise DriverError(f"unit plugin does not support reconciliation: {plugin_name}") from exc
-    return plugin.semantic_result(result)
+        raise DriverError(f"unit driver does not support reconciliation: {driver_name}") from exc
+    return driver.semantic_result(result)
+
+
+# Transitional aliases keep the existing CLI/test surface usable while the
+# repository documents and entry points move to the UnitDriver vocabulary.
+UnitPlugin = UnitDriver
+load_unit_plugins = load_unit_drivers
+UNIT_PLUGINS = UNIT_DRIVERS
+PLUGIN_VERSIONS = DRIVER_VERSIONS
+MATERIALIZATION_PLUGINS = MATERIALIZATION_DRIVERS
+RECONCILIATION_PLUGINS = RECONCILIATION_DRIVERS
+PLANNING_PLUGINS = PLANNING_DRIVERS
+VERIFICATION_PLUGINS = VERIFICATION_DRIVERS

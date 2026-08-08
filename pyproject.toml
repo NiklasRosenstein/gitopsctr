@@ -29,11 +29,11 @@ Repository = "https://github.com/NiklasRosenstein/gitopsctr"
 gitopsctr = "gitopsctr.cli:main"
 
 [project.entry-points."gitopsctr.drivers"]
-frontend-s3-cloudfront = "gitopsctr.contrib.driver.frontend_s3_cloudfront:PLUGIN"
-oci-images = "gitopsctr.contrib.driver.oci_images:PLUGIN"
-terraform = "gitopsctr.contrib.driver.terraform:PLUGIN"
-vite-oci-bundle = "gitopsctr.contrib.driver.vite_oci_bundle:PLUGIN"
-kubernetes-manifests = "gitopsctr.contrib.driver.kubernetes_manifests:PLUGIN"
+"unit.gitopsctr.io/v1/FrontendS3Cloudfront" = "gitopsctr.contrib.drivers.frontend_s3_cloudfront:DRIVER"
+"unit.gitopsctr.io/v1/OciImages" = "gitopsctr.contrib.drivers.oci_images:DRIVER"
+"unit.gitopsctr.io/v1/Terraform" = "gitopsctr.contrib.drivers.terraform:DRIVER"
+"unit.gitopsctr.io/v1/ViteOciBundle" = "gitopsctr.contrib.drivers.vite_oci_bundle:DRIVER"
+"unit.gitopsctr.io/v1/KubernetesManifests" = "gitopsctr.contrib.drivers.kubernetes_manifests:DRIVER"
 
 [dependency-groups]
 dev = [

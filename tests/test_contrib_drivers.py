@@ -73,18 +73,18 @@ def test_contributed_driver_entry_points_load_one_module_per_driver():
     entry_points = configuration["project"]["entry-points"]["gitopsctr.drivers"]
 
     assert entry_points == {
-        "frontend-s3-cloudfront": "gitopsctr.contrib.driver.frontend_s3_cloudfront:PLUGIN",
-        "kubernetes-manifests": "gitopsctr.contrib.driver.kubernetes_manifests:PLUGIN",
-        "oci-images": "gitopsctr.contrib.driver.oci_images:PLUGIN",
-        "terraform": "gitopsctr.contrib.driver.terraform:PLUGIN",
-        "vite-oci-bundle": "gitopsctr.contrib.driver.vite_oci_bundle:PLUGIN",
+        "unit.gitopsctr.io/v1/FrontendS3Cloudfront": "gitopsctr.contrib.drivers.frontend_s3_cloudfront:DRIVER",
+        "unit.gitopsctr.io/v1/KubernetesManifests": "gitopsctr.contrib.drivers.kubernetes_manifests:DRIVER",
+        "unit.gitopsctr.io/v1/OciImages": "gitopsctr.contrib.drivers.oci_images:DRIVER",
+        "unit.gitopsctr.io/v1/Terraform": "gitopsctr.contrib.drivers.terraform:DRIVER",
+        "unit.gitopsctr.io/v1/ViteOciBundle": "gitopsctr.contrib.drivers.vite_oci_bundle:DRIVER",
     }
     assert {plugin.reconcile.__module__ for plugin in driver_registry.RECONCILIATION_PLUGINS.values()} == {
-        "gitopsctr.contrib.driver.frontend_s3_cloudfront",
-        "gitopsctr.contrib.driver.kubernetes_manifests",
-        "gitopsctr.contrib.driver.oci_images",
-        "gitopsctr.contrib.driver.terraform",
-        "gitopsctr.contrib.driver.vite_oci_bundle",
+        "gitopsctr.contrib.drivers.frontend_s3_cloudfront",
+        "gitopsctr.contrib.drivers.kubernetes_manifests",
+        "gitopsctr.contrib.drivers.oci_images",
+        "gitopsctr.contrib.drivers.terraform",
+        "gitopsctr.contrib.drivers.vite_oci_bundle",
     }
     assert all(isinstance(plugin, UnitPlugin) for plugin in driver_registry.UNIT_PLUGINS.values())
 
