@@ -1,4 +1,5 @@
 {
+  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/frontend-s3-cloudfront/v1/unit.schema.json",
   "schema": 1,
   "name": "frontend",
   "driver": "frontend-s3-cloudfront",

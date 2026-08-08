@@ -20,6 +20,9 @@ Helm rendering uses the `helm` executable and records its installed version with
 
 ```json
 {
+  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/kubernetes-manifests/v1/unit.schema.json",
+  "schema": 1,
+  "name": "web",
   "driver": "kubernetes-manifests",
   "source": {"path": "charts/web", "inputs": ["**/*"]},
   "materialize": {

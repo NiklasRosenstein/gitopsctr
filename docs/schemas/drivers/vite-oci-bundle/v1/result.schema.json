@@ -1,0 +1,89 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/vite-oci-bundle/v1/result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifacts": {
+      "additionalProperties": {
+        "additionalProperties": false,
+        "properties": {
+          "artifacts": {
+            "additionalProperties": {
+              "additionalProperties": false,
+              "properties": {
+                "artifactType": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "oci-artifact"
+                },
+                "uri": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "artifactType",
+                "uri"
+              ],
+              "title": "BundleArtifactModel",
+              "type": "object"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "schema": {
+            "const": 1
+          },
+          "unit": {
+            "additionalProperties": false,
+            "properties": {
+              "driver": {
+                "type": "string"
+              },
+              "inputHash": {
+                "type": "string"
+              },
+              "inputHashVersion": {
+                "const": 1
+              },
+              "name": {
+                "type": "string"
+              },
+              "sourceRevision": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "driver",
+              "inputHashVersion",
+              "inputHash",
+              "sourceRevision"
+            ],
+            "title": "ViteArtifactIdentity",
+            "type": "object"
+          }
+        },
+        "required": [
+          "schema",
+          "unit",
+          "artifacts"
+        ],
+        "title": "FrontendDocumentModel",
+        "type": "object"
+      },
+      "propertyNames": {
+        "type": "string"
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "artifacts"
+  ],
+  "title": "ViteBundleResultModel",
+  "type": "object"
+}

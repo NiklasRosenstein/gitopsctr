@@ -1,0 +1,19 @@
+site_name: gitopsctr
+site_url: https://niklasrosenstein.github.io/gitopsctr/
+repo_url: https://github.com/NiklasRosenstein/gitopsctr
+repo_name: NiklasRosenstein/gitopsctr
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.sections
+nav:
+  - Overview: index.md
+  - JSON Schemas: schemas.md
+  - Kubernetes manifests: kubernetes-manifests.md
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+strict: true

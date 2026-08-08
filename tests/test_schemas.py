@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from jsonschema import Draft202012Validator
+from referencing import Registry, Resource
 
 from gitopsctr import schemas
 from gitopsctr.contracts import CORE_CONTRACTS, ContractError
@@ -26,6 +27,7 @@ def authored_examples() -> list[dict]:
 def desired_example(unit: dict) -> dict:
     desired = deepcopy(unit)
     driver = desired["driver"]
+    desired["$schema"] = schemas.driver_schema(driver, "desired-unit")["$id"]
     desired["source"] |= {
         "revision": REVISION,
         "inputHash": DIGEST,
@@ -142,6 +144,36 @@ def test_result_and_composed_receipt_schemas(driver):
     Draft202012Validator.check_schema(receipt_schema)
     Draft202012Validator(receipt_schema).validate(receipt)
     assert len(receipt_schema["allOf"]) == 2
+
+
+def test_latest_aliases_resolve_from_the_local_schema_catalog():
+    documents = schemas.schema_documents()
+    registry = Registry().with_resources(
+        (document["$id"], Resource.from_contents(document)) for document in documents.values() if "$id" in document
+    )
+    terraform_unit = next(unit for unit in authored_examples() if unit["driver"] == "terraform")
+
+    Draft202012Validator(
+        documents[Path("drivers/terraform/latest/unit.schema.json")],
+        registry=registry,
+    ).validate(terraform_unit)
+
+
+def test_generated_schemas_and_examples_validate_from_the_local_catalog():
+    documents = schemas.schema_documents()
+    published = [document for document in documents.values() if "$id" in document]
+    registry = Registry().with_resources((document["$id"], Resource.from_contents(document)) for document in published)
+    by_id = {document["$id"]: document for document in published}
+
+    for document in published:
+        Draft202012Validator.check_schema(document)
+    for authored in authored_examples():
+        Draft202012Validator(by_id[authored["$schema"]], registry=registry).validate(authored)
+        desired = desired_example(authored)
+        Draft202012Validator(by_id[desired["$schema"]], registry=registry).validate(desired)
+    for path in sorted((ROOT / "tests/fixtures").rglob("environment.json")):
+        environment = json.loads(path.read_text())
+        Draft202012Validator(by_id[environment["$schema"]], registry=registry).validate(environment)
 
 
 def test_schema_catalog_is_deterministic_checkable_and_preserves_history(tmp_path):

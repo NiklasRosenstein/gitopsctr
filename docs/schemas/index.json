@@ -1,0 +1,57 @@
+{
+  "core": {
+    "desired-unit": "core/v1/desired-unit.schema.json",
+    "environment": "core/v1/environment.schema.json",
+    "materialization": "core/v1/materialization.schema.json",
+    "promotion": "core/v1/promotion.schema.json",
+    "receipt": "core/v1/receipt.schema.json"
+  },
+  "drivers": {
+    "frontend-s3-cloudfront": {
+      "schemas": {
+        "desired-unit": "drivers/frontend-s3-cloudfront/v1/desired-unit.schema.json",
+        "receipt": "drivers/frontend-s3-cloudfront/v1/receipt.schema.json",
+        "result": "drivers/frontend-s3-cloudfront/v1/result.schema.json",
+        "unit": "drivers/frontend-s3-cloudfront/v1/unit.schema.json"
+      },
+      "version": 1
+    },
+    "kubernetes-manifests": {
+      "schemas": {
+        "desired-unit": "drivers/kubernetes-manifests/v1/desired-unit.schema.json",
+        "receipt": "drivers/kubernetes-manifests/v1/receipt.schema.json",
+        "result": "drivers/kubernetes-manifests/v1/result.schema.json",
+        "unit": "drivers/kubernetes-manifests/v1/unit.schema.json"
+      },
+      "version": 1
+    },
+    "oci-images": {
+      "schemas": {
+        "desired-unit": "drivers/oci-images/v2/desired-unit.schema.json",
+        "receipt": "drivers/oci-images/v2/receipt.schema.json",
+        "result": "drivers/oci-images/v2/result.schema.json",
+        "unit": "drivers/oci-images/v2/unit.schema.json"
+      },
+      "version": 2
+    },
+    "terraform": {
+      "schemas": {
+        "desired-unit": "drivers/terraform/v2/desired-unit.schema.json",
+        "receipt": "drivers/terraform/v2/receipt.schema.json",
+        "result": "drivers/terraform/v2/result.schema.json",
+        "unit": "drivers/terraform/v2/unit.schema.json"
+      },
+      "version": 2
+    },
+    "vite-oci-bundle": {
+      "schemas": {
+        "desired-unit": "drivers/vite-oci-bundle/v1/desired-unit.schema.json",
+        "receipt": "drivers/vite-oci-bundle/v1/receipt.schema.json",
+        "result": "drivers/vite-oci-bundle/v1/result.schema.json",
+        "unit": "drivers/vite-oci-bundle/v1/unit.schema.json"
+      },
+      "version": 1
+    }
+  },
+  "schema": 1
+}

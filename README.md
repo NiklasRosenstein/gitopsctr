@@ -28,7 +28,8 @@ the current directory. Use `--repository PATH` or `GITOPSCTR_REPOSITORY` to sele
 Important commands include:
 
 - `advance-desired`: materialize the next desired-state commit.
-- `reconcile`: run one unit's driver and publish its receipt.
+- `reconcile --plan`: run a speculative plugin plan without applying or publishing a receipt.
+- `reconcile`: apply one unit and publish its receipt.
 - `converge`: reconcile a dependency closure locally.
 - `promote`: promote a clean environment through its configured change gate.
 - `rollback`: publish a forward desired-state commit from historical state.
@@ -51,6 +52,16 @@ The `kubernetes-manifests` plugin renders Helm or plain YAML into the desired Gi
 materialization-only external delivery, and read-only Argo CD observation. See
 [`docs/kubernetes-manifests.md`](docs/kubernetes-manifests.md) for the desired-tree contract, delivery modes,
 promotion evidence, rollback behavior, and local kind demo.
+
+## JSON Schemas
+
+Built-in plugins publish Draft 2020-12 schemas for authored units, desired units, raw results, and composed receipts at
+[`https://niklasrosenstein.github.io/gitopsctr/schemas/`](https://niklasrosenstein.github.io/gitopsctr/schemas/).
+Core environment, promotion, materialization, desired-unit, and receipt-envelope schemas are published alongside them.
+
+Use `gitopsctr schemas show DRIVER KIND` for one schema and `gitopsctr schemas export DIRECTORY` to generate the complete
+catalog. Committed specifications should use pinned `$schema` URLs; gitopsctr treats the field as an untrusted editor
+hint and never fetches it.
 
 ## GitHub Action
 

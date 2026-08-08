@@ -37,6 +37,7 @@ kubernetes-manifests = "gitopsctr.contrib.driver.kubernetes_manifests:PLUGIN"
 
 [dependency-groups]
 dev = [
+  "mkdocs-material>=9.7.1",
   "pytest>=8",
   "ruff>=0.12",
   "ty>=0.0.1a16",

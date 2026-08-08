@@ -442,11 +442,14 @@ def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path
     )
 
     unit = deploy_release.load_json(candidate / "units/aws-application.json")
+    assert unit["$schema"] == deploy_release.driver_schema("terraform", "desired-unit")["$id"]
     assert unit["terraform"]["variables"]["control_image_uri"].endswith("1" * 64)
     assert unit["resolvedInputs"]["promotion"] == {
         "units/aws-application.json": deploy_release.file_blob(promoted_unit)
     }
-    assert deploy_release.load_json(candidate / "promotion.json") == context.document()
+    promotion = deploy_release.load_json(candidate / "promotion.json")
+    assert promotion == context.document()
+    assert promotion["$schema"] == deploy_release.CORE_CONTRACTS["promotion"].json_schema()["$id"]
 
 
 def test_promotion_requires_every_source_unit_to_be_clean(tmp_path):

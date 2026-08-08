@@ -1,0 +1,5 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/frontend-s3-cloudfront/latest/unit.schema.json",
+  "$ref": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/frontend-s3-cloudfront/v1/unit.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

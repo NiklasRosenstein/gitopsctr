@@ -6,3 +6,5 @@ __pycache__/
 dist/
 *.egg-info/
 .demo-state/
+.kubernetes-demo-state/
+site/

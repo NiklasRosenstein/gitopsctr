@@ -1,4 +1,5 @@
 {
+  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/core/v1/environment.schema.json",
   "schema": 1,
   "name": "dev"
 }

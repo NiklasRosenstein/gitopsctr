@@ -246,6 +246,8 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
 
     assert calls == ["infrastructure"] * driver_runs
     assert len(publications) == driver_runs
+    if publications:
+        assert publications[0]["$schema"] == deploy_release.driver_schema("terraform", "receipt")["$id"]
     assert changed is bool(driver_runs)
     assert outputs == [(bool(driver_runs), "")]
 

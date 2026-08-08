@@ -1,4 +1,5 @@
 {
+  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/oci-images/v2/unit.schema.json",
   "schema": 1,
   "name": "application-images",
   "driver": "oci-images",

@@ -1,0 +1,5 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/terraform/latest/receipt.schema.json",
+  "$ref": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/terraform/v2/receipt.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

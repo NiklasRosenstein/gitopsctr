@@ -1,0 +1,43 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/terraform/v2/result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "applied": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "sourceRevision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sourceRevision"
+      ],
+      "title": "AppliedTerraformModel",
+      "type": "object"
+    },
+    "outputs": {
+      "propertyNames": {
+        "type": "string"
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "applied",
+    "outputs"
+  ],
+  "title": "TerraformResultModel",
+  "type": "object"
+}
