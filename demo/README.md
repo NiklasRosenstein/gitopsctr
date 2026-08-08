@@ -37,6 +37,13 @@ Remove the demo's named containers, cached images, local Git remote, receipts, a
 mise run demo-clean
 ```
 
+CI runs the same end-to-end acceptance flow available locally. It deploys from an empty state, requires a second
+convergence to run no drivers and move no refs, and always cleans up:
+
+```console
+mise run demo-acceptance
+```
+
 ## Why this is not the test fixture
 
 `tests/fixtures/repository` is deliberately synthetic: controller tests use it globally and must not require

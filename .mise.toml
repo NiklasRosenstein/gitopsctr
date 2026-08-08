@@ -40,3 +40,7 @@ run = "uv run python demo/run.py reset"
 [tasks.demo-clean]
 description = "Remove the local demo resources and state"
 run = "uv run python demo/run.py clean"
+
+[tasks.demo-acceptance]
+description = "Deploy, prove clean convergence, and clean the real local demo"
+run = "uv run python demo/run.py acceptance"

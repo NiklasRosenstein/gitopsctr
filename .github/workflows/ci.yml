@@ -42,3 +42,19 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked --all-groups
       - run: uv run pytest -q
+
+  acceptance:
+    name: Real Docker/Terraform demo
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: python uv terraform
+      - run: uv sync --locked --all-groups
+      - name: Deploy and prove clean convergence
+        run: mise run demo-acceptance
+      - name: Clean up demo resources
+        if: always()
+        run: mise run demo-clean

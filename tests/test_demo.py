@@ -4,6 +4,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import pytest
+
 from gitopsctr import cli
 
 DEMO_ROOT = Path(__file__).parents[1] / "demo"
@@ -40,3 +42,37 @@ def test_demo_runner_materializes_local_runtime_configuration(tmp_path, monkeypa
     assert image["publish"]["repositories"]["application"] == "localhost:5001/gitopsctr-demo/app"
     assert service["terraform"]["backend"]["path"] == str(state)
     assert service["terraform"]["variables"]["host_port"] == 18081
+
+
+def test_demo_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):
+    events: list[object] = []
+    heads = iter((("desired", "observed"), ("desired", "observed")))
+    monkeypatch.setattr(demo, "clean", lambda registry: events.append(("clean", registry)))
+    monkeypatch.setattr(
+        demo,
+        "converge",
+        lambda registry_port, app_port, **kwargs: events.append(("converge", registry_port, app_port, kwargs)),
+    )
+    monkeypatch.setattr(demo, "deployment_heads", lambda: next(heads))
+
+    demo.acceptance(5001, 18081)
+
+    assert events == [
+        ("clean", "localhost:5001"),
+        ("converge", 5001, 18081, {}),
+        ("converge", 5001, 18081, {"expect_clean": True}),
+        ("clean", "localhost:5001"),
+    ]
+
+
+def test_demo_acceptance_cleans_after_a_failed_invariant(monkeypatch):
+    cleaned: list[str] = []
+    heads = iter((("desired-1", "observed"), ("desired-2", "observed")))
+    monkeypatch.setattr(demo, "clean", cleaned.append)
+    monkeypatch.setattr(demo, "converge", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(demo, "deployment_heads", lambda: next(heads))
+
+    with pytest.raises(RuntimeError, match="moved desired or observed refs"):
+        demo.acceptance(5001, 18081)
+
+    assert cleaned == ["localhost:5001", "localhost:5001"]

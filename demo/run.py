@@ -161,13 +161,27 @@ def clean(registry: str) -> None:
     print("Demo resources and state removed.")
 
 
-def converge(registry_port: int, app_port: int) -> None:
+def deployment_heads() -> tuple[str, str]:
+    def head(ref: str) -> str:
+        return run(
+            "git",
+            "--git-dir",
+            str(REMOTE),
+            "rev-parse",
+            f"refs/heads/{ref}",
+            capture=True,
+        ).stdout.strip()
+
+    return head("deploy/dev"), head("observed/dev")
+
+
+def converge(registry_port: int, app_port: int, *, expect_clean: bool = False) -> None:
     registry = f"localhost:{registry_port}"
     for command in ("docker", "git", "terraform", "curl"):
         require_command(command)
     prepare_repository(registry, app_port)
     ensure_registry(registry_port)
-    run(
+    result = run(
         sys.executable,
         "-m",
         "gitopsctr",
@@ -180,7 +194,13 @@ def converge(registry_port: int, app_port: int) -> None:
         "HEAD",
         "--yes",
         cwd=WORKTREE,
+        capture=expect_clean,
     )
+    if expect_clean:
+        output = result.stdout + result.stderr
+        print(output, end="" if output.endswith("\n") else "\n")
+        if "no drivers ran; 0 ref movements" not in output:
+            raise RuntimeError("second convergence was not clean")
     message = verify_application(app_port)
     print(f"\nDemo is running at http://127.0.0.1:{app_port}/")
     print(f"Response: {message}")
@@ -188,9 +208,24 @@ def converge(registry_port: int, app_port: int) -> None:
     print("Run 'mise run demo-clean' to remove all demo effects.")
 
 
+def acceptance(registry_port: int, app_port: int) -> None:
+    registry = f"localhost:{registry_port}"
+    clean(registry)
+    try:
+        converge(registry_port, app_port)
+        first_heads = deployment_heads()
+        converge(registry_port, app_port, expect_clean=True)
+        second_heads = deployment_heads()
+        if second_heads != first_heads:
+            raise RuntimeError("clean convergence moved desired or observed refs")
+        print(f"Acceptance passed: deploy/dev={second_heads[0][:12]} observed/dev={second_heads[1][:12]}")
+    finally:
+        clean(registry)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("run", "reset", "clean"), nargs="?", default="run")
+    parser.add_argument("operation", choices=("run", "reset", "clean", "acceptance"), nargs="?", default="run")
     args = parser.parse_args()
     registry_port = int(os.environ.get("GITOPSCTR_DEMO_REGISTRY_PORT", "5000"))
     app_port = int(os.environ.get("GITOPSCTR_DEMO_APP_PORT", "18080"))
@@ -198,6 +233,8 @@ def main() -> int:
     try:
         if args.operation == "clean":
             clean(registry)
+        elif args.operation == "acceptance":
+            acceptance(registry_port, app_port)
         elif args.operation == "reset":
             clean(registry)
             converge(registry_port, app_port)
