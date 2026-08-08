@@ -148,7 +148,9 @@ ANSI_ROLES = {
     "error": "\x1b[1;31m",
     "focus": "\x1b[1;36m",
     "label": "\x1b[1m",
+    "environment": "\x1b[3;4m",
 }
+ANSI_ROLE_CLOSINGS = {"environment": "\x1b[23;24m"}
 STATUS_ROLES = {
     "DONE": "success",
     "CLEAN": "success",
@@ -210,7 +212,8 @@ def style_text(text: str, role: str, stream: TextIO | None = None) -> str:
     """Apply a portable ANSI role only when the destination supports styling."""
     output_stream = stream or sys.stderr
     code = ANSI_ROLES[role]
-    return f"{code}{text}{ANSI_RESET}" if color_enabled(output_stream) else text
+    closing = ANSI_ROLE_CLOSINGS.get(role, ANSI_RESET)
+    return f"{code}{text}{closing}" if color_enabled(output_stream) else text
 
 
 def style_unit(unit_name: str, stream: TextIO | None = None) -> str:
@@ -222,7 +225,7 @@ def style_branch(ref: str, stream: TextIO | None = None) -> str:
 
 
 def style_environment(environment: str, stream: TextIO | None = None) -> str:
-    return style_text(environment, "entity", stream)
+    return style_text(environment, "environment", stream)
 
 
 def style_units(unit_names: list[str] | tuple[str, ...], stream: TextIO | None = None) -> str:

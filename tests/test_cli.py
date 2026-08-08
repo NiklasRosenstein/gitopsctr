@@ -732,7 +732,7 @@ def test_colored_progress_uses_semantic_roles_and_keeps_stdout_clean(monkeypatch
     assert "\x1b[1;31mRESULT\x1b[0m" in output.err
     assert "\x1b[1;36mfrontend\x1b[0m" in output.err
     assert "\x1b[1;36mdeploy/dev\x1b[0m" in output.err
-    assert "\x1b[1;36mdev\x1b[0m" in output.err
+    assert "\x1b[3;4mdev\x1b[23;24m" in output.err
 
 
 def test_machine_readable_stdout_stays_uncolored_when_color_is_forced(monkeypatch, capsys):

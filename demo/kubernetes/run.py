@@ -163,6 +163,7 @@ def converge(provider: Provider, *, expect_clean: bool = False) -> None:
         print(output, end="" if output.endswith("\n") else "\n")
         if "no drivers ran; 0 ref movements" not in output:
             raise RuntimeError("second Kubernetes convergence was not clean")
+    print()
     verify_resource(provider)
 
 
