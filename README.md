@@ -42,8 +42,8 @@ registry and live under `gitopsctr.contrib.driver`.
 
 ## GitHub Action
 
-The repository's root composite action wraps reconciliation preparation, `reconcile`, `advance-desired`, and
-`promote`. `operation: prepare` is action-only orchestration terminology: it selects an exact desired revision
+The repository's root composite action wraps reconciliation preparation, `reconcile`, `advance-desired`, `promote`,
+and `rollback`. `operation: prepare` is action-only orchestration terminology: it selects an exact desired revision
 by calling `advance-desired` for a supplied source revision or `resolve-desired` otherwise. It does not add a
 CLI command or persisted controller state. The action can
 install the CLI from PyPI, from the checked-out action revision, or from an explicit Git repository
@@ -67,6 +67,24 @@ The outputs are `active`, `desired-revision`, `desired-changed`, and `advance-af
 exact `desired-revision` makes the run fixed (`advance-after-reconcile=false`); without one, later receipts may
 continue materializing desired state. A source revision superseded through `require-source-ref` returns
 `active=false`.
+
+Publish a full-tree or targeted forward rollback through the same change-gate behavior as the CLI:
+
+```yaml
+- id: rollback
+  uses: NiklasRosenstein/gitopsctr@<commit-or-ref>
+  with:
+    operation: rollback
+    package-source: action
+    environment: prod
+    rollback-revision: <historical-desired-sha>
+    units: aws-application,frontend
+    reason: Incident mitigation
+```
+
+An empty `units` input rolls back the full tree. The action exposes the standard `change-revision`,
+`change-status`, `change-url`, `candidate-ref`, and `target-ref` outputs for direct publication or a gated pull
+request.
 
 Install the package bundled with the exact action revision while testing an unreleased change:
 

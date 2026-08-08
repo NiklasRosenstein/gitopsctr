@@ -109,6 +109,32 @@ case "${OPERATION}" in
     [[ -n "${REQUIRE_SOURCE_REF}" ]] && args+=(--require-source-ref "${REQUIRE_SOURCE_REF}")
     [[ "${DRY}" == "true" ]] && args+=(--dry)
     ;;
+  rollback)
+    require_input environment "${ENVIRONMENT}"
+    require_input rollback-revision "${ROLLBACK_REVISION}"
+    require_input reason "${ROLLBACK_REASON}"
+    args+=(
+      rollback
+      --environment "${ENVIRONMENT}"
+      --to-desired-revision "${ROLLBACK_REVISION}"
+      --reason "${ROLLBACK_REASON}"
+    )
+    [[ -n "${DESIRED_REF}" ]] && args+=(--desired-ref "${DESIRED_REF}")
+    [[ -n "${OBSERVED_REF}" ]] && args+=(--observed-ref "${OBSERVED_REF}")
+    if [[ -n "${ROLLBACK_UNITS}" ]]; then
+      IFS=',' read -ra rollback_units <<< "${ROLLBACK_UNITS}"
+      for raw_unit in "${rollback_units[@]}"; do
+        unit="${raw_unit#"${raw_unit%%[![:space:]]*}"}"
+        unit="${unit%"${unit##*[![:space:]]}"}"
+        if [[ -z "${unit}" ]]; then
+          echo "units contains an empty unit name" >&2
+          exit 2
+        fi
+        args+=(--unit "${unit}")
+      done
+    fi
+    [[ "${DRY}" == "true" ]] && args+=(--dry)
+    ;;
   promote)
     require_input from-environment "${FROM_ENVIRONMENT}"
     require_input to-environment "${TO_ENVIRONMENT}"
@@ -124,7 +150,7 @@ case "${OPERATION}" in
     [[ -n "${CANDIDATE_REF}" ]] && args+=(--candidate-ref "${CANDIDATE_REF}")
     ;;
   *)
-    echo "operation must be prepare, reconcile, advance, or promote" >&2
+    echo "operation must be prepare, reconcile, advance, promote, or rollback" >&2
     exit 2
     ;;
 esac

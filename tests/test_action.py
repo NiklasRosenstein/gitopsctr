@@ -52,6 +52,9 @@ def _action_environment(tmp_path: Path, **overrides: str) -> dict[str, str]:
         "REAPPLY": "false",
         "REPORT": "",
         "REQUIRE_SOURCE_REF": "",
+        "ROLLBACK_REASON": "",
+        "ROLLBACK_REVISION": "",
+        "ROLLBACK_UNITS": "",
         "SOURCE_REVISION": "",
         "SPECIFICATION_REVISION": "",
         "TO_ENVIRONMENT": "",
@@ -245,6 +248,50 @@ def test_advance_action_maps_environment_and_refs(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("units", "unit_arguments"),
+    [
+        ("", []),
+        ("aws-application, frontend", ["--unit", "aws-application", "--unit", "frontend"]),
+    ],
+)
+def test_rollback_action_maps_full_or_targeted_change(
+    tmp_path: Path,
+    units: str,
+    unit_arguments: list[str],
+) -> None:
+    result = _run_action(
+        tmp_path,
+        OPERATION="rollback",
+        ENVIRONMENT="prod",
+        ROLLBACK_REVISION="d" * 40,
+        ROLLBACK_UNITS=units,
+        ROLLBACK_REASON="Incident mitigation",
+        DESIRED_REF="deploy/prod",
+        OBSERVED_REF="observed/prod",
+        DRY="true",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _action_arguments(tmp_path) == [
+        "--repository",
+        str(tmp_path),
+        "rollback",
+        "--environment",
+        "prod",
+        "--to-desired-revision",
+        "d" * 40,
+        "--reason",
+        "Incident mitigation",
+        "--desired-ref",
+        "deploy/prod",
+        "--observed-ref",
+        "observed/prod",
+        *unit_arguments,
+        "--dry",
+    ]
+
+
 def test_promote_action_defaults_to_the_workflow_revision(tmp_path: Path) -> None:
     result = _run_action(
         tmp_path,
@@ -284,6 +331,20 @@ def test_promote_action_defaults_to_the_workflow_revision(tmp_path: Path) -> Non
                 "DESIRED_REVISION": "d" * 40,
             },
             "source-revision and desired-revision are mutually exclusive",
+        ),
+        (
+            {"OPERATION": "rollback", "ENVIRONMENT": "prod", "ROLLBACK_REVISION": "d" * 40},
+            "reason is required",
+        ),
+        (
+            {
+                "OPERATION": "rollback",
+                "ENVIRONMENT": "prod",
+                "ROLLBACK_REVISION": "d" * 40,
+                "ROLLBACK_REASON": "test",
+                "ROLLBACK_UNITS": "aws-application,,frontend",
+            },
+            "units contains an empty unit name",
         ),
     ],
 )

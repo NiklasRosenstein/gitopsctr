@@ -1,9 +1,9 @@
 name: gitopsctr
-description: Prepare, reconcile, advance, or promote Git-backed deployment state
+description: Prepare, reconcile, advance, promote, or roll back Git-backed deployment state
 
 inputs:
   operation:
-    description: Operation to run (prepare, reconcile, advance, or promote)
+    description: Operation to run (prepare, reconcile, advance, promote, or rollback)
     required: true
   package-source:
     description: Install from pypi, this action revision, or an explicit git repository
@@ -26,7 +26,7 @@ inputs:
     required: false
     default: .
   environment:
-    description: Deployment environment for reconcile or advance
+    description: Deployment environment for prepare, reconcile, advance, or rollback
     required: false
     default: ""
   unit:
@@ -69,12 +69,24 @@ inputs:
     description: Optional candidate ref for a gated promotion
     required: false
     default: ""
+  rollback-revision:
+    description: Historical desired-state revision to restore through a forward rollback
+    required: false
+    default: ""
+  units:
+    description: Optional comma-separated rollback unit names; empty rolls back the full tree
+    required: false
+    default: ""
+  reason:
+    description: Required operator reason for rollback
+    required: false
+    default: ""
   advance:
     description: Advance desired state as part of reconcile
     required: false
     default: "false"
   dry:
-    description: Resolve or reconcile without publishing state
+    description: Resolve, reconcile, or validate rollback without publishing state
     required: false
     default: "false"
   reapply:
@@ -165,6 +177,9 @@ runs:
         REAPPLY: ${{ inputs.reapply }}
         REPORT: ${{ inputs.report }}
         REQUIRE_SOURCE_REF: ${{ inputs.require-source-ref }}
+        ROLLBACK_REASON: ${{ inputs.reason }}
+        ROLLBACK_REVISION: ${{ inputs.rollback-revision }}
+        ROLLBACK_UNITS: ${{ inputs.units }}
         SOURCE_REVISION: ${{ inputs.source-revision }}
         SPECIFICATION_REVISION: ${{ inputs.specification-revision }}
         TO_ENVIRONMENT: ${{ inputs.to-environment }}
