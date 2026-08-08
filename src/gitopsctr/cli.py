@@ -23,7 +23,9 @@ from datetime import UTC, datetime
 from functools import cache
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
-from typing import Any, TextIO
+from typing import Any, TextIO, TypedDict
+
+import yaml
 
 from gitopsctr.api import GVK, ApiError
 from gitopsctr.artifacts import ArtifactApi, require_artifact_api
@@ -140,6 +142,28 @@ class UnitChangeExplanation:
     commits: tuple[str, ...]
     files: tuple[str, ...]
     specification_paths: tuple[str, ...]
+
+
+class RevisionSnapshot(TypedDict):
+    ref: str
+    revision: str | None
+
+
+class UnitStatusSnapshot(TypedDict):
+    unit: str
+    status: str
+    reason: str
+
+
+class EnvironmentSnapshot(TypedDict):
+    desired: RevisionSnapshot
+    observed: RevisionSnapshot
+    statuses: list[UnitStatusSnapshot]
+
+
+class EnvironmentRow(EnvironmentSnapshot):
+    environment: str
+    counts: dict[str, int]
 
 
 ANSI_RESET = "\x1b[0m"
@@ -2863,6 +2887,11 @@ def command_resolve_desired(args: argparse.Namespace) -> None:
 
 
 def command_status(args: argparse.Namespace) -> None:
+    if args.environment is None:
+        if args.unit or args.desired_ref or args.desired_revision or args.observed_ref or args.verbose:
+            raise OperationError("status options other than --environment are only available for one environment")
+        command_list_environments(argparse.Namespace(json=False))
+        return
     desired_ref, observed_ref = deployment_refs(
         REPOSITORY_ROOT,
         args.environment,
@@ -2894,6 +2923,13 @@ def command_status(args: argparse.Namespace) -> None:
         )
         specifications = load_environment_specifications(REPOSITORY_ROOT, args.environment)
         statuses = reconciliation_statuses(sorted(specifications), desired, observed)
+        if args.unit is not None:
+            if args.unit not in specifications:
+                available = ", ".join(sorted(specifications)) or "none"
+                raise OperationError(
+                    f"unknown unit {args.unit!r} for environment {args.environment!r}; available units: {available}"
+                )
+            statuses = [item for item in statuses if item[0] == args.unit]
         log_reconciliation_status(
             args.environment,
             statuses,
@@ -2904,53 +2940,140 @@ def command_status(args: argparse.Namespace) -> None:
         )
 
 
-def command_facts(args: argparse.Namespace) -> None:
-    _, observed_ref = deployment_refs(
-        REPOSITORY_ROOT,
-        args.environment,
-        None,
-        args.observed_ref,
+def _environment_names() -> list[str]:
+    project = load_project_config(REPOSITORY_ROOT)
+    root = REPOSITORY_ROOT.joinpath(*project.environments_path.parts)
+    if not root.is_dir():
+        return []
+    return sorted(path.name for path in root.iterdir() if path.is_dir())
+
+
+def _unit_status_snapshot(environment: str, desired_ref: str, observed_ref: str) -> EnvironmentSnapshot:
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary = Path(temporary_directory)
+        desired = temporary / "desired"
+        observed = temporary / "observed"
+        desired_revision = observed_tree(desired_ref, desired)
+        observed_revision = observed_tree(observed_ref, observed)
+        specifications = load_environment_specifications(REPOSITORY_ROOT, environment)
+        statuses = reconciliation_statuses(sorted(specifications), desired, observed)
+        return {
+            "desired": {"ref": desired_ref, "revision": desired_revision},
+            "observed": {"ref": observed_ref, "revision": observed_revision},
+            "statuses": [
+                {"unit": unit, "status": status, "reason": reason} for unit, status, reason in statuses
+            ],
+        }
+
+
+def print_inspection_document(
+    document: dict[str, Any], *, force_json: bool = False, force_yaml: bool = False
+) -> None:
+    """Print one inspection document using the project's configured format."""
+    selected = (
+        DocumentFormat.JSON
+        if force_json
+        else DocumentFormat.YAML
+        if force_yaml
+        else load_project_config(REPOSITORY_ROOT).write_format
     )
+    if selected is DocumentFormat.JSON:
+        print(json.dumps(document, indent=2, sort_keys=True))
+        return
+    yaml_document = dict(document)
+    schema_hint = yaml_document.pop("$schema", None)
+    text = yaml.safe_dump(yaml_document, sort_keys=False, default_flow_style=False, allow_unicode=False)
+    if isinstance(schema_hint, str):
+        text = f"# yaml-language-server: $schema={schema_hint}\n{text}"
+    print(text, end="")
+
+
+def command_list_environments(args: argparse.Namespace) -> None:
+    rows: list[EnvironmentRow] = []
+    for environment in _environment_names():
+        desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, environment)
+        snapshot = _unit_status_snapshot(environment, desired_ref, observed_ref)
+        statuses = snapshot["statuses"]
+        counts = {
+            status: sum(item["status"] == status for item in statuses)
+            for status in ("CLEAN", "READY", "WAIT", "MATERIALIZED")
+        }
+        rows.append({"environment": environment, **snapshot, "counts": counts})
+
+    if args.json:
+        print(json.dumps({"schema": 1, "environments": rows}, indent=2, sort_keys=True))
+        return
+    log_heading("Environments")
+    for index, row in enumerate(rows):
+        if index:
+            print(file=sys.stderr)
+        desired = describe_revision(row["desired"]["revision"], sys.stderr) if row["desired"]["revision"] else "none"
+        observed = describe_revision(row["observed"]["revision"], sys.stderr) if row["observed"]["revision"] else "none"
+        counts = ", ".join(f"{name.lower()}={count}" for name, count in row["counts"].items() if count)
+        log_status("ENV", style_environment(row["environment"]))
+        log_status("DESIRED", f"{style_branch(row['desired']['ref'])} at {desired}")
+        log_status("OBSERVED", f"{style_branch(row['observed']['ref'])} at {observed}")
+        log_status("UNITS", counts or "no units")
+
+
+def command_list_units(args: argparse.Namespace) -> None:
+    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment)
+    snapshot = _unit_status_snapshot(args.environment, desired_ref, observed_ref)
+    result = {"schema": 1, "environment": args.environment, **snapshot}
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    log_heading(f"Units for {style_environment(args.environment)}")
+    for item in snapshot["statuses"]:
+        log_status(item["status"], f"{style_unit(item['unit'])}: {item['reason']}")
+
+
+def command_show_desired(args: argparse.Namespace) -> None:
+    desired_ref, _ = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref)
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        desired = Path(temporary_directory) / "desired"
+        revision = resolve_ref(desired_ref, args.desired_revision)
+        materialize_revision(revision, desired)
+        path = unit_document_path(desired, args.unit)
+        if not path.is_file():
+            raise OperationError(f"{desired_ref} has no desired unit {args.unit}")
+        document = load_json(path)
+        unit = load_unit(path, args.unit)
+        validate_unit_materialization(desired, args.unit, unit)
+    print_inspection_document(document, force_json=args.json, force_yaml=args.yaml)
+
+
+def command_show_receipt(args: argparse.Namespace) -> None:
+    _, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, observed_override=args.observed_ref)
     with tempfile.TemporaryDirectory() as temporary_directory:
         observed = Path(temporary_directory) / "observed"
-        observed_revision = observed_tree(observed_ref, observed)
-        receipts = sorted(
-            path for path in (observed / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}
-        )
-        if args.unit:
-            receipt = unit_document_path(observed, args.unit)
-            if not receipt.is_file():
-                raise OperationError(f"{observed_ref} has no receipt for {args.unit}")
-            receipts = [receipt]
-
-        metadata = {"$schema", "schema", "unit", "driver", "desired", "resolvedInputs", "controller"}
-        units = {}
-        for path in receipts:
-            receipt = load_receipt(path, path.stem)
-            unit_name = path.stem
-            validate_receipt_document(receipt, f"observation receipt units/{path.name}")
-            if receipt.get("unit") != unit_name:
-                raise OperationError(f"invalid observation receipt: units/{path.name}")
-            units[unit_name] = {key: value for key, value in receipt.items() if key not in metadata}
-
-        result = {
-            "schema": 1,
-            "environment": args.environment,
-            "observed": {"ref": observed_ref, "revision": observed_revision},
-            "units": units,
-        }
-        if args.json:
-            print(json.dumps(result, indent=2, sort_keys=True))
-            return
-
-        revision = describe_revision(observed_revision, sys.stdout) if observed_revision else "no receipts"
-        print(
-            f"Observed facts for {style_environment(args.environment, sys.stdout)} "
-            f"({style_branch(observed_ref, sys.stdout)} at {revision})"
-        )
-        for unit_name, facts in units.items():
-            print(f"\n{style_unit(unit_name, sys.stdout)}")
-            print(json.dumps(facts, indent=2, sort_keys=True))
+        observed_tree(observed_ref, observed)
+        path = unit_document_path(observed, args.unit)
+        if not path.is_file():
+            raise OperationError(f"{observed_ref} has no receipt for {args.unit}")
+        document = load_json(path)
+        receipt = load_receipt(path, args.unit)
+        validate_receipt_document(receipt, f"observation receipt units/{path.name}")
+        artifacts: dict[str, Any] = {}
+        for name, descriptor in (receipt.get("artifacts") or {}).items():
+            if not isinstance(descriptor, dict) or not isinstance(descriptor.get("path"), str):
+                raise OperationError(f"receipt for {args.unit} has an invalid artifact descriptor {name!r}")
+            artifact_relative = PurePosixPath(descriptor["path"])
+            if artifact_relative.is_absolute() or ".." in artifact_relative.parts:
+                raise OperationError(f"receipt artifact {name!r} has an unsafe path")
+            artifact_path = observed.joinpath(*artifact_relative.parts)
+            if not artifact_path.is_file():
+                raise OperationError(f"receipt artifact {name!r} is missing at {descriptor['path']}")
+            artifacts[name] = load_json(artifact_path)
+    if args.artifact is not None:
+        if args.artifact not in artifacts:
+            available = ", ".join(sorted(artifacts)) or "none"
+            raise OperationError(f"{observed_ref} receipt for {args.unit} has no artifact {args.artifact!r}; available: {available}")
+        print_inspection_document(artifacts[args.artifact], force_json=args.json, force_yaml=args.yaml)
+    elif args.artifacts:
+        print_inspection_document(artifacts, force_json=args.json, force_yaml=args.yaml)
+    else:
+        print_inspection_document(document, force_json=args.json, force_yaml=args.yaml)
 
 
 def command_verify(args: argparse.Namespace) -> None:
@@ -4391,9 +4514,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = commands.add_parser(
         "status",
-        help="show which deployment units are clean, ready, or waiting",
+        help="show deployment status for all environments, one environment, or one unit",
     )
-    status.add_argument("--environment", required=True)
+    status.add_argument("--environment", help="environment to inspect; omit for all environments")
+    status.add_argument("--unit", help="limit detailed status to one unit in the selected environment")
     status.add_argument("--desired-ref", help="override the environment's desired ref")
     status.add_argument(
         "--desired-revision",
@@ -4403,15 +4527,44 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--verbose", action="store_true")
     status.set_defaults(handler=command_status)
 
-    facts = commands.add_parser(
-        "facts",
-        help="show the facts recorded by deployment unit observations",
+    list_command = commands.add_parser("list", help="list project environments or deployment units")
+    list_commands = list_command.add_subparsers(dest="list_command", required=True)
+    list_environments = list_commands.add_parser(
+        "environments", help="list environments and their deployment summary"
     )
-    facts.add_argument("--environment", required=True)
-    facts.add_argument("--unit", help="show facts for one deployment unit")
-    facts.add_argument("--observed-ref", help="override the environment's observed ref")
-    facts.add_argument("--json", action="store_true", help="emit one machine-readable document")
-    facts.set_defaults(handler=command_facts)
+    list_environments.add_argument("--json", action="store_true", help="emit one machine-readable document")
+    list_environments.set_defaults(handler=command_list_environments)
+    list_units = list_commands.add_parser("units", help="list units and their reconciliation status")
+    list_units.add_argument("--environment", required=True)
+    list_units.add_argument("--json", action="store_true", help="emit one machine-readable document")
+    list_units.set_defaults(handler=command_list_units)
+
+    show = commands.add_parser("show", help="show a desired unit or observation receipt")
+    show_commands = show.add_subparsers(dest="show_command", required=True)
+    desired = show_commands.add_parser("desired", aliases=("desired-unit",), help="show one desired unit")
+    desired.add_argument("--environment", required=True)
+    desired.add_argument("unit")
+    desired.add_argument("--desired-ref", help="override the environment's desired ref")
+    desired.add_argument("--desired-revision", help="exact desired commit; defaults to the current desired ref head")
+    desired_format = desired.add_mutually_exclusive_group()
+    desired_format.add_argument("--json", action="store_true", help="force JSON instead of the project format")
+    desired_format.add_argument("--yaml", action="store_true", help="force YAML instead of the project format")
+    desired.set_defaults(handler=command_show_desired)
+    receipt = show_commands.add_parser("receipt", help="show one observation receipt and its artifacts")
+    receipt.add_argument("--environment", required=True)
+    receipt.add_argument("unit")
+    receipt.add_argument("--observed-ref", help="override the environment's observed ref")
+    receipt_format = receipt.add_mutually_exclusive_group()
+    receipt_format.add_argument("--json", action="store_true", help="force JSON instead of the project format")
+    receipt_format.add_argument("--yaml", action="store_true", help="force YAML instead of the project format")
+    receipt_artifacts = receipt.add_mutually_exclusive_group()
+    receipt_artifacts.add_argument("--artifact", help="show one named artifact instead of the receipt")
+    receipt_artifacts.add_argument(
+        "--artifacts",
+        action="store_true",
+        help="show all artifacts as an object keyed by artifact name",
+    )
+    receipt.set_defaults(handler=command_show_receipt)
 
     verify = commands.add_parser(
         "verify",

@@ -112,7 +112,7 @@ def test_desired_candidate_drops_legacy_artifact_catalogue(tmp_path, monkeypatch
     assert not (candidate / "artifacts").exists()
 
 
-def test_facts_reports_driver_results_without_receipt_metadata(monkeypatch, capsys):
+def test_show_receipt_reports_receipt_and_artifacts(monkeypatch, capsys):
     def materialize_observed(_ref, output):
         _write_json(
             output / "units/aws-application.json",
@@ -130,22 +130,36 @@ def test_facts_reports_driver_results_without_receipt_metadata(monkeypatch, caps
         return "a" * 40
 
     monkeypatch.setattr(deploy_release, "observed_tree", materialize_observed)
-    args = deploy_release.build_parser().parse_args(["facts", "--environment", "dev", "--json"])
+    args = deploy_release.build_parser().parse_args(
+        ["show", "receipt", "--environment", "dev", "aws-application", "--json"]
+    )
 
     args.handler(args)
 
     result = json.loads(capsys.readouterr().out)
     assert result == {
         "schema": 1,
-        "environment": "dev",
-        "observed": {"ref": "observed/dev", "revision": "a" * 40},
-        "units": {
-            "aws-application": {
-                "applied": {"sourceRevision": "c" * 40},
-                "outputs": {"api_url": "https://api.example"},
-            }
-        },
+        "unit": "aws-application",
+        "driver": "terraform",
+        "desired": {"revision": "b" * 40, "unitBlob": "blob"},
+        "resolvedInputs": {"observed": {}},
+        "controller": {"observed_at": "2026-08-07T00:00:00Z"},
+        "applied": {"sourceRevision": "c" * 40},
+        "outputs": {"api_url": "https://api.example"},
     }
+
+
+def test_show_document_format_can_force_yaml_or_json():
+    args = deploy_release.build_parser().parse_args(
+        ["show", "receipt", "--environment", "dev", "web", "--yaml"]
+    )
+    assert args.yaml is True
+    assert args.json is False
+
+    with pytest.raises(SystemExit):
+        deploy_release.build_parser().parse_args(
+            ["show", "receipt", "--environment", "dev", "web", "--json", "--yaml"]
+        )
 
 
 def test_blocked_driver_transition_omits_previous_unit_and_reports_wait(tmp_path, monkeypatch, capsys):
@@ -1056,15 +1070,57 @@ def test_compact_approval_card_shows_driver_change_evidence_and_write_boundary(t
     assert "WRITES   driver effects; receipt to observed/dev on success" in output
 
 
-def test_status_requires_an_explicit_environment_and_leaves_refs_to_resolution():
-    with pytest.raises(SystemExit):
-        deploy_release.build_parser().parse_args(["status"])
-
+def test_status_allows_all_environment_and_single_unit_modes():
+    all_environments = deploy_release.build_parser().parse_args(["status"])
+    assert all_environments.environment is None
+    assert all_environments.unit is None
     args = deploy_release.build_parser().parse_args(["status", "--environment", "staging"])
     assert args.environment == "staging"
+    assert args.unit is None
     assert args.desired_ref is None
     assert args.observed_ref is None
     assert args.verbose is False
+
+    unit = deploy_release.build_parser().parse_args(["status", "--environment", "staging", "--unit", "web"])
+    assert unit.environment == "staging"
+    assert unit.unit == "web"
+
+
+def test_status_without_environment_delegates_to_environment_summary(monkeypatch):
+    captured = []
+    monkeypatch.setattr(deploy_release, "command_list_environments", lambda args: captured.append(args.json))
+
+    args = deploy_release.build_parser().parse_args(["status"])
+    args.handler(args)
+
+    assert captured == [False]
+
+
+def test_status_can_focus_on_one_unit(tmp_path, monkeypatch):
+    captured = []
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(deploy_release, "observed_tree", lambda _ref, output: output.mkdir() or "a" * 40)
+    monkeypatch.setattr(
+        deploy_release,
+        "load_environment_specifications",
+        lambda *_args: {"web": {}, "api": {}},
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "reconciliation_statuses",
+        lambda *_args: [("api", "CLEAN", "observation matches desired state"), ("web", "READY", "inputs changed")],
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "log_reconciliation_status",
+        lambda environment, statuses, *_args, **_kwargs: captured.append((environment, statuses)),
+    )
+
+    args = deploy_release.build_parser().parse_args(["status", "--environment", "dev", "--unit", "web"])
+    args.handler(args)
+
+    assert captured == [("dev", [("web", "READY", "inputs changed")])]
 
 
 def test_environment_refs_use_convention_and_allow_configuration(tmp_path):

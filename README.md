@@ -33,6 +33,9 @@ Important commands include:
 - `reconcile --plan`: run a speculative unit-driver plan without applying or publishing a receipt.
 - `reconcile`: apply one unit and publish its receipt.
 - `converge`: reconcile a dependency closure locally.
+- `list environments` and `list units`: inspect deployment summaries and unit status.
+- `status`: show all environments, one environment, or one unit within an environment.
+- `show desired` and `show receipt`: print a desired unit or observation receipt in the project's format.
 - `promote`: promote a clean environment through its configured change gate.
 - `rollback`: publish a forward desired-state commit from historical state.
 - `verify`: ask supported drivers to check external state without writing receipts.
@@ -40,6 +43,18 @@ Important commands include:
 Human-readable progress output uses semantic ANSI colors on terminals and in CI logs. It stays plain when redirected
 to a file or captured for automation. Set `NO_COLOR=1` to disable styling or `FORCE_COLOR=1` to enable it explicitly.
 Machine-readable stdout remains uncolored.
+
+Explore a project without changing state:
+
+```console
+gitopsctr list environments
+gitopsctr list units --environment dev
+gitopsctr show desired --environment dev web
+gitopsctr show receipt --environment dev web
+gitopsctr show receipt --environment dev web --artifact containers
+gitopsctr show receipt --environment dev web --artifacts
+# Add --json or --yaml to override the project's preferred document format.
+```
 
 ## Demo
 

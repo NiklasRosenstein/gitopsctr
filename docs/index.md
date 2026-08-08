@@ -13,6 +13,10 @@ operator can run locally.
 - `reconcile --plan` runs a unit driver's speculative plan without applying or writing a receipt.
 - `reconcile` applies one desired unit and publishes its typed receipt.
 - `converge` advances and reconciles a dependency closure until every unit is terminal.
+- `list environments` and `list units` summarize deployment state for exploration.
+- `status` shows all environments, one environment, or one unit within an environment.
+- `show desired` and `show receipt` print resolved units and observation receipts in the project's format; receipt
+  artifacts are opt-in with `--artifact` or `--artifacts`, and `--json`/`--yaml` override the format.
 - `promote` and `rollback` publish direct changes or pull-request candidates according to `changeGate`.
 - `verify` asks supported unit drivers to check external state without changing Git or external state.
 
