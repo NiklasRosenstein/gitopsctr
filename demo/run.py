@@ -146,13 +146,15 @@ def remove_demo_images(registry: str) -> None:
         )
         image_ids.update(result.stdout.split())
     if image_ids:
-        run("docker", "image", "rm", "--force", *sorted(image_ids), check=False)
+        run("docker", "image", "rm", "--force", *sorted(image_ids))
 
 
 def clean(registry: str) -> None:
     if shutil.which("docker") is not None:
-        run("docker", "container", "rm", "--force", APP_NAME, check=False, capture=True)
-        run("docker", "container", "rm", "--force", REGISTRY_NAME, check=False, capture=True)
+        for name in (APP_NAME, REGISTRY_NAME):
+            existing = run("docker", "container", "inspect", name, check=False, capture=True)
+            if existing.returncode == 0:
+                run("docker", "container", "rm", "--force", name)
         remove_demo_images(registry)
     if STATE_ROOT.exists():
         shutil.rmtree(STATE_ROOT)
