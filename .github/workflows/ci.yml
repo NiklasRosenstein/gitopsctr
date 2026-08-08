@@ -58,3 +58,19 @@ jobs:
       - name: Clean up demo resources
         if: always()
         run: mise run demo-clean
+
+  kubernetes-acceptance:
+    name: Real Helm/kind demo
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: python uv helm kind kubectl
+      - run: uv sync --locked --all-groups
+      - name: Render, deploy, verify, and prove clean convergence
+        run: mise run kubernetes-acceptance
+      - name: Clean up kind resources
+        if: always()
+        run: mise run kubernetes-demo-clean

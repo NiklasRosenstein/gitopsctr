@@ -1,6 +1,9 @@
 [tools]
 actionlint = "latest"
 oras = "latest"
+helm = "latest"
+kind = "latest"
+kubectl = "latest"
 python = "3.12"
 terraform = "latest"
 uv = "latest"
@@ -44,3 +47,15 @@ run = "uv run python demo/run.py clean"
 [tasks.demo-acceptance]
 description = "Deploy, prove clean convergence, and clean the real local demo"
 run = "uv run python demo/run.py acceptance"
+
+[tasks.kubernetes-demo]
+description = "Render and deploy the Helm demo to a local kind cluster"
+run = "uv run python demo/kubernetes/run.py run"
+
+[tasks.kubernetes-demo-clean]
+description = "Remove the Kubernetes demo cluster and state"
+run = "uv run python demo/kubernetes/run.py clean"
+
+[tasks.kubernetes-acceptance]
+description = "Render, deploy, verify, prove clean convergence, and clean the kind demo"
+run = "uv run python demo/kubernetes/run.py acceptance"

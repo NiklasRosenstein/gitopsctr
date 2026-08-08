@@ -42,10 +42,15 @@ for prerequisites, the reconciliation flow, and cleanup instructions.
 
 ## Driver plugins
 
-Drivers are discovered from the `gitopsctr.drivers` Python entry-point group. An entry point must load
-an instance of `gitopsctr.driver.Driver`. Optional controller operations are declared through independent
-capability base classes such as `VerificationCapability`. The drivers distributed in this package use the
-same public registry and live under `gitopsctr.contrib.driver`.
+Unit plugins are discovered from the `gitopsctr.drivers` Python entry-point group. An entry point must load
+an instance of `gitopsctr.driver.UnitPlugin` implementing at least `MaterializationCapability` or
+`ReconciliationCapability`. Verification is an independent optional capability. The plugins distributed in this
+package use the same public registry and live under `gitopsctr.contrib.driver`, one module per plugin.
+
+The `kubernetes-manifests` plugin renders Helm or plain YAML into the desired Git tree. It supports direct apply,
+materialization-only external delivery, and read-only Argo CD observation. See
+[`docs/kubernetes-manifests.md`](docs/kubernetes-manifests.md) for the desired-tree contract, delivery modes,
+promotion evidence, rollback behavior, and local kind demo.
 
 ## GitHub Action
 

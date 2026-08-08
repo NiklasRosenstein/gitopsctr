@@ -44,6 +44,10 @@ convergence to run no drivers and move no refs, and always cleans up:
 mise run demo-acceptance
 ```
 
+The separate [`kubernetes`](kubernetes/) demo renders a real Helm chart, commits the resulting payload, applies it to
+a kind cluster, and verifies it with `kubectl diff`. Run `mise run kubernetes-acceptance` for its full CI flow. See
+[`docs/kubernetes-manifests.md`](../docs/kubernetes-manifests.md) for configuration and cleanup details.
+
 ## Why this is not the test fixture
 
 `tests/fixtures/repository` is deliberately synthetic: controller tests use it globally and must not require

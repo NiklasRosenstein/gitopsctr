@@ -15,6 +15,14 @@ demo = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = demo
 SPEC.loader.exec_module(demo)
 
+KUBERNETES_SPEC = importlib.util.spec_from_file_location(
+    "gitopsctr_kubernetes_demo_runner", DEMO_ROOT / "kubernetes/run.py"
+)
+assert KUBERNETES_SPEC is not None and KUBERNETES_SPEC.loader is not None
+kubernetes_demo = importlib.util.module_from_spec(KUBERNETES_SPEC)
+sys.modules[KUBERNETES_SPEC.name] = kubernetes_demo
+KUBERNETES_SPEC.loader.exec_module(kubernetes_demo)
+
 
 def test_demo_repository_exercises_observation_driven_convergence():
     specifications = cli.load_environment_specifications(demo.TEMPLATE, "dev")
@@ -76,3 +84,48 @@ def test_demo_acceptance_cleans_after_a_failed_invariant(monkeypatch):
         demo.acceptance(5001, 18081)
 
     assert cleaned == ["localhost:5001", "localhost:5001"]
+
+
+def test_kubernetes_demo_is_a_real_helm_direct_delivery_unit():
+    specifications = cli.load_environment_specifications(kubernetes_demo.TEMPLATE, "dev")
+    specification = specifications["web"]
+
+    assert specification["source"]["inputs"] == ["**/*"]
+    assert specification["materialize"]["type"] == "helm"
+    assert specification["delivery"] == {
+        "mode": "direct",
+        "kubeContext": kubernetes_demo.KUBE_CONTEXT,
+        "prune": False,
+        "wait": [],
+    }
+
+
+def test_kubernetes_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):
+    events: list[object] = []
+    heads = iter((("desired", "observed"), ("desired", "observed")))
+    monkeypatch.setattr(kubernetes_demo, "clean", lambda: events.append("clean"))
+    monkeypatch.setattr(kubernetes_demo, "start", lambda: events.append("start"))
+    monkeypatch.setattr(
+        kubernetes_demo,
+        "converge",
+        lambda **kwargs: events.append(("converge", kwargs)),
+    )
+    monkeypatch.setattr(kubernetes_demo, "deployment_heads", lambda: next(heads))
+
+    kubernetes_demo.acceptance()
+
+    assert events == ["clean", "start", ("converge", {"expect_clean": True}), "clean"]
+
+
+def test_kubernetes_acceptance_cleans_after_a_failed_invariant(monkeypatch):
+    events: list[object] = []
+    heads = iter((("desired-1", "observed"), ("desired-2", "observed")))
+    monkeypatch.setattr(kubernetes_demo, "clean", lambda: events.append("clean"))
+    monkeypatch.setattr(kubernetes_demo, "start", lambda: None)
+    monkeypatch.setattr(kubernetes_demo, "converge", lambda **_kwargs: None)
+    monkeypatch.setattr(kubernetes_demo, "deployment_heads", lambda: next(heads))
+
+    with pytest.raises(RuntimeError, match="moved desired or observed refs"):
+        kubernetes_demo.acceptance()
+
+    assert events == ["clean", "clean"]
