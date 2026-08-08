@@ -35,6 +35,10 @@ run = "uv run gitopsctr schemas export docs/schemas --check"
 [tasks.docs]
 run = "uv run mkdocs build --strict"
 
+[tasks.docs-serve]
+description = "Serve the documentation with live reload"
+run = "uv run mkdocs serve"
+
 [tasks.check]
 depends = ["actionlint", "docs", "lint", "schemas-check", "typecheck", "test"]
 
