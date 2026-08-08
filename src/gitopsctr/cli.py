@@ -22,11 +22,15 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from gitopsctr.driver import (
+    MATERIALIZATION_PLUGINS,
     PLUGIN_VERSIONS,
     RECONCILIATION_PLUGINS,
     UNIT_PLUGINS,
     VERIFICATION_PLUGINS,
     DriverError,
+    MaterializationContext,
+    MaterializationResult,
+    ReconciliationCapability,
     ReconciliationContext,
     VerificationContext,
     VerificationStatus,
@@ -61,7 +65,7 @@ class PromotionContext:
     desired_ref: str
     desired_revision: str
     observed_ref: str
-    observed_revision: str
+    observed_revision: str | None
     specification_revision: str
     desired_root: Path
 
@@ -341,6 +345,80 @@ def directory_files(directory: Path) -> dict[str, bytes]:
     }
 
 
+def unit_requires_reconciliation(unit: dict[str, Any]) -> bool:
+    plugin_name = unit.get("driver")
+    plugin = UNIT_PLUGINS.get(plugin_name) if isinstance(plugin_name, str) else None
+    if plugin is None:
+        raise OperationError(f"unit uses an unknown plugin: {plugin_name!r}")
+    if not isinstance(plugin, ReconciliationCapability):
+        return False
+    try:
+        return plugin.reconciliation_required(unit)
+    except DriverError as exc:
+        raise OperationError(str(exc)) from exc
+
+
+def materialization_tree_digest(root: Path) -> str:
+    if not root.is_dir() or root.is_symlink():
+        raise OperationError("materialization output must be a directory")
+    entries: list[dict[str, str]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise OperationError(f"materialization output contains a symbolic link: {path.relative_to(root)}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise OperationError(f"materialization output contains a non-file: {path.relative_to(root)}")
+        content = path.read_bytes()
+        entries.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "mode": "100755" if path.stat().st_mode & 0o111 else "100644",
+                "contentHash": hashlib.sha256(content).hexdigest(),
+            }
+        )
+    if not entries:
+        raise OperationError("materialization output is empty")
+    payload = {"materializationHashVersion": 1, "files": entries}
+    return f"sha256:{hashlib.sha256(canonical_json(payload)).hexdigest()}"
+
+
+def validate_unit_materialization(desired_root: Path, unit_name: str, unit: dict[str, Any]) -> None:
+    plugin_name = unit.get("driver")
+    expects_materialization = isinstance(plugin_name, str) and plugin_name in MATERIALIZATION_PLUGINS
+    descriptor = unit.get("materialization")
+    if not expects_materialization:
+        if descriptor is not None:
+            raise OperationError(f"{unit_name} records materialization for a plugin without that capability")
+        return
+    if not isinstance(descriptor, dict) or set(descriptor) != {"path", "digest", "mediaType", "metadata"}:
+        raise OperationError(f"{unit_name} has an invalid materialization descriptor")
+    expected_path = f"manifests/{unit_name}"
+    if descriptor.get("path") != expected_path:
+        raise OperationError(f"{unit_name} materialization path must be {expected_path}")
+    digest = descriptor.get("digest")
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise OperationError(f"{unit_name} has an invalid materialization digest")
+    if not isinstance(descriptor.get("mediaType"), str) or not descriptor["mediaType"]:
+        raise OperationError(f"{unit_name} has an invalid materialization media type")
+    if not isinstance(descriptor.get("metadata"), dict):
+        raise OperationError(f"{unit_name} has invalid materialization metadata")
+    actual = materialization_tree_digest(desired_root / expected_path)
+    if actual != digest:
+        raise OperationError(f"{unit_name} materialized payload does not match its digest")
+
+
+def copy_unit_materialization(source: Path, destination: Path, unit_name: str, unit: dict[str, Any]) -> None:
+    validate_unit_materialization(source, unit_name, unit)
+    target = destination / "manifests" / unit_name
+    if target.exists():
+        shutil.rmtree(target)
+    descriptor = unit.get("materialization")
+    if descriptor is not None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source / "manifests" / unit_name, target)
+
+
 def require_unit_specification(
     specification: dict[str, Any], expected_name: str | None = None
 ) -> tuple[str, dict[str, Any]]:
@@ -556,6 +634,15 @@ def load_environment(source_root: Path, environment_name: str) -> dict[str, Any]
             or len(set(allowed_sources)) != len(allowed_sources)
         ):
             raise OperationError(f"{environment_name} promotion allowedSources must be unique environment names")
+    promotion_policy = environment.get("promotionPolicy")
+    if promotion_policy is not None and (
+        not isinstance(promotion_policy, dict)
+        or set(promotion_policy) != {"minimumEvidence"}
+        or promotion_policy.get("minimumEvidence") not in {"reconciled", "materialized"}
+    ):
+        raise OperationError(
+            f"{environment_name} promotionPolicy must contain minimumEvidence 'reconciled' or 'materialized'"
+        )
     return environment
 
 
@@ -567,6 +654,11 @@ def allowed_promotion_sources(source_root: Path, environment_name: str) -> set[s
     environment = load_environment(source_root, environment_name)
     promotion = environment.get("promotion")
     return set(promotion["allowedSources"]) if promotion is not None else set()
+
+
+def minimum_promotion_evidence(source_root: Path, environment_name: str) -> str:
+    policy = load_environment(source_root, environment_name).get("promotionPolicy")
+    return str(policy["minimumEvidence"]) if policy is not None else "reconciled"
 
 
 def resolve_advance_source_revision(
@@ -612,6 +704,11 @@ def load_environment_specifications(source_root: Path, environment_name: str) ->
     specifications = {path.stem: load_json(path) for path in unit_paths}
     for unit_name, specification in specifications.items():
         require_unit_specification(specification, unit_name)
+    for consumer, specification in specifications.items():
+        for reference in reference_paths(specification, "fromObservation"):
+            producer = Path(reference).stem
+            if producer in specifications and not unit_requires_reconciliation(specifications[producer]):
+                raise OperationError(f"{consumer} cannot observe materialization-only unit {producer!r}")
     return specifications
 
 
@@ -631,6 +728,11 @@ def reconciliation_statuses(unit_names: list[str], desired: Path, observed: Path
         receipt_path = observed / "units" / f"{unit_name}.json"
         if not unit_path.is_file():
             statuses.append((unit_name, "WAIT", "desired inputs are not materialized"))
+            continue
+        unit = load_json(unit_path)
+        validate_unit_materialization(desired, unit_name, unit)
+        if not unit_requires_reconciliation(unit):
+            statuses.append((unit_name, "MATERIALIZED", "desired payload is published for external delivery"))
             continue
         if not receipt_path.is_file():
             statuses.append((unit_name, "READY", "no observation receipt"))
@@ -862,6 +964,8 @@ def log_reconciliation_status(
         log_status("NEXT", ", ".join(ready))
     elif any(status == "WAIT" for _, status, _ in statuses):
         log_status("NEXT", "none ready; waiting for upstream observations")
+    elif any(status == "MATERIALIZED" for _, status, _ in statuses):
+        log_status("NEXT", "none; all units are complete")
     else:
         log_status("NEXT", "none; all units are clean")
 
@@ -895,7 +999,7 @@ def log_convergence_plan(
     changed = [row for row in rows if previous_by_unit.get(row[0]) != row[1:] or row[1] == "NEXT"]
     log_heading("Plan" if previous is None else "Plan update")
     for unit_name, status, reason in changed:
-        message = unit_name if status == "CLEAN" else f"{unit_name}: {reason}"
+        message = unit_name if status in {"CLEAN", "MATERIALIZED"} else f"{unit_name}: {reason}"
         log_status(status, message)
 
 
@@ -938,6 +1042,80 @@ def log_convergence_action(
         if field := bounded_evidence(explanation.specification_paths):
             log_status("FIELD", field)
     log_status("WRITES", f"driver effects; receipt to {observed_ref} on success")
+
+
+def materialize_resolved_unit(
+    environment_name: str,
+    unit_name: str,
+    resolved: dict[str, Any],
+    source_root: Path,
+    source_revision: str,
+    current_desired: Path,
+    candidate: Path,
+) -> dict[str, Any]:
+    plugin_name = resolved.get("driver")
+    plugin = MATERIALIZATION_PLUGINS.get(plugin_name) if isinstance(plugin_name, str) else None
+    if plugin is None:
+        return resolved
+
+    previous_path = current_desired / "units" / f"{unit_name}.json"
+    if previous_path.is_file():
+        previous = load_json(previous_path)
+        previous_without_materialization = {
+            name: value for name, value in previous.items() if name != "materialization"
+        }
+        if previous_without_materialization == resolved:
+            validate_unit_materialization(current_desired, unit_name, previous)
+            copy_unit_materialization(current_desired, candidate, unit_name, previous)
+            return {**resolved, "materialization": previous["materialization"]}
+
+    output_root = candidate / "manifests" / unit_name
+    if output_root.exists():
+        shutil.rmtree(output_root)
+    output_root.mkdir(parents=True)
+    source = resolved.get("source")
+    if not isinstance(source, dict):
+        raise OperationError(f"{unit_name} has no resolved source for materialization")
+    selected_revision = source.get("revision")
+    source_path = source.get("path")
+    if not isinstance(selected_revision, str) or not isinstance(source_path, str):
+        raise OperationError(f"{unit_name} has an invalid materialization source")
+
+    def run_materializer(selected_source_root: Path) -> MaterializationResult:
+        result = plugin.materialize(
+            MaterializationContext(
+                environment=environment_name,
+                source_root=selected_source_root,
+                source_revision=selected_revision,
+                source_path=source_path,
+                unit=resolved,
+                output_root=output_root,
+            )
+        )
+        if not isinstance(result, MaterializationResult):
+            raise DriverError(f"{plugin_name} returned an invalid materialization result")
+        return result
+
+    if selected_revision == source_revision:
+        result = run_materializer(source_root)
+    else:
+        with tempfile.TemporaryDirectory(prefix="gitopsctr-materialization-source-") as directory:
+            selected_source_root = Path(directory) / "source"
+            materialize_revision(selected_revision, selected_source_root)
+            result = run_materializer(selected_source_root)
+    if not result.media_type:
+        raise DriverError(f"{plugin_name} returned an empty materialization media type")
+    resolved = {
+        **resolved,
+        "materialization": {
+            "path": f"manifests/{unit_name}",
+            "digest": materialization_tree_digest(output_root),
+            "mediaType": result.media_type,
+            "metadata": result.metadata,
+        },
+    }
+    validate_unit_materialization(candidate, unit_name, resolved)
+    return resolved
 
 
 def build_desired_candidate(
@@ -1010,6 +1188,15 @@ def build_desired_candidate(
                     resolved["resolvedInputs"]["promotion"] = promotion_inputs
                 if observed_inputs:
                     resolved["resolvedInputs"]["observed"] = observed_inputs
+            resolved = materialize_resolved_unit(
+                environment_name,
+                unit_name,
+                resolved,
+                source_root,
+                source_revision,
+                current_desired,
+                candidate,
+            )
             candidate_unit = candidate_units / f"{unit_name}.json"
             write_json(candidate_unit, resolved)
             previous_unit = current_desired / "units" / f"{unit_name}.json"
@@ -1054,6 +1241,7 @@ def build_desired_candidate(
         next_driver = prepared[unit_name]["driver"]
         if previous_driver == next_driver:
             shutil.copy2(previous, candidate_units / previous.name)
+            copy_unit_materialization(current_desired, candidate, unit_name, load_json(previous))
             resolution = "retain previous desired state"
         elif previous_driver is not None:
             resolution = f"omit previous {previous_driver} desired state while transitioning to {next_driver}"
@@ -1098,11 +1286,14 @@ def load_promotion_context(current_desired: Path, temporary: Path) -> PromotionC
     if not all(isinstance(ref, str) and ref for ref in (desired_ref, observed_ref)):
         raise OperationError("promotion.json has invalid source refs")
     desired_revision = require_revision(source.get("desiredRevision"), "promotion source desiredRevision")
-    observed_revision = require_revision(source.get("observedRevision"), "promotion source observedRevision")
+    observed_value = source.get("observedRevision")
+    observed_revision = (
+        None if observed_value is None else require_revision(observed_value, "promotion source observedRevision")
+    )
     specification_revision = require_revision(document.get("specificationRevision"), "promotion specificationRevision")
     if resolve_ref(desired_ref, desired_revision) != desired_revision:
         raise OperationError("promotion source desired revision changed unexpectedly")
-    if resolve_ref(observed_ref, observed_revision) != observed_revision:
+    if observed_revision is not None and resolve_ref(observed_ref, observed_revision) != observed_revision:
         raise OperationError("promotion source observed revision changed unexpectedly")
     desired_root = temporary / "promotion-source"
     materialize_revision(desired_revision, desired_root)
@@ -1120,9 +1311,17 @@ def load_promotion_context(current_desired: Path, temporary: Path) -> PromotionC
 def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) -> bool:
     unit_path = desired / "units" / f"{unit_name}.json"
     receipt_path = observed / "units" / f"{unit_name}.json"
-    if not unit_path.is_file() or not receipt_path.is_file():
+    if not unit_path.is_file():
         return False
     unit = load_json(unit_path)
+    try:
+        validate_unit_materialization(desired, unit_name, unit)
+        if not unit_requires_reconciliation(unit):
+            return True
+    except (DriverError, OperationError):
+        return False
+    if not receipt_path.is_file():
+        return False
     receipt = load_json(receipt_path)
     driver = unit.get("driver")
     desired_evidence = receipt.get("desired")
@@ -1143,7 +1342,7 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
     return True
 
 
-def require_clean_source(desired: Path, observed: Path) -> None:
+def require_clean_source(desired: Path, observed: Path, minimum_evidence: str = "reconciled") -> None:
     unit_names = sorted(path.stem for path in (desired / "units").glob("*.json"))
     if not unit_names:
         raise OperationError("promotion source desired state has no units")
@@ -1153,7 +1352,8 @@ def require_clean_source(desired: Path, observed: Path) -> None:
     if unresolved:
         raise OperationError(f"promotion source has unresolved desired units: {', '.join(unresolved)}")
     statuses = reconciliation_statuses(unit_names, desired, observed)
-    unclean = [f"{unit_name} ({status.lower()})" for unit_name, status, _ in statuses if status != "CLEAN"]
+    accepted = {"CLEAN", "MATERIALIZED"} if minimum_evidence == "materialized" else {"CLEAN"}
+    unclean = [f"{unit_name} ({status.lower()})" for unit_name, status, _ in statuses if status not in accepted]
     if unclean:
         raise OperationError(f"promotion source is not fully reconciled: {', '.join(unclean)}")
 
@@ -1181,7 +1381,14 @@ def find_clean_observed_snapshot(
     desired: Path,
     unit_names: list[str],
     temporary: Path,
-) -> str:
+) -> str | None:
+    receipt_units = [
+        unit_name
+        for unit_name in unit_names
+        if unit_requires_reconciliation(load_json(desired / "units" / f"{unit_name}.json"))
+    ]
+    if not receipt_units:
+        return None
     observed_head = fetch_ref(observed_ref)
     if observed_head is None:
         raise OperationError(f"{observed_ref} has no observation history")
@@ -1189,7 +1396,7 @@ def find_clean_observed_snapshot(
     for index, revision in enumerate(revisions):
         observed = temporary / f"observed-{index}"
         materialize_revision(revision, observed)
-        if all(historical_receipt_matches(desired, observed, unit_name) for unit_name in unit_names):
+        if all(historical_receipt_matches(desired, observed, unit_name) for unit_name in receipt_units):
             return revision
     raise OperationError("rollback target was never fully clean in one observed-state snapshot")
 
@@ -1431,15 +1638,20 @@ def command_promote(args: argparse.Namespace) -> None:
 
         source_desired_ref, source_observed_ref = deployment_refs(source_root, args.from_environment)
         source_desired_revision = resolve_ref(source_desired_ref, args.source_desired_revision)
-        source_observed_revision = resolve_ref(source_observed_ref)
+        source_observed_revision = fetch_ref(source_observed_ref)
         source_desired = temporary / "source-desired"
         source_observed = temporary / "source-observed"
         materialize_revision(source_desired_revision, source_desired)
-        materialize_revision(source_observed_revision, source_observed)
-        require_clean_source(source_desired, source_observed)
+        if source_observed_revision is None:
+            source_observed.mkdir(parents=True)
+        else:
+            materialize_revision(source_observed_revision, source_observed)
+        evidence = minimum_promotion_evidence(source_root, args.from_environment)
+        require_clean_source(source_desired, source_observed, evidence)
+        evidence_label = "reconciled" if evidence == "reconciled" else "promotion-complete"
         log_status(
             "SOURCE",
-            f"{source_desired_ref} {short_revision(source_desired_revision)} is clean at "
+            f"{source_desired_ref} {short_revision(source_desired_revision)} is {evidence_label} at "
             f"{short_revision(source_observed_revision)}",
         )
 
@@ -1618,6 +1830,7 @@ def validate_materialized_desired(
         if contains_reference(unit):
             raise OperationError(f"{description} unit {unit_name} contains unresolved inputs")
         driver, _source = require_unit(unit, unit_name)
+        validate_unit_materialization(desired, unit_name, unit)
         if driver != specifications[unit_name].get("driver"):
             raise OperationError(f"{description} unit {unit_name} does not match its specification driver")
     return specifications, desired_units
@@ -1753,15 +1966,22 @@ def command_rollback(args: argparse.Namespace) -> None:
         }
         candidate = temporary / "candidate"
         base = target if mode == "full" else current
-        shutil.copytree(base / "units", candidate / "units")
-        if (base / "promotion.json").is_file():
-            shutil.copy2(base / "promotion.json", candidate / "promotion.json")
+        shutil.copytree(base, candidate)
         if mode == "units":
             for unit_name in materialized_units:
+                historical_unit = load_json(target / "units" / f"{unit_name}.json")
+                validate_unit_materialization(target, unit_name, historical_unit)
                 shutil.copy2(
                     target / "units" / f"{unit_name}.json",
                     candidate / "units" / f"{unit_name}.json",
                 )
+                copy_unit_materialization(target, candidate, unit_name, historical_unit)
+        for unit_name in materialized_units:
+            validate_unit_materialization(
+                candidate,
+                unit_name,
+                load_json(candidate / "units" / f"{unit_name}.json"),
+            )
         requested_label = "all" if mode == "full" else ", ".join(requested_units)
         materialized_label = ", ".join(materialized_units)
         commit_message = (
@@ -1922,6 +2142,7 @@ def command_verify(args: argparse.Namespace) -> None:
         for unit_name in selected:
             unit = load_json(available[unit_name])
             driver_name, source = require_unit(unit, unit_name)
+            validate_unit_materialization(desired, unit_name, unit)
             if contains_reference(unit):
                 raise OperationError(f"{unit_name} desired state is not fully materialized")
             if driver_name not in VERIFICATION_PLUGINS:
@@ -2306,10 +2527,16 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             return False
         unit = load_json(unit_path)
         driver_name, source = require_unit(unit, args.unit)
+        validate_unit_materialization(desired, args.unit, unit)
         log_status("DRIVER", driver_name)
         log_status("SOURCE", f"{short_revision(source['revision'])} ({source['path']})")
         if contains_reference(unit):
             raise OperationError(f"{args.unit} desired state is not fully materialized")
+        if not unit_requires_reconciliation(unit):
+            log_status("SKIP", "unit is complete after desired-state materialization")
+            log_status("DONE", f"{args.unit}: materialized for external delivery")
+            write_reconcile_outputs(False, pre_advanced_revision)
+            return False
 
         def advance_if_requested() -> str:
             if not args.advance:
@@ -2448,7 +2675,7 @@ def log_compact_convergence_summary(
     else:
         log_status("RESULT", result)
     for unit_name, status, reason in unselected or []:
-        if status != "CLEAN":
+        if status not in {"CLEAN", "MATERIALIZED"}:
             log_status("UNSCOPED", f"{unit_name}: {status.lower()}; {reason}")
 
 
@@ -2487,7 +2714,7 @@ def log_convergence_summary(
         f"{short_revision(start_heads[1])} -> {short_revision(end_heads[1])}",
     )
     for unit_name, status, reason in unselected or []:
-        if status != "CLEAN":
+        if status not in {"CLEAN", "MATERIALIZED"}:
             log_status("UNSCOPED", f"{unit_name}: {status.lower()}; {reason}")
     log_status("RESULT", result)
 
@@ -2667,9 +2894,15 @@ def command_converge(args: argparse.Namespace) -> None:
                         args.verbose,
                     )
 
-                if all(status == "CLEAN" for _, status, _ in statuses):
+                if all(status in {"CLEAN", "MATERIALIZED"} for _, status, _ in statuses):
                     all_statuses = reconciliation_statuses(sorted(specifications), desired, observed)
                     unselected = [item for item in all_statuses if item[0] not in set(scope)]
+                    materialized_count = sum(status == "MATERIALIZED" for _, status, _ in statuses)
+                    result = (
+                        "CLEAN"
+                        if materialized_count == 0
+                        else f"COMPLETE: {len(scope) - materialized_count} clean; {materialized_count} materialized"
+                    )
                     if args.verbose:
                         log_convergence_summary(
                             args.environment,
@@ -2679,7 +2912,7 @@ def command_converge(args: argparse.Namespace) -> None:
                             advances,
                             (start_desired, start_observed),
                             (last_desired, last_observed),
-                            "CLEAN",
+                            result,
                             unselected,
                         )
                     else:
@@ -2688,7 +2921,7 @@ def command_converge(args: argparse.Namespace) -> None:
                             scope,
                             steps,
                             advances,
-                            "CLEAN",
+                            result,
                             unselected,
                         )
                     return

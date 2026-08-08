@@ -454,8 +454,8 @@ def test_promotion_requires_every_source_unit_to_be_clean(tmp_path):
     observed = tmp_path / "observed"
     first = desired / "units/first.json"
     second = desired / "units/second.json"
-    _write_json(first, {"name": "first"})
-    _write_json(second, {"name": "second"})
+    _write_json(first, _unit("first"))
+    _write_json(second, _unit("second"))
     _write_json(
         observed / "units/first.json",
         {"desired": {"unitBlob": deploy_release.file_blob(first)}},
@@ -668,8 +668,8 @@ def test_reconciliation_statuses_identify_clean_ready_and_waiting_units(tmp_path
     desired = tmp_path / "desired"
     observed = tmp_path / "observed"
     clean_unit = desired / "units/application-images.json"
-    _write_json(clean_unit, {"name": "application-images"})
-    _write_json(desired / "units/aws-application.json", {"name": "aws-application"})
+    _write_json(clean_unit, _unit("application-images"))
+    _write_json(desired / "units/aws-application.json", _unit("aws-application"))
     _write_json(
         observed / "units/application-images.json",
         {"desired": {"unitBlob": deploy_release.file_blob(clean_unit)}},
@@ -1238,7 +1238,19 @@ def _install_convergence_simulation(
             return
         index = desired_revisions.index(revision)
         for unit_name, blob in desired_units[index].items():
-            _write_json(output / f"units/{unit_name}.json", {"blob": blob})
+            specification = specifications[unit_name]
+            _write_json(
+                output / f"units/{unit_name}.json",
+                {
+                    **specification,
+                    "source": {
+                        **specification["source"],
+                        "revision": source_revision,
+                        "driverVersion": deploy_release.PLUGIN_VERSIONS[specification["driver"]],
+                    },
+                    "blob": blob,
+                },
+            )
 
     def observed_tree(ref: str, output: Path):
         output.mkdir(parents=True, exist_ok=True)
@@ -1550,7 +1562,18 @@ def test_promoted_converge_uses_merged_specification_without_source_revision(tmp
                 },
             )
         elif revision == desired_revision:
-            _write_json(output / "units/application.json", {"blob": "release-v1"})
+            _write_json(
+                output / "units/application.json",
+                {
+                    **_unit("application"),
+                    "source": {
+                        "path": "infra/deploy",
+                        "revision": reviewed,
+                        "driverVersion": deploy_release.PLUGIN_VERSIONS["terraform"],
+                    },
+                    "blob": "release-v1",
+                },
+            )
 
     def observed_tree(ref, output):
         output.mkdir(parents=True, exist_ok=True)

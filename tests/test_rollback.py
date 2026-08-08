@@ -194,6 +194,7 @@ def _install_rollback_simulation(
     gate: str = "none",
     current_promoted: bool = False,
     target_promoted: bool = False,
+    materialized_payloads: bool = False,
 ):
     revisions = {
         "target": "a" * 40,
@@ -223,7 +224,20 @@ def _install_rollback_simulation(
 
     def write_desired(output, revision, value, promoted):
         for name in specifications:
-            _write_json(output / f"units/{name}.json", _desired_unit(name, revision, value))
+            unit = _desired_unit(name, revision, value)
+            if materialized_payloads:
+                payload = output / f"manifests/{name}"
+                payload.mkdir(parents=True, exist_ok=True)
+                (payload / "rendered.yaml").write_text(f"unit: {name}\nvalue: {value}\n")
+                if value == "current":
+                    (payload / "stale.yaml").write_text("stale: true\n")
+                unit["materialization"] = {
+                    "path": f"manifests/{name}",
+                    "digest": deploy_release.materialization_tree_digest(payload),
+                    "mediaType": "application/yaml",
+                    "metadata": {"renderer": "test"},
+                }
+            _write_json(output / f"units/{name}.json", unit)
         if promoted:
             _write_json(output / "promotion.json", _promotion_document(revision))
 
@@ -292,6 +306,12 @@ def _install_rollback_simulation(
     )
     monkeypatch.setattr(deploy_release, "change_gate", lambda *_args: gate)
     monkeypatch.setattr(deploy_release, "publish_tree", publish)
+    if materialized_payloads:
+        monkeypatch.setitem(
+            deploy_release.MATERIALIZATION_PLUGINS,
+            "terraform",
+            deploy_release.UNIT_PLUGINS["terraform"],
+        )
     return revisions, publications
 
 
@@ -345,6 +365,46 @@ def test_rollback_publishes_complete_forward_desired_state(
     assert f"Requested-Units: {requested_label}" in message
     assert f"Materialized-Units: {materialized_label}" in message
     assert "Reason: Known-bad release" in message
+
+
+@pytest.mark.parametrize(
+    ("units", "historical_units"),
+    [([], {"base", "consumer", "unrelated"}), (["base"], {"base", "consumer"})],
+)
+def test_rollback_copies_exact_historical_payloads_and_removes_stale_files(
+    units, historical_units, tmp_path, monkeypatch
+):
+    revisions, publications = _install_rollback_simulation(monkeypatch, materialized_payloads=True)
+    arguments = [
+        "rollback",
+        "--environment",
+        "dev",
+        "--to-desired-revision",
+        revisions["target"],
+        "--reason",
+        "Known-bad release",
+    ]
+    for unit in units:
+        arguments.extend(["--unit", unit])
+
+    args = deploy_release.build_parser().parse_args(arguments)
+    args.handler(args)
+
+    files = publications[0]["files"]
+    for name in {"base", "consumer", "unrelated"}:
+        expected_value = "rollback" if name in historical_units else "current"
+        assert files[f"manifests/{name}/rendered.yaml"] == f"unit: {name}\nvalue: {expected_value}\n".encode()
+        assert (f"manifests/{name}/stale.yaml" in files) is (name not in historical_units)
+        unit = json.loads(files[f"units/{name}.json"])
+        assert unit["materialization"]["path"] == f"manifests/{name}"
+        payload_root = tmp_path / name
+        for path, content in files.items():
+            prefix = f"manifests/{name}/"
+            if path.startswith(prefix):
+                output = payload_root / path.removeprefix(prefix)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(content)
+        assert unit["materialization"]["digest"] == deploy_release.materialization_tree_digest(payload_root)
 
 
 @pytest.mark.parametrize(
