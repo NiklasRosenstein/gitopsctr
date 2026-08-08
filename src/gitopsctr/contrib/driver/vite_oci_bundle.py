@@ -9,8 +9,18 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, Literal, TypedDict
 
+from gitopsctr.contracts import (
+    AuthoredSource,
+    AwsEcrCredentialProvider,
+    DesiredSource,
+    MashumaroContract,
+    MaterializationDocument,
+    SchemaDocument,
+    StrictModel,
+    schema_url,
+)
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -54,6 +64,70 @@ class FrontendDocument(TypedDict):
 
 class ViteBundleResult(TypedDict):
     artifacts: dict[str, FrontendDocument]
+
+
+@dataclass(frozen=True, kw_only=True)
+class ViteBuild(StrictModel):
+    nodeVersion: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class VitePublication(StrictModel):
+    repository: str
+    credentialProvider: AwsEcrCredentialProvider | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ViteOciBundleUnit(SchemaDocument):
+    schema: Literal[1]
+    name: str
+    driver: Literal["vite-oci-bundle"]
+    source: AuthoredSource
+    build: ViteBuild | None = None
+    publish: VitePublication | None = None
+    artifacts: list[Literal["frontend.json"]] | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ViteOciBundleDesiredUnit(SchemaDocument):
+    schema: Literal[1]
+    name: str
+    driver: Literal["vite-oci-bundle"]
+    source: DesiredSource
+    build: ViteBuild | None = None
+    publish: VitePublication | None = None
+    artifacts: list[Literal["frontend.json"]] | None = None
+    inputs: dict[str, Any] | None = None
+    resolvedInputs: dict[str, dict[str, str]] | None = None
+    materialization: MaterializationDocument | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class BundleArtifactModel(StrictModel):
+    type: Literal["oci-artifact"]
+    artifactType: str
+    uri: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class ViteArtifactIdentity(StrictModel):
+    name: str
+    driver: str
+    inputHashVersion: Literal[1]
+    inputHash: str
+    sourceRevision: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class FrontendDocumentModel(StrictModel):
+    schema: Literal[1]
+    unit: ViteArtifactIdentity
+    artifacts: dict[str, BundleArtifactModel]
+
+
+@dataclass(frozen=True, kw_only=True)
+class ViteBundleResultModel(StrictModel):
+    artifacts: dict[str, FrontendDocumentModel]
 
 
 @dataclass(frozen=True)
@@ -103,6 +177,13 @@ def deterministic_archive(source: Path, destination: Path) -> None:
 
 class ViteOciBundlePlugin(UnitPlugin, PlanningCapability, ReconciliationCapability):
     version = 1
+    schema_base_uri = schema_url("drivers/vite-oci-bundle", version, "").removesuffix(".schema.json")
+    unit_contract = MashumaroContract(ViteOciBundleUnit, schema_url("drivers/vite-oci-bundle", version, "unit"))
+    desired_unit_contract = MashumaroContract(
+        ViteOciBundleDesiredUnit,
+        schema_url("drivers/vite-oci-bundle", version, "desired-unit"),
+    )
+    result_contract = MashumaroContract(ViteBundleResultModel, schema_url("drivers/vite-oci-bundle", version, "result"))
     _select_semantic_result = staticmethod(select_result_fields("artifacts"))
 
     @staticmethod

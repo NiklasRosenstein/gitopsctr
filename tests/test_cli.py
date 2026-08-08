@@ -1248,7 +1248,7 @@ def _install_convergence_simulation(
                         "revision": source_revision,
                         "driverVersion": deploy_release.PLUGIN_VERSIONS[specification["driver"]],
                     },
-                    "blob": blob,
+                    "terraform": {"variables": {"blob": blob}},
                 },
             )
 
@@ -1292,7 +1292,7 @@ def _install_convergence_simulation(
     monkeypatch.setattr(
         deploy_release,
         "file_blob",
-        lambda path: deploy_release.load_json(path)["blob"],
+        lambda path: deploy_release.load_json(path)["terraform"]["variables"]["blob"],
     )
     return state
 
@@ -1571,7 +1571,7 @@ def test_promoted_converge_uses_merged_specification_without_source_revision(tmp
                         "revision": reviewed,
                         "driverVersion": deploy_release.PLUGIN_VERSIONS["terraform"],
                     },
-                    "blob": "release-v1",
+                    "terraform": {"variables": {"blob": "release-v1"}},
                 },
             )
 
@@ -1589,7 +1589,11 @@ def test_promoted_converge_uses_merged_specification_without_source_revision(tmp
     monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
     monkeypatch.setattr(deploy_release, "fetch_ref", lambda ref: "e" * 40)
     monkeypatch.setattr(deploy_release, "load_promotion_context", lambda *_args: context)
-    monkeypatch.setattr(deploy_release, "file_blob", lambda path: deploy_release.load_json(path)["blob"])
+    monkeypatch.setattr(
+        deploy_release,
+        "file_blob",
+        lambda path: deploy_release.load_json(path)["terraform"]["variables"]["blob"],
+    )
 
     def advance(_environment, source_revision, *_args, **_kwargs):
         assert source_revision is None

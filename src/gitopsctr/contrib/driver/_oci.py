@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, cast
 
-from gitopsctr.driver import DriverError, JsonObject, UnitExecutionContext
+from gitopsctr.document import JsonObject
+from gitopsctr.driver import DriverError, UnitExecutionContext
 
 from ._common import require_strings, run
 

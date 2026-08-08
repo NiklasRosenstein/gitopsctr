@@ -16,7 +16,11 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Build Tools",
 ]
-dependencies = ["PyYAML>=6"]
+dependencies = [
+    "jsonschema>=4.25",
+    "mashumaro>=3.17",
+    "PyYAML>=6",
+]
 
 [project.urls]
 Repository = "https://github.com/NiklasRosenstein/gitopsctr"

@@ -10,9 +10,8 @@ from importlib.metadata import entry_points
 from pathlib import Path
 from typing import ClassVar
 
-type JsonScalar = None | bool | int | float | str
-type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
-type JsonObject = dict[str, JsonValue]
+from gitopsctr.document import DocumentContract, JsonObject
+
 type ReconciliationResult = Mapping[str, object]
 
 
@@ -24,6 +23,10 @@ class UnitPlugin:
     """A versioned deployment-unit plugin discovered through an entry point."""
 
     version: ClassVar[int] = 0
+    schema_base_uri: ClassVar[str | None] = None
+    unit_contract: ClassVar[DocumentContract]
+    desired_unit_contract: ClassVar[DocumentContract]
+    result_contract: ClassVar[DocumentContract]
 
 
 @dataclass(frozen=True)
@@ -147,6 +150,12 @@ def load_unit_plugins() -> dict[str, UnitPlugin]:
             raise DriverError(
                 f"unit plugin entry point {entry_point.name!r} has no materialization or reconciliation capability"
             )
+        for kind in ("unit", "desired_unit", "result"):
+            contract = getattr(plugin, f"{kind}_contract", None)
+            if not isinstance(contract, DocumentContract):
+                raise DriverError(
+                    f"unit plugin entry point {entry_point.name!r} has no {kind.replace('_', '-')} contract"
+                )
         plugins[entry_point.name] = plugin
     return plugins
 

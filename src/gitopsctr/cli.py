@@ -18,9 +18,12 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from gitopsctr.contracts import CORE_CONTRACTS, with_schema
+from gitopsctr.document import ContractError, DocumentContract
 from gitopsctr.driver import (
     MATERIALIZATION_PLUGINS,
     PLANNING_PLUGINS,
@@ -44,6 +47,7 @@ from gitopsctr.forges import (
     ManualChangeRequest,
     ensure_change_request,
 )
+from gitopsctr.schemas import driver_schema, encoded_schema, export_schemas, show_schema
 
 GIT_AUTHOR_NAME = os.environ.get("GITOPSCTR_GIT_AUTHOR_NAME", "gitopsctr")
 GIT_AUTHOR_EMAIL = os.environ.get(
@@ -72,17 +76,20 @@ class PromotionContext:
     desired_root: Path
 
     def document(self) -> dict[str, Any]:
-        return {
-            "schema": 1,
-            "source": {
-                "environment": self.source_environment,
-                "desiredRef": self.desired_ref,
-                "desiredRevision": self.desired_revision,
-                "observedRef": self.observed_ref,
-                "observedRevision": self.observed_revision,
+        return with_schema(
+            {
+                "schema": 1,
+                "source": {
+                    "environment": self.source_environment,
+                    "desiredRef": self.desired_ref,
+                    "desiredRevision": self.desired_revision,
+                    "observedRef": self.observed_ref,
+                    "observedRevision": self.observed_revision,
+                },
+                "specificationRevision": self.specification_revision,
             },
-            "specificationRevision": self.specification_revision,
-        }
+            str(CORE_CONTRACTS["promotion"].json_schema()["$id"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -269,6 +276,23 @@ def command_publish_tree(args: argparse.Namespace) -> None:
     print(commit)
 
 
+def command_schemas_show(args: argparse.Namespace) -> None:
+    try:
+        document = show_schema(args.driver, args.kind)
+    except ValueError as exc:
+        raise OperationError(str(exc)) from exc
+    print(encoded_schema(document), end="")
+
+
+def command_schemas_export(args: argparse.Namespace) -> None:
+    directory = Path(args.directory)
+    changed = export_schemas(directory, check=args.check)
+    if args.check and changed:
+        raise OperationError("generated schemas are stale: " + ", ".join(path.as_posix() for path in changed))
+    if not args.check:
+        print(directory.resolve())
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text())
@@ -277,6 +301,33 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise OperationError(f"expected a JSON object in {path}")
     return value
+
+
+def validate_document(contract: DocumentContract, document: object, description: str) -> dict[str, Any]:
+    try:
+        return contract.validate(document)
+    except ContractError as exc:
+        raise OperationError(f"invalid {description}: {exc}") from exc
+
+
+def validate_receipt_document(document: object, description: str) -> dict[str, Any]:
+    if not isinstance(document, dict):
+        raise OperationError(f"invalid {description}: expected a JSON object")
+    driver = document.get("driver")
+    if driver is None and "$schema" not in document:
+        # Pre-contract receipts remain readable; every newly written receipt carries a driver and $schema.
+        return document
+    if not isinstance(driver, str) or driver not in UNIT_PLUGINS:
+        raise OperationError(f"invalid {description}: unknown driver {driver!r}")
+    from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import ValidationError
+
+    candidate = {**document, "$schema": None}
+    try:
+        Draft202012Validator(driver_schema(driver, "receipt")).validate(candidate)
+    except ValidationError as exc:
+        raise OperationError(f"invalid {description}: {exc.message}") from exc
+    return document
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
@@ -387,6 +438,12 @@ def materialization_tree_digest(root: Path) -> str:
 
 def validate_unit_materialization(desired_root: Path, unit_name: str, unit: dict[str, Any]) -> None:
     plugin_name = unit.get("driver")
+    if isinstance(plugin_name, str) and plugin_name in UNIT_PLUGINS:
+        validate_document(
+            UNIT_PLUGINS[plugin_name].desired_unit_contract,
+            unit,
+            f"persisted desired {plugin_name} unit {unit_name}",
+        )
     expects_materialization = isinstance(plugin_name, str) and plugin_name in MATERIALIZATION_PLUGINS
     descriptor = unit.get("materialization")
     if not expects_materialization:
@@ -435,6 +492,7 @@ def require_unit_specification(
         raise OperationError(f"invalid unit specification: {expected_name or name!r}")
     if driver not in UNIT_PLUGINS:
         raise OperationError(f"{name} uses an unknown driver: {driver!r}")
+    validate_document(UNIT_PLUGINS[driver].unit_contract, specification, f"{driver} unit {expected_name or name}")
     if not isinstance(source, dict):
         raise OperationError(f"{name} requires a source object")
     safe_source_path(source.get("path"), f"{name} source path")
@@ -502,6 +560,7 @@ def current_receipt(observed: Path, candidate_units: Path, unit_name: str) -> di
     if not receipt_path.is_file() or not unit_path.is_file():
         return None
     receipt = load_json(receipt_path)
+    validate_receipt_document(receipt, f"persisted receipt for {unit_name}")
     if receipt.get("desired", {}).get("unitBlob") != file_blob(unit_path):
         return None
     return receipt
@@ -645,6 +704,7 @@ def load_environment(source_root: Path, environment_name: str) -> dict[str, Any]
         raise OperationError(
             f"{environment_name} promotionPolicy must contain minimumEvidence 'reconciled' or 'materialized'"
         )
+    validate_document(CORE_CONTRACTS["environment"], environment, f"environment specification {environment_name}")
     return environment
 
 
@@ -740,6 +800,7 @@ def reconciliation_statuses(unit_names: list[str], desired: Path, observed: Path
             statuses.append((unit_name, "READY", "no observation receipt"))
             continue
         receipt = load_json(receipt_path)
+        validate_receipt_document(receipt, f"persisted receipt for {unit_name}")
         if receipt.get("desired", {}).get("unitBlob") == file_blob(unit_path):
             statuses.append((unit_name, "CLEAN", "observation matches desired state"))
         else:
@@ -892,6 +953,7 @@ def unit_change_explanation(unit_name: str, desired: Path, observed: Path) -> Un
     if not receipt_path.is_file() or not current_path.is_file():
         return None
     receipt = load_json(receipt_path)
+    validate_receipt_document(receipt, f"persisted receipt for {unit_name}")
     previous_revision = receipt.get("desired", {}).get("revision")
     if not isinstance(previous_revision, str):
         return None
@@ -1056,8 +1118,14 @@ def materialize_resolved_unit(
     candidate: Path,
 ) -> dict[str, Any]:
     plugin_name = resolved.get("driver")
+    if not isinstance(plugin_name, str) or plugin_name not in UNIT_PLUGINS:
+        raise OperationError(f"{unit_name} uses an unknown unit plugin: {plugin_name!r}")
+    unit_plugin = UNIT_PLUGINS[plugin_name]
+    desired_schema_id = str(driver_schema(plugin_name, "desired-unit")["$id"])
+    resolved = with_schema({key: value for key, value in resolved.items() if key != "$schema"}, desired_schema_id)
     plugin = MATERIALIZATION_PLUGINS.get(plugin_name) if isinstance(plugin_name, str) else None
     if plugin is None:
+        validate_document(unit_plugin.desired_unit_contract, resolved, f"materialized {plugin_name} unit {unit_name}")
         return resolved
 
     previous_path = current_desired / "units" / f"{unit_name}.json"
@@ -1069,7 +1137,9 @@ def materialize_resolved_unit(
         if previous_without_materialization == resolved:
             validate_unit_materialization(current_desired, unit_name, previous)
             copy_unit_materialization(current_desired, candidate, unit_name, previous)
-            return {**resolved, "materialization": previous["materialization"]}
+            reused = {**resolved, "materialization": previous["materialization"]}
+            validate_document(unit_plugin.desired_unit_contract, reused, f"materialized {plugin_name} unit {unit_name}")
+            return reused
 
     output_root = candidate / "manifests" / unit_name
     if output_root.exists():
@@ -1116,6 +1186,7 @@ def materialize_resolved_unit(
             "metadata": result.metadata,
         },
     }
+    validate_document(unit_plugin.desired_unit_contract, resolved, f"materialized {plugin_name} unit {unit_name}")
     validate_unit_materialization(candidate, unit_name, resolved)
     return resolved
 
@@ -1269,8 +1340,7 @@ def load_promotion_context(current_desired: Path, temporary: Path) -> PromotionC
     if not path.is_file():
         return None
     document = load_json(path)
-    if set(document) != {"schema", "source", "specificationRevision"} or document.get("schema") != 1:
-        raise OperationError("invalid promotion.json")
+    validate_document(CORE_CONTRACTS["promotion"], document, "promotion.json")
     source = document.get("source")
     if not isinstance(source, dict) or set(source) != {
         "environment",
@@ -1325,6 +1395,10 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
     if not receipt_path.is_file():
         return False
     receipt = load_json(receipt_path)
+    try:
+        validate_receipt_document(receipt, f"historical receipt for {unit_name}")
+    except OperationError:
+        return False
     driver = unit.get("driver")
     desired_evidence = receipt.get("desired")
     if (
@@ -2088,11 +2162,12 @@ def command_facts(args: argparse.Namespace) -> None:
                 raise OperationError(f"{observed_ref} has no receipt for {args.unit}")
             receipts = [receipt]
 
-        metadata = {"schema", "unit", "driver", "desired", "resolvedInputs", "controller"}
+        metadata = {"$schema", "schema", "unit", "driver", "desired", "resolvedInputs", "controller"}
         units = {}
         for path in receipts:
             receipt = load_json(path)
             unit_name = path.stem
+            validate_receipt_document(receipt, f"observation receipt units/{path.name}")
             if receipt.get("schema") != 1 or receipt.get("unit") != unit_name:
                 raise OperationError(f"invalid observation receipt: units/{path.name}")
             units[unit_name] = {key: value for key, value in receipt.items() if key not in metadata}
@@ -2188,6 +2263,7 @@ def require_unit(unit: dict[str, Any], unit_name: str) -> tuple[str, dict[str, s
     driver = unit.get("driver")
     if driver not in UNIT_PLUGINS:
         raise OperationError(f"{unit_name} uses an unknown unit plugin: {driver!r}")
+    validate_document(UNIT_PLUGINS[driver].desired_unit_contract, unit, f"desired {driver} unit {unit_name}")
     source = unit.get("source")
     if not isinstance(source, dict) or not isinstance(source.get("path"), str):
         raise OperationError(f"{unit_name} has an invalid source")
@@ -2205,6 +2281,7 @@ def require_unit(unit: dict[str, Any], unit_name: str) -> tuple[str, dict[str, s
 
 def controller_evidence() -> dict[str, str]:
     evidence = {
+        "version": version("gitopsctr"),
         "revision": os.environ.get("GITHUB_SHA") or git("rev-parse", "HEAD^{commit}").stdout.strip(),
         "observed_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     }
@@ -2385,6 +2462,7 @@ def publish_receipt_cas(
     receipt: dict[str, Any],
     desired_revision: str,
 ) -> str:
+    validate_receipt_document(receipt, f"candidate receipt for {unit_name}")
     for attempt in range(5):
         if attempt:
             log_status("RETRY", f"observation publish attempt {attempt + 1}/5")
@@ -2393,6 +2471,8 @@ def publish_receipt_cas(
             observed_revision = observed_tree(observed_ref, observed)
             receipt_path = observed / "units" / f"{unit_name}.json"
             existing_receipt = load_json(receipt_path) if receipt_path.is_file() else None
+            if existing_receipt is not None:
+                validate_receipt_document(existing_receipt, f"persisted receipt for {unit_name}")
             if existing_receipt is not None and existing_receipt.get("desired", {}).get("unitBlob") == receipt.get(
                 "desired", {}
             ).get("unitBlob"):
@@ -2559,6 +2639,8 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         unit_blob = file_blob(unit_path)
         receipt_path = observed / "units" / f"{args.unit}.json"
         previous_receipt = load_json(receipt_path) if receipt_path.is_file() else None
+        if previous_receipt is not None:
+            validate_receipt_document(previous_receipt, f"persisted receipt for {args.unit}")
         if receipt_path.is_file():
             assert previous_receipt is not None
             receipt = previous_receipt
@@ -2598,7 +2680,9 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 planner = PLANNING_PLUGINS[driver_name]
             except KeyError as exc:
                 raise OperationError(f"{args.unit} uses {driver_name}, which does not support planning") from exc
-            planner.plan(PlanningContext(**execution))
+            planned = planner.plan(PlanningContext(**execution))
+            if planned is not None:
+                raise DriverError(f"{driver_name} planning returned a value; planning evidence belongs in reports")
             log_status("PLAN", f"{driver_name} planning succeeded")
             log_status("DONE", f"{args.unit}: no remote changes")
             write_reconcile_outputs(False)
@@ -2613,6 +2697,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 previous_receipt=previous_receipt,
             )
         )
+        validate_document(UNIT_PLUGINS[driver_name].result_contract, result, f"{driver_name} reconciliation result")
         reserved = {
             "schema",
             "unit",
@@ -2623,15 +2708,19 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         overlap = reserved.intersection(result)
         if overlap:
             raise OperationError(f"driver returned reserved observation fields: {sorted(overlap)}")
-        receipt = {
-            "schema": 1,
-            "unit": args.unit,
-            "driver": driver_name,
-            "desired": {"revision": desired_revision, "unitBlob": unit_blob},
-            "resolvedInputs": unit.get("resolvedInputs", {}),
-            "controller": controller_evidence(),
-            **result,
-        }
+        receipt = with_schema(
+            {
+                "schema": 1,
+                "unit": args.unit,
+                "driver": driver_name,
+                "desired": {"revision": desired_revision, "unitBlob": unit_blob},
+                "resolvedInputs": unit.get("resolvedInputs", {}),
+                "controller": controller_evidence(),
+                **result,
+            },
+            str(driver_schema(driver_name, "receipt")["$id"]),
+        )
+        validate_receipt_document(receipt, f"{driver_name} receipt")
         revision = publish_receipt_cas(
             observed_ref,
             args.unit,
@@ -3035,6 +3124,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
+    schemas = commands.add_parser("schemas", help="show or export public JSON Schemas")
+    schema_commands = schemas.add_subparsers(dest="schema_command", required=True)
+    schemas_show = schema_commands.add_parser("show", help="print one core or driver schema")
+    schemas_show.add_argument("driver", help="driver name or 'core'")
+    schemas_show.add_argument("kind", help="document kind")
+    schemas_show.set_defaults(handler=command_schemas_show)
+    schemas_export = schema_commands.add_parser("export", help="write the deterministic schema catalog")
+    schemas_export.add_argument("directory")
+    schemas_export.add_argument("--check", action="store_true", help="fail if generated files differ")
+    schemas_export.set_defaults(handler=command_schemas_export)
+
     read = commands.add_parser("read-tree", help="materialize a data-only Git ref")
     read.add_argument("--ref", required=True)
     read.add_argument("--revision")
@@ -3250,7 +3350,8 @@ def main() -> int:
     global REPOSITORY_ROOT
     args = build_parser().parse_args()
     try:
-        REPOSITORY_ROOT = resolve_repository_root(args.repository)
+        if args.command != "schemas":
+            REPOSITORY_ROOT = resolve_repository_root(args.repository)
         args.handler(args)
     except (DriverError, OperationError, subprocess.CalledProcessError) as exc:
         if isinstance(exc, subprocess.CalledProcessError):

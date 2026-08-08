@@ -6,12 +6,22 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
+from gitopsctr.contracts import (
+    AuthoredSource,
+    DesiredSource,
+    MashumaroContract,
+    MaterializationDocument,
+    SchemaDocument,
+    StrictModel,
+    schema_url,
+)
+from gitopsctr.document import JsonValue
 from gitopsctr.driver import (
     DriverError,
-    JsonValue,
     PlanningCapability,
     PlanningContext,
     ReconciliationCapability,
@@ -35,6 +45,55 @@ class AppliedTerraform(TypedDict):
 class TerraformResult(TypedDict):
     applied: AppliedTerraform
     outputs: dict[str, JsonValue]
+
+
+@dataclass(frozen=True, kw_only=True)
+class TerraformHttpCheck(StrictModel):
+    type: Literal["http"]
+    urlOutput: str
+    path: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class TerraformConfiguration(StrictModel):
+    backend: dict[str, str | int | float | bool] | None = None
+    variables: dict[str, Any] | None = None
+    observeOutputs: list[str] | None = None
+    checks: list[TerraformHttpCheck] | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class TerraformUnit(SchemaDocument):
+    schema: Literal[1]
+    name: str
+    driver: Literal["terraform"]
+    source: AuthoredSource
+    terraform: TerraformConfiguration | None = None
+    inputs: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class TerraformDesiredUnit(SchemaDocument):
+    schema: Literal[1]
+    name: str
+    driver: Literal["terraform"]
+    source: DesiredSource
+    terraform: TerraformConfiguration | None = None
+    inputs: dict[str, Any] | None = None
+    resolvedInputs: dict[str, dict[str, str]] | None = None
+    materialization: MaterializationDocument | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class AppliedTerraformModel(StrictModel):
+    sourceRevision: str
+    path: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class TerraformResultModel(StrictModel):
+    applied: AppliedTerraformModel
+    outputs: dict[str, Any]
 
 
 def terraform_runtime(
@@ -75,6 +134,13 @@ def terraform_runtime(
 
 class TerraformPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability, VerificationCapability):
     version = 2
+    schema_base_uri = schema_url("drivers/terraform", version, "").removesuffix(".schema.json")
+    unit_contract = MashumaroContract(TerraformUnit, schema_url("drivers/terraform", version, "unit"))
+    desired_unit_contract = MashumaroContract(
+        TerraformDesiredUnit,
+        schema_url("drivers/terraform", version, "desired-unit"),
+    )
+    result_contract = MashumaroContract(TerraformResultModel, schema_url("drivers/terraform", version, "result"))
     _select_semantic_result = staticmethod(select_result_fields("applied", "outputs"))
 
     @staticmethod

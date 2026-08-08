@@ -4,11 +4,24 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import cli
+from gitopsctr.document import DocumentContract, JsonObject
 from gitopsctr.driver import MaterializationCapability, MaterializationContext, MaterializationResult, UnitPlugin
+
+
+class RenderOnlyContract(DocumentContract):
+    def validate(self, document: object) -> JsonObject:
+        assert isinstance(document, dict)
+        return document
+
+    def json_schema(self) -> JsonObject:
+        return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object"}
 
 
 class RenderOnlyPlugin(UnitPlugin, MaterializationCapability):
     version = 1
+    unit_contract = RenderOnlyContract()
+    desired_unit_contract = RenderOnlyContract()
+    result_contract = RenderOnlyContract()
 
     def __init__(self) -> None:
         self.calls = 0

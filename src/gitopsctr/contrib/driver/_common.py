@@ -8,7 +8,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from gitopsctr.driver import DriverError, JsonObject, ReconciliationResult, SemanticResultSelector
+from gitopsctr.document import JsonObject
+from gitopsctr.driver import DriverError, ReconciliationResult, SemanticResultSelector
 
 
 def run(

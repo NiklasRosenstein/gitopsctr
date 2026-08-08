@@ -8,11 +8,21 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
+from gitopsctr.contracts import (
+    AuthoredSource,
+    AwsEcrCredentialProvider,
+    DesiredSource,
+    MashumaroContract,
+    MaterializationDocument,
+    SchemaDocument,
+    StrictModel,
+    schema_url,
+)
+from gitopsctr.document import JsonObject
 from gitopsctr.driver import (
     DriverError,
-    JsonObject,
     PlanningCapability,
     PlanningContext,
     ReconciliationCapability,
@@ -67,6 +77,80 @@ class FrontendResult(TypedDict):
     published: PublishedFrontend
 
 
+@dataclass(frozen=True, kw_only=True)
+class FrontendPull(StrictModel):
+    credentialProvider: AwsEcrCredentialProvider | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class FrontendAuthoredInputs(StrictModel):
+    bundle: Any = None
+    bucket: Any = None
+    distributionId: Any = None
+    url: Any = None
+    runtimeConfig: Any = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class RuntimeAuthModel(StrictModel):
+    mode: Literal["cognito"]
+    issuer: str
+    clientId: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class RuntimeConfigurationModel(StrictModel):
+    schema: Literal[1]
+    apiBase: str
+    auth: RuntimeAuthModel
+
+
+@dataclass(frozen=True, kw_only=True)
+class FrontendDesiredInputs(StrictModel):
+    bundle: str
+    bucket: str
+    distributionId: str
+    url: str
+    runtimeConfig: RuntimeConfigurationModel
+
+
+@dataclass(frozen=True, kw_only=True)
+class FrontendUnit(SchemaDocument):
+    schema: Literal[1]
+    name: str
+    driver: Literal["frontend-s3-cloudfront"]
+    source: AuthoredSource
+    inputs: FrontendAuthoredInputs | None = None
+    pull: FrontendPull | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class FrontendDesiredUnit(SchemaDocument):
+    schema: Literal[1]
+    name: str
+    driver: Literal["frontend-s3-cloudfront"]
+    source: DesiredSource
+    inputs: FrontendDesiredInputs | FrontendAuthoredInputs | None = None
+    pull: FrontendPull | None = None
+    resolvedInputs: dict[str, dict[str, str]] | None = None
+    materialization: MaterializationDocument | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class PublishedFrontendModel(StrictModel):
+    sourceRevision: str
+    path: str
+    bundle: str
+    artifactDigest: str
+    runtimeConfigHash: str
+    url: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class FrontendResultModel(StrictModel):
+    published: PublishedFrontendModel
+
+
 @dataclass(frozen=True)
 class FrontendRuntime:
     inputs: FrontendInputs
@@ -110,6 +194,19 @@ def runtime_configuration(inputs: JsonObject) -> RuntimeConfiguration:
 
 class FrontendS3CloudfrontPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability):
     version = 1
+    schema_base_uri = schema_url("drivers/frontend-s3-cloudfront", version, "").removesuffix(".schema.json")
+    unit_contract = MashumaroContract(
+        FrontendUnit,
+        schema_url("drivers/frontend-s3-cloudfront", version, "unit"),
+    )
+    desired_unit_contract = MashumaroContract(
+        FrontendDesiredUnit,
+        schema_url("drivers/frontend-s3-cloudfront", version, "desired-unit"),
+    )
+    result_contract = MashumaroContract(
+        FrontendResultModel,
+        schema_url("drivers/frontend-s3-cloudfront", version, "result"),
+    )
     _select_semantic_result = staticmethod(select_result_fields("published"))
 
     @staticmethod

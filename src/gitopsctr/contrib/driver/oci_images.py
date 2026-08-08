@@ -4,8 +4,18 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
-from typing import TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
+from gitopsctr.contracts import (
+    AuthoredSource,
+    AwsEcrCredentialProvider,
+    DesiredSource,
+    MashumaroContract,
+    MaterializationDocument,
+    SchemaDocument,
+    StrictModel,
+    schema_url,
+)
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -41,6 +51,71 @@ class ContainersDocument(TypedDict):
 
 class OciImagesResult(TypedDict):
     artifacts: dict[str, ContainersDocument]
+
+
+@dataclass(frozen=True, kw_only=True)
+class OciBuild(StrictModel):
+    dockerfile: str
+    platform: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class OciPublication(StrictModel):
+    repositories: dict[str, str]
+    credentialProvider: AwsEcrCredentialProvider | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class OciImagesUnit(SchemaDocument):
+    schema: Literal[1]
+    name: str
+    driver: Literal["oci-images"]
+    source: AuthoredSource
+    build: OciBuild | None = None
+    publish: OciPublication | None = None
+    artifacts: list[Literal["containers.json"]] | None = None
+    environment: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class OciImagesDesiredUnit(SchemaDocument):
+    schema: Literal[1]
+    name: str
+    driver: Literal["oci-images"]
+    source: DesiredSource
+    build: OciBuild | None = None
+    publish: OciPublication | None = None
+    artifacts: list[Literal["containers.json"]] | None = None
+    inputs: dict[str, Any] | None = None
+    resolvedInputs: dict[str, dict[str, str]] | None = None
+    materialization: MaterializationDocument | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ArtifactIdentityModel(StrictModel):
+    name: str
+    driver: str
+    inputHashVersion: Literal[1]
+    inputHash: str
+    sourceRevision: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class OciImageArtifactModel(StrictModel):
+    type: Literal["oci-image"]
+    uri: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class ContainersDocumentModel(StrictModel):
+    schema: Literal[1]
+    unit: ArtifactIdentityModel
+    artifacts: dict[str, OciImageArtifactModel]
+
+
+@dataclass(frozen=True, kw_only=True)
+class OciImagesResultModel(StrictModel):
+    artifacts: dict[str, ContainersDocumentModel]
 
 
 @dataclass(frozen=True)
@@ -92,6 +167,13 @@ def oci_digest(repository: str, tag: str, docker_environment: dict[str, str] | N
 
 class OciImagesPlugin(UnitPlugin, PlanningCapability, ReconciliationCapability):
     version = 2
+    schema_base_uri = schema_url("drivers/oci-images", version, "").removesuffix(".schema.json")
+    unit_contract = MashumaroContract(OciImagesUnit, schema_url("drivers/oci-images", version, "unit"))
+    desired_unit_contract = MashumaroContract(
+        OciImagesDesiredUnit,
+        schema_url("drivers/oci-images", version, "desired-unit"),
+    )
+    result_contract = MashumaroContract(OciImagesResultModel, schema_url("drivers/oci-images", version, "result"))
     _select_semantic_result = staticmethod(select_result_fields("artifacts"))
 
     @staticmethod

@@ -206,23 +206,27 @@ def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monke
         SimpleNamespace(plan=lambda context: calls.append(context)),
     )
 
-    deploy_release.command_reconcile(
-        Namespace(
-            unit="aws-application",
-            environment="dev",
-            desired_ref="deploy/dev",
-            desired_revision=None,
-            observed_ref="observed/dev",
-            plan=True,
-            report=str(report),
-            source_revision=None,
-            advance=False,
-            require_source_ref=None,
-        )
+    args = Namespace(
+        unit="aws-application",
+        environment="dev",
+        desired_ref="deploy/dev",
+        desired_revision=None,
+        observed_ref="observed/dev",
+        plan=True,
+        report=str(report),
+        source_revision=None,
+        advance=False,
+        require_source_ref=None,
     )
+    deploy_release.command_reconcile(args)
 
     assert len(calls) == 1
     assert calls[0].report == report
+
+    monkeypatch.delitem(deploy_release.PLANNING_PLUGINS, "terraform")
+    materializations = 0
+    with pytest.raises(deploy_release.OperationError, match="does not support planning"):
+        deploy_release.command_reconcile(args)
 
 
 def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_path, monkeypatch):
@@ -334,7 +338,7 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
 
     def fake_driver(context):
         events.append(("driver", context.source_revision))
-        return {}
+        return {"applied": {"sourceRevision": context.source_revision}, "outputs": {}}
 
     def fake_publish(*_args):
         events.append(("receipt",))

@@ -186,7 +186,16 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
     def observed_tree(_ref: str, output: Path):
         _write_json(
             output / "units/infrastructure.json",
-            {"desired": {"unitBlob": "same-unit"}},
+            {
+                "schema": 1,
+                "unit": "infrastructure",
+                "driver": "terraform",
+                "desired": {"revision": DESIRED_REVISION, "unitBlob": "same-unit"},
+                "resolvedInputs": {},
+                "controller": {"revision": "c" * 40},
+                "applied": {"sourceRevision": "a" * 40},
+                "outputs": {},
+            },
         )
         return "o" * 40
 
@@ -213,7 +222,11 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
         "write_reconcile_outputs",
         lambda changed, desired="": outputs.append((changed, desired)),
     )
-    monkeypatch.setitem(deploy_release.RECONCILIATION_PLUGINS, "terraform", SimpleNamespace(reconcile=driver))
+    monkeypatch.setitem(
+        deploy_release.RECONCILIATION_PLUGINS,
+        "terraform",
+        SimpleNamespace(reconcile=driver, result_contract=deploy_release.UNIT_PLUGINS["terraform"].result_contract),
+    )
 
     changed = deploy_release.command_reconcile(
         Namespace(

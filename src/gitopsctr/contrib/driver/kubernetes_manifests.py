@@ -7,14 +7,24 @@ import shutil
 import tempfile
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
 import yaml
 
+from gitopsctr.contracts import (
+    AuthoredSource,
+    DesiredSource,
+    MashumaroContract,
+    MashumaroUnionContract,
+    SchemaDocument,
+    StrictModel,
+    schema_url,
+)
+from gitopsctr.document import JsonObject
 from gitopsctr.driver import (
     DriverError,
-    JsonObject,
     MaterializationCapability,
     MaterializationContext,
     MaterializationResult,
@@ -58,6 +68,136 @@ class ObservedApplication(TypedDict):
 
 class ArgoResult(TypedDict):
     observed: ObservedApplication
+
+
+@dataclass(frozen=True, kw_only=True)
+class HelmMaterialization(StrictModel):
+    type: Literal["helm"]
+    releaseName: str
+    namespace: str
+    values: dict[str, Any]
+    allowSecrets: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class PlainMaterialization(StrictModel):
+    type: Literal["plain"]
+    paths: list[str] | None = None
+    allowSecrets: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReadinessWait(StrictModel):
+    resource: str
+    namespace: str
+    condition: str
+    timeoutSeconds: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class ArgoApiObserver(StrictModel):
+    type: Literal["argocd"]
+    access: Literal["api"]
+    application: str
+    applicationNamespace: str
+    argocdContext: str
+    timeoutSeconds: int = 600
+
+
+@dataclass(frozen=True, kw_only=True)
+class ArgoKubernetesObserver(StrictModel):
+    type: Literal["argocd"]
+    access: Literal["kubernetes"]
+    application: str
+    applicationNamespace: str
+    kubeContext: str
+    timeoutSeconds: int = 600
+
+
+@dataclass(frozen=True, kw_only=True)
+class DirectDelivery(StrictModel):
+    mode: Literal["direct"]
+    kubeContext: str
+    prune: bool = False
+    wait: list[ReadinessWait] | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ExternalDelivery(StrictModel):
+    mode: Literal["external"]
+    observer: ArgoApiObserver | ArgoKubernetesObserver | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class KubernetesUnit(SchemaDocument):
+    schema: Literal[1]
+    name: str
+    driver: Literal["kubernetes-manifests"]
+    source: AuthoredSource
+    materialize: HelmMaterialization | PlainMaterialization
+    delivery: DirectDelivery | ExternalDelivery
+
+
+@dataclass(frozen=True, kw_only=True)
+class ResourceIdentityModel(StrictModel):
+    apiVersion: str
+    kind: str
+    namespace: str
+    name: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class KubernetesMaterializationMetadata(StrictModel):
+    renderer: Literal["helm", "plain"]
+    inventory: list[ResourceIdentityModel]
+    version: str | None = None
+    releaseName: str | None = None
+    namespace: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class KubernetesMaterializationDescriptor(StrictModel):
+    path: str
+    digest: str
+    mediaType: str
+    metadata: KubernetesMaterializationMetadata
+
+
+@dataclass(frozen=True, kw_only=True)
+class KubernetesDesiredUnit(SchemaDocument):
+    schema: Literal[1]
+    name: str
+    driver: Literal["kubernetes-manifests"]
+    source: DesiredSource
+    materialize: HelmMaterialization | PlainMaterialization
+    delivery: DirectDelivery | ExternalDelivery
+    materialization: KubernetesMaterializationDescriptor
+    inputs: dict[str, Any] | None = None
+    resolvedInputs: dict[str, dict[str, str]] | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class AppliedManifestsModel(StrictModel):
+    manifestDigest: str
+    inventory: list[ResourceIdentityModel]
+
+
+@dataclass(frozen=True, kw_only=True)
+class KubernetesResultModel(StrictModel):
+    applied: AppliedManifestsModel
+
+
+@dataclass(frozen=True, kw_only=True)
+class ObservedApplicationModel(StrictModel):
+    application: str
+    desiredRevision: str
+    syncStatus: Literal["Synced"]
+    healthStatus: Literal["Healthy"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class ArgoResultModel(StrictModel):
+    observed: ObservedApplicationModel
 
 
 def require_object(value: object, description: str) -> dict[str, Any]:
@@ -293,6 +433,20 @@ class KubernetesManifestsPlugin(
     VerificationCapability,
 ):
     version = 1
+    schema_base_uri = schema_url("drivers/kubernetes-manifests", version, "").removesuffix(".schema.json")
+    unit_contract = MashumaroContract(
+        KubernetesUnit,
+        schema_url("drivers/kubernetes-manifests", version, "unit"),
+    )
+    desired_unit_contract = MashumaroContract(
+        KubernetesDesiredUnit,
+        schema_url("drivers/kubernetes-manifests", version, "desired-unit"),
+    )
+    result_contract = MashumaroUnionContract(
+        (KubernetesResultModel, ArgoResultModel),
+        schema_url("drivers/kubernetes-manifests", version, "result"),
+        "kubernetes-manifests result v1",
+    )
     _select_direct_result = staticmethod(select_result_fields("applied"))
     _select_argo_result = staticmethod(select_result_fields("observed"))
 
