@@ -18,8 +18,7 @@ def _specification(name: str, producer: str | None = None) -> dict:
     inputs = {}
     if producer:
         inputs["value"] = {
-            "fromObservation": f"units/{producer}.json",
-            "pointer": "/outputs/value",
+            "fromReceipt": {"unit": producer, "pointer": "/outputs/value"},
         }
     return {
         "schema": 1,
@@ -226,13 +225,13 @@ def _install_rollback_simulation(
         for name in specifications:
             unit = _desired_unit(name, revision, value)
             if materialized_payloads:
-                payload = output / f"manifests/{name}"
+                payload = output / f"materialized/{name}"
                 payload.mkdir(parents=True, exist_ok=True)
                 (payload / "rendered.yaml").write_text(f"unit: {name}\nvalue: {value}\n")
                 if value == "current":
                     (payload / "stale.yaml").write_text("stale: true\n")
                 unit["materialization"] = {
-                    "path": f"manifests/{name}",
+                    "path": f"materialized/{name}",
                     "digest": deploy_release.materialization_tree_digest(payload),
                     "mediaType": "application/yaml",
                     "metadata": {"renderer": "test"},
@@ -393,13 +392,13 @@ def test_rollback_copies_exact_historical_payloads_and_removes_stale_files(
     files = publications[0]["files"]
     for name in {"base", "consumer", "unrelated"}:
         expected_value = "rollback" if name in historical_units else "current"
-        assert files[f"manifests/{name}/rendered.yaml"] == f"unit: {name}\nvalue: {expected_value}\n".encode()
-        assert (f"manifests/{name}/stale.yaml" in files) is (name not in historical_units)
+        assert files[f"materialized/{name}/rendered.yaml"] == f"unit: {name}\nvalue: {expected_value}\n".encode()
+        assert (f"materialized/{name}/stale.yaml" in files) is (name not in historical_units)
         unit = json.loads(files[f"units/{name}.json"])
-        assert unit["materialization"]["path"] == f"manifests/{name}"
+        assert unit["materialization"]["path"] == f"materialized/{name}"
         payload_root = tmp_path / name
         for path, content in files.items():
-            prefix = f"manifests/{name}/"
+            prefix = f"materialized/{name}/"
             if path.startswith(prefix):
                 output = payload_root / path.removeprefix(prefix)
                 output.parent.mkdir(parents=True, exist_ok=True)

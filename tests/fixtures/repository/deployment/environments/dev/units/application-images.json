@@ -6,9 +6,6 @@
     "name": "application-images"
   },
   "spec": {
-    "artifacts": [
-      "containers.json"
-    ],
     "build": {
       "dockerfile": "Dockerfile",
       "platform": "linux/amd64"

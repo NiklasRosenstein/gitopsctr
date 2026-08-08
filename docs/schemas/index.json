@@ -1,5 +1,7 @@
 {
   "apis": {
+    "artifact.gitopsctr.io/v1/ContainerImages": "apis/artifact.gitopsctr.io/v1/ContainerImages.schema.json",
+    "artifact.gitopsctr.io/v1/FrontendBundle": "apis/artifact.gitopsctr.io/v1/FrontendBundle.schema.json",
     "gitopsctr.io/v1/Environment": "apis/gitopsctr.io/v1/Environment.schema.json",
     "gitopsctr.io/v1/Project": "apis/gitopsctr.io/v1/Project.schema.json",
     "gitopsctr.io/v1/Promotion": "apis/gitopsctr.io/v1/Promotion.schema.json",

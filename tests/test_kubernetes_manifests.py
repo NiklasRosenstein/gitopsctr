@@ -72,7 +72,7 @@ def unit(
         "materialize": renderer or {"type": "plain", "paths": ["*.yaml"]},
         "delivery": delivery or {"mode": "external"},
         "materialization": {
-            "path": "manifests/web",
+            "path": "materialized/web",
             "digest": DIGEST,
             "mediaType": "application/vnd.gitopsctr.kubernetes-manifests.v1",
             "metadata": {
@@ -111,7 +111,7 @@ def reconciliation_context(
     previous_receipt: dict | None = None,
     runner=None,
 ) -> ReconciliationContext:
-    payload = tmp_path / "desired/manifests/web"
+    payload = tmp_path / "desired/materialized/web"
     payload.mkdir(parents=True, exist_ok=True)
     (payload / "manifest.yaml").write_text(manifest())
     context = ReconciliationContext(
@@ -266,7 +266,7 @@ def test_direct_delivery_applies_waits_then_prunes_previous_inventory(tmp_path, 
 
     result = kubernetes.DRIVER.reconcile(reconciliation_context(tmp_path, desired_unit, previous, runner))
 
-    assert result["applied"]["manifestDigest"] == DIGEST
+    assert result.result["applied"]["manifestDigest"] == DIGEST
     assert [call[0][3] for call in calls] == ["apply", "--namespace", "delete"]
     assert calls[0][0] == (
         "kubectl",
@@ -276,7 +276,7 @@ def test_direct_delivery_applies_waits_then_prunes_previous_inventory(tmp_path, 
         "--server-side",
         "--field-manager=gitopsctr-dev-web",
         "--filename",
-        str(tmp_path / "desired/manifests/web"),
+        str(tmp_path / "desired/materialized/web"),
     )
     assert calls[1][0][-4:] == (
         "wait",
@@ -351,7 +351,7 @@ def test_argo_observation_supports_both_read_only_transports(access, tmp_path, m
 
     result = kubernetes.DRIVER.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
 
-    assert result == {
+    assert result.result == {
         "observed": {
             "application": "web",
             "desiredRevision": REVISION,

@@ -1,0 +1,92 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/artifact.gitopsctr.io/v1/FrontendBundle.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "default": null
+    },
+    "apiVersion": {
+      "const": "artifact.gitopsctr.io/v1"
+    },
+    "bundle": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactType": {
+          "type": "string"
+        },
+        "uri": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
+        "artifactType"
+      ],
+      "title": "FrontendBundle",
+      "type": "object"
+    },
+    "kind": {
+      "const": "FrontendBundle"
+    },
+    "metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "ArtifactMetadata",
+      "type": "object"
+    },
+    "producer": {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "unit.gitopsctr.io/v1"
+        },
+        "driverVersion": {
+          "type": "integer"
+        },
+        "inputHash": {
+          "type": "string"
+        },
+        "inputHashVersion": {
+          "const": 1
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "sourceRevision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "name",
+        "driverVersion",
+        "sourceRevision",
+        "inputHashVersion",
+        "inputHash"
+      ],
+      "title": "ArtifactProducer",
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "producer",
+    "bundle"
+  ],
+  "title": "FrontendBundleResource",
+  "type": "object"
+}

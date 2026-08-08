@@ -1,0 +1,94 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/artifact.gitopsctr.io/v1/ContainerImages.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "default": null
+    },
+    "apiVersion": {
+      "const": "artifact.gitopsctr.io/v1"
+    },
+    "images": {
+      "additionalProperties": {
+        "additionalProperties": false,
+        "properties": {
+          "uri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "uri"
+        ],
+        "title": "ContainerImage",
+        "type": "object"
+      },
+      "propertyNames": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "kind": {
+      "const": "ContainerImages"
+    },
+    "metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "ArtifactMetadata",
+      "type": "object"
+    },
+    "producer": {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "unit.gitopsctr.io/v1"
+        },
+        "driverVersion": {
+          "type": "integer"
+        },
+        "inputHash": {
+          "type": "string"
+        },
+        "inputHashVersion": {
+          "const": 1
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "sourceRevision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "name",
+        "driverVersion",
+        "sourceRevision",
+        "inputHashVersion",
+        "inputHash"
+      ],
+      "title": "ArtifactProducer",
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "producer",
+    "images"
+  ],
+  "title": "ContainerImagesResource",
+  "type": "object"
+}

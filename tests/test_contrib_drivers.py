@@ -145,7 +145,6 @@ def _oci_context(
             "source": {"inputHash": "sha256:" + "b" * 64},
             "build": {"dockerfile": "Dockerfile", "platform": "linux/amd64"},
             "publish": publication,
-            "artifacts": ["containers.json"],
         },
         inputs={},
     )
@@ -253,7 +252,7 @@ def test_oci_images_without_provider_uses_existing_docker_auth(tmp_path, monkeyp
     result = oci_images.DRIVER.reconcile(replace(_oci_context(tmp_path), execution=execution_for(unexpected_run)))
 
     assert environments == [None, None]
-    assert result["artifacts"]["containers.json"]["artifacts"]["control"]["uri"] == (
+    assert result.artifacts["containers"]["images"]["control"]["uri"] == (
         f"{REGISTRY}/example-application-control@{DIGEST}"
     )
     assert f"| AUTH {REGISTRY}: existing Docker credentials or anonymous access" in capsys.readouterr().err
@@ -361,7 +360,7 @@ def test_oci_images_recovers_partial_publication_without_rebuilding(tmp_path, mo
     assert not any(command[:2] == ("docker", "build") for command in commands)
     assert any(command[:2] == ("docker", "pull") for command in commands)
     assert len([command for command in commands if command[:2] == ("docker", "push")]) == 1
-    artifacts = result["artifacts"]["containers.json"]["artifacts"]
+    artifacts = result.artifacts["containers"]["images"]
     assert {artifact["uri"].rsplit("@", 1)[1] for artifact in artifacts.values()} == {DIGEST}
 
 
@@ -414,8 +413,7 @@ def test_oci_images_builds_once_and_exports_to_local_cluster(tmp_path, target, e
 
     assert len([command for command in commands if command[:2] == ("docker", "build")]) == 1
     assert commands[-1] == expected_load
-    assert result["artifacts"]["containers.json"]["artifacts"]["application"] == {
-        "type": "oci-image",
+    assert result.artifacts["containers"]["images"]["application"] == {
         "uri": f"application-images:{'b' * 64}",
     }
 
@@ -439,7 +437,7 @@ def test_oci_images_reuses_registry_image_when_exporting_to_cluster(tmp_path, mo
     assert not any(command[:2] == ("docker", "build") for command in commands)
     assert any(command[:2] == ("docker", "pull") for command in commands)
     assert commands[-1][:3] == ("kind", "load", "docker-image")
-    assert result["artifacts"]["containers.json"]["artifacts"]["registry"]["uri"].endswith(f"@{DIGEST}")
+    assert result.artifacts["containers"]["images"]["registry"]["uri"].endswith(f"@{DIGEST}")
 
 
 def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path, monkeypatch):
@@ -459,7 +457,6 @@ def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path,
                 "repository": f"{REGISTRY}/example-application-frontend",
                 "credentialProvider": {"type": "aws-ecr"},
             },
-            "artifacts": ["frontend.json"],
         },
         inputs={},
     )
@@ -481,7 +478,7 @@ def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path,
 
     result = vite_oci_bundle.DRIVER.reconcile(context)
 
-    assert result["artifacts"]["frontend.json"]["artifacts"]["bundle"]["uri"] == (
+    assert result.artifacts["frontend"]["bundle"]["uri"] == (
         f"{REGISTRY}/example-application-frontend@{DIGEST}"
     )
 
@@ -563,7 +560,7 @@ def test_frontend_deploy_overwrites_index_and_verifies_cloudfront(tmp_path, monk
             frontend_s3_cloudfront.DRIVER.reconcile(context)
     else:
         result = frontend_s3_cloudfront.DRIVER.reconcile(context)
-        assert result["published"]["bundle"] == context.inputs["bundle"]
+        assert result.result["published"]["bundle"] == context.inputs["bundle"]
 
     index_upload = next(
         command for command in commands if command[:3] == ("aws", "s3", "cp") and command[4].endswith("/index.html")
@@ -754,13 +751,13 @@ def test_terraform_verification_turns_other_exit_codes_into_driver_errors(tmp_pa
     (
         (
             "oci-images",
-            {"artifacts": {"containers.json": {}}, "controller": {"run": "ignored"}},
-            {"artifacts": {"containers.json": {}}},
+            {},
+            {},
         ),
         (
             "vite-oci-bundle",
-            {"artifacts": {"frontend.json": {}}, "plan": {"ignored": True}},
-            {"artifacts": {"frontend.json": {}}},
+            {},
+            {},
         ),
         (
             "terraform",
@@ -796,7 +793,7 @@ def test_every_reconciliation_driver_defines_result_semantics():
     (
         ("unknown", {}, "does not support reconciliation"),
         ("terraform", {"applied": {}}, "missing semantic fields: outputs"),
-        ("oci-images", None, "driver result must be an object"),
+        ("oci-images", None, "receipt result must be empty"),
     ),
 )
 def test_driver_semantics_fail_loudly_for_unknown_or_incomplete_results(driver, result, message):

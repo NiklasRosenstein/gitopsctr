@@ -6,20 +6,6 @@
     "$schema": {
       "default": null
     },
-    "artifacts": {
-      "anyOf": [
-        {
-          "items": {
-            "const": "frontend.json"
-          },
-          "type": "array"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null
-    },
     "build": {
       "anyOf": [
         {

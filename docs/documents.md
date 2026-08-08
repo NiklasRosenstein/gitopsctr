@@ -12,8 +12,8 @@ spec:
   writeFormat: json
 ```
 
-The file is named `gitopsctr.yaml`; generated desired state, promotions, and
-receipts follow its setting. Readers accept either extension. See the
+The file is named `gitopsctr.yaml`; generated desired state, promotions,
+receipts, and artifacts follow its setting. Readers accept either extension. See the
 [`Project` resource documentation](project-configuration.md) and its published
 [`Project.schema.json`](schemas/apis/gitopsctr.io/v1/Project.schema.json).
 
@@ -73,6 +73,28 @@ Multi-target validation reports all errors before failing unless
 `--fail-fast` is used. Environment and Project validation includes duplicate
 representation, resource identity, driver contract, safe-path, and cross-unit
 observation checks.
+
+## Desired payloads, artifacts, and references
+
+Materialization drivers commit desired payloads below `materialized/<unit>/` and record that exact path and digest in
+the desired unit. Reconciliation drivers may instead publish typed observed-state resources below
+`artifacts/<unit>/<logical-name>.yaml|json`. Receipt `status.artifacts` contains the resource identity, path, media
+type, and serialized-byte digest. Artifact names and contracts are defined by the driver, not by the authored unit.
+
+References are self-contained objects. Their JSON Pointer is relative to the typed driver result, the complete
+artifact resource, or the promoted desired unit respectively:
+
+```yaml
+receiptValue:
+  fromReceipt: {unit: infrastructure, pointer: /outputs/url}
+image:
+  fromArtifact: {unit: application-images, name: containers, pointer: /images/application/uri}
+promotedValue:
+  fromPromotion: {unit: infrastructure, pointer: /terraform/variables/environment}
+```
+
+Each reference may include `dryFallback`. A receipt or artifact is usable only while it matches the producer's current
+desired unit; artifacts are additionally checked against their descriptor, digest, identity, and registered contract.
 
 The generic receipt points back to the unit kind:
 

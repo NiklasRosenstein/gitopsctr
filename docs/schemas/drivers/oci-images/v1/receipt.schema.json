@@ -7,6 +7,47 @@
         "$schema": {
           "default": null
         },
+        "artifacts": {
+          "additionalProperties": false,
+          "properties": {
+            "containers": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "const": "artifact.gitopsctr.io/v1"
+                },
+                "digest": {
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "ContainerImages"
+                },
+                "mediaType": {
+                  "enum": [
+                    "application/vnd.gitopsctr.container-images.v1+yaml",
+                    "application/vnd.gitopsctr.container-images.v1+json"
+                  ]
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "path",
+                "digest",
+                "mediaType"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "containers"
+          ],
+          "type": "object"
+        },
         "controller": {
           "anyOf": [
             {
@@ -92,89 +133,12 @@
       "required": [
         "unit",
         "driver",
-        "desired"
+        "desired",
+        "artifacts"
       ],
       "type": "object"
     },
     {
-      "properties": {
-        "artifacts": {
-          "additionalProperties": {
-            "additionalProperties": false,
-            "properties": {
-              "artifacts": {
-                "additionalProperties": {
-                  "additionalProperties": false,
-                  "properties": {
-                    "type": {
-                      "const": "oci-image"
-                    },
-                    "uri": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "type",
-                    "uri"
-                  ],
-                  "title": "OciImageArtifactModel",
-                  "type": "object"
-                },
-                "propertyNames": {
-                  "type": "string"
-                },
-                "type": "object"
-              },
-              "schema": {
-                "const": 1
-              },
-              "unit": {
-                "additionalProperties": false,
-                "properties": {
-                  "driver": {
-                    "type": "string"
-                  },
-                  "inputHash": {
-                    "type": "string"
-                  },
-                  "inputHashVersion": {
-                    "const": 1
-                  },
-                  "name": {
-                    "type": "string"
-                  },
-                  "sourceRevision": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "name",
-                  "driver",
-                  "inputHashVersion",
-                  "inputHash",
-                  "sourceRevision"
-                ],
-                "title": "ArtifactIdentityModel",
-                "type": "object"
-              }
-            },
-            "required": [
-              "schema",
-              "unit",
-              "artifacts"
-            ],
-            "title": "ContainersDocumentModel",
-            "type": "object"
-          },
-          "propertyNames": {
-            "type": "string"
-          },
-          "type": "object"
-        }
-      },
-      "required": [
-        "artifacts"
-      ],
       "type": "object"
     }
   ],

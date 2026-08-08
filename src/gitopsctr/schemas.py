@@ -7,7 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
 
-from gitopsctr.contracts import CORE_CONTRACTS, SCHEMA_ROOT, receipt_schema, schema_url
+from gitopsctr.contracts import CORE_CONTRACTS, SCHEMA_ROOT, artifact_descriptors_schema, receipt_schema, schema_url
 from gitopsctr.document import DocumentContract, JsonObject
 from gitopsctr.driver import UNIT_DRIVERS, UnitDriver
 from gitopsctr.formats import PROJECT_RESOURCE_SCHEMA
@@ -96,6 +96,19 @@ def receipt_resource_schema(driver: str) -> JsonObject:
     result.pop("$schema", None)
     result.pop("$id", None)
     result.pop("title", None)
+    status_properties: dict[str, Any] = {
+        "controller": {"type": "object"},
+        "result": result,
+    }
+    status_required = ["controller", "result"]
+    if driver_instance.artifact_contracts:
+        status_properties["artifacts"] = artifact_descriptors_schema(
+            {
+                name: (artifact.api_version, artifact.kind, artifact.media_type)
+                for name, artifact in driver_instance.artifact_contracts.items()
+            }
+        )
+        status_required.append("artifacts")
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": resource_schema_url(driver_instance.api_version, driver_instance.kind, "receipt"),
@@ -132,11 +145,8 @@ def receipt_resource_schema(driver: str) -> JsonObject:
             },
             "status": {
                 "type": "object",
-                "properties": {
-                    "controller": {"type": "object"},
-                    "result": result,
-                },
-                "required": ["controller", "result"],
+                "properties": status_properties,
+                "required": status_required,
                 "additionalProperties": False,
             },
         },
@@ -188,7 +198,15 @@ def driver_schema(driver: str, kind: str) -> JsonObject:
         "result": plugin.result_contract,
     }
     if kind == "receipt":
-        schema = receipt_schema(driver, plugin.version, plugin.result_contract)
+        schema = receipt_schema(
+            driver,
+            plugin.version,
+            plugin.result_contract,
+            {
+                name: (artifact.api_version, artifact.kind, artifact.media_type)
+                for name, artifact in plugin.artifact_contracts.items()
+            },
+        )
     else:
         try:
             schema = contracts[kind].json_schema()
@@ -209,6 +227,10 @@ def show_schema(scope: str, kind: str) -> JsonObject:
         if kind == "Project":
             return project_resource_schema()
         return core_resource_schema(kind)
+    for plugin in UNIT_DRIVERS.values():
+        for artifact in plugin.artifact_contracts.values():
+            if artifact.api_version == scope and artifact.kind == kind:
+                return artifact.contract.json_schema()
     if scope.startswith("unit.gitopsctr.io/v1/"):
         return show_schema("unit.gitopsctr.io/v1", f"{scope.rsplit('/', 1)[1]}/{kind}")
     if scope == "unit.gitopsctr.io/v1":
@@ -257,6 +279,16 @@ def schema_documents() -> dict[Path, JsonObject]:
         path = Path("apis/gitopsctr.io/v1") / f"{kind}.schema.json"
         documents[path] = project_resource_schema() if kind == "Project" else core_resource_schema(kind)
         index["apis"][f"gitopsctr.io/v1/{kind}"] = path.as_posix()
+    artifact_contracts = {
+        (artifact.api_version, artifact.kind): artifact
+        for plugin in UNIT_DRIVERS.values()
+        for artifact in plugin.artifact_contracts.values()
+    }
+    for (api_version, kind), artifact in sorted(artifact_contracts.items()):
+        group, version = api_version.rsplit("/", 1)
+        path = Path("apis") / group / version / f"{kind}.schema.json"
+        documents[path] = artifact.contract.json_schema()
+        index["apis"][f"{api_version}/{kind}"] = path.as_posix()
     for driver, driver_instance in sorted(UNIT_DRIVERS.items()):
         root = Path("apis/unit.gitopsctr.io/v1") / driver_instance.kind
         for profile in ("authored", "desired"):

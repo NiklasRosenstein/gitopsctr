@@ -12,7 +12,7 @@ resolved unit JSON form one atomic desired-state component:
 ```text
 deploy/dev
 ├── units/web.yaml
-└── manifests/web/
+└── materialized/web/
     └── manifest.yaml
 ```
 
@@ -46,8 +46,8 @@ spec:
     mode: external
 ```
 
-Values are resolved after `fromObservation` and `fromPromotion`, so either reference can appear anywhere below
-`materialize.values`. Plain rendering copies matching YAML files with stable paths:
+Values are resolved after `fromReceipt`, `fromArtifact`, and `fromPromotion`, so any reference can appear anywhere
+below `materialize.values`. Plain rendering copies matching YAML files with stable paths:
 
 ```yaml
 materialize:

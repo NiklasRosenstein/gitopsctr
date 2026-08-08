@@ -27,6 +27,7 @@ from gitopsctr.driver import (
     PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
+    ReconciliationOutput,
     ReconciliationResult,
     UnitDriver,
     UnitExecutionContext,
@@ -242,7 +243,7 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
     def plan(self, context: PlanningContext) -> None:
         self._runtime(context)
 
-    def reconcile(self, context: ReconciliationContext) -> FrontendResult:
+    def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
         runtime = self._runtime(context)
         inputs = runtime.inputs
 
@@ -348,16 +349,18 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
             *curl_args,
             f"{inputs['url']}/runtime-config.json",
         )
-        return {
-            "published": {
-                "sourceRevision": context.source_revision,
-                "path": context.source_path,
-                "bundle": inputs["bundle"],
-                "artifactDigest": runtime.artifact_digest,
-                "runtimeConfigHash": runtime.runtime_digest,
-                "url": inputs["url"],
+        return ReconciliationOutput(
+            result={
+                "published": {
+                    "sourceRevision": context.source_revision,
+                    "path": context.source_path,
+                    "bundle": inputs["bundle"],
+                    "artifactDigest": runtime.artifact_digest,
+                    "runtimeConfigHash": runtime.runtime_digest,
+                    "url": inputs["url"],
+                }
             }
-        }
+        )
 
     def semantic_result(self, result: object) -> ReconciliationResult:
         return self._select_semantic_result(result)

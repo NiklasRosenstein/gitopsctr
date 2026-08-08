@@ -7,6 +7,47 @@
         "$schema": {
           "default": null
         },
+        "artifacts": {
+          "additionalProperties": false,
+          "properties": {
+            "frontend": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "const": "artifact.gitopsctr.io/v1"
+                },
+                "digest": {
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "FrontendBundle"
+                },
+                "mediaType": {
+                  "enum": [
+                    "application/vnd.gitopsctr.frontend-bundle.v1+yaml",
+                    "application/vnd.gitopsctr.frontend-bundle.v1+json"
+                  ]
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "path",
+                "digest",
+                "mediaType"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "frontend"
+          ],
+          "type": "object"
+        },
         "controller": {
           "anyOf": [
             {
@@ -92,93 +133,12 @@
       "required": [
         "unit",
         "driver",
-        "desired"
+        "desired",
+        "artifacts"
       ],
       "type": "object"
     },
     {
-      "properties": {
-        "artifacts": {
-          "additionalProperties": {
-            "additionalProperties": false,
-            "properties": {
-              "artifacts": {
-                "additionalProperties": {
-                  "additionalProperties": false,
-                  "properties": {
-                    "artifactType": {
-                      "type": "string"
-                    },
-                    "type": {
-                      "const": "oci-artifact"
-                    },
-                    "uri": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "type",
-                    "artifactType",
-                    "uri"
-                  ],
-                  "title": "BundleArtifactModel",
-                  "type": "object"
-                },
-                "propertyNames": {
-                  "type": "string"
-                },
-                "type": "object"
-              },
-              "schema": {
-                "const": 1
-              },
-              "unit": {
-                "additionalProperties": false,
-                "properties": {
-                  "driver": {
-                    "type": "string"
-                  },
-                  "inputHash": {
-                    "type": "string"
-                  },
-                  "inputHashVersion": {
-                    "const": 1
-                  },
-                  "name": {
-                    "type": "string"
-                  },
-                  "sourceRevision": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "name",
-                  "driver",
-                  "inputHashVersion",
-                  "inputHash",
-                  "sourceRevision"
-                ],
-                "title": "ViteArtifactIdentity",
-                "type": "object"
-              }
-            },
-            "required": [
-              "schema",
-              "unit",
-              "artifacts"
-            ],
-            "title": "FrontendDocumentModel",
-            "type": "object"
-          },
-          "propertyNames": {
-            "type": "string"
-          },
-          "type": "object"
-        }
-      },
-      "required": [
-        "artifacts"
-      ],
       "type": "object"
     }
   ],

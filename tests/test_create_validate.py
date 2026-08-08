@@ -154,6 +154,7 @@ def test_create_unit_generates_a_valid_builtin_scaffold(tmp_path: Path, driver_n
     unit = cli.normalize_unit_document(document, driver_name)
     UNIT_DRIVERS[driver_name].unit_contract.validate(unit)
     assert unit["source"]["path"] == f"services/{driver_name}"
+    assert "artifacts" not in unit
     assert text.startswith(
         f"# yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/"
         f"unit.gitopsctr.io/v1/{UNIT_DRIVERS[driver_name].kind}/authored.schema.json\n"
@@ -294,7 +295,7 @@ def test_validate_applies_cross_unit_observation_rules(tmp_path: Path, capsys: p
         "name": "consumer",
         "driver": "terraform",
         **UNIT_DRIVERS["terraform"].scaffold_unit_spec("consumer", "terraform"),
-        "inputs": {"value": {"fromObservation": "units/manifests.yaml"}},
+        "inputs": {"value": {"fromReceipt": {"unit": "manifests"}}},
     }
     write_yaml(units / "manifests.yaml", cli.serialize_unit_document(producer, profile="authored"))
     write_yaml(units / "consumer.yaml", cli.serialize_unit_document(consumer, profile="authored"))

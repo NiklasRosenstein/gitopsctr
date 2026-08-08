@@ -30,20 +30,6 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
-        "artifacts": {
-          "anyOf": [
-            {
-              "items": {
-                "const": "containers.json"
-              },
-              "type": "array"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
         "build": {
           "anyOf": [
             {

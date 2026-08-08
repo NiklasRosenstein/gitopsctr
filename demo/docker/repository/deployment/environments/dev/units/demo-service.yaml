@@ -14,8 +14,10 @@ spec:
       container_name: gitopsctr-demo-app
       host_port: __APP_PORT__
       image:
-        fromObservation: units/demo-image.yaml
-        pointer: /artifacts/containers.json/artifacts/application/uri
+        fromArtifact:
+          unit: demo-image
+          name: containers
+          pointer: /images/application/uri
     observeOutputs: [container_id, url]
     checks:
       - type: http

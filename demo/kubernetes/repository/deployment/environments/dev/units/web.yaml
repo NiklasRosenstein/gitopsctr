@@ -14,8 +14,10 @@ spec:
     values:
       message: rendered and reconciled
       image:
-        fromObservation: units/demo-image.yaml
-        pointer: /artifacts/containers.json/artifacts/application/uri
+        fromArtifact:
+          unit: demo-image
+          name: containers
+          pointer: /images/application/uri
     allowSecrets: false
   delivery:
     mode: direct

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from gitopsctr import cli as deploy_release
-from gitopsctr.driver import VerificationContext, VerificationResult, VerificationStatus
+from gitopsctr.driver import ReconciliationOutput, VerificationContext, VerificationResult, VerificationStatus
 
 DESIRED_REVISION = "d" * 40
 
@@ -58,7 +58,7 @@ def _install_desired_state(monkeypatch, units: list[dict[str, object]]) -> list[
                 )
 
     monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
-    for name in ("observed_tree", "publish_receipt_cas", "write_json"):
+    for name in ("observed_tree", "publish_observation_cas", "write_json"):
         monkeypatch.setattr(
             deploy_release,
             name,
@@ -154,8 +154,7 @@ def test_verify_rejects_unmaterialized_desired_units_before_running_driver(monke
     unit = _unit("infrastructure", "terraform", "a" * 40)
     unit["inputs"] = {
         "image": {
-            "fromObservation": "units/images.json",
-            "pointer": "/artifacts/image",
+            "fromReceipt": {"unit": "images", "pointer": "/image"},
         }
     }
     materialized = _install_desired_state(monkeypatch, [unit])
@@ -209,7 +208,9 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
 
     def driver(context):
         calls.append(context.unit["name"])
-        return {"applied": {"sourceRevision": context.source_revision}, "outputs": {}}
+        return ReconciliationOutput(
+            result={"applied": {"sourceRevision": context.source_revision}, "outputs": {}}
+        )
 
     monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
     monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
@@ -217,8 +218,8 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
     monkeypatch.setattr(deploy_release, "controller_evidence", lambda: {"revision": "c" * 40})
     monkeypatch.setattr(
         deploy_release,
-        "publish_receipt_cas",
-        lambda _ref, _unit, receipt, _revision: publications.append(receipt) or "p" * 40,
+        "publish_observation_cas",
+        lambda _ref, _unit, receipt, _desired, _artifacts, _revision: publications.append(receipt) or "p" * 40,
     )
     monkeypatch.setattr(
         deploy_release,

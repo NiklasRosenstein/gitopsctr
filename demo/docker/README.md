@@ -3,8 +3,8 @@
 This demo exercises the real reconciliation path without cloud credentials:
 
 1. `demo-image` builds a small HTTP server image and publishes it to a local OCI registry.
-2. Its receipt records the immutable image digest on `observed/dev`.
-3. `demo-service` consumes that digest through `fromObservation`.
+2. Its receipt describes the external `containers` artifact on `observed/dev`.
+3. `demo-service` consumes that artifact's immutable digest through `fromArtifact`.
 4. Terraform uses the Docker provider to pull the digest and run it on `http://127.0.0.1:18080`.
 
 The runner creates an isolated source repository and bare Git remote under `.docker-demo-state/`. It never writes

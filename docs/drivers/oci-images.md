@@ -2,7 +2,8 @@
 
 The OCI images driver builds a Docker image once and exports it to one or more named targets. Registry targets
 publish immutable digests; kind and minikube targets load the deterministic local tag directly into a cluster. The
-resulting `containers.json` lets downstream units consume either reference through observations.
+driver publishes a versioned `ContainerImages` resource at
+`artifacts/<unit>/containers.yaml` (or `.json`) for downstream units.
 
 **Kind:** `unit.gitopsctr.io/v1/OciImages`<br>
 **Capabilities:** planning, reconciliation
@@ -27,7 +28,6 @@ spec:
       application:
         type: registry
         repository: registry.example/application
-  artifacts: [containers.json]
 ```
 
 `build.dockerfile` is resolved from the source checkout and `platform` is passed to Docker. `publish.targets` maps
@@ -49,7 +49,16 @@ publish:
 
 The driver builds once per reconciliation. It reuses a matching registry image when possible, then pushes registry
 targets and loads local targets. Registry artifacts contain digest-pinned URIs; local artifacts contain the
-input-hash-tagged image name loaded into the selected cluster.
+input-hash-tagged image name loaded into the selected cluster. The driver always produces its `containers` artifact;
+units do not declare artifact filenames.
+
+```yaml
+image:
+  fromArtifact:
+    unit: application-images
+    name: containers
+    pointer: /images/application/uri
+```
 
 Planning builds the image but does not export it. Reconciliation requires all existing registry targets to agree on
 the digest; disagreement fails loudly.
@@ -59,3 +68,4 @@ the digest; disagreement fails loudly.
 - [authored unit](../schemas/apis/unit.gitopsctr.io/v1/OciImages/authored.schema.json)
 - [desired unit](../schemas/apis/unit.gitopsctr.io/v1/OciImages/desired.schema.json)
 - [receipt](../schemas/apis/unit.gitopsctr.io/v1/OciImages/receipt.schema.json)
+- [ContainerImages artifact](../schemas/apis/artifact.gitopsctr.io/v1/ContainerImages.schema.json)

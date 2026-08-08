@@ -32,6 +32,7 @@ from gitopsctr.driver import (
     PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
+    ReconciliationOutput,
     ReconciliationResult,
     UnitDriver,
     VerificationCapability,
@@ -250,8 +251,16 @@ def materialization_configuration(unit: JsonObject) -> dict[str, Any]:
     return configuration
 
 
-def materialization_descriptor(unit: JsonObject) -> tuple[str, list[ResourceIdentity]]:
+@dataclass(frozen=True)
+class ResolvedMaterialization:
+    path: str
+    digest: str
+    inventory: list[ResourceIdentity]
+
+
+def materialization_descriptor(unit: JsonObject) -> ResolvedMaterialization:
     descriptor = require_object(unit.get("materialization"), "kubernetes-manifests materialization descriptor")
+    path = require_string(descriptor.get("path"), "kubernetes-manifests materialization path")
     digest = require_string(descriptor.get("digest"), "kubernetes-manifests materialization digest")
     metadata = require_object(descriptor.get("metadata"), "kubernetes-manifests materialization metadata")
     raw_inventory = metadata.get("inventory")
@@ -264,7 +273,7 @@ def materialization_descriptor(unit: JsonObject) -> tuple[str, list[ResourceIden
         if not all(isinstance(item[field], str) for field in item):
             raise DriverError("kubernetes-manifests materialization inventory is invalid")
         inventory.append(cast(ResourceIdentity, item))
-    return digest, inventory
+    return ResolvedMaterialization(path, digest, inventory)
 
 
 def manifest_inventory(root: Path, allow_secrets: bool) -> list[ResourceIdentity]:
@@ -540,15 +549,17 @@ class KubernetesManifestsDriver(
             raise DriverError("external Kubernetes delivery without an observer does not support planning")
         materialization_descriptor(context.unit)
 
-    def reconcile(self, context: ReconciliationContext) -> KubernetesResult | ArgoResult:
+    def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
         delivery = delivery_configuration(context.unit)
         observer = argo_observer(delivery)
         if observer is not None:
-            return self._observe_argo(context, observer, wait=True)
+            return ReconciliationOutput(result=self._observe_argo(context, observer, wait=True))
         if delivery["mode"] != "direct":
             raise DriverError("external Kubernetes delivery without an observer does not reconcile")
 
-        digest, inventory = materialization_descriptor(context.unit)
+        materialization = materialization_descriptor(context.unit)
+        digest = materialization.digest
+        inventory = materialization.inventory
         context_name = require_string(delivery.get("kubeContext"), "direct delivery kubeContext")
         prune = cast(bool, delivery.get("prune", False))
         waits = cast(list[object], delivery.get("wait", []))
@@ -559,7 +570,7 @@ class KubernetesManifestsDriver(
             "--server-side",
             f"--field-manager={manager}",
             "--filename",
-            str(context.desired_root / "manifests" / cast(str, context.unit["name"])),
+            str(context.desired_root / materialization.path),
         )
         for item in waits:
             wait = require_object(item, "Kubernetes readiness wait")
@@ -579,7 +590,7 @@ class KubernetesManifestsDriver(
             )
         if prune:
             self._prune_previous(context, context_name, inventory)
-        return {"applied": {"manifestDigest": digest, "inventory": inventory}}
+        return ReconciliationOutput(result={"applied": {"manifestDigest": digest, "inventory": inventory}})
 
     @staticmethod
     def _prune_previous(
@@ -642,13 +653,14 @@ class KubernetesManifestsDriver(
         if delivery["mode"] != "direct":
             raise DriverError("external Kubernetes delivery without an observer cannot be verified")
         context_name = require_string(delivery.get("kubeContext"), "direct delivery kubeContext")
+        materialization = materialization_descriptor(context.unit)
         result = context.execution.run(
             *kubectl_prefix(context_name),
             "diff",
             "--server-side",
             f"--field-manager={field_manager(context.environment, context.unit.get('name'))}",
             "--filename",
-            str(context.desired_root / "manifests" / cast(str, context.unit["name"])),
+            str(context.desired_root / materialization.path),
             output=CommandOutput.CAPTURE,
             check=False,
         )

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cache
@@ -24,7 +25,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from gitopsctr.contracts import CORE_CONTRACTS, with_schema
-from gitopsctr.document import ContractError, DocumentContract
+from gitopsctr.document import ContractError, DocumentContract, JsonObject
 from gitopsctr.driver import (
     DRIVER_GVKS,
     DRIVER_NAMES_BY_GVK,
@@ -40,6 +41,7 @@ from gitopsctr.driver import (
     PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
+    ReconciliationOutput,
     VerificationContext,
     VerificationStatus,
     semantic_reconciliation_result,
@@ -78,6 +80,14 @@ class OperationError(RuntimeError):
 
 class ReferenceUnavailable(OperationError):
     pass
+
+
+@dataclass(frozen=True)
+class TemplateResolution:
+    value: Any
+    promotions: dict[str, str]
+    receipts: dict[str, str]
+    artifacts: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -493,6 +503,7 @@ def normalize_receipt_document(document: dict[str, Any], expected_unit: str | No
         "desired": specification.get("desired", {}),
         "resolvedInputs": specification.get("resolvedInputs", {}),
         "controller": status.get("controller", {}),
+        "artifacts": status.get("artifacts", {}),
         **result,
     }
 
@@ -502,7 +513,7 @@ def serialize_receipt_document(receipt: dict[str, Any]) -> dict[str, Any]:
     unit = receipt.get("unit")
     if not isinstance(driver, str) or driver not in UNIT_DRIVERS or not isinstance(unit, str):
         raise OperationError("receipt is missing a known driver or unit")
-    reserved = {"schema", "unit", "driver", "desired", "resolvedInputs", "controller", "$schema"}
+    reserved = {"schema", "unit", "driver", "desired", "resolvedInputs", "controller", "artifacts", "$schema"}
     return {
         "$schema": resource_schema_url(DRIVER_GVKS[driver].rsplit("/", 1)[0], DRIVER_GVKS[driver].rsplit("/", 1)[1], "receipt"),
         "apiVersion": CORE_API_VERSION,
@@ -519,6 +530,7 @@ def serialize_receipt_document(receipt: dict[str, Any]) -> dict[str, Any]:
         },
         "status": {
             "controller": receipt.get("controller", {}),
+            **({"artifacts": receipt["artifacts"]} if receipt.get("artifacts") else {}),
             "result": {key: value for key, value in receipt.items() if key not in reserved},
         },
     }
@@ -744,7 +756,7 @@ def validate_unit_materialization(desired_root: Path, unit_name: str, unit: dict
         return
     if not isinstance(descriptor, dict) or set(descriptor) != {"path", "digest", "mediaType", "metadata"}:
         raise OperationError(f"{unit_name} has an invalid materialization descriptor")
-    expected_path = f"manifests/{unit_name}"
+    expected_path = f"materialized/{unit_name}"
     if descriptor.get("path") != expected_path:
         raise OperationError(f"{unit_name} materialization path must be {expected_path}")
     digest = descriptor.get("digest")
@@ -761,13 +773,14 @@ def validate_unit_materialization(desired_root: Path, unit_name: str, unit: dict
 
 def copy_unit_materialization(source: Path, destination: Path, unit_name: str, unit: dict[str, Any]) -> None:
     validate_unit_materialization(source, unit_name, unit)
-    target = destination / "manifests" / unit_name
+    descriptor = unit.get("materialization")
+    relative_path = descriptor["path"] if isinstance(descriptor, dict) else f"materialized/{unit_name}"
+    target = destination / relative_path
     if target.exists():
         shutil.rmtree(target)
-    descriptor = unit.get("materialization")
     if descriptor is not None:
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source / "manifests" / unit_name, target)
+        shutil.copytree(source / relative_path, target)
 
 
 def require_unit_specification(
@@ -788,9 +801,6 @@ def require_unit_specification(
     inputs = source.get("inputs")
     if inputs is not None and (not isinstance(inputs, list) or not all(isinstance(value, str) for value in inputs)):
         raise OperationError(f"{name} source inputs must be a list of paths or glob patterns")
-    artifacts = specification.get("artifacts", [])
-    if not isinstance(artifacts, list) or not all(re.fullmatch(r"[a-z0-9-]+\.json", str(value)) for value in artifacts):
-        raise OperationError(f"{name} artifacts must be JSON filenames")
     return driver, source
 
 
@@ -843,6 +853,179 @@ def file_blob(path: Path) -> str:
     return git("hash-object", str(path)).stdout.strip()
 
 
+def sha256_file(path: Path) -> str:
+    return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+
+def artifact_document_path(root: Path, unit_name: str, artifact_name: str) -> Path:
+    directory = root / "artifacts" / unit_name
+    selected = load_project_config(REPOSITORY_ROOT).write_format
+    return directory / f"{artifact_name}{selected.suffix}"
+
+
+def write_artifact_documents(
+    observed: Path,
+    unit_name: str,
+    driver_name: str,
+    documents: Mapping[str, JsonObject],
+) -> dict[str, dict[str, str]]:
+    driver = UNIT_DRIVERS[driver_name]
+    expected = set(driver.artifact_contracts)
+    if set(documents) != expected:
+        raise DriverError(
+            f"{driver_name} returned artifact documents {sorted(documents)}; expected {sorted(expected)}"
+        )
+    target = observed / "artifacts" / unit_name
+    if target.exists():
+        shutil.rmtree(target)
+    if not documents:
+        return {}
+    selected = load_project_config(REPOSITORY_ROOT).write_format
+    descriptors: dict[str, dict[str, str]] = {}
+    for name, document in documents.items():
+        artifact = driver.artifact_contracts[name]
+        validate_document(artifact.contract, document, f"{driver_name} artifact {name}")
+        schema_id = str(artifact.contract.json_schema()["$id"])
+        serialized = {"$schema": schema_id, **document}
+        path = write_document(target / f"{name}{selected.suffix}", serialized, format=selected)
+        descriptors[name] = {
+            "apiVersion": artifact.api_version,
+            "kind": artifact.kind,
+            "path": path.relative_to(observed).as_posix(),
+            "digest": sha256_file(path),
+            "mediaType": f"{artifact.media_type}+{selected.value}",
+        }
+    return descriptors
+
+
+def validate_artifact_output_identity(
+    driver_name: str,
+    unit: dict[str, Any],
+    documents: Mapping[str, JsonObject],
+) -> None:
+    driver = UNIT_DRIVERS[driver_name]
+    if set(documents) != set(driver.artifact_contracts):
+        raise DriverError(
+            f"{driver_name} returned artifact documents {sorted(documents)}; "
+            f"expected {sorted(driver.artifact_contracts)}"
+        )
+    if not documents:
+        return
+    source = unit.get("source")
+    if not isinstance(source, dict):
+        raise DriverError(f"{driver_name} desired unit has no source identity")
+    for name, document in documents.items():
+        validate_document(driver.artifact_contracts[name].contract, document, f"{driver_name} artifact {name}")
+        metadata = document.get("metadata")
+        producer = document.get("producer")
+        if isinstance(metadata, dict) and metadata.get("name") != name:
+            log_status(
+                "WARN",
+                f"{driver_name} artifact {name!r} has resource name {metadata.get('name')!r}",
+            )
+        if (
+            not isinstance(metadata, dict)
+            or not isinstance(producer, dict)
+            or producer.get("apiVersion") != driver.api_version
+            or producer.get("kind") != driver.kind
+            or producer.get("name") != unit.get("name")
+            or producer.get("driverVersion") != driver.version
+            or producer.get("sourceRevision") != source.get("revision")
+            or producer.get("inputHashVersion") != 1
+            or producer.get("inputHash") != source.get("inputHash")
+        ):
+            raise DriverError(f"{driver_name} artifact {name!r} has the wrong producer identity")
+
+
+def load_artifact_document(
+    observed: Path,
+    unit: dict[str, Any],
+    receipt: dict[str, Any],
+    artifact_name: str,
+) -> tuple[dict[str, Any], str]:
+    driver_name = receipt.get("driver")
+    if not isinstance(driver_name, str) or driver_name not in UNIT_DRIVERS:
+        raise ReferenceUnavailable("artifact receipt has an unknown driver")
+    contract = UNIT_DRIVERS[driver_name].artifact_contracts.get(artifact_name)
+    if contract is None:
+        raise ReferenceUnavailable(f"unit does not produce artifact {artifact_name!r}")
+    descriptors = receipt.get("artifacts")
+    descriptor = descriptors.get(artifact_name) if isinstance(descriptors, dict) else None
+    if not isinstance(descriptor, dict):
+        raise ReferenceUnavailable(f"receipt does not describe artifact {artifact_name!r}")
+    expected_path = artifact_document_path(observed, str(receipt.get("unit")), artifact_name)
+    recorded_path = descriptor.get("path")
+    if not isinstance(recorded_path, str) or PurePosixPath(recorded_path).is_absolute() or ".." in PurePosixPath(recorded_path).parts:
+        raise ReferenceUnavailable(f"artifact {artifact_name!r} has an unsafe path")
+    path = observed / recorded_path
+    if path != expected_path or not path.is_file():
+        raise ReferenceUnavailable(f"artifact {artifact_name!r} does not exist at its required path")
+    if descriptor.get("apiVersion") != contract.api_version or descriptor.get("kind") != contract.kind:
+        raise ReferenceUnavailable(f"artifact {artifact_name!r} has the wrong contract identity")
+    expected_media_type = f"{contract.media_type}+{'json' if path.suffix == '.json' else 'yaml'}"
+    if descriptor.get("mediaType") != expected_media_type:
+        raise ReferenceUnavailable(f"artifact {artifact_name!r} has the wrong media type")
+    digest = descriptor.get("digest")
+    if not isinstance(digest, str) or sha256_file(path) != digest:
+        raise ReferenceUnavailable(f"artifact {artifact_name!r} does not match its digest")
+    document = load_document(path)
+    if not isinstance(document, dict):
+        raise ReferenceUnavailable(f"artifact {artifact_name!r} is not an object")
+    validate_document(contract.contract, document, f"persisted {driver_name} artifact {artifact_name}")
+    producer = document.get("producer")
+    metadata = document.get("metadata")
+    source = unit.get("source")
+    if isinstance(metadata, dict) and metadata.get("name") != artifact_name:
+        log_status(
+            "WARN",
+            f"persisted {driver_name} artifact {artifact_name!r} has resource name {metadata.get('name')!r}",
+        )
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(producer, dict)
+        or not isinstance(source, dict)
+        or (
+            producer.get("apiVersion") != UNIT_DRIVERS[driver_name].api_version
+            or producer.get("kind") != UNIT_DRIVERS[driver_name].kind
+            or producer.get("name") != unit.get("name")
+            or producer.get("driverVersion") != UNIT_DRIVERS[driver_name].version
+            or producer.get("sourceRevision") != source.get("revision")
+            or producer.get("inputHash") != source.get("inputHash")
+        )
+    ):
+        raise ReferenceUnavailable(f"artifact {artifact_name!r} has stale producer identity")
+    return document, digest
+
+
+def validate_receipt_artifacts(
+    observed: Path,
+    unit: dict[str, Any],
+    receipt: dict[str, Any],
+) -> None:
+    driver_name = unit.get("driver")
+    if not isinstance(driver_name, str) or driver_name not in UNIT_DRIVERS:
+        raise OperationError("desired unit has an unknown driver")
+    receipt_driver = receipt.get("driver")
+    expected = set(UNIT_DRIVERS[driver_name].artifact_contracts)
+    if receipt_driver != driver_name and (receipt_driver is not None or expected):
+        raise OperationError(f"persisted receipt driver is not {driver_name!r}")
+    descriptors = receipt.get("artifacts", {})
+    if not isinstance(descriptors, dict) or set(descriptors) != expected:
+        raise OperationError(
+            f"persisted {driver_name} receipt describes artifacts {sorted(descriptors) if isinstance(descriptors, dict) else []}; "
+            f"expected {sorted(expected)}"
+        )
+    directory = observed / "artifacts" / str(unit.get("name"))
+    actual_paths = {path for path in directory.rglob("*") if path.is_file()} if directory.is_dir() else set()
+    expected_paths = {artifact_document_path(observed, str(unit.get("name")), name) for name in expected}
+    if actual_paths != expected_paths:
+        raise OperationError(
+            f"persisted {driver_name} artifact files do not match its complete contract set"
+        )
+    for artifact_name in expected:
+        load_artifact_document(observed, unit, receipt, artifact_name)
+
+
 def current_receipt(observed: Path, candidate_units: Path, unit_name: str) -> dict[str, Any] | None:
     receipt_path = unit_document_path(observed, unit_name)
     unit_path = unit_document_path(candidate_units.parent, unit_name)
@@ -852,6 +1035,7 @@ def current_receipt(observed: Path, candidate_units: Path, unit_name: str) -> di
     validate_receipt_document(receipt, f"persisted receipt for {unit_name}")
     if receipt.get("desired", {}).get("unitBlob") != file_blob(unit_path):
         return None
+    validate_receipt_artifacts(observed, load_unit(unit_path, unit_name), receipt)
     return receipt
 
 
@@ -862,61 +1046,67 @@ def resolve_template(
     observed_revision: str | None,
     dry: bool = False,
     promotion: Path | None = None,
-) -> tuple[Any, dict[str, str], dict[str, str]]:
+) -> TemplateResolution:
     promotion_inputs: dict[str, str] = {}
-    observed_inputs: dict[str, str] = {}
+    receipt_inputs: dict[str, str] = {}
+    artifact_inputs: dict[str, str] = {}
 
     def resolve(candidate_value: Any) -> Any:
         if isinstance(candidate_value, list):
             return [resolve(item) for item in candidate_value]
         if not isinstance(candidate_value, dict):
             return candidate_value
-        reference_keys = {"fromObservation", "fromPromotion"}.intersection(candidate_value)
+        reference_keys = {"fromReceipt", "fromArtifact", "fromPromotion"}.intersection(candidate_value)
         if not reference_keys:
             return {name: resolve(item) for name, item in candidate_value.items()}
-        if len(reference_keys) != 1 or set(candidate_value) - {
-            *reference_keys,
-            "pointer",
-            "dryFallback",
-        }:
-            raise OperationError("invalid observation or promotion reference")
+        if len(reference_keys) != 1 or set(candidate_value) != reference_keys:
+            raise OperationError("invalid receipt, artifact, or promotion reference")
         reference_type = reference_keys.pop()
         reference = candidate_value.get(reference_type)
-        pointer = candidate_value.get("pointer", "")
-        pattern = r"units/[a-z0-9-]+\.(?:json|ya?ml)"
-        if not isinstance(reference, str) or not re.fullmatch(pattern, reference):
-            raise OperationError(f"invalid {reference_type} path: {reference!r}")
+        allowed = {"unit", "pointer", "dryFallback"} | ({"name"} if reference_type == "fromArtifact" else set())
+        if not isinstance(reference, dict) or set(reference) - allowed or "unit" not in reference:
+            raise OperationError(f"invalid {reference_type} reference")
+        referenced_unit = reference.get("unit")
+        if not isinstance(referenced_unit, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", referenced_unit):
+            raise OperationError(f"invalid {reference_type} unit: {referenced_unit!r}")
+        pointer = reference.get("pointer", "")
         if not isinstance(pointer, str):
-            raise OperationError(f"invalid JSON pointer for {reference!r}")
-        referenced_unit = Path(reference).stem
+            raise OperationError(f"invalid JSON pointer for {reference_type} {referenced_unit!r}")
         try:
             if reference_type == "fromPromotion":
                 if promotion is None:
-                    raise ReferenceUnavailable(f"promotion does not exist: {reference}")
-                path = reference_document_path(promotion, reference)
-                fingerprints = promotion_inputs
+                    raise ReferenceUnavailable(f"promotion does not exist: {referenced_unit}")
+                path = unit_document_path(promotion, referenced_unit)
+                if not path.is_file():
+                    raise ReferenceUnavailable(f"promoted unit does not exist: {referenced_unit}")
+                promotion_inputs[referenced_unit] = file_blob(path)
+                document = load_unit(path, referenced_unit)
             else:
                 if observed_revision is None:
-                    raise ReferenceUnavailable(f"observation does not exist: {reference}")
-                if current_receipt(observed, candidate / "units", referenced_unit) is None:
-                    raise ReferenceUnavailable(f"observation is stale: {reference}")
-                path = reference_document_path(observed, reference)
-                fingerprints = observed_inputs
-            if not path.is_file():
-                raise ReferenceUnavailable(f"referenced file does not exist: {reference}")
-            fingerprints[reference] = file_blob(path)
-            document = (
-                load_unit(path, referenced_unit)
-                if reference_type == "fromPromotion"
-                else load_receipt(path, referenced_unit)
-            )
+                    raise ReferenceUnavailable(f"receipt does not exist: {referenced_unit}")
+                receipt = current_receipt(observed, candidate / "units", referenced_unit)
+                if receipt is None:
+                    raise ReferenceUnavailable(f"receipt is stale: {referenced_unit}")
+                if reference_type == "fromReceipt":
+                    receipt_inputs[referenced_unit] = file_blob(unit_document_path(observed, referenced_unit))
+                    reserved = {
+                        "$schema", "schema", "unit", "driver", "desired", "resolvedInputs", "controller", "artifacts"
+                    }
+                    document = {key: item for key, item in receipt.items() if key not in reserved}
+                else:
+                    artifact_name = reference.get("name")
+                    if not isinstance(artifact_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", artifact_name):
+                        raise OperationError(f"invalid fromArtifact name: {artifact_name!r}")
+                    producer_unit = load_unit(unit_document_path(candidate, referenced_unit), referenced_unit)
+                    document, digest = load_artifact_document(observed, producer_unit, receipt, artifact_name)
+                    artifact_inputs[f"{referenced_unit}/{artifact_name}"] = digest
             return json_pointer(document, pointer)
         except ReferenceUnavailable:
-            if dry and "dryFallback" in candidate_value:
-                return resolve(candidate_value["dryFallback"])
+            if dry and "dryFallback" in reference:
+                return resolve(reference["dryFallback"])
             raise
 
-    return resolve(value), promotion_inputs, observed_inputs
+    return TemplateResolution(resolve(value), promotion_inputs, receipt_inputs, artifact_inputs)
 
 
 def resolved_unit_source(
@@ -1081,10 +1271,17 @@ def load_environment_specifications(source_root: Path, environment_name: str) ->
     for unit_name, specification in specifications.items():
         require_unit_specification(specification, unit_name)
     for consumer, specification in specifications.items():
-        for reference in reference_paths(specification, "fromObservation"):
-            producer = Path(reference).stem
+        for producer in observation_reference_units(specification):
             if producer in specifications and not unit_requires_reconciliation(specifications[producer]):
                 raise OperationError(f"{consumer} cannot observe materialization-only unit {producer!r}")
+        for producer, artifact_name in artifact_references(specification):
+            if producer in specifications:
+                driver_name = specifications[producer].get("driver")
+                driver = UNIT_DRIVERS.get(driver_name) if isinstance(driver_name, str) else None
+                if driver is not None and artifact_name not in driver.artifact_contracts:
+                    raise OperationError(
+                        f"{consumer} references unknown artifact {producer}/{artifact_name}"
+                    )
     return specifications
 
 
@@ -1116,6 +1313,7 @@ def reconciliation_statuses(unit_names: list[str], desired: Path, observed: Path
         receipt = load_receipt(receipt_path, unit_name)
         validate_receipt_document(receipt, f"persisted receipt for {unit_name}")
         if receipt.get("desired", {}).get("unitBlob") == file_blob(unit_path):
+            validate_receipt_artifacts(observed, unit, receipt)
             statuses.append((unit_name, "CLEAN", "observation matches desired state"))
         else:
             statuses.append(
@@ -1218,17 +1416,20 @@ def classify_unit_change(
         previous_inputs = {}
     if not isinstance(current_inputs, dict):
         current_inputs = {}
-    previous_observed = previous_inputs.get("observed", {})
-    current_observed = current_inputs.get("observed", {})
-    if not isinstance(previous_observed, dict):
-        previous_observed = {}
-    if not isinstance(current_observed, dict):
-        current_observed = {}
+    previous_observed: dict[str, Any] = {}
+    current_observed: dict[str, Any] = {}
+    for category in ("receipts", "artifacts"):
+        previous_category = previous_inputs.get(category, {})
+        current_category = current_inputs.get(category, {})
+        if isinstance(previous_category, dict):
+            previous_observed.update(previous_category)
+        if isinstance(current_category, dict):
+            current_observed.update(current_category)
     if previous_observed != current_observed:
         changed = sorted(set(previous_observed) | set(current_observed))
         causes.append("upstream observations changed: " + ", ".join(Path(path).stem for path in changed))
-    previous_promotion = previous_inputs.get("promotion", {})
-    current_promotion = current_inputs.get("promotion", {})
+    previous_promotion = previous_inputs.get("promotions", {})
+    current_promotion = current_inputs.get("promotions", {})
     if not isinstance(previous_promotion, dict):
         previous_promotion = {}
     if not isinstance(current_promotion, dict):
@@ -1456,7 +1657,7 @@ def materialize_resolved_unit(
             validate_document(unit_plugin.desired_unit_contract, reused, f"materialized {plugin_name} unit {unit_name}")
             return reused
 
-    output_root = candidate / "manifests" / unit_name
+    output_root = candidate / "materialized" / unit_name
     if output_root.exists():
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True)
@@ -1496,7 +1697,7 @@ def materialize_resolved_unit(
     resolved = {
         **resolved,
         "materialization": {
-            "path": f"manifests/{unit_name}",
+            "path": f"materialized/{unit_name}",
             "digest": materialization_tree_digest(output_root),
             "mediaType": result.media_type,
             "metadata": result.metadata,
@@ -1560,7 +1761,7 @@ def build_desired_candidate(
         progressed = False
         for unit_name in sorted(unresolved):
             try:
-                resolved, promotion_inputs, observed_inputs = resolve_template(
+                resolution = resolve_template(
                     prepared[unit_name],
                     candidate,
                     observed,
@@ -1571,12 +1772,15 @@ def build_desired_candidate(
             except ReferenceUnavailable as exc:
                 unavailable[unit_name] = str(exc)
                 continue
-            if promotion_inputs or observed_inputs:
+            resolved = resolution.value
+            if resolution.promotions or resolution.receipts or resolution.artifacts:
                 resolved["resolvedInputs"] = {}
-                if promotion_inputs:
-                    resolved["resolvedInputs"]["promotion"] = promotion_inputs
-                if observed_inputs:
-                    resolved["resolvedInputs"]["observed"] = observed_inputs
+                if resolution.promotions:
+                    resolved["resolvedInputs"]["promotions"] = resolution.promotions
+                if resolution.receipts:
+                    resolved["resolvedInputs"]["receipts"] = resolution.receipts
+                if resolution.artifacts:
+                    resolved["resolvedInputs"]["artifacts"] = resolution.artifacts
             resolved = materialize_resolved_unit(
                 environment_name,
                 unit_name,
@@ -1589,24 +1793,23 @@ def build_desired_candidate(
             candidate_unit = write_unit(candidate_units / f"{unit_name}.json", resolved, source_root)
             previous_unit = unit_document_path(current_desired, unit_name)
             previous = load_unit(previous_unit, unit_name) if previous_unit.is_file() else None
-            previous_observations = (
-                previous.get("resolvedInputs", {}).get("observed", {}) if previous is not None else {}
-            )
+            previous_receipts = previous.get("resolvedInputs", {}).get("receipts", {}) if previous is not None else {}
+            previous_artifacts = previous.get("resolvedInputs", {}).get("artifacts", {}) if previous is not None else {}
             previous_promotions = (
-                previous.get("resolvedInputs", {}).get("promotion", {}) if previous is not None else {}
+                previous.get("resolvedInputs", {}).get("promotions", {}) if previous is not None else {}
             )
-            if promotion_inputs:
+            if resolution.promotions:
                 promotion_resolution = (
                     "new promotion changes resolved inputs"
-                    if previous_promotions != promotion_inputs
+                    if previous_promotions != resolution.promotions
                     else "promotion already matches resolved inputs"
                 )
                 if verbose:
                     log_status("PROMOTE", f"{unit_name}: {promotion_resolution}")
-            if observed_inputs:
+            if resolution.receipts or resolution.artifacts:
                 observation_resolution = (
                     "new observation changes resolved inputs"
-                    if previous_observations != observed_inputs
+                    if previous_receipts != resolution.receipts or previous_artifacts != resolution.artifacts
                     else "observations already match resolved inputs"
                 )
                 if verbose:
@@ -1729,6 +1932,7 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
     ):
         return False
     try:
+        validate_receipt_artifacts(observed, unit, receipt)
         semantic_reconciliation_result(driver, receipt)
     except DriverError:
         return False
@@ -1797,8 +2001,7 @@ def find_clean_observed_snapshot(
 def downstream_unit_closure(specifications: dict[str, dict[str, Any]], selected: list[str]) -> list[str]:
     consumers: dict[str, set[str]] = {unit: set() for unit in specifications}
     for consumer, specification in specifications.items():
-        for reference in reference_paths(specification, "fromObservation"):
-            producer = Path(reference).stem
+        for producer in observation_reference_units(specification):
             if producer not in specifications:
                 raise OperationError(f"{consumer} references unknown observation unit {producer!r}")
             consumers[producer].add(consumer)
@@ -2659,14 +2862,14 @@ def contains_reference(value: Any) -> bool:
     if isinstance(value, list):
         return any(contains_reference(item) for item in value)
     if isinstance(value, dict):
-        return bool({"fromObservation", "fromPromotion"}.intersection(value)) or any(
+        return bool({"fromReceipt", "fromArtifact", "fromPromotion"}.intersection(value)) or any(
             contains_reference(item) for item in value.values()
         )
     return False
 
 
 def reference_paths(value: Any, reference_type: str) -> set[str]:
-    """Collect validated unit-reference paths of one type from a specification."""
+    """Collect validated logical unit names referenced by one reference type."""
     paths: set[str] = set()
     if isinstance(value, list):
         for item in value:
@@ -2674,12 +2877,38 @@ def reference_paths(value: Any, reference_type: str) -> set[str]:
     elif isinstance(value, dict):
         if reference_type in value:
             reference = value[reference_type]
-            if not isinstance(reference, str) or not re.fullmatch(r"units/[a-z0-9-]+\.(?:json|ya?ml)", reference):
-                raise OperationError(f"invalid {reference_type} path: {reference!r}")
-            paths.add(reference)
+            unit_name = reference.get("unit") if isinstance(reference, dict) else None
+            if not isinstance(unit_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name):
+                raise OperationError(f"invalid {reference_type} unit: {unit_name!r}")
+            paths.add(unit_name)
         for item in value.values():
             paths.update(reference_paths(item, reference_type))
     return paths
+
+
+def artifact_references(value: Any) -> set[tuple[str, str]]:
+    """Collect validated producer and logical-name pairs from artifact references."""
+    references: set[tuple[str, str]] = set()
+    if isinstance(value, list):
+        for item in value:
+            references.update(artifact_references(item))
+    elif isinstance(value, dict):
+        if "fromArtifact" in value:
+            reference = value["fromArtifact"]
+            unit_name = reference.get("unit") if isinstance(reference, dict) else None
+            artifact_name = reference.get("name") if isinstance(reference, dict) else None
+            if not isinstance(unit_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name):
+                raise OperationError(f"invalid fromArtifact unit: {unit_name!r}")
+            if not isinstance(artifact_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", artifact_name):
+                raise OperationError(f"invalid fromArtifact name: {artifact_name!r}")
+            references.add((unit_name, artifact_name))
+        for item in value.values():
+            references.update(artifact_references(item))
+    return references
+
+
+def observation_reference_units(value: Any) -> set[str]:
+    return reference_paths(value, "fromReceipt") | reference_paths(value, "fromArtifact")
 
 
 def convergence_scope(
@@ -2700,9 +2929,7 @@ def convergence_scope(
     while pending:
         unit_name = pending.pop()
         depth = depths[unit_name]
-        dependencies = {
-            Path(reference).stem for reference in reference_paths(specifications[unit_name], "fromObservation")
-        }
+        dependencies = observation_reference_units(specifications[unit_name])
         missing = sorted(dependencies - specifications.keys())
         if missing:
             raise OperationError(f"{unit_name} references unknown observation unit(s): {', '.join(missing)}")
@@ -2729,11 +2956,7 @@ def convergence_order(specifications: dict[str, dict[str, Any]], scope: list[str
         if unit_name in visiting:
             return
         visiting.add(unit_name)
-        dependencies = sorted(
-            Path(reference).stem
-            for reference in reference_paths(specifications[unit_name], "fromObservation")
-            if Path(reference).stem in included
-        )
+        dependencies = sorted(observation_reference_units(specifications[unit_name]) & included)
         for dependency in dependencies:
             visit(dependency)
         visiting.remove(unit_name)
@@ -2749,9 +2972,7 @@ def observation_dependency_graph(specifications: dict[str, dict[str, Any]], scop
     included = set(scope)
     return {
         unit_name: sorted(
-            Path(reference).stem
-            for reference in reference_paths(specifications[unit_name], "fromObservation")
-            if Path(reference).stem in included
+            observation_reference_units(specifications[unit_name]) & included
         )
         for unit_name in sorted(scope)
     }
@@ -2793,39 +3014,48 @@ def nested_strings(value: Any) -> list[str]:
     return []
 
 
-def publish_receipt_cas(
+def publish_observation_cas(
     observed_ref: str,
     unit_name: str,
     receipt: dict[str, Any],
+    unit: dict[str, Any],
+    artifact_documents: Mapping[str, JsonObject],
     desired_revision: str,
 ) -> str:
-    validate_receipt_document(receipt, f"candidate receipt for {unit_name}")
     for attempt in range(5):
         if attempt:
             log_status("RETRY", f"observation publish attempt {attempt + 1}/5")
         with tempfile.TemporaryDirectory() as temporary_directory:
             observed = Path(temporary_directory) / "observed"
             observed_revision = observed_tree(observed_ref, observed)
+            driver = receipt.get("driver")
+            if not isinstance(driver, str) or driver not in UNIT_DRIVERS:
+                raise OperationError(f"candidate receipt for {unit_name} has an unknown driver")
+            validate_artifact_output_identity(driver, unit, artifact_documents)
             receipt_path = unit_document_path(observed, unit_name)
             existing_receipt = load_receipt(receipt_path, unit_name) if receipt_path.is_file() else None
             if existing_receipt is not None:
                 validate_receipt_document(existing_receipt, f"persisted receipt for {unit_name}")
-            if existing_receipt is not None and existing_receipt.get("desired", {}).get("unitBlob") == receipt.get(
+                if existing_receipt.get("desired", {}).get("unitBlob") == receipt.get("desired", {}).get("unitBlob"):
+                    validate_receipt_artifacts(observed, unit, existing_receipt)
+            descriptors = write_artifact_documents(observed, unit_name, driver, artifact_documents)
+            candidate_receipt = {**receipt, "artifacts": descriptors}
+            validate_receipt_document(candidate_receipt, f"candidate receipt for {unit_name}")
+            if existing_receipt is not None and existing_receipt.get("desired", {}).get("unitBlob") == candidate_receipt.get(
                 "desired", {}
             ).get("unitBlob"):
                 if observed_revision is None:
                     raise OperationError(f"{observed_ref} receipt has no revision")
-                driver = receipt.get("driver")
-                if existing_receipt.get("driver") != driver or not isinstance(driver, str):
+                if existing_receipt.get("driver") != driver:
                     raise OperationError(f"duplicate {unit_name} receipt changed its reconciliation driver")
                 existing_result = semantic_reconciliation_result(driver, existing_receipt)
-                candidate_result = semantic_reconciliation_result(driver, receipt)
+                candidate_result = semantic_reconciliation_result(driver, candidate_receipt)
                 if existing_result != candidate_result:
                     raise OperationError(
                         f"duplicate {unit_name} receipt for the same desired unit has a different semantic result"
                     )
                 return observed_revision
-            write_preferred_document(receipt_path, receipt, REPOSITORY_ROOT)
+            write_preferred_document(receipt_path, candidate_receipt, REPOSITORY_ROOT)
             try:
                 return publish_tree(
                     observed_ref,
@@ -2981,12 +3211,11 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         if receipt_path.is_file():
             assert previous_receipt is not None
             receipt = previous_receipt
-            skip_clean_unit = not args.plan or bool(unit.get("artifacts"))
-            if (
-                not getattr(args, "reapply", False)
-                and skip_clean_unit
-                and receipt.get("desired", {}).get("unitBlob") == unit_blob
-            ):
+            skip_clean_unit = not args.plan or bool(UNIT_DRIVERS[driver_name].artifact_contracts)
+            receipt_is_current = receipt.get("desired", {}).get("unitBlob") == unit_blob
+            if receipt_is_current:
+                validate_receipt_artifacts(observed, unit, receipt)
+            if not getattr(args, "reapply", False) and skip_clean_unit and receipt_is_current:
                 log_status("KEEP", "observation already matches desired state")
                 if args.plan:
                     advanced_revision = ""
@@ -3029,12 +3258,15 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             plugin = RECONCILIATION_DRIVERS[driver_name]
         except KeyError as exc:
             raise OperationError(f"{args.unit} uses {driver_name}, which does not support reconciliation") from exc
-        result = plugin.reconcile(
+        output = plugin.reconcile(
             ReconciliationContext(
                 **execution,
                 previous_receipt=previous_receipt,
             )
         )
+        if not isinstance(output, ReconciliationOutput):
+            raise DriverError(f"{driver_name} reconciliation did not return ReconciliationOutput")
+        result = dict(output.result)
         validate_document(UNIT_DRIVERS[driver_name].result_contract, result, f"{driver_name} reconciliation result")
         reserved = {
             "schema",
@@ -3057,11 +3289,12 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             },
             str(driver_schema(driver_name, "receipt")["$id"]),
         )
-        validate_receipt_document(receipt, f"{driver_name} receipt")
-        revision = publish_receipt_cas(
+        revision = publish_observation_cas(
             observed_ref,
             args.unit,
             receipt,
+            unit,
+            output.artifacts,
             desired_revision,
         )
         log_status(
@@ -3681,12 +3914,12 @@ def _validate_environment(environment_name: str, collector: ValidationCollector)
 
     for consumer, specification in specifications.items():
         try:
-            references = reference_paths(specification, "fromObservation")
+            references = observation_reference_units(specification)
         except OperationError as exc:
             collector.invalid(units_root / consumer, exc)
             continue
         for reference in references:
-            producer = Path(reference).stem
+            producer = reference
             if producer in specifications:
                 try:
                     reconciles = unit_requires_reconciliation(specifications[producer])
@@ -3698,6 +3931,22 @@ def _validate_environment(environment_name: str, collector: ValidationCollector)
                         units_root / consumer,
                         f"{consumer} cannot observe materialization-only unit {producer!r}",
                     )
+        try:
+            artifacts = artifact_references(specification)
+        except OperationError as exc:
+            collector.invalid(units_root / consumer, exc)
+            continue
+        for producer, artifact_name in artifacts:
+            producer_specification = specifications.get(producer)
+            if producer_specification is None:
+                continue
+            driver_name = producer_specification.get("driver")
+            driver = UNIT_DRIVERS.get(driver_name) if isinstance(driver_name, str) else None
+            if driver is not None and artifact_name not in driver.artifact_contracts:
+                collector.invalid(
+                    units_root / consumer,
+                    f"{consumer} references unknown artifact {producer}/{artifact_name}",
+                )
 
 
 def command_validate(args: argparse.Namespace) -> None:

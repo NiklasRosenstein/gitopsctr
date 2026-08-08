@@ -15,4 +15,3 @@ spec:
       application:
         type: registry
         repository: __REGISTRY__/gitopsctr-demo/app
-  artifacts: [containers.json]

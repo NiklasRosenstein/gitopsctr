@@ -5,10 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict, cast
 
+from gitopsctr.artifacts import ARTIFACT_API_VERSION, CONTAINER_IMAGES_CONTRACT
 from gitopsctr.contracts import (
     AuthoredSource,
     AwsEcrCredentialProvider,
     DesiredSource,
+    EmptyResultModel,
     MashumaroContract,
     MaterializationDocument,
     SchemaDocument,
@@ -17,22 +19,22 @@ from gitopsctr.contracts import (
 )
 from gitopsctr.document import JsonObject
 from gitopsctr.driver import (
+    ArtifactDocumentContract,
     DriverError,
     PlanningCapability,
     PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
+    ReconciliationOutput,
     ReconciliationResult,
     UnitDriver,
 )
 from gitopsctr.execution import CommandOutput, DriverExecution
 
-from ._common import select_result_fields
 from ._oci import (
     OCI_DIGEST_RE,
-    ArtifactUnitIdentity,
     ResolvedCredentialProvider,
-    artifact_unit_identity,
+    artifact_producer_identity,
     registry_authentication,
     repository_registry,
     resolve_credential_provider,
@@ -40,18 +42,7 @@ from ._oci import (
 
 
 class OciImageArtifact(TypedDict):
-    type: str
     uri: str
-
-
-class ContainersDocument(TypedDict):
-    schema: int
-    unit: ArtifactUnitIdentity
-    artifacts: dict[str, OciImageArtifact]
-
-
-class OciImagesResult(TypedDict):
-    artifacts: dict[str, ContainersDocument]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -94,7 +85,6 @@ class OciImagesUnit(SchemaDocument):
     source: AuthoredSource
     build: OciBuild | None = None
     publish: OciPublication | None = None
-    artifacts: list[Literal["containers.json"]] | None = None
     environment: str | None = None
 
 
@@ -105,37 +95,9 @@ class OciImagesDesiredUnit(SchemaDocument):
     source: DesiredSource
     build: OciBuild | None = None
     publish: OciPublication | None = None
-    artifacts: list[Literal["containers.json"]] | None = None
     inputs: dict[str, Any] | None = None
     resolvedInputs: dict[str, dict[str, str]] | None = None
     materialization: MaterializationDocument | None = None
-
-
-@dataclass(frozen=True, kw_only=True)
-class ArtifactIdentityModel(StrictModel):
-    name: str
-    driver: str
-    inputHashVersion: Literal[1]
-    inputHash: str
-    sourceRevision: str
-
-
-@dataclass(frozen=True, kw_only=True)
-class OciImageArtifactModel(StrictModel):
-    type: Literal["oci-image"]
-    uri: str
-
-
-@dataclass(frozen=True, kw_only=True)
-class ContainersDocumentModel(StrictModel):
-    schema: Literal[1]
-    unit: ArtifactIdentityModel
-    artifacts: dict[str, OciImageArtifactModel]
-
-
-@dataclass(frozen=True, kw_only=True)
-class OciImagesResultModel(StrictModel):
-    artifacts: dict[str, ContainersDocumentModel]
 
 
 @dataclass(frozen=True)
@@ -147,7 +109,7 @@ class OciRuntime:
     dockerfile: str
     platform: str
     input_hash: str
-    unit_identity: ArtifactUnitIdentity
+    producer: JsonObject
     tag: str
     local_image: str
 
@@ -199,8 +161,15 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
         OciImagesDesiredUnit,
         schema_url("drivers/oci-images", version, "desired-unit"),
     )
-    result_contract = MashumaroContract(OciImagesResultModel, schema_url("drivers/oci-images", version, "result"))
-    _select_semantic_result = staticmethod(select_result_fields("artifacts"))
+    result_contract = MashumaroContract(EmptyResultModel, schema_url("drivers/oci-images", version, "result"))
+    artifact_contracts = {
+        "containers": ArtifactDocumentContract(
+            ARTIFACT_API_VERSION,
+            "ContainerImages",
+            CONTAINER_IMAGES_CONTRACT,
+            "application/vnd.gitopsctr.container-images.v1",
+        )
+    }
 
     def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject:
         return {"source": {"path": source_path}}
@@ -210,7 +179,6 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
         specification = context.unit
         build = specification.get("build")
         publication = specification.get("publish")
-        outputs = specification.get("artifacts")
         if not isinstance(build, dict) or not isinstance(publication, dict):
             raise DriverError("oci-images requires build and publish objects")
         targets = publication.get("targets")
@@ -251,16 +219,19 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
             raise DriverError("oci-images requires dockerfile and platform")
         dockerfile = cast(str, dockerfile)
         platform = cast(str, platform)
-        if outputs != ["containers.json"]:
-            raise DriverError("oci-images currently produces the containers.json artifact")
-
         source = specification.get("source")
         input_hash = source.get("inputHash") if isinstance(source, dict) else None
         if not isinstance(input_hash, str) or not OCI_DIGEST_RE.fullmatch(input_hash):
             raise DriverError("oci-images requires a resolved source inputHash")
-        unit_identity = artifact_unit_identity(context, input_hash, "oci-images unit")
+        producer = artifact_producer_identity(
+            context,
+            input_hash,
+            "oci-images unit",
+            kind="OciImages",
+            driver_version=OciImagesDriver.version,
+        )
         tag = f"input-{input_hash.removeprefix('sha256:')}"
-        local_image = f"{unit_identity['name']}:{input_hash.removeprefix('sha256:')}"
+        local_image = f"{producer['name']}:{input_hash.removeprefix('sha256:')}"
         return OciRuntime(
             resolved_targets,
             repositories,
@@ -269,7 +240,7 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
             dockerfile,
             platform,
             input_hash,
-            unit_identity,
+            producer,
             tag,
             local_image,
         )
@@ -292,7 +263,7 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
     def plan(self, context: PlanningContext) -> None:
         self._build_image(context, self._runtime(context))
 
-    def reconcile(self, context: ReconciliationContext) -> OciImagesResult:
+    def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
         runtime = self._runtime(context)
         repositories = runtime.repositories
         targets = runtime.targets
@@ -347,7 +318,7 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
                     digest = oci_digest(context.execution, repository, tag, docker_environment)
                 if digest is None:
                     raise DriverError(f"OCI registry did not return a digest for {repository}:{tag}")
-                artifacts[name] = {"type": "oci-image", "uri": f"{repository}@{digest}"}
+                artifacts[name] = {"uri": f"{repository}@{digest}"}
 
             if len({artifact["uri"].rsplit("@", 1)[1] for artifact in artifacts.values()}) > 1:
                 raise DriverError("published repositories disagree on the artifact digest")
@@ -361,20 +332,24 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
                     context.execution.run(
                         "minikube", "--profile", target["profile"], "image", "load", local_image, "--daemon"
                     )
-                artifacts[name] = {"type": "oci-image", "uri": local_image}
+                artifacts[name] = {"uri": local_image}
 
-        return {
-            "artifacts": {
-                "containers.json": {
-                    "schema": 1,
-                    "unit": runtime.unit_identity,
-                    "artifacts": artifacts,
+        return ReconciliationOutput(
+            artifacts=cast(dict[str, JsonObject], {
+                "containers": {
+                    "apiVersion": ARTIFACT_API_VERSION,
+                    "kind": "ContainerImages",
+                    "metadata": {"name": "containers"},
+                    "producer": runtime.producer,
+                    "images": artifacts,
                 }
-            }
-        }
+            })
+        )
 
     def semantic_result(self, result: object) -> ReconciliationResult:
-        return self._select_semantic_result(result)
+        if result == {}:
+            return {}
+        raise DriverError("oci-images receipt result must be empty")
 
 
 DRIVER = OciImagesDriver()

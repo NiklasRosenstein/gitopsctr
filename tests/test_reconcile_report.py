@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from gitopsctr import cli as deploy_release
+from gitopsctr.driver import ReconciliationOutput
 from tests.conftest import write_test_document
 
 
@@ -28,15 +29,18 @@ def test_reconcile_parser_exposes_plan_without_a_dry_alias():
 def test_observation_reference_uses_fallback_only_during_dry_resolution(tmp_path):
     template = {
         "image": {
-            "fromObservation": "units/application-images.json",
-            "pointer": "/artifacts/containers.json/artifacts/control/uri",
-            "dryFallback": "preview.invalid/control@sha256:" + "0" * 64,
+            "fromArtifact": {
+                "unit": "application-images",
+                "name": "containers",
+                "pointer": "/images/control/uri",
+                "dryFallback": "preview.invalid/control@sha256:" + "0" * 64,
+            },
         }
     }
     candidate = tmp_path / "candidate"
     observed = tmp_path / "observed"
 
-    resolved, desired_inputs, observed_inputs = deploy_release.resolve_template(
+    resolution = deploy_release.resolve_template(
         template,
         candidate,
         observed,
@@ -44,9 +48,10 @@ def test_observation_reference_uses_fallback_only_during_dry_resolution(tmp_path
         dry=True,
     )
 
-    assert resolved == {"image": "preview.invalid/control@sha256:" + "0" * 64}
-    assert desired_inputs == {}
-    assert observed_inputs == {}
+    assert resolution.value == {"image": "preview.invalid/control@sha256:" + "0" * 64}
+    assert resolution.promotions == {}
+    assert resolution.receipts == {}
+    assert resolution.artifacts == {}
 
     try:
         deploy_release.resolve_template(template, candidate, observed, None)
@@ -60,22 +65,62 @@ def test_observation_reference_materializes_artifact_into_consumer(tmp_path):
     candidate = tmp_path / "candidate"
     observed = tmp_path / "observed"
     producer = candidate / "units/application-images.json"
-    _write_json(producer, {"name": "application-images"})
+    unit = {
+        "name": "application-images",
+        "driver": "oci-images",
+        "source": {
+            "path": ".",
+            "revision": "a" * 40,
+            "driverVersion": 1,
+            "inputHash": "sha256:" + "2" * 64,
+        },
+    }
+    _write_json(producer, unit)
+    artifact_path = observed / "artifacts/application-images/containers.yaml"
+    _write_json(
+        artifact_path,
+        {
+            "apiVersion": "artifact.gitopsctr.io/v1",
+            "kind": "ContainerImages",
+            "metadata": {"name": "containers"},
+            "producer": {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "OciImages",
+                "name": "application-images",
+                "driverVersion": 1,
+                "sourceRevision": "a" * 40,
+                "inputHashVersion": 1,
+                "inputHash": "sha256:" + "2" * 64,
+            },
+            "images": {"control": {"uri": "registry.example/control@sha256:" + "1" * 64}},
+        },
+    )
     _write_json(
         observed / "units/application-images.json",
         {
+            "unit": "application-images",
+            "driver": "oci-images",
             "desired": {"unitBlob": deploy_release.file_blob(producer)},
             "artifacts": {
-                "containers.json": {"artifacts": {"control": {"uri": "registry.example/control@sha256:" + "1" * 64}}}
+                "containers": {
+                    "apiVersion": "artifact.gitopsctr.io/v1",
+                    "kind": "ContainerImages",
+                    "path": "artifacts/application-images/containers.yaml",
+                    "digest": deploy_release.sha256_file(artifact_path),
+                    "mediaType": "application/vnd.gitopsctr.container-images.v1+yaml",
+                }
             },
         },
     )
 
-    resolved, desired_inputs, observed_inputs = deploy_release.resolve_template(
+    resolution = deploy_release.resolve_template(
         {
             "image": {
-                "fromObservation": "units/application-images.json",
-                "pointer": "/artifacts/containers.json/artifacts/control/uri",
+                "fromArtifact": {
+                    "unit": "application-images",
+                    "name": "containers",
+                    "pointer": "/images/control/uri",
+                },
             }
         },
         candidate,
@@ -83,27 +128,31 @@ def test_observation_reference_materializes_artifact_into_consumer(tmp_path):
         "a" * 40,
     )
 
-    assert resolved == {"image": "registry.example/control@sha256:" + "1" * 64}
-    assert desired_inputs == {}
-    assert observed_inputs == {
-        "units/application-images.json": deploy_release.file_blob(observed / "units/application-images.json")
-    }
+    assert resolution.value == {"image": "registry.example/control@sha256:" + "1" * 64}
+    assert resolution.promotions == {}
+    assert resolution.receipts == {}
+    assert resolution.artifacts == {"application-images/containers": deploy_release.sha256_file(artifact_path)}
 
 
-def test_observation_reference_normalizes_resource_receipt_before_applying_pointer(tmp_path):
+def test_receipt_reference_normalizes_resource_receipt_before_applying_pointer(tmp_path):
     candidate = tmp_path / "candidate"
     observed = tmp_path / "observed"
-    producer = candidate / "units/application-images.yaml"
+    producer = candidate / "units/infrastructure.yaml"
     producer.parent.mkdir(parents=True)
-    producer.write_text("name: application-images\n")
-    receipt_path = observed / "units/application-images.yaml"
+    producer.write_text(
+        "name: infrastructure\n"
+        "driver: terraform\n"
+        "source:\n"
+        "  path: infra/deploy\n"
+    )
+    receipt_path = observed / "units/infrastructure.yaml"
     receipt_path.parent.mkdir(parents=True)
     receipt_path.write_text(
         json.dumps(
             deploy_release.serialize_receipt_document(
                 {
-                    "unit": "application-images",
-                    "driver": "oci-images",
+                    "unit": "infrastructure",
+                    "driver": "terraform",
                     "desired": {"revision": "d" * 40, "unitBlob": deploy_release.file_blob(producer)},
                     "resolvedInputs": {},
                     "controller": {
@@ -111,34 +160,17 @@ def test_observation_reference_normalizes_resource_receipt_before_applying_point
                         "revision": "a" * 40,
                         "observed_at": "2026-08-08T00:00:00Z",
                     },
-                    "artifacts": {
-                        "containers.json": {
-                            "schema": 1,
-                            "unit": {
-                                "name": "application-images",
-                                "driver": "oci-images",
-                                "inputHashVersion": 1,
-                                "inputHash": "sha256:" + "1" * 64,
-                                "sourceRevision": "a" * 40,
-                            },
-                            "artifacts": {
-                                "control": {
-                                    "type": "oci-image",
-                                    "uri": "registry.example/control@sha256:" + "1" * 64,
-                                }
-                            },
-                        }
-                    },
+                    "applied": {"sourceRevision": "a" * 40},
+                    "outputs": {"url": "https://example.invalid"},
                 }
             )
         )
     )
 
-    resolved, promotion_inputs, observed_inputs = deploy_release.resolve_template(
+    resolution = deploy_release.resolve_template(
         {
-            "image": {
-                "fromObservation": "units/application-images.yaml",
-                "pointer": "/artifacts/containers.json/artifacts/control/uri",
+            "url": {
+                "fromReceipt": {"unit": "infrastructure", "pointer": "/outputs/url"},
             }
         },
         candidate,
@@ -146,9 +178,10 @@ def test_observation_reference_normalizes_resource_receipt_before_applying_point
         "b" * 40,
     )
 
-    assert resolved == {"image": "registry.example/control@sha256:" + "1" * 64}
-    assert promotion_inputs == {}
-    assert observed_inputs == {"units/application-images.yaml": deploy_release.file_blob(receipt_path)}
+    assert resolution.value == {"url": "https://example.invalid"}
+    assert resolution.promotions == {}
+    assert resolution.receipts == {"infrastructure": deploy_release.file_blob(receipt_path)}
+    assert resolution.artifacts == {}
 
 
 def test_promotion_reference_normalizes_resource_unit_before_applying_pointer(tmp_path):
@@ -168,11 +201,13 @@ def test_promotion_reference_normalizes_resource_unit_before_applying_pointer(tm
         )
     )
 
-    resolved, promotion_inputs, observed_inputs = deploy_release.resolve_template(
+    resolution = deploy_release.resolve_template(
         {
             "image": {
-                "fromPromotion": "units/aws-application.yaml",
-                "pointer": "/terraform/variables/control_image_uri",
+                "fromPromotion": {
+                    "unit": "aws-application",
+                    "pointer": "/terraform/variables/control_image_uri",
+                },
             }
         },
         tmp_path / "candidate",
@@ -181,9 +216,10 @@ def test_promotion_reference_normalizes_resource_unit_before_applying_pointer(tm
         promotion=promotion,
     )
 
-    assert resolved == {"image": "registry.example/control@sha256:" + "1" * 64}
-    assert promotion_inputs == {"units/aws-application.yaml": deploy_release.file_blob(source_unit)}
-    assert observed_inputs == {}
+    assert resolution.value == {"image": "registry.example/control@sha256:" + "1" * 64}
+    assert resolution.promotions == {"aws-application": deploy_release.file_blob(source_unit)}
+    assert resolution.receipts == {}
+    assert resolution.artifacts == {}
 
 
 def test_unknown_unit_fails_before_advancing_desired_state(monkeypatch):
@@ -345,7 +381,7 @@ def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_p
             {
                 "schema": 1,
                 "name": "application-images",
-                "driver": "oci-images",
+                "driver": "terraform",
                 "source": {"path": ".", "revision": "a" * 40},
             },
         )
@@ -371,7 +407,7 @@ def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_p
     )
     monkeypatch.setitem(
         deploy_release.RECONCILIATION_DRIVERS,
-        "oci-images",
+        "terraform",
         SimpleNamespace(reconcile=lambda _context: (_ for _ in ()).throw(AssertionError("clean unit ran its driver"))),
     )
 
@@ -434,7 +470,9 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
 
     def fake_driver(context):
         events.append(("driver", context.source_revision))
-        return {"applied": {"sourceRevision": context.source_revision}, "outputs": {}}
+        return ReconciliationOutput(
+            result={"applied": {"sourceRevision": context.source_revision}, "outputs": {}}
+        )
 
     def fake_publish(*_args):
         events.append(("receipt",))
@@ -449,7 +487,7 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
     monkeypatch.setattr(deploy_release, "observed_tree", fake_observed_tree)
     monkeypatch.setattr(deploy_release, "resolve_ref", unexpected_resolve)
     monkeypatch.setattr(deploy_release, "file_blob", lambda _path: "unit-blob")
-    monkeypatch.setattr(deploy_release, "publish_receipt_cas", fake_publish)
+    monkeypatch.setattr(deploy_release, "publish_observation_cas", fake_publish)
     monkeypatch.setitem(
         deploy_release.RECONCILIATION_DRIVERS,
         "terraform",

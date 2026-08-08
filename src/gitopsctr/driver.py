@@ -24,6 +24,24 @@ class DriverError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class ArtifactDocumentContract:
+    """A logical artifact output and its independently versioned resource contract."""
+
+    api_version: str
+    kind: str
+    contract: DocumentContract
+    media_type: str
+
+
+@dataclass(frozen=True)
+class ReconciliationOutput:
+    """Validated observation facts and artifact resources returned by reconciliation."""
+
+    result: ReconciliationResult = field(default_factory=dict)
+    artifacts: Mapping[str, JsonObject] = field(default_factory=dict)
+
+
 class UnitDriver:
     """A versioned implementation of one unit API kind."""
 
@@ -35,6 +53,7 @@ class UnitDriver:
     unit_contract: ClassVar[DocumentContract]
     desired_unit_contract: ClassVar[DocumentContract]
     result_contract: ClassVar[DocumentContract]
+    artifact_contracts: ClassVar[Mapping[str, ArtifactDocumentContract]] = {}
 
     def scaffold_unit_spec(self, name: str, source_path: str) -> JsonObject | None:
         """Return an authored unit spec body, or ``None`` when scaffolding is unsupported.
@@ -125,8 +144,8 @@ class ReconciliationCapability(ABC):
         return True
 
     @abstractmethod
-    def reconcile(self, context: ReconciliationContext) -> ReconciliationResult:
-        """Converge one unit and return fields for its observation receipt."""
+    def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
+        """Converge one unit and return its observation facts and artifact resources."""
 
     @abstractmethod
     def semantic_result(self, result: object) -> ReconciliationResult:
@@ -157,8 +176,23 @@ class VerificationCapability(ABC):
 SemanticResultSelector = Callable[[object], ReconciliationResult]
 
 
+def _register_artifact_gvk(
+    contracts: dict[str, ArtifactDocumentContract],
+    artifact: ArtifactDocumentContract,
+) -> None:
+    artifact_gvk = f"{artifact.api_version}/{artifact.kind}"
+    registered = contracts.get(artifact_gvk)
+    if registered is not None and (
+        registered.contract.json_schema() != artifact.contract.json_schema()
+        or registered.media_type != artifact.media_type
+    ):
+        raise DriverError(f"artifact GVK {artifact_gvk!r} has conflicting installed contracts")
+    contracts[artifact_gvk] = artifact
+
+
 def load_unit_drivers() -> dict[str, UnitDriver]:
     drivers: dict[str, UnitDriver] = {}
+    artifact_gvks: dict[str, ArtifactDocumentContract] = {}
     for entry_point in entry_points(group="gitopsctr.drivers"):
         driver = entry_point.load()
         if not isinstance(driver, UnitDriver):
@@ -184,6 +218,39 @@ def load_unit_drivers() -> dict[str, UnitDriver]:
                 raise DriverError(
                     f"unit driver entry point {entry_point.name!r} has no {kind.replace('_', '-')} contract"
                 )
+        for artifact_name, artifact in driver.artifact_contracts.items():
+            if not artifact_name or not artifact_name.replace("-", "").isalnum() or not artifact_name.islower():
+                raise DriverError(
+                    f"unit driver entry point {entry_point.name!r} has invalid artifact name {artifact_name!r}"
+                )
+            if not isinstance(artifact, ArtifactDocumentContract) or not isinstance(
+                artifact.contract, DocumentContract
+            ):
+                raise DriverError(
+                    f"unit driver entry point {entry_point.name!r} has an invalid artifact contract"
+                )
+            if not all(
+                isinstance(value, str) and value
+                for value in (artifact.api_version, artifact.kind, artifact.media_type)
+            ):
+                raise DriverError(
+                    f"unit driver entry point {entry_point.name!r} has incomplete artifact metadata"
+                )
+            properties = artifact.contract.json_schema().get("properties", {})
+            if (
+                not isinstance(properties, dict)
+                or properties.get("apiVersion", {}).get("const") != artifact.api_version
+                or properties.get("kind", {}).get("const") != artifact.kind
+            ):
+                raise DriverError(
+                    f"unit driver entry point {entry_point.name!r} artifact {artifact_name!r} "
+                    "metadata does not match its resource contract"
+                )
+            _register_artifact_gvk(artifact_gvks, artifact)
+        if driver.artifact_contracts and not isinstance(driver, ReconciliationCapability):
+            raise DriverError(
+                f"unit driver entry point {entry_point.name!r} advertises artifacts without reconciliation"
+            )
         drivers[driver.driver_name] = driver
     return drivers
 
@@ -209,4 +276,29 @@ def semantic_reconciliation_result(driver_name: str, result: object) -> Reconcil
         driver = RECONCILIATION_DRIVERS[driver_name]
     except KeyError as exc:
         raise DriverError(f"unit driver does not support reconciliation: {driver_name}") from exc
-    return driver.semantic_result(result)
+    artifacts: object = None
+    candidate = result
+    if isinstance(result, Mapping) and "desired" in result and "driver" in result:
+        reserved = {
+            "$schema",
+            "schema",
+            "unit",
+            "driver",
+            "desired",
+            "resolvedInputs",
+            "controller",
+            "artifacts",
+        }
+        candidate = {key: value for key, value in result.items() if key not in reserved}
+        artifacts = result.get("artifacts")
+    semantic = dict(driver.semantic_result(candidate))
+    if isinstance(artifacts, Mapping) and artifacts:
+        semantic["artifacts"] = {
+            name: {
+                key: descriptor[key]
+                for key in ("apiVersion", "kind", "digest")
+                if isinstance(descriptor, Mapping) and key in descriptor
+            }
+            for name, descriptor in artifacts.items()
+        }
+    return semantic

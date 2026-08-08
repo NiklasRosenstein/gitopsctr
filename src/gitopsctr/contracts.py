@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
@@ -27,6 +28,11 @@ class StrictModel(DataClassDictMixin):
 @dataclass(frozen=True, kw_only=True)
 class SchemaDocument(StrictModel):
     schema_hint: Any = field(default=None, metadata={"alias": "$schema"})
+
+
+@dataclass(frozen=True, kw_only=True)
+class EmptyResultModel(StrictModel):
+    pass
 
 
 @dataclass(frozen=True)
@@ -198,7 +204,17 @@ class ReceiptDocument(SchemaDocument):
     desired: ReceiptDesired
     resolvedInputs: dict[str, dict[str, str]] | None = None
     controller: dict[str, Any] | None = None
+    artifacts: dict[str, ArtifactDescriptor] | None = None
     planEvidence: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ArtifactDescriptor(StrictModel):
+    apiVersion: str
+    kind: str
+    path: str
+    digest: str
+    mediaType: str
 
 
 CORE_CONTRACTS: dict[str, DocumentContract] = {
@@ -223,7 +239,35 @@ def schema_url(scope: str, version: int, kind: str) -> str:
     return f"{SCHEMA_ROOT}/{scope}/v{version}/{kind}.schema.json"
 
 
-def receipt_schema(driver: str, version: int, result_contract: DocumentContract) -> JsonObject:
+def artifact_descriptors_schema(artifacts: Mapping[str, tuple[str, str, str]]) -> JsonObject:
+    properties: dict[str, Any] = {}
+    for name, (api_version, kind, media_type) in artifacts.items():
+        properties[name] = {
+            "type": "object",
+            "properties": {
+                "apiVersion": {"const": api_version},
+                "kind": {"const": kind},
+                "path": {"type": "string"},
+                "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                "mediaType": {"enum": [f"{media_type}+yaml", f"{media_type}+json"]},
+            },
+            "required": ["apiVersion", "kind", "path", "digest", "mediaType"],
+            "additionalProperties": False,
+        }
+    return cast(JsonObject, {
+        "type": "object",
+        "properties": properties,
+        "required": sorted(properties),
+        "additionalProperties": False,
+    })
+
+
+def receipt_schema(
+    driver: str,
+    version: int,
+    result_contract: DocumentContract,
+    artifacts: Mapping[str, tuple[str, str, str]] | None = None,
+) -> JsonObject:
     """Compose the generic receipt envelope with a plugin's flattened result."""
     core = deepcopy(CORE_CONTRACTS["receipt"].json_schema())
     result = deepcopy(result_contract.json_schema())
@@ -234,6 +278,9 @@ def receipt_schema(driver: str, version: int, result_contract: DocumentContract)
         component.pop("additionalProperties", None)
     for variant in cast(list[dict[str, Any]], result.get("oneOf", [])):
         variant.pop("additionalProperties", None)
+    if artifacts:
+        cast(dict[str, Any], core["properties"])["artifacts"] = artifact_descriptors_schema(artifacts)
+        cast(list[str], core["required"]).append("artifacts")
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": schema_url(f"drivers/{driver}", version, "receipt"),

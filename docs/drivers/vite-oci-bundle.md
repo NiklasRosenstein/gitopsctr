@@ -2,8 +2,8 @@
 
 The Vite OCI bundle driver installs dependencies, builds a Vite application,
 archives `dist/` deterministically, and publishes the archive as an OCI
-artifact. The resulting `frontend.json` document exposes the immutable bundle
-URI to downstream units.
+artifact. The driver publishes a versioned `FrontendBundle` resource at
+`artifacts/<unit>/frontend.yaml` (or `.json`) for downstream units.
 
 **Kind:** `unit.gitopsctr.io/v1/ViteOciBundle`<br>
 **Capabilities:** planning, reconciliation
@@ -24,7 +24,6 @@ spec:
     nodeVersion: "24"
   publish:
     repository: registry.example/frontend
-  artifacts: [frontend.json]
 ```
 
 The current contract intentionally pins `build.nodeVersion` to `24`. The
@@ -33,10 +32,20 @@ creates a reproducible tar+gzip layer. The optional credential provider uses
 the same AWS ECR shape as the OCI images driver.
 
 Planning performs the local build without publishing. Reconciliation publishes
-the immutable artifact and returns its digest and artifact type.
+the immutable artifact and always produces the driver-defined `frontend`
+artifact; units do not declare artifact filenames.
+
+```yaml
+bundle:
+  fromArtifact:
+    unit: frontend-bundle
+    name: frontend
+    pointer: /bundle/uri
+```
 
 ## Schemas
 
 - [authored unit](../schemas/apis/unit.gitopsctr.io/v1/ViteOciBundle/authored.schema.json)
 - [desired unit](../schemas/apis/unit.gitopsctr.io/v1/ViteOciBundle/desired.schema.json)
 - [receipt](../schemas/apis/unit.gitopsctr.io/v1/ViteOciBundle/receipt.schema.json)
+- [FrontendBundle artifact](../schemas/apis/artifact.gitopsctr.io/v1/FrontendBundle.schema.json)

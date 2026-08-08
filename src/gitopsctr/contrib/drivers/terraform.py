@@ -25,6 +25,7 @@ from gitopsctr.driver import (
     PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
+    ReconciliationOutput,
     ReconciliationResult,
     UnitDriver,
     VerificationCapability,
@@ -229,7 +230,7 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
         if report_text is not None:
             terraform("show", "-no-color", str(plan), reported=True)
 
-    def reconcile(self, context: ReconciliationContext) -> TerraformResult:
+    def reconcile(self, context: ReconciliationContext) -> ReconciliationOutput:
         runtime = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,
@@ -307,10 +308,12 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
                 f"{outputs[output_name]}{path}",
             )
 
-        return {
-            "applied": {"sourceRevision": context.source_revision, "path": context.source_path},
-            "outputs": outputs,
-        }
+        return ReconciliationOutput(
+            result={
+                "applied": {"sourceRevision": context.source_revision, "path": context.source_path},
+                "outputs": outputs,
+            }
+        )
 
     def verify(self, context: VerificationContext) -> VerificationResult:
         runtime = terraform_runtime(context)

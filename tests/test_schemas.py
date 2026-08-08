@@ -36,7 +36,7 @@ def desired_example(unit: dict) -> dict:
     }
     if driver == "kubernetes-manifests":
         desired["materialization"] = {
-            "path": f"manifests/{desired['name']}",
+            "path": f"materialized/{desired['name']}",
             "digest": DIGEST,
             "mediaType": "application/vnd.gitopsctr.kubernetes-manifests.v1",
             "metadata": {
@@ -90,42 +90,8 @@ def test_resource_contracts_use_api_version_instead_of_envelope_schema_field():
 
 RESULTS = {
     "terraform": {"applied": {"sourceRevision": REVISION, "path": "infra"}, "outputs": {}},
-    "oci-images": {
-        "artifacts": {
-            "containers.json": {
-                "schema": 1,
-                "unit": {
-                    "name": "images",
-                    "driver": "oci-images",
-                    "inputHashVersion": 1,
-                    "inputHash": DIGEST,
-                    "sourceRevision": REVISION,
-                },
-                "artifacts": {"app": {"type": "oci-image", "uri": f"registry.example/app@{DIGEST}"}},
-            }
-        }
-    },
-    "vite-oci-bundle": {
-        "artifacts": {
-            "frontend.json": {
-                "schema": 1,
-                "unit": {
-                    "name": "web",
-                    "driver": "vite-oci-bundle",
-                    "inputHashVersion": 1,
-                    "inputHash": DIGEST,
-                    "sourceRevision": REVISION,
-                },
-                "artifacts": {
-                    "bundle": {
-                        "type": "oci-artifact",
-                        "artifactType": "application/vnd.gitopsctr.frontend.v1",
-                        "uri": f"registry.example/web@{DIGEST}",
-                    }
-                },
-            }
-        }
-    },
+    "oci-images": {},
+    "vite-oci-bundle": {},
     "frontend-s3-cloudfront": {
         "published": {
             "sourceRevision": REVISION,
@@ -154,6 +120,17 @@ def test_result_and_composed_receipt_schemas(driver):
         "controller": {"version": "0.1.0", "revision": REVISION, "observed_at": "2026-08-08T00:00:00Z"},
         **result,
     }
+    if plugin.artifact_contracts:
+        receipt["artifacts"] = {
+            name: {
+                "apiVersion": artifact.api_version,
+                "kind": artifact.kind,
+                "path": f"artifacts/example/{name}.yaml",
+                "digest": DIGEST,
+                "mediaType": f"{artifact.media_type}+yaml",
+            }
+            for name, artifact in plugin.artifact_contracts.items()
+        }
 
     receipt_schema = schemas.driver_schema(driver, "receipt")
     Draft202012Validator.check_schema(receipt_schema)
@@ -210,6 +187,9 @@ def test_schema_catalog_is_deterministic_checkable_and_preserves_history(tmp_pat
 
     index = json.loads((tmp_path / "index.json").read_text())
     assert index["drivers"]["terraform"]["version"] == 2
+    assert index["apis"]["artifact.gitopsctr.io/v1/ContainerImages"] == (
+        "apis/artifact.gitopsctr.io/v1/ContainerImages.schema.json"
+    )
     latest = json.loads((tmp_path / "drivers/terraform/latest/unit.schema.json").read_text())
     assert latest["$ref"].endswith("/drivers/terraform/v2/unit.schema.json")
 
@@ -249,11 +229,14 @@ def test_schema_cli_show_export_and_check_work_outside_a_git_repository(tmp_path
 def test_schema_cli_can_show_resource_envelopes():
     environment = schemas.show_schema("gitopsctr.io/v1", "Environment")
     project = schemas.show_schema("gitopsctr.io/v1", "Project")
+    artifact = schemas.show_schema("artifact.gitopsctr.io/v1", "ContainerImages")
     unit = schemas.show_schema("unit.gitopsctr.io/v1/Terraform", "authored")
     receipt = schemas.show_schema("unit.gitopsctr.io/v1", "Terraform/receipt")
     assert environment["properties"]["kind"]["const"] == "Environment"
     assert project["$id"].endswith("/apis/gitopsctr.io/v1/Project.schema.json")
     assert project["properties"]["kind"]["const"] == "Project"
     assert project["properties"]["spec"]["properties"]["writeFormat"]["enum"] == ["yaml", "json"]
+    assert artifact["properties"]["kind"]["const"] == "ContainerImages"
+    assert "images" in artifact["required"]
     assert unit["properties"]["kind"]["const"] == "Terraform"
     assert receipt["properties"]["kind"]["const"] == "Receipt"

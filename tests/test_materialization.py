@@ -77,8 +77,7 @@ def source_tree(root: Path, *, policy: str | None = None, consumer: bool = False
                 "source": {"path": "."},
                 "inputs": {
                     "rendered": {
-                        "fromObservation": "units/rendered.json",
-                        "pointer": "/outputs/value",
+                        "fromReceipt": {"unit": "rendered", "pointer": "/outputs/value"},
                     }
                 },
             },
@@ -117,12 +116,12 @@ def test_advancement_materializes_and_reuses_an_unchanged_payload(tmp_path, monk
     first_unit = cli.load_unit(first / "units/rendered.json", "rendered")
 
     assert plugin.calls == 1
-    assert (first / "manifests/rendered/rendered.yaml").read_text() == (
+    assert (first / "materialized/rendered/rendered.yaml").read_text() == (
         "environment: dev\nrevision: " + "a" * 40 + "\n"
     )
     assert first_unit["materialization"] == {
-        "path": "manifests/rendered",
-        "digest": cli.materialization_tree_digest(first / "manifests/rendered"),
+        "path": "materialized/rendered",
+        "digest": cli.materialization_tree_digest(first / "materialized/rendered"),
         "mediaType": "application/yaml",
         "metadata": {"renderer": "test"},
     }
@@ -133,7 +132,9 @@ def test_advancement_materializes_and_reuses_an_unchanged_payload(tmp_path, monk
     second = materialize_candidate(tmp_path, source, first, "second")
 
     assert plugin.calls == 1
-    assert cli.directory_files(second / "manifests/rendered") == cli.directory_files(first / "manifests/rendered")
+    assert cli.directory_files(second / "materialized/rendered") == cli.directory_files(
+        first / "materialized/rendered"
+    )
     assert cli.load_unit(second / "units/rendered.json", "rendered")["materialization"] == first_unit["materialization"]
 
 
@@ -142,7 +143,7 @@ def test_materialized_payload_tampering_fails_before_status_or_promotion(tmp_pat
     source = tmp_path / "source"
     source_tree(source)
     desired = materialize_candidate(tmp_path, source, tmp_path / "empty", "desired")
-    (desired / "manifests/rendered/rendered.yaml").write_text("tampered: true\n")
+    (desired / "materialized/rendered/rendered.yaml").write_text("tampered: true\n")
 
     with pytest.raises(cli.OperationError, match="does not match its digest"):
         cli.reconciliation_statuses(["rendered"], desired, tmp_path / "desired-observed")

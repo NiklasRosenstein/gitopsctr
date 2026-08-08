@@ -6,9 +6,6 @@
     "name": "frontend-bundle"
   },
   "spec": {
-    "artifacts": [
-      "frontend.json"
-    ],
     "build": {
       "nodeVersion": "24"
     },

@@ -86,7 +86,11 @@ def test_kubernetes_demo_is_a_real_image_and_helm_delivery(tmp_path, monkeypatch
     assert cli.convergence_order(specifications, ["demo-image", "web"]) == ["demo-image", "web"]
     assert specification["source"]["inputs"] == ["**/*"]
     assert specification["materialize"]["type"] == "helm"
-    assert specification["materialize"]["values"]["image"]["fromObservation"] == "units/demo-image.yaml"
+    assert specification["materialize"]["values"]["image"]["fromArtifact"] == {
+        "unit": "demo-image",
+        "name": "containers",
+        "pointer": "/images/application/uri",
+    }
     assert specification["delivery"] == {
         "mode": "direct",
         "kubeContext": kubernetes_demo.kube_context(provider),

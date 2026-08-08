@@ -15,4 +15,3 @@ spec:
       application:
         type: kind
         cluster: __CLUSTER_NAME__
-  artifacts: [containers.json]

@@ -6,6 +6,49 @@
     "$schema": {
       "default": null
     },
+    "artifacts": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "additionalProperties": false,
+            "properties": {
+              "apiVersion": {
+                "type": "string"
+              },
+              "digest": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "mediaType": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "apiVersion",
+              "kind",
+              "path",
+              "digest",
+              "mediaType"
+            ],
+            "title": "ArtifactDescriptor",
+            "type": "object"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "controller": {
       "anyOf": [
         {

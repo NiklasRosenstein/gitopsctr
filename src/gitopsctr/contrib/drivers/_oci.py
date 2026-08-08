@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import cast
 
 from gitopsctr.document import JsonObject
 from gitopsctr.driver import DriverError, UnitExecutionContext
@@ -35,19 +35,20 @@ class RegistryCredentials:
     password: str
 
 
-class ArtifactUnitIdentity(TypedDict):
-    name: str
-    driver: str
-    inputHashVersion: int
-    inputHash: str
-    sourceRevision: str
-
-
-def artifact_unit_identity(context: UnitExecutionContext, input_hash: str, contract: str) -> ArtifactUnitIdentity:
+def artifact_producer_identity(
+    context: UnitExecutionContext,
+    input_hash: str,
+    contract: str,
+    *,
+    kind: str,
+    driver_version: int,
+) -> JsonObject:
     require_strings(context.unit, ("name", "driver"), contract)
     return {
+        "apiVersion": "unit.gitopsctr.io/v1",
+        "kind": kind,
         "name": cast(str, context.unit["name"]),
-        "driver": cast(str, context.unit["driver"]),
+        "driverVersion": driver_version,
         "inputHashVersion": 1,
         "inputHash": input_hash,
         "sourceRevision": context.source_revision,

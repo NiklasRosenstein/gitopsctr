@@ -53,10 +53,11 @@ def test_desired_resolution_logs_unit_and_observation_decision(tmp_path, monkeyp
     monkeypatch.setattr(
         deploy_release,
         "resolve_template",
-        lambda value, *_args: (
-            value,
-            {},
-            {"units/aws-application.json": "new"},
+        lambda value, *_args: deploy_release.TemplateResolution(
+            value=value,
+            promotions={},
+            receipts={"aws-application": "new"},
+            artifacts={},
         ),
     )
 
@@ -88,7 +89,6 @@ def test_desired_candidate_drops_legacy_artifact_catalogue(tmp_path, monkeypatch
         "name": "application-images",
         "driver": "oci-images",
         "source": {"path": "."},
-        "artifacts": ["containers.json"],
     }
     _write_json(
         source / "deployment/environments/dev/environment.json",
@@ -160,8 +160,7 @@ def test_blocked_driver_transition_omits_previous_unit_and_reports_wait(tmp_path
         "source": {"path": "scripts/deployment_drivers.py"},
         "inputs": {
             "bundle": {
-                "fromObservation": "units/frontend-bundle.json",
-                "pointer": "/artifacts/frontend.json/artifacts/bundle/uri",
+                "fromArtifact": {"unit": "frontend-bundle", "name": "frontend", "pointer": "/bundle/uri"},
             }
         },
     }
@@ -216,8 +215,7 @@ def test_blocked_unit_with_same_driver_retains_previous_desired_state(tmp_path, 
         "source": {"path": "scripts/deployment_drivers.py"},
         "inputs": {
             "bundle": {
-                "fromObservation": "units/frontend-bundle.json",
-                "pointer": "/artifacts/frontend.json/artifacts/bundle/uri",
+                "fromArtifact": {"unit": "frontend-bundle", "name": "frontend", "pointer": "/bundle/uri"},
             }
         },
     }
@@ -259,7 +257,6 @@ def test_removing_producer_environment_preserves_existing_input_hash(tmp_path):
         "source": {"path": ".", "inputs": ["Dockerfile"]},
         "build": {"dockerfile": "Dockerfile", "platform": "linux/amd64"},
         "publish": {"targets": {"control": {"type": "registry", "repository": "registry.example.com/control"}}},
-        "artifacts": ["containers.json"],
     }
     legacy_specification = {**specification, "environment": "dev"}
     legacy_hash = deploy_release.unit_input_hash(legacy_specification, source)
@@ -351,11 +348,13 @@ def test_promotion_reference_materializes_from_source_desired_unit(tmp_path):
         {"terraform": {"variables": {"control_image_uri": "registry.example/control@sha256:" + "1" * 64}}},
     )
 
-    resolved, promotion_inputs, observed_inputs = deploy_release.resolve_template(
+    resolution = deploy_release.resolve_template(
         {
             "image": {
-                "fromPromotion": "units/aws-application.json",
-                "pointer": "/terraform/variables/control_image_uri",
+                "fromPromotion": {
+                    "unit": "aws-application",
+                    "pointer": "/terraform/variables/control_image_uri",
+                },
             }
         },
         tmp_path / "candidate",
@@ -364,9 +363,10 @@ def test_promotion_reference_materializes_from_source_desired_unit(tmp_path):
         promotion=promotion,
     )
 
-    assert resolved == {"image": "registry.example/control@sha256:" + "1" * 64}
-    assert promotion_inputs == {"units/aws-application.json": deploy_release.file_blob(source_unit)}
-    assert observed_inputs == {}
+    assert resolution.value == {"image": "registry.example/control@sha256:" + "1" * 64}
+    assert resolution.promotions == {"aws-application": deploy_release.file_blob(source_unit)}
+    assert resolution.receipts == {}
+    assert resolution.artifacts == {}
 
 
 def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path, monkeypatch):
@@ -383,8 +383,10 @@ def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path
         "terraform": {
             "variables": {
                 "control_image_uri": {
-                    "fromPromotion": "units/aws-application.json",
-                    "pointer": "/terraform/variables/control_image_uri",
+                    "fromPromotion": {
+                        "unit": "aws-application",
+                        "pointer": "/terraform/variables/control_image_uri",
+                    },
                 }
             }
         },
@@ -449,8 +451,8 @@ def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path
     )
     unit = deploy_release.load_unit(unit_path, "aws-application")
     assert unit["terraform"]["variables"]["control_image_uri"].endswith("1" * 64)
-    assert unit["resolvedInputs"]["promotion"] == {
-        "units/aws-application.json": deploy_release.file_blob(promoted_unit)
+    assert unit["resolvedInputs"]["promotions"] == {
+        "aws-application": deploy_release.file_blob(promoted_unit)
     }
     promotion_path = deploy_release.document_candidates(candidate, "promotion")[0]
     assert promotion_path.read_text().startswith(
@@ -804,7 +806,17 @@ def test_duplicate_receipt_reuses_identical_semantic_result_without_writing(tmp_
         "planEvidence": {"digest": "different-and-ignored"},
     }
 
-    assert deploy_release.publish_receipt_cas("observed/dev", "aws-application", candidate, "c" * 40) == "b" * 40
+    assert (
+        deploy_release.publish_observation_cas(
+                "observed/dev",
+                "aws-application",
+                candidate,
+                {"name": "aws-application", "driver": "terraform"},
+                {},
+                "c" * 40,
+        )
+        == "b" * 40
+    )
 
 
 def test_duplicate_receipt_rejects_a_different_semantic_result(tmp_path, monkeypatch):
@@ -828,7 +840,14 @@ def test_duplicate_receipt_rejects_a_different_semantic_result(tmp_path, monkeyp
     }
 
     with pytest.raises(deploy_release.OperationError, match="different semantic result"):
-        deploy_release.publish_receipt_cas("observed/dev", "aws-application", candidate, "c" * 40)
+        deploy_release.publish_observation_cas(
+            "observed/dev",
+            "aws-application",
+            candidate,
+            {"name": "aws-application", "driver": "terraform"},
+            {},
+            "c" * 40,
+        )
 
 
 def test_unit_change_explanation_classifies_causal_changes(monkeypatch):
@@ -840,7 +859,7 @@ def test_unit_change_explanation_classifies_causal_changes(monkeypatch):
             "inputHash": "sha256:old",
             "driverVersion": 1,
         },
-        "resolvedInputs": {"observed": {"units/images.json": "old"}},
+        "resolvedInputs": {"receipts": {"images": "old"}},
         "terraform": {"variables": {"environment": "old"}},
     }
     current = {
@@ -851,7 +870,7 @@ def test_unit_change_explanation_classifies_causal_changes(monkeypatch):
             "inputHash": "sha256:new",
             "driverVersion": 2,
         },
-        "resolvedInputs": {"observed": {"units/images.json": "new"}},
+        "resolvedInputs": {"receipts": {"images": "new"}},
         "terraform": {"variables": {"environment": "dev"}},
     }
     monkeypatch.setattr(
@@ -1071,8 +1090,7 @@ def test_convergence_scope_includes_only_transitive_observation_dependencies():
             "aws-application",
             {
                 "image": {
-                    "fromObservation": "units/application-images.json",
-                    "pointer": "/image",
+                    "fromReceipt": {"unit": "application-images", "pointer": "/image"},
                 }
             },
         ),
@@ -1081,12 +1099,10 @@ def test_convergence_scope_includes_only_transitive_observation_dependencies():
             "frontend",
             {
                 "bundle": {
-                    "fromObservation": "units/frontend-bundle.json",
-                    "pointer": "/bundle",
+                    "fromReceipt": {"unit": "frontend-bundle", "pointer": "/bundle"},
                 },
                 "api": {
-                    "fromObservation": "units/aws-application.json",
-                    "pointer": "/api",
+                    "fromReceipt": {"unit": "aws-application", "pointer": "/api"},
                 },
             },
         ),
@@ -1172,8 +1188,7 @@ def test_dependencies_command_prints_the_resolved_tree(monkeypatch, capsys):
                 "producer",
                 {
                     "value": {
-                        "fromObservation": "units/base.json",
-                        "pointer": "/value",
+                        "fromReceipt": {"unit": "base", "pointer": "/value"},
                     }
                 },
             ),
@@ -1184,8 +1199,7 @@ def test_dependencies_command_prints_the_resolved_tree(monkeypatch, capsys):
                 "consumer",
                 {
                     "value": {
-                        "fromObservation": "units/producer.json",
-                        "pointer": "/value",
+                        "fromReceipt": {"unit": "producer", "pointer": "/value"},
                     }
                 },
             ),
@@ -1379,8 +1393,7 @@ def test_converge_runs_dependency_first_and_ignores_unselected_unit(tmp_path, mo
             "consumer",
             {
                 "value": {
-                    "fromObservation": "units/producer.json",
-                    "pointer": "/value",
+                    "fromReceipt": {"unit": "producer", "pointer": "/value"},
                 }
             },
         ),
@@ -1565,8 +1578,7 @@ def test_converge_exits_at_unmerged_promotion_review_gate(tmp_path, monkeypatch,
         "application",
         {
             "image": {
-                "fromPromotion": "units/application.json",
-                "pointer": "/image",
+                "fromPromotion": {"unit": "application", "pointer": "/image"},
             }
         },
     )
@@ -1629,8 +1641,7 @@ def test_promoted_converge_uses_merged_specification_without_source_revision(tmp
                         "application",
                         {
                             "image": {
-                                "fromPromotion": "units/application.json",
-                                "pointer": "/image",
+                                "fromPromotion": {"unit": "application", "pointer": "/image"},
                             }
                         },
                     )
