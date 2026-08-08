@@ -25,10 +25,10 @@ Repository = "https://github.com/NiklasRosenstein/gitopsctr"
 gitopsctr = "gitopsctr.cli:main"
 
 [project.entry-points."gitopsctr.drivers"]
-frontend-s3-cloudfront = "gitopsctr.contrib.driver.implementations:FRONTEND_S3_CLOUDFRONT"
-oci-images = "gitopsctr.contrib.driver.implementations:OCI_IMAGES"
-terraform = "gitopsctr.contrib.driver.implementations:TERRAFORM"
-vite-oci-bundle = "gitopsctr.contrib.driver.implementations:VITE_OCI_BUNDLE"
+frontend-s3-cloudfront = "gitopsctr.contrib.driver.frontend_s3_cloudfront:PLUGIN"
+oci-images = "gitopsctr.contrib.driver.oci_images:PLUGIN"
+terraform = "gitopsctr.contrib.driver.terraform:PLUGIN"
+vite-oci-bundle = "gitopsctr.contrib.driver.vite_oci_bundle:PLUGIN"
 
 [dependency-groups]
 dev = [

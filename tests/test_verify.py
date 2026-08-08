@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import cli as deploy_release
-from gitopsctr.contrib.driver import implementations as deployment_drivers
+from gitopsctr.driver import DriverContext, VerificationResult, VerificationStatus
 
 DESIRED_REVISION = "d" * 40
 
@@ -69,24 +69,24 @@ def test_verify_runs_every_selected_driver_and_reports_drift_after_all_units(mon
         _unit("infrastructure", "terraform", "b" * 40),
     ]
     materialized = _install_desired_state(monkeypatch, units)
-    calls: list[tuple[str, deployment_drivers.DriverContext]] = []
+    calls: list[tuple[str, DriverContext]] = []
 
     def verifier(status):
         def verify(context):
             calls.append((context.unit["name"], context))
-            return deployment_drivers.VerificationResult(status)
+            return VerificationResult(status)
 
         return verify
 
     monkeypatch.setitem(
         deploy_release.VERIFICATION_DRIVERS,
         "oci-images",
-        verifier(deployment_drivers.VerificationStatus.DRIFT),
+        verifier(VerificationStatus.DRIFT),
     )
     monkeypatch.setitem(
         deploy_release.VERIFICATION_DRIVERS,
         "terraform",
-        verifier(deployment_drivers.VerificationStatus.CLEAN),
+        verifier(VerificationStatus.CLEAN),
     )
 
     with pytest.raises(deploy_release.OperationError, match="detected drift in: images"):
@@ -113,10 +113,7 @@ def test_verify_deduplicates_selected_units_and_reports_clean(monkeypatch, capsy
     monkeypatch.setitem(
         deploy_release.VERIFICATION_DRIVERS,
         "terraform",
-        lambda context: (
-            calls.append(context.unit["name"])
-            or deployment_drivers.VerificationResult(deployment_drivers.VerificationStatus.CLEAN)
-        ),
+        lambda context: calls.append(context.unit["name"]) or VerificationResult(VerificationStatus.CLEAN),
     )
 
     deploy_release.command_verify(Namespace(environment="prod", unit=["infrastructure", "infrastructure"]))
