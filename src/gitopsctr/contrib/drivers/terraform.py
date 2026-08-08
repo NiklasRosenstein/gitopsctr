@@ -321,4 +321,3 @@ class TerraformDriver(UnitDriver, PlanningCapability, ReconciliationCapability, 
 
 
 DRIVER = TerraformDriver()
-PLUGIN = DRIVER

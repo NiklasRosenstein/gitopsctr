@@ -12,7 +12,7 @@ from referencing import Registry, Resource
 
 from gitopsctr import schemas
 from gitopsctr.contracts import CORE_CONTRACTS, ContractError
-from gitopsctr.driver import UNIT_PLUGINS
+from gitopsctr.driver import UNIT_DRIVERS
 
 ROOT = Path(__file__).parents[1]
 REVISION = "a" * 40
@@ -31,7 +31,7 @@ def desired_example(unit: dict) -> dict:
     desired["source"] |= {
         "revision": REVISION,
         "inputHash": DIGEST,
-        "driverVersion": UNIT_PLUGINS[driver].version,
+        "driverVersion": UNIT_DRIVERS[driver].version,
     }
     if driver == "kubernetes-manifests":
         desired["materialization"] = {
@@ -51,7 +51,7 @@ def desired_example(unit: dict) -> dict:
 
 @pytest.mark.parametrize("unit", authored_examples(), ids=lambda unit: f"{unit['driver']}-{unit['name']}")
 def test_builtin_contracts_validate_authored_and_desired_examples(unit):
-    plugin = UNIT_PLUGINS[unit["driver"]]
+    plugin = UNIT_DRIVERS[unit["driver"]]
 
     plugin.unit_contract.validate(unit)
     plugin.desired_unit_contract.validate(desired_example(unit))
@@ -63,7 +63,7 @@ def test_builtin_contracts_validate_authored_and_desired_examples(unit):
 
 def test_schema_hint_is_ignored_for_runtime_validation():
     unit = authored_examples()[0]
-    contract = UNIT_PLUGINS[unit["driver"]].unit_contract
+    contract = UNIT_DRIVERS[unit["driver"]].unit_contract
 
     for hint in (None, "https://example.invalid/schema.json", 42):
         candidate = {key: value for key, value in unit.items() if key != "$schema"}
@@ -126,7 +126,7 @@ RESULTS = {
 
 @pytest.mark.parametrize("driver", sorted(RESULTS))
 def test_result_and_composed_receipt_schemas(driver):
-    plugin = UNIT_PLUGINS[driver]
+    plugin = UNIT_DRIVERS[driver]
     result = RESULTS[driver]
     plugin.result_contract.validate(result)
     receipt = {

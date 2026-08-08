@@ -201,7 +201,7 @@ def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monke
     monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
     monkeypatch.setattr(deploy_release, "file_blob", lambda _path: "same-unit")
     monkeypatch.setitem(
-        deploy_release.PLANNING_PLUGINS,
+        deploy_release.PLANNING_DRIVERS,
         "terraform",
         SimpleNamespace(plan=lambda context: calls.append(context)),
     )
@@ -223,7 +223,7 @@ def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monke
     assert len(calls) == 1
     assert calls[0].report == report
 
-    monkeypatch.delitem(deploy_release.PLANNING_PLUGINS, "terraform")
+    monkeypatch.delitem(deploy_release.PLANNING_DRIVERS, "terraform")
     materializations = 0
     with pytest.raises(deploy_release.OperationError, match="does not support planning"):
         deploy_release.command_reconcile(args)
@@ -274,7 +274,7 @@ def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_p
         lambda reconciled, desired="": outputs.append((reconciled, desired)),
     )
     monkeypatch.setitem(
-        deploy_release.RECONCILIATION_PLUGINS,
+        deploy_release.RECONCILIATION_DRIVERS,
         "oci-images",
         SimpleNamespace(reconcile=lambda _context: (_ for _ in ()).throw(AssertionError("clean unit ran its driver"))),
     )
@@ -355,7 +355,7 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
     monkeypatch.setattr(deploy_release, "file_blob", lambda _path: "unit-blob")
     monkeypatch.setattr(deploy_release, "publish_receipt_cas", fake_publish)
     monkeypatch.setitem(
-        deploy_release.RECONCILIATION_PLUGINS,
+        deploy_release.RECONCILIATION_DRIVERS,
         "terraform",
         SimpleNamespace(reconcile=fake_driver),
     )

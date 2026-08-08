@@ -309,4 +309,3 @@ class OciImagesDriver(UnitDriver, PlanningCapability, ReconciliationCapability):
 
 
 DRIVER = OciImagesDriver()
-PLUGIN = DRIVER

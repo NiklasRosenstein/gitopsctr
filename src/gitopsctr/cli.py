@@ -27,13 +27,12 @@ from gitopsctr.document import ContractError, DocumentContract
 from gitopsctr.driver import (
     DRIVER_GVKS,
     DRIVER_NAMES_BY_GVK,
-    MATERIALIZATION_PLUGINS,
-    PLANNING_PLUGINS,
-    PLUGIN_VERSIONS,
-    RECONCILIATION_PLUGINS,
+    DRIVER_VERSIONS,
+    MATERIALIZATION_DRIVERS,
+    PLANNING_DRIVERS,
+    RECONCILIATION_DRIVERS,
     UNIT_DRIVERS,
-    UNIT_PLUGINS,
-    VERIFICATION_PLUGINS,
+    VERIFICATION_DRIVERS,
     DriverError,
     MaterializationContext,
     MaterializationResult,
@@ -561,7 +560,7 @@ def validate_receipt_document(document: object, description: str) -> dict[str, A
     if driver is None and "$schema" not in document:
         # Pre-contract receipts remain readable; every newly written receipt carries a driver and $schema.
         return document
-    if not isinstance(driver, str) or driver not in UNIT_PLUGINS:
+    if not isinstance(driver, str) or driver not in UNIT_DRIVERS:
         raise OperationError(f"invalid {description}: unknown driver {driver!r}")
     from jsonschema import Draft202012Validator
     from jsonschema.exceptions import ValidationError
@@ -660,7 +659,7 @@ def directory_files(directory: Path) -> dict[str, bytes]:
 
 def unit_requires_reconciliation(unit: dict[str, Any]) -> bool:
     plugin_name = unit.get("driver")
-    plugin = UNIT_PLUGINS.get(plugin_name) if isinstance(plugin_name, str) else None
+    plugin = UNIT_DRIVERS.get(plugin_name) if isinstance(plugin_name, str) else None
     if plugin is None:
         raise OperationError(f"unit uses an unknown plugin: {plugin_name!r}")
     if not isinstance(plugin, ReconciliationCapability):
@@ -698,13 +697,13 @@ def materialization_tree_digest(root: Path) -> str:
 
 def validate_unit_materialization(desired_root: Path, unit_name: str, unit: dict[str, Any]) -> None:
     plugin_name = unit.get("driver")
-    if isinstance(plugin_name, str) and plugin_name in UNIT_PLUGINS:
+    if isinstance(plugin_name, str) and plugin_name in UNIT_DRIVERS:
         validate_document(
-            UNIT_PLUGINS[plugin_name].desired_unit_contract,
+            UNIT_DRIVERS[plugin_name].desired_unit_contract,
             unit,
             f"persisted desired {plugin_name} unit {unit_name}",
         )
-    expects_materialization = isinstance(plugin_name, str) and plugin_name in MATERIALIZATION_PLUGINS
+    expects_materialization = isinstance(plugin_name, str) and plugin_name in MATERIALIZATION_DRIVERS
     descriptor = unit.get("materialization")
     if not expects_materialization:
         if descriptor is not None:
@@ -751,9 +750,9 @@ def require_unit_specification(
         or (expected_name is not None and name != expected_name)
     ):
         raise OperationError(f"invalid unit specification: {expected_name or name!r}")
-    if driver not in UNIT_PLUGINS:
+    if driver not in UNIT_DRIVERS:
         raise OperationError(f"{name} uses an unknown driver: {driver!r}")
-    validate_document(UNIT_PLUGINS[driver].unit_contract, specification, f"{driver} unit {expected_name or name}")
+    validate_document(UNIT_DRIVERS[driver].unit_contract, specification, f"{driver} unit {expected_name or name}")
     if not isinstance(source, dict):
         raise OperationError(f"{name} requires a source object")
     safe_source_path(source.get("path"), f"{name} source path")
@@ -781,7 +780,7 @@ def unit_input_hash(specification: dict[str, Any], source_root: Path) -> str:
         {
             "kind": "unit",
             "driver": driver,
-            "driverVersion": PLUGIN_VERSIONS[driver],
+            "driverVersion": DRIVER_VERSIONS[driver],
             "specification": specification,
         },
     )
@@ -926,7 +925,7 @@ def resolved_unit_source(
             **source,
             "revision": revision,
             "inputHash": input_hash,
-            "driverVersion": PLUGIN_VERSIONS[driver],
+            "driverVersion": DRIVER_VERSIONS[driver],
         },
         inputs_changed,
     )
@@ -1393,12 +1392,12 @@ def materialize_resolved_unit(
     candidate: Path,
 ) -> dict[str, Any]:
     plugin_name = resolved.get("driver")
-    if not isinstance(plugin_name, str) or plugin_name not in UNIT_PLUGINS:
+    if not isinstance(plugin_name, str) or plugin_name not in UNIT_DRIVERS:
         raise OperationError(f"{unit_name} uses an unknown unit plugin: {plugin_name!r}")
-    unit_plugin = UNIT_PLUGINS[plugin_name]
+    unit_plugin = UNIT_DRIVERS[plugin_name]
     desired_schema_id = str(driver_schema(plugin_name, "desired-unit")["$id"])
     resolved = with_schema({key: value for key, value in resolved.items() if key != "$schema"}, desired_schema_id)
-    plugin = MATERIALIZATION_PLUGINS.get(plugin_name) if isinstance(plugin_name, str) else None
+    plugin = MATERIALIZATION_DRIVERS.get(plugin_name) if isinstance(plugin_name, str) else None
     if plugin is None:
         validate_document(unit_plugin.desired_unit_contract, resolved, f"materialized {plugin_name} unit {unit_name}")
         return resolved
@@ -2520,7 +2519,7 @@ def command_verify(args: argparse.Namespace) -> None:
             validate_unit_materialization(desired, unit_name, unit)
             if contains_reference(unit):
                 raise OperationError(f"{unit_name} desired state is not fully materialized")
-            if driver_name not in VERIFICATION_PLUGINS:
+            if driver_name not in VERIFICATION_DRIVERS:
                 raise OperationError(f"{unit_name} uses {driver_name}, which does not support verification")
             prepared.append((unit_name, driver_name, unit, source))
 
@@ -2529,7 +2528,7 @@ def command_verify(args: argparse.Namespace) -> None:
             log_status("VERIFY", f"{unit_name} ({driver_name})")
             source_root = temporary / "sources" / unit_name
             materialize_revision(source["revision"], source_root)
-            result = VERIFICATION_PLUGINS[driver_name].verify(
+            result = VERIFICATION_DRIVERS[driver_name].verify(
                 VerificationContext(
                     environment=args.environment,
                     desired_root=desired,
@@ -2560,9 +2559,9 @@ def require_unit(unit: dict[str, Any], unit_name: str) -> tuple[str, dict[str, s
     if unit.get("schema") != 1 or unit.get("name") != unit_name:
         raise OperationError(f"invalid desired unit: {unit_name}")
     driver = unit.get("driver")
-    if driver not in UNIT_PLUGINS:
+    if driver not in UNIT_DRIVERS:
         raise OperationError(f"{unit_name} uses an unknown unit plugin: {driver!r}")
-    validate_document(UNIT_PLUGINS[driver].desired_unit_contract, unit, f"desired {driver} unit {unit_name}")
+    validate_document(UNIT_DRIVERS[driver].desired_unit_contract, unit, f"desired {driver} unit {unit_name}")
     source = unit.get("source")
     if not isinstance(source, dict) or not isinstance(source.get("path"), str):
         raise OperationError(f"{unit_name} has an invalid source")
@@ -2570,10 +2569,10 @@ def require_unit(unit: dict[str, Any], unit_name: str) -> tuple[str, dict[str, s
     if not re.fullmatch(r"[0-9a-f]{40}", str(source.get("revision", ""))):
         raise OperationError(f"{unit_name} has an invalid source revision")
     recorded_version = source.get("driverVersion")
-    if recorded_version is not None and recorded_version != PLUGIN_VERSIONS[driver]:
+    if recorded_version is not None and recorded_version != DRIVER_VERSIONS[driver]:
         raise OperationError(
             f"{unit_name} requires {driver} driver version {recorded_version}; "
-            f"controller provides {PLUGIN_VERSIONS[driver]}"
+            f"controller provides {DRIVER_VERSIONS[driver]}"
         )
     return driver, source
 
@@ -2977,7 +2976,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         }
         if args.plan:
             try:
-                planner = PLANNING_PLUGINS[driver_name]
+                planner = PLANNING_DRIVERS[driver_name]
             except KeyError as exc:
                 raise OperationError(f"{args.unit} uses {driver_name}, which does not support planning") from exc
             planned = planner.plan(PlanningContext(**execution))
@@ -2988,7 +2987,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             write_reconcile_outputs(False)
             return False
         try:
-            plugin = RECONCILIATION_PLUGINS[driver_name]
+            plugin = RECONCILIATION_DRIVERS[driver_name]
         except KeyError as exc:
             raise OperationError(f"{args.unit} uses {driver_name}, which does not support reconciliation") from exc
         result = plugin.reconcile(
@@ -2997,7 +2996,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 previous_receipt=previous_receipt,
             )
         )
-        validate_document(UNIT_PLUGINS[driver_name].result_contract, result, f"{driver_name} reconciliation result")
+        validate_document(UNIT_DRIVERS[driver_name].result_contract, result, f"{driver_name} reconciliation result")
         reserved = {
             "schema",
             "unit",

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import driver as driver_registry
-from gitopsctr.contrib.driver import (
+from gitopsctr.contrib.drivers import (
     _oci,
     frontend_s3_cloudfront,
     kubernetes_manifests,
@@ -25,7 +25,7 @@ from gitopsctr.driver import (
     PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
-    UnitPlugin,
+    UnitDriver,
     VerificationCapability,
     VerificationResult,
     VerificationStatus,
@@ -79,31 +79,31 @@ def test_contributed_driver_entry_points_load_one_module_per_driver():
         "unit.gitopsctr.io/v1/Terraform": "gitopsctr.contrib.drivers.terraform:DRIVER",
         "unit.gitopsctr.io/v1/ViteOciBundle": "gitopsctr.contrib.drivers.vite_oci_bundle:DRIVER",
     }
-    assert {plugin.reconcile.__module__ for plugin in driver_registry.RECONCILIATION_PLUGINS.values()} == {
+    assert {plugin.reconcile.__module__ for plugin in driver_registry.RECONCILIATION_DRIVERS.values()} == {
         "gitopsctr.contrib.drivers.frontend_s3_cloudfront",
         "gitopsctr.contrib.drivers.kubernetes_manifests",
         "gitopsctr.contrib.drivers.oci_images",
         "gitopsctr.contrib.drivers.terraform",
         "gitopsctr.contrib.drivers.vite_oci_bundle",
     }
-    assert all(isinstance(plugin, UnitPlugin) for plugin in driver_registry.UNIT_PLUGINS.values())
+    assert all(isinstance(plugin, UnitDriver) for plugin in driver_registry.UNIT_DRIVERS.values())
 
 
 def test_driver_capabilities_are_independent_and_explicit():
-    assert all(isinstance(plugin, PlanningCapability) for plugin in driver_registry.PLANNING_PLUGINS.values())
-    assert isinstance(terraform.PLUGIN, VerificationCapability)
-    assert isinstance(kubernetes_manifests.PLUGIN, VerificationCapability)
-    assert not isinstance(oci_images.PLUGIN, VerificationCapability)
-    assert not isinstance(vite_oci_bundle.PLUGIN, VerificationCapability)
-    assert not isinstance(frontend_s3_cloudfront.PLUGIN, VerificationCapability)
-    assert driver_registry.VERIFICATION_PLUGINS == {
-        "kubernetes-manifests": kubernetes_manifests.PLUGIN,
-        "terraform": terraform.PLUGIN,
+    assert all(isinstance(plugin, PlanningCapability) for plugin in driver_registry.PLANNING_DRIVERS.values())
+    assert isinstance(terraform.DRIVER, VerificationCapability)
+    assert isinstance(kubernetes_manifests.DRIVER, VerificationCapability)
+    assert not isinstance(oci_images.DRIVER, VerificationCapability)
+    assert not isinstance(vite_oci_bundle.DRIVER, VerificationCapability)
+    assert not isinstance(frontend_s3_cloudfront.DRIVER, VerificationCapability)
+    assert driver_registry.VERIFICATION_DRIVERS == {
+        "kubernetes-manifests": kubernetes_manifests.DRIVER,
+        "terraform": terraform.DRIVER,
     }
 
 
 def test_reconciliation_capability_requires_core_operations():
-    class IncompletePlugin(UnitPlugin, ReconciliationCapability):
+    class IncompletePlugin(UnitDriver, ReconciliationCapability):
         version = 1
 
     with pytest.raises(TypeError, match="abstract"):
@@ -210,7 +210,7 @@ def test_oci_images_uses_optional_aws_ecr_provider_without_persisting_credential
         _oci_context(tmp_path, credential_provider={"type": "aws-ecr"}),
         execution=execution_for(fake_run),
     )
-    result = oci_images.PLUGIN.reconcile(context)
+    result = oci_images.DRIVER.reconcile(context)
 
     aws_command = next(command for command, _ in commands if command[0] == "aws")
     assert aws_command == ("aws", "ecr", "get-login-password", "--region", "eu-west-1")
@@ -243,7 +243,7 @@ def test_oci_images_without_provider_uses_existing_docker_auth(tmp_path, monkeyp
 
     monkeypatch.setattr(oci_images, "oci_digest", fake_digest)
 
-    result = oci_images.PLUGIN.reconcile(replace(_oci_context(tmp_path), execution=execution_for(unexpected_run)))
+    result = oci_images.DRIVER.reconcile(replace(_oci_context(tmp_path), execution=execution_for(unexpected_run)))
 
     assert environments == [None, None]
     assert result["artifacts"]["containers.json"]["artifacts"]["control"]["uri"] == (
@@ -274,7 +274,7 @@ def test_oci_images_rejects_invalid_provider_and_repository_configuration(
     )
 
     with pytest.raises(DriverError, match=message):
-        oci_images.PLUGIN.reconcile(
+        oci_images.DRIVER.reconcile(
             replace(
                 _oci_context(
                     tmp_path,
@@ -305,7 +305,7 @@ def test_oci_images_plan_builds_without_requesting_credentials(tmp_path, monkeyp
             execution=execution_for(fake_run),
         )
     )
-    assert oci_images.PLUGIN.plan(context) is None
+    assert oci_images.DRIVER.plan(context) is None
     assert commands == [
         (
             "docker",
@@ -339,7 +339,7 @@ def test_oci_images_recovers_partial_publication_without_rebuilding(tmp_path, mo
 
     monkeypatch.setattr(oci_images, "oci_digest", fake_digest)
 
-    result = oci_images.PLUGIN.reconcile(replace(_oci_context(tmp_path), execution=execution_for(fake_run)))
+    result = oci_images.DRIVER.reconcile(replace(_oci_context(tmp_path), execution=execution_for(fake_run)))
 
     assert not any(command[:2] == ("docker", "build") for command in commands)
     assert any(command[:2] == ("docker", "pull") for command in commands)
@@ -356,7 +356,7 @@ def test_oci_images_rejects_disagreeing_repository_digests(tmp_path, monkeypatch
     )
 
     with pytest.raises(DriverError, match="disagree"):
-        oci_images.PLUGIN.reconcile(
+        oci_images.DRIVER.reconcile(
             replace(_oci_context(tmp_path), execution=execution_for(lambda *_args, **_kwargs: None))
         )
 
@@ -398,7 +398,7 @@ def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path,
         execution=execution_for(lambda *_args, **_kwargs: pytest.fail("existing artifact must skip all commands")),
     )
 
-    result = vite_oci_bundle.PLUGIN.reconcile(context)
+    result = vite_oci_bundle.DRIVER.reconcile(context)
 
     assert result["artifacts"]["frontend.json"]["artifacts"]["bundle"]["uri"] == (
         f"{REGISTRY}/example-application-frontend@{DIGEST}"
@@ -479,9 +479,9 @@ def test_frontend_deploy_overwrites_index_and_verifies_cloudfront(tmp_path, monk
 
     if stale_index:
         with pytest.raises(DriverError, match="did not serve"):
-            frontend_s3_cloudfront.PLUGIN.reconcile(context)
+            frontend_s3_cloudfront.DRIVER.reconcile(context)
     else:
-        result = frontend_s3_cloudfront.PLUGIN.reconcile(context)
+        result = frontend_s3_cloudfront.DRIVER.reconcile(context)
         assert result["published"]["bundle"] == context.inputs["bundle"]
 
     index_upload = next(
@@ -542,7 +542,7 @@ def test_terraform_accepts_driver_neutral_backend_configuration(tmp_path, monkey
         _terraform_context(tmp_path, tmp_path / "report", {"path": str(state)}),
         execution=execution_for(fake_run),
     )
-    terraform.PLUGIN.plan(_planning_context(reconciliation))
+    terraform.DRIVER.plan(_planning_context(reconciliation))
 
     init = next(command for command in commands if command[1] == "init")
     assert init == ("terraform", "init", f"-backend-config=path={state}")
@@ -550,7 +550,7 @@ def test_terraform_accepts_driver_neutral_backend_configuration(tmp_path, monkey
 
 def test_terraform_rejects_structured_backend_values(tmp_path):
     with pytest.raises(DriverError, match="strings, numbers, or booleans"):
-        terraform.PLUGIN.plan(
+        terraform.DRIVER.plan(
             _planning_context(_terraform_context(tmp_path, tmp_path / "report", {"path": ["not", "a", "scalar"]}))
         )
 
@@ -570,7 +570,7 @@ def test_terraform_plan_saves_binary_plan_and_rendered_report(tmp_path, monkeypa
         return subprocess.CompletedProcess(args, 0, "initialized\n", "")
 
     reconciliation = replace(_terraform_context(tmp_path, report), execution=execution_for(fake_run))
-    result = terraform.PLUGIN.plan(_planning_context(reconciliation))
+    result = terraform.DRIVER.plan(_planning_context(reconciliation))
 
     assert result is None
     assert (report / "plan.tfplan").read_bytes() == b"saved plan"
@@ -597,7 +597,7 @@ def test_terraform_report_contains_plan_failure_diagnostics(tmp_path, monkeypatc
 
     with pytest.raises(subprocess.CalledProcessError):
         reconciliation = replace(_terraform_context(tmp_path, report), execution=execution_for(fake_run))
-        terraform.PLUGIN.plan(_planning_context(reconciliation))
+        terraform.DRIVER.plan(_planning_context(reconciliation))
 
     assert (report / "plan.txt").read_text() == "Error: speculative plan failed\n"
     assert not (report / "plan.tfplan").exists()
@@ -625,7 +625,7 @@ def test_terraform_verification_uses_refresh_enabled_read_only_saved_plan(
         return subprocess.CompletedProcess(args, 0, "initialized\n", "")
 
     reconciliation = replace(_terraform_context(tmp_path, report), execution=execution_for(fake_run))
-    result = driver_registry.VERIFICATION_PLUGINS["terraform"].verify(
+    result = driver_registry.VERIFICATION_DRIVERS["terraform"].verify(
         driver_registry.VerificationContext(
             environment=reconciliation.environment,
             desired_root=reconciliation.desired_root,
@@ -663,7 +663,7 @@ def test_terraform_verification_turns_other_exit_codes_into_driver_errors(tmp_pa
         return subprocess.CompletedProcess(args, 0, "initialized\n", "")
 
     with pytest.raises(DriverError, match="state lock failed"):
-        terraform.PLUGIN.verify(replace(_terraform_context(tmp_path, report), execution=execution_for(fake_run)))
+        terraform.DRIVER.verify(replace(_terraform_context(tmp_path, report), execution=execution_for(fake_run)))
 
     assert (report / "verify.txt").read_text() == "Error: state lock failed\n"
 
@@ -706,8 +706,8 @@ def test_driver_semantics_select_only_driver_defined_result_fields(driver, resul
 
 
 def test_every_reconciliation_driver_defines_result_semantics():
-    assert set(driver_registry.UNIT_PLUGINS) == set(driver_registry.RECONCILIATION_PLUGINS)
-    assert driver_registry.load_unit_plugins() == driver_registry.UNIT_PLUGINS
+    assert set(driver_registry.UNIT_DRIVERS) == set(driver_registry.RECONCILIATION_DRIVERS)
+    assert driver_registry.load_unit_drivers() == driver_registry.UNIT_DRIVERS
 
 
 @pytest.mark.parametrize(

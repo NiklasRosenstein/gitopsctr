@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from gitopsctr.contrib.driver import kubernetes_manifests as kubernetes
+from gitopsctr.contrib.drivers import kubernetes_manifests as kubernetes
 from gitopsctr.driver import (
     DriverError,
     MaterializationContext,
@@ -169,7 +169,7 @@ def test_plain_materialization_preserves_paths_and_records_inventory(tmp_path):
     (chart / "nested/worker.yml").write_text(manifest("Service", "worker", ""))
     desired_unit = unit(renderer={"type": "plain", "paths": ["*.yaml", "nested/*.yml"]})
 
-    result = kubernetes.PLUGIN.materialize(materialization_context(tmp_path, desired_unit))
+    result = kubernetes.DRIVER.materialize(materialization_context(tmp_path, desired_unit))
 
     assert (tmp_path / "output/root.yaml").read_text() == manifest()
     assert (tmp_path / "output/nested/worker.yml").read_text() == manifest("Service", "worker", "")
@@ -205,7 +205,7 @@ def test_helm_materialization_records_installed_version_and_resolved_values(tmp_
         }
     )
 
-    result = kubernetes.PLUGIN.materialize(materialization_context(tmp_path, desired_unit, run))
+    result = kubernetes.DRIVER.materialize(materialization_context(tmp_path, desired_unit, run))
 
     assert (tmp_path / "output/manifest.yaml").read_text() == manifest()
     assert result.metadata["renderer"] == "helm"
@@ -219,19 +219,19 @@ def test_materialization_rejects_core_secrets_by_default(tmp_path):
     (chart / "secret.yaml").write_text(manifest("Secret", "credentials"))
 
     with pytest.raises(DriverError, match="refuses core Secret"):
-        kubernetes.PLUGIN.materialize(materialization_context(tmp_path, unit()))
+        kubernetes.DRIVER.materialize(materialization_context(tmp_path, unit()))
 
     shutil.rmtree(tmp_path / "output")
     allowed = unit(renderer={"type": "plain", "paths": ["*.yaml"], "allowSecrets": True})
-    result = kubernetes.PLUGIN.materialize(materialization_context(tmp_path, allowed))
+    result = kubernetes.DRIVER.materialize(materialization_context(tmp_path, allowed))
     assert result.metadata["inventory"][0]["kind"] == "Secret"
 
 
 def test_external_delivery_without_observer_is_materialization_only():
     desired_unit = unit()
 
-    assert kubernetes.PLUGIN.reconciliation_required(desired_unit) is False
-    assert kubernetes.PLUGIN.verification_supported(desired_unit) is False
+    assert kubernetes.DRIVER.reconciliation_required(desired_unit) is False
+    assert kubernetes.DRIVER.verification_supported(desired_unit) is False
 
 
 def test_direct_delivery_applies_waits_then_prunes_previous_inventory(tmp_path, monkeypatch):
@@ -264,7 +264,7 @@ def test_direct_delivery_applies_waits_then_prunes_previous_inventory(tmp_path, 
         calls.append((args, kwargs))
         return completed(args)
 
-    result = kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit, previous, runner))
+    result = kubernetes.DRIVER.reconcile(reconciliation_context(tmp_path, desired_unit, previous, runner))
 
     assert result["applied"]["manifestDigest"] == DIGEST
     assert [call[0][3] for call in calls] == ["apply", "--namespace", "delete"]
@@ -294,7 +294,7 @@ def test_direct_plan_has_no_kubectl_effects(tmp_path, monkeypatch):
     def runner(*_args, **_kwargs):
         pytest.fail("kubectl must not run")
 
-    result = kubernetes.PLUGIN.plan(planning_context(tmp_path, desired_unit, runner))
+    result = kubernetes.DRIVER.plan(planning_context(tmp_path, desired_unit, runner))
 
     assert result is None
 
@@ -311,7 +311,7 @@ def test_direct_verification_uses_kubectl_diff(exit_code, status, tmp_path, monk
         calls.append((args, kwargs))
         return completed(args, returncode=exit_code)
 
-    assert kubernetes.PLUGIN.verify(verification_context(tmp_path, desired_unit, runner)).status is status
+    assert kubernetes.DRIVER.verify(verification_context(tmp_path, desired_unit, runner)).status is status
     assert calls[0][0][3:6] == ("diff", "--server-side", "--field-manager=gitopsctr-dev-web")
     assert calls[0][1]["output"] is CommandOutput.CAPTURE
     assert calls[0][1]["check"] is False
@@ -349,7 +349,7 @@ def test_argo_observation_supports_both_read_only_transports(access, tmp_path, m
         calls.append((args, kwargs))
         return completed(args, stdout=json.dumps(application()))
 
-    result = kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
+    result = kubernetes.DRIVER.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
 
     assert result == {
         "observed": {
@@ -375,7 +375,7 @@ def test_argo_wrong_revision_times_out_without_a_receipt(tmp_path, monkeypatch):
     monkeypatch.setattr(kubernetes.time, "sleep", lambda _seconds: None)
 
     with pytest.raises(DriverError, match="timed out"):
-        kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
+        kubernetes.DRIVER.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
 
 
 def test_argo_degraded_and_multi_source_applications_fail(tmp_path, monkeypatch):
@@ -386,9 +386,9 @@ def test_argo_degraded_and_multi_source_applications_fail(tmp_path, monkeypatch)
         return completed(args, stdout=json.dumps(next(responses)))
 
     with pytest.raises(DriverError, match="health is Degraded"):
-        kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
+        kubernetes.DRIVER.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
     with pytest.raises(DriverError, match="single-source"):
-        kubernetes.PLUGIN.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
+        kubernetes.DRIVER.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
 
 
 def test_argo_verification_reports_status_mismatch_as_drift(tmp_path, monkeypatch):
@@ -398,6 +398,6 @@ def test_argo_verification_reports_status_mismatch_as_drift(tmp_path, monkeypatc
         return completed(args, stdout=json.dumps(application(sync="OutOfSync")))
 
     assert (
-        kubernetes.PLUGIN.verify(verification_context(tmp_path, desired_unit, runner)).status
+        kubernetes.DRIVER.verify(verification_context(tmp_path, desired_unit, runner)).status
         is VerificationStatus.DRIFT
     )

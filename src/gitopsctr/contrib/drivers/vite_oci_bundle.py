@@ -284,4 +284,3 @@ class ViteOciBundleDriver(UnitDriver, PlanningCapability, ReconciliationCapabili
 
 
 DRIVER = ViteOciBundleDriver()
-PLUGIN = DRIVER

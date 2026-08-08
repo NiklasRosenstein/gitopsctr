@@ -5,7 +5,7 @@ import pytest
 
 from gitopsctr import cli
 from gitopsctr.document import DocumentContract, JsonObject
-from gitopsctr.driver import MaterializationCapability, MaterializationContext, MaterializationResult, UnitPlugin
+from gitopsctr.driver import MaterializationCapability, MaterializationContext, MaterializationResult, UnitDriver
 
 
 class RenderOnlyContract(DocumentContract):
@@ -17,7 +17,7 @@ class RenderOnlyContract(DocumentContract):
         return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object"}
 
 
-class RenderOnlyPlugin(UnitPlugin, MaterializationCapability):
+class RenderOnlyPlugin(UnitDriver, MaterializationCapability):
     version = 1
     unit_contract = RenderOnlyContract()
     desired_unit_contract = RenderOnlyContract()
@@ -43,9 +43,9 @@ def write_json(path: Path, value: object) -> None:
 
 def install_render_only(monkeypatch: pytest.MonkeyPatch) -> RenderOnlyPlugin:
     plugin = RenderOnlyPlugin()
-    monkeypatch.setitem(cli.UNIT_PLUGINS, "render-only", plugin)
-    monkeypatch.setitem(cli.MATERIALIZATION_PLUGINS, "render-only", plugin)
-    monkeypatch.setitem(cli.PLUGIN_VERSIONS, "render-only", plugin.version)
+    monkeypatch.setitem(cli.UNIT_DRIVERS, "render-only", plugin)
+    monkeypatch.setitem(cli.MATERIALIZATION_DRIVERS, "render-only", plugin)
+    monkeypatch.setitem(cli.DRIVER_VERSIONS, "render-only", plugin.version)
     return plugin
 
 

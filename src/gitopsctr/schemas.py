@@ -9,7 +9,7 @@ from typing import Any, cast
 
 from gitopsctr.contracts import CORE_CONTRACTS, SCHEMA_ROOT, receipt_schema, schema_url
 from gitopsctr.document import DocumentContract, JsonObject
-from gitopsctr.driver import UNIT_DRIVERS, UNIT_PLUGINS, UnitDriver
+from gitopsctr.driver import UNIT_DRIVERS, UnitDriver
 from gitopsctr.formats import PROJECT_CONFIG_SCHEMA
 
 DRIVER_KINDS = ("unit", "desired-unit", "result", "receipt")
@@ -179,7 +179,7 @@ def project_config_schema() -> JsonObject:
 
 def driver_schema(driver: str, kind: str) -> JsonObject:
     try:
-        plugin = UNIT_PLUGINS[driver]
+        plugin = UNIT_DRIVERS[driver]
     except KeyError as exc:
         raise ValueError(f"unknown schema driver: {driver}") from exc
     contracts: dict[str, DocumentContract] = {
@@ -236,7 +236,7 @@ def schema_documents() -> dict[Path, JsonObject]:
         path = Path("core/v1") / f"{kind}.schema.json"
         documents[path] = contract.json_schema()
         index["core"][kind] = path.as_posix()
-    for driver, plugin in sorted(UNIT_PLUGINS.items()):
+    for driver, plugin in sorted(UNIT_DRIVERS.items()):
         version_root = Path("drivers") / driver / f"v{plugin.version}"
         latest_root = Path("drivers") / driver / "latest"
         driver_index = {"version": plugin.version, "schemas": {}}

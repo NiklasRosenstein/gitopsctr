@@ -1,8 +1,7 @@
 """Unit driver contracts and entry-point discovery.
 
 A unit is a resource instance; a :class:`UnitDriver` implements the resource
-kind and advertises the capabilities it supports.  ``Plugin`` remains a
-packaging/discovery term, not the runtime domain model.
+kind and advertises the capabilities it supports.
 """
 
 from __future__ import annotations
@@ -201,15 +200,3 @@ def semantic_reconciliation_result(driver_name: str, result: object) -> Reconcil
     except KeyError as exc:
         raise DriverError(f"unit driver does not support reconciliation: {driver_name}") from exc
     return driver.semantic_result(result)
-
-
-# Transitional aliases keep the existing CLI/test surface usable while the
-# repository documents and entry points move to the UnitDriver vocabulary.
-UnitPlugin = UnitDriver
-load_unit_plugins = load_unit_drivers
-UNIT_PLUGINS = UNIT_DRIVERS
-PLUGIN_VERSIONS = DRIVER_VERSIONS
-MATERIALIZATION_PLUGINS = MATERIALIZATION_DRIVERS
-RECONCILIATION_PLUGINS = RECONCILIATION_DRIVERS
-PLANNING_PLUGINS = PLANNING_DRIVERS
-VERIFICATION_PLUGINS = VERIFICATION_DRIVERS

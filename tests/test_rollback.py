@@ -39,7 +39,7 @@ def _desired_unit(name: str, revision: str, value: str) -> dict:
             "path": "infra/deploy",
             "revision": revision,
             "inputHash": f"sha256:{value}",
-            "driverVersion": deploy_release.PLUGIN_VERSIONS["terraform"],
+            "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"],
         },
         "terraform": {"variables": {"value": value}},
     }
@@ -308,9 +308,9 @@ def _install_rollback_simulation(
     monkeypatch.setattr(deploy_release, "publish_tree", publish)
     if materialized_payloads:
         monkeypatch.setitem(
-            deploy_release.MATERIALIZATION_PLUGINS,
+            deploy_release.MATERIALIZATION_DRIVERS,
             "terraform",
-            deploy_release.UNIT_PLUGINS["terraform"],
+            deploy_release.UNIT_DRIVERS["terraform"],
         )
     return revisions, publications
 

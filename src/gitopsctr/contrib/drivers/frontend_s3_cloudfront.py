@@ -363,4 +363,3 @@ class FrontendS3CloudfrontDriver(UnitDriver, PlanningCapability, ReconciliationC
 
 
 DRIVER = FrontendS3CloudfrontDriver()
-PLUGIN = DRIVER

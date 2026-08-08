@@ -426,7 +426,7 @@ def argo_application_status(document: dict[str, Any]) -> tuple[str, str, str]:
     return revision, sync_status, health_status
 
 
-class KubernetesManifestsPlugin(
+class KubernetesManifestsDriver(
     UnitDriver,
     MaterializationCapability,
     PlanningCapability,
@@ -690,5 +690,4 @@ class KubernetesManifestsPlugin(
         raise DriverError("kubernetes-manifests result must contain exactly applied or observed")
 
 
-DRIVER = KubernetesManifestsPlugin()
-PLUGIN = DRIVER
+DRIVER = KubernetesManifestsDriver()

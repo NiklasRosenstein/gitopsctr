@@ -697,7 +697,7 @@ def test_desired_unit_rejects_an_incompatible_running_driver_version():
         "source": {
             "path": "infra/deploy",
             "revision": "a" * 40,
-            "driverVersion": deploy_release.PLUGIN_VERSIONS["terraform"] + 1,
+            "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"] + 1,
         },
     }
 
@@ -1249,7 +1249,7 @@ def _install_convergence_simulation(
                     "source": {
                         **specification["source"],
                         "revision": source_revision,
-                        "driverVersion": deploy_release.PLUGIN_VERSIONS[specification["driver"]],
+                        "driverVersion": deploy_release.DRIVER_VERSIONS[specification["driver"]],
                     },
                     "terraform": {"variables": {"blob": blob}},
                 },
@@ -1572,7 +1572,7 @@ def test_promoted_converge_uses_merged_specification_without_source_revision(tmp
                     "source": {
                         "path": "infra/deploy",
                         "revision": reviewed,
-                        "driverVersion": deploy_release.PLUGIN_VERSIONS["terraform"],
+                        "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"],
                     },
                     "terraform": {"variables": {"blob": "release-v1"}},
                 },
