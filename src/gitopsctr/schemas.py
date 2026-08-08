@@ -198,6 +198,25 @@ def show_schema(scope: str, kind: str) -> JsonObject:
             return CORE_CONTRACTS[kind].json_schema()
         except KeyError as exc:
             raise ValueError(f"unknown core schema kind: {kind}") from exc
+    if scope == "gitopsctr.io/v1":
+        return core_resource_schema(kind)
+    if scope.startswith("unit.gitopsctr.io/v1/"):
+        return show_schema("unit.gitopsctr.io/v1", f"{scope.rsplit('/', 1)[1]}/{kind}")
+    if scope == "unit.gitopsctr.io/v1":
+        if "/" not in kind:
+            raise ValueError("unit API schema kind must be <Kind>/<authored|desired|receipt>")
+        resource_kind, profile = kind.split("/", 1)
+        driver = next(
+            (name for name, driver_instance in UNIT_DRIVERS.items() if driver_instance.kind == resource_kind),
+            None,
+        )
+        if driver is None:
+            raise ValueError(f"unknown unit API kind: {resource_kind}")
+        if profile == "receipt":
+            return receipt_resource_schema(driver)
+        if profile not in {"authored", "desired"}:
+            raise ValueError(f"unknown unit API schema profile: {profile}")
+        return unit_resource_schema(driver, profile)
     return driver_schema(scope, kind)
 
 

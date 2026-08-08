@@ -108,6 +108,31 @@ def convert_desired(tree: Path, source_revision: str) -> None:
         write_yaml(tree / "promotion.yaml", cli.serialize_promotion_document(promotion))
 
 
+def rewrite_promotion_lineage(
+    tree: Path,
+    desired_heads: dict[str, tuple[str, str]],
+    observed_heads: dict[str, tuple[str, str]],
+) -> None:
+    paths = document_candidates(tree, "promotion")
+    if not paths:
+        return
+    promotion = cli.normalize_promotion_document(load_document(paths[0]))
+    source = promotion.get("source")
+    if not isinstance(source, dict) or not isinstance(source.get("environment"), str):
+        raise RuntimeError("promotion source is missing its environment")
+    source_environment = source["environment"]
+    desired = desired_heads.get(source_environment)
+    observed = observed_heads.get(source_environment)
+    if desired is None:
+        raise RuntimeError(f"promotion source deploy/{source_environment} has not been migrated")
+    updated_source = {**source, "desiredRevision": desired[1]}
+    updated_source["observedRevision"] = observed[1] if observed is not None else None
+    write_yaml(
+        tree / "promotion.yaml",
+        cli.serialize_promotion_document({**promotion, "source": updated_source}),
+    )
+
+
 def convert_observed(tree: Path, desired_revision: str, desired_tree: Path) -> None:
     units = tree / "units"
     for path in sorted(path for path in units.glob("*") if path.suffix in {".json", ".yaml", ".yml"}):
@@ -159,6 +184,7 @@ def migrate(*, apply: bool, push: bool) -> dict[str, str]:
         results[branch] = new_source
 
         desired_heads: dict[str, tuple[str, str]] = {}
+        desired_trees: dict[str, Path] = {}
         for ref, old in local_refs("deploy/"):
             environment = ref.removeprefix("refs/heads/deploy/")
             desired_tree = root / f"desired-{environment}"
@@ -167,8 +193,22 @@ def migrate(*, apply: bool, push: bool) -> dict[str, str]:
             (desired_tree / "gitopsctr.yaml").write_text("writeFormat: yaml\n")
             new = commit_tree(desired_tree, old, f"Migrate desired {environment} documents to YAML resources")
             desired_heads[environment] = (old, new)
+            desired_trees[environment] = desired_tree
             results[ref] = new
 
+        # Rewrite promotion references after every desired head is known. This
+        # keeps source desired revisions from pointing at pre-migration commits.
+        for environment, (old, current) in list(desired_heads.items()):
+            tree = desired_trees[environment]
+            if not document_candidates(tree, "promotion"):
+                continue
+            rewrite_promotion_lineage(tree, desired_heads, {})
+            new = commit_tree(tree, current, f"Migrate {environment} promotion lineage")
+            desired_heads[environment] = (old, new)
+            results[f"refs/heads/deploy/{environment}"] = new
+
+        observed_heads: dict[str, tuple[str, str]] = {}
+        observed_trees: dict[str, Path] = {}
         for ref, old in local_refs("observed/"):
             environment = ref.removeprefix("refs/heads/observed/")
             desired = desired_heads.get(environment)
@@ -180,7 +220,30 @@ def migrate(*, apply: bool, push: bool) -> dict[str, str]:
             convert_observed(observed_tree, desired[1], desired_tree)
             (observed_tree / "gitopsctr.yaml").write_text("writeFormat: yaml\n")
             new = commit_tree(observed_tree, old, f"Migrate observed {environment} receipts to YAML resources")
+            observed_heads[environment] = (old, new)
+            observed_trees[environment] = observed_tree
             results[ref] = new
+
+        # Add observed promotion lineage now that observation heads exist, then
+        # refresh receipts once more so their desired revision matches the
+        # final desired commit.
+        for environment, (old, current) in list(desired_heads.items()):
+            tree = desired_trees[environment]
+            if not document_candidates(tree, "promotion"):
+                continue
+            rewrite_promotion_lineage(tree, desired_heads, observed_heads)
+            new = commit_tree(tree, current, f"Migrate {environment} observed promotion lineage")
+            desired_heads[environment] = (old, new)
+            results[f"refs/heads/deploy/{environment}"] = new
+        for environment, (old, current) in list(observed_heads.items()):
+            tree = observed_trees[environment]
+            desired = desired_heads.get(environment)
+            if desired is None:
+                continue
+            convert_observed(tree, desired[1], desired_trees[environment])
+            new = commit_tree(tree, current, f"Migrate observed {environment} desired lineage")
+            observed_heads[environment] = (old, new)
+            results[f"refs/heads/observed/{environment}"] = new
 
     if apply:
         update_ref(source_ref, results[branch], old_source)

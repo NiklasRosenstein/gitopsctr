@@ -512,6 +512,16 @@ def load_unit(path: Path, expected_name: str | None = None) -> dict[str, Any]:
     return normalize_unit_document(load_json(path), expected_name or path.stem)
 
 
+def reference_document_path(root: Path, reference: str) -> Path:
+    exact = root / reference
+    if exact.is_file():
+        return exact
+    path = PurePosixPath(reference)
+    if len(path.parts) == 2 and path.parts[0] == "units":
+        return unit_document_path(root, path.stem)
+    return exact
+
+
 def write_unit(path: Path, unit: dict[str, Any], project_root: Path) -> Path:
     if resource_documents_enabled(project_root):
         selected = load_project_config(project_root).write_format
@@ -829,7 +839,7 @@ def resolve_template(
         reference_type = reference_keys.pop()
         reference = candidate_value.get(reference_type)
         pointer = candidate_value.get("pointer", "")
-        pattern = r"units/[a-z0-9-]+\.json"
+        pattern = r"units/[a-z0-9-]+\.(?:json|ya?ml)"
         if not isinstance(reference, str) or not re.fullmatch(pattern, reference):
             raise OperationError(f"invalid {reference_type} path: {reference!r}")
         if not isinstance(pointer, str):
@@ -838,7 +848,7 @@ def resolve_template(
             if reference_type == "fromPromotion":
                 if promotion is None:
                     raise ReferenceUnavailable(f"promotion does not exist: {reference}")
-                path = promotion / reference
+                path = reference_document_path(promotion, reference)
                 fingerprints = promotion_inputs
             else:
                 if observed_revision is None:
@@ -846,7 +856,7 @@ def resolve_template(
                 unit_name = Path(reference).stem
                 if current_receipt(observed, candidate / "units", unit_name) is None:
                     raise ReferenceUnavailable(f"observation is stale: {reference}")
-                path = observed / reference
+                path = reference_document_path(observed, reference)
                 fingerprints = observed_inputs
             if not path.is_file():
                 raise ReferenceUnavailable(f"referenced file does not exist: {reference}")
@@ -2607,7 +2617,7 @@ def reference_paths(value: Any, reference_type: str) -> set[str]:
     elif isinstance(value, dict):
         if reference_type in value:
             reference = value[reference_type]
-            if not isinstance(reference, str) or not re.fullmatch(r"units/[a-z0-9-]+\.json", reference):
+            if not isinstance(reference, str) or not re.fullmatch(r"units/[a-z0-9-]+\.(?:json|ya?ml)", reference):
                 raise OperationError(f"invalid {reference_type} path: {reference!r}")
             paths.add(reference)
         for item in value.values():

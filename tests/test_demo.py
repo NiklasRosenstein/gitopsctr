@@ -1,10 +1,10 @@
 import importlib.util
-import json
 import shutil
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from gitopsctr import cli
 
@@ -44,12 +44,12 @@ def test_demo_runner_materializes_local_runtime_configuration(tmp_path, monkeypa
 
     demo.configure_template("localhost:5001", 18081)
 
-    image = json.loads((worktree / "deployment/environments/dev/units/demo-image.json").read_text())
-    service = json.loads((worktree / "deployment/environments/dev/units/demo-service.json").read_text())
-    assert image["build"]["platform"] == "linux/arm64"
-    assert image["publish"]["repositories"]["application"] == "localhost:5001/gitopsctr-demo/app"
-    assert service["terraform"]["backend"]["path"] == str(state)
-    assert service["terraform"]["variables"]["host_port"] == 18081
+    image = yaml.safe_load((worktree / "deployment/environments/dev/units/demo-image.yaml").read_text())
+    service = yaml.safe_load((worktree / "deployment/environments/dev/units/demo-service.yaml").read_text())
+    assert image["spec"]["build"]["platform"] == "linux/arm64"
+    assert image["spec"]["publish"]["repositories"]["application"] == "localhost:5001/gitopsctr-demo/app"
+    assert service["spec"]["terraform"]["backend"]["path"] == str(state)
+    assert service["spec"]["terraform"]["variables"]["host_port"] == 18081
 
 
 def test_demo_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):

@@ -1,0 +1,16 @@
+$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/OciImages/authored.schema.json
+apiVersion: unit.gitopsctr.io/v1
+kind: OciImages
+metadata:
+  name: demo-image
+spec:
+  source:
+    path: .
+    inputs: [Dockerfile, app.py]
+  build:
+    dockerfile: Dockerfile
+    platform: __DOCKER_PLATFORM__
+  publish:
+    repositories:
+      application: __REGISTRY__/gitopsctr-demo/app
+  artifacts: [containers.json]

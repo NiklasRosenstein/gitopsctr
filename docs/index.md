@@ -27,6 +27,6 @@ For development, run `mise install`, `mise run sync`, and `mise run check`.
 
 ## Contracts
 
-Every built-in plugin publishes schemas for its authored unit, materialized desired unit, applied result, and composed
+Every built-in unit driver publishes schemas for its authored unit, materialized desired unit, applied result, and composed
 receipt. Start with the [JSON Schema catalog](schemas.md), or read about [Kubernetes manifest
 materialization](kubernetes-manifests.md).

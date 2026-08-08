@@ -1,33 +1,36 @@
 # JSON Schemas
 
-Typed plugin models are the authority for runtime validation and Draft 2020-12 schema generation. Each built-in plugin
-publishes four contracts:
+Typed unit-driver models are the authority for runtime validation and Draft 2020-12 schema generation. Each driver
+publishes authored, desired, result, and composed receipt contracts:
 
 - `unit`: authored environment input;
 - `desired-unit`: the fully resolved document stored under `deploy/<environment>/units/`;
 - `result`: the raw semantic result returned after applying;
 - `receipt`: the generic receipt envelope composed with that plugin result.
 
-Core schemas cover environment, promotion, materialization, desired-unit, and receipt envelopes. The complete
+Controller resources use `gitopsctr.io/v1`; unit resources use `unit.gitopsctr.io/v1`. The complete
 machine-readable catalog is [`schemas/index.json`](schemas/index.json).
 
 ## Use a pinned schema
 
-Authored documents should point to the exact plugin version:
+Authored documents should point to the exact API schema:
 
-```json
-{
-  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/terraform/v2/unit.schema.json",
-  "schema": 1,
-  "name": "infrastructure",
-  "driver": "terraform",
-  "source": {"path": "infra", "inputs": ["*.tf"]},
-  "terraform": {
-    "backend": {"path": ".state/dev.tfstate"},
-    "variables": {"environment": "dev"},
-    "observeOutputs": []
-  }
-}
+```yaml
+$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json
+apiVersion: unit.gitopsctr.io/v1
+kind: Terraform
+metadata:
+  name: infrastructure
+spec:
+  source:
+    path: infra
+    inputs: ["*.tf"]
+  terraform:
+    backend:
+      path: .state/dev.tfstate
+    variables:
+      environment: dev
+    observeOutputs: []
 ```
 
 `$schema` helps editors but is never trusted by the runtime: gitopsctr does not fetch it or select validation behavior
@@ -39,7 +42,8 @@ from it. Newly generated desired units, promotions, and receipts always contain 
 
 ```console
 gitopsctr schemas show terraform receipt
-gitopsctr schemas show core environment
+gitopsctr schemas show gitopsctr.io/v1 Environment
+gitopsctr schemas show unit.gitopsctr.io/v1/Terraform authored
 gitopsctr schemas export docs/schemas
 gitopsctr schemas export docs/schemas --check
 ```

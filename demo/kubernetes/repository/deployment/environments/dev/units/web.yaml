@@ -1,0 +1,21 @@
+$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/KubernetesManifests/authored.schema.json
+apiVersion: unit.gitopsctr.io/v1
+kind: KubernetesManifests
+metadata:
+  name: web
+spec:
+  source:
+    path: charts/web
+    inputs: ["**/*"]
+  materialize:
+    type: helm
+    releaseName: web
+    namespace: default
+    values:
+      message: rendered and reconciled
+    allowSecrets: false
+  delivery:
+    mode: direct
+    kubeContext: kind-gitopsctr-kubernetes-demo
+    prune: false
+    wait: []

@@ -60,6 +60,7 @@ def docker_platform() -> str:
 def configure_template(registry: str, app_port: int) -> None:
     replacements = {
         '"__APP_PORT__"': str(app_port),
+        "__APP_PORT__": str(app_port),
         "__DOCKER_PLATFORM__": docker_platform(),
         "__REGISTRY__": registry,
         "__TERRAFORM_STATE__": TERRAFORM_STATE.as_posix(),

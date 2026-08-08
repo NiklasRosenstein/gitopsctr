@@ -5,35 +5,39 @@ resolved unit JSON form one atomic desired-state component:
 
 ```text
 deploy/dev
-├── units/web.json
+├── units/web.yaml
 └── manifests/web/
     └── manifest.yaml
 ```
 
 The controller records the payload path, media type, digest, renderer metadata, and deterministic resource inventory
-in `units/web.json`. Reconciliation, verification, promotion, and rollback consume these committed bytes. Rollback
+in `units/web.yaml`. Reconciliation, verification, promotion, and rollback consume these committed bytes. Rollback
 copies historical bytes and their unit descriptor exactly; it never reruns Helm.
 
 ## Rendering
 
 Helm rendering uses the `helm` executable and records its installed version without enforcing one:
 
-```json
-{
-  "$schema": "https://niklasrosenstein.github.io/gitopsctr/schemas/drivers/kubernetes-manifests/v1/unit.schema.json",
-  "schema": 1,
-  "name": "web",
-  "driver": "kubernetes-manifests",
-  "source": {"path": "charts/web", "inputs": ["**/*"]},
-  "materialize": {
-    "type": "helm",
-    "releaseName": "web",
-    "namespace": "web",
-    "values": {"image": {"tag": "current"}},
-    "allowSecrets": false
-  },
-  "delivery": {"mode": "external"}
-}
+```yaml
+$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/KubernetesManifests/authored.schema.json
+apiVersion: unit.gitopsctr.io/v1
+kind: KubernetesManifests
+metadata:
+  name: web
+spec:
+  source:
+    path: charts/web
+    inputs: ["**/*"]
+  materialize:
+    type: helm
+    releaseName: web
+    namespace: web
+    values:
+      image:
+        tag: current
+    allowSecrets: false
+  delivery:
+    mode: external
 ```
 
 Values are resolved after `fromObservation` and `fromPromotion`, so either reference can appear anywhere below

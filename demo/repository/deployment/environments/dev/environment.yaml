@@ -1,0 +1,6 @@
+$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Environment.schema.json
+apiVersion: gitopsctr.io/v1
+kind: Environment
+metadata:
+  name: dev
+spec: {}

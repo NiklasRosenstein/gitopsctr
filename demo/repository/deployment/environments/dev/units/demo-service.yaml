@@ -1,0 +1,23 @@
+$schema: https://niklasrosenstein.github.io/gitopsctr/schemas/apis/unit.gitopsctr.io/v1/Terraform/authored.schema.json
+apiVersion: unit.gitopsctr.io/v1
+kind: Terraform
+metadata:
+  name: demo-service
+spec:
+  source:
+    path: infrastructure
+    inputs: ["*.tf"]
+  terraform:
+    backend:
+      path: __TERRAFORM_STATE__
+    variables:
+      container_name: gitopsctr-demo-app
+      host_port: __APP_PORT__
+      image:
+        fromObservation: units/demo-image.yaml
+        pointer: /artifacts/containers.json/artifacts/application/uri
+    observeOutputs: [container_id, url]
+    checks:
+      - type: http
+        urlOutput: url
+        path: /

@@ -7,8 +7,9 @@ from pathlib import Path
 
 import pytest
 import yaml
+from jsonschema import Draft202012Validator
 
-from gitopsctr import cli
+from gitopsctr import cli, schemas
 from gitopsctr.formats import DocumentFormat, load_project_config, write_document
 
 
@@ -59,6 +60,22 @@ spec:
     assert environment["name"] == "dev"
     assert specifications["infrastructure"]["driver"] == "terraform"
     assert specifications["infrastructure"]["name"] == "infrastructure"
+
+
+def test_yaml_demo_documents_validate_against_published_resource_schemas():
+    root = Path(__file__).parents[1]
+    documents = schemas.schema_documents()
+    by_id = {document["$id"]: document for document in documents.values() if "$id" in document}
+    paths = [
+        root / "demo/repository/deployment/environments/dev/environment.yaml",
+        root / "demo/repository/deployment/environments/dev/units/demo-image.yaml",
+        root / "demo/repository/deployment/environments/dev/units/demo-service.yaml",
+        root / "demo/kubernetes/repository/deployment/environments/dev/environment.yaml",
+        root / "demo/kubernetes/repository/deployment/environments/dev/units/web.yaml",
+    ]
+    for path in paths:
+        document = yaml.safe_load(path.read_text())
+        Draft202012Validator(by_id[document["$schema"]]).validate(document)
 
 
 def test_migration_script_converts_a_source_branch_in_one_forward_commit(tmp_path: Path):
