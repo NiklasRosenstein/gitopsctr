@@ -774,6 +774,59 @@ def test_reconciliation_explanation_is_visible_and_bounded_before_approval(tmp_p
     assert "FILE     M\tinfra/deploy/main.tf" in output
 
 
+def test_convergence_plan_distinguishes_next_later_wait_and_clean():
+    rows = deploy_release.convergence_plan_rows(
+        [
+            ("application-images", "CLEAN", "observation matches desired state"),
+            ("aws-application", "READY", "desired inputs changed since its last receipt"),
+            ("frontend", "READY", "desired inputs changed since its last receipt"),
+            ("frontend-bundle", "WAIT", "desired inputs are not materialized"),
+        ],
+        ["application-images", "aws-application", "frontend-bundle", "frontend"],
+    )
+
+    assert rows == [
+        ("application-images", "CLEAN", "observation matches desired state"),
+        ("aws-application", "NEXT", "desired inputs changed since its last receipt"),
+        ("frontend-bundle", "WAIT", "desired inputs are not materialized"),
+        ("frontend", "LATER", "re-evaluate after aws-application"),
+    ]
+
+
+def test_compact_approval_card_shows_driver_change_evidence_and_write_boundary(tmp_path, monkeypatch, capsys):
+    desired = tmp_path / "desired"
+    observed = tmp_path / "observed"
+    _write_json(desired / "units/aws-application.json", {"driver": "terraform"})
+    explanation = deploy_release.UnitChangeExplanation(
+        previous_desired_revision="a" * 40,
+        previous_source_revision="b" * 40,
+        current_source_revision="c" * 40,
+        causes=("source inputs changed",),
+        commits=("f4fa74b Consume extracted deployment action", "1234567 Older change"),
+        files=("M\tinfra/deploy/README.md", "M\tinfra/deploy/main.tf"),
+        specification_paths=(),
+    )
+    monkeypatch.setattr(deploy_release, "unit_change_explanation", lambda *_args: explanation)
+
+    deploy_release.log_convergence_action(
+        "aws-application",
+        "desired inputs changed since its last receipt",
+        "d" * 40,
+        desired,
+        observed,
+        "observed/dev",
+    )
+
+    output = capsys.readouterr().err
+    assert "Next action: aws-application" in output
+    assert "DRIVER   terraform" in output
+    assert "SOURCE   bbbbbbbbbbbb -> cccccccccccc" in output
+    assert "CAUSE    source inputs changed" in output
+    assert "COMMIT   f4fa74b Consume extracted deployment action (+1 more)" in output
+    assert "FILE     M\tinfra/deploy/README.md (+1 more)" in output
+    assert "WRITES   driver effects; receipt to observed/dev on success" in output
+
+
 def test_status_requires_an_explicit_environment_and_leaves_refs_to_resolution():
     with pytest.raises(SystemExit):
         deploy_release.build_parser().parse_args(["status"])
@@ -1214,11 +1267,12 @@ def test_converge_runs_dependency_first_and_ignores_unselected_unit(tmp_path, mo
     assert state["advance_summarize"] == [False, False, False]
     output = capsys.readouterr().err
     assert "SCOPE    consumer, producer" in output
-    assert "DEPEND   consumer: producer" in output
-    assert "DEPEND   producer: none" in output
-    assert "Convergence step 1 (limit 4): producer" in output
-    assert "RESULT   CLEAN" in output
-    assert output.count("MOVE") == 4
+    assert "NEXT     producer: no observation receipt" in output
+    assert "WAIT     consumer: desired inputs are not materialized" in output
+    assert "RUN      producer" in output
+    assert "RUN      consumer" in output
+    assert "RESULT   CLEAN: 2/2 units" in output
+    assert "DEPEND" not in output
 
 
 def test_converge_requires_approval_before_each_reconciliation(tmp_path, monkeypatch, capsys):
@@ -1244,8 +1298,38 @@ def test_converge_requires_approval_before_each_reconciliation(tmp_path, monkeyp
 
     assert state["reconciled"] == []
     output = capsys.readouterr().err
-    assert "APPROVE  Reconcile application? [y/N]" in output
+    assert "Next action: application" in output
+    assert "APPROVE  Continue with application? [y/N]" in output
     assert "RESULT   FAILED: reconciliation of application was not approved" in output
+
+
+def test_converge_verbose_preserves_dependency_and_reconciliation_trace(tmp_path, monkeypatch, capsys):
+    state = _install_convergence_simulation(
+        monkeypatch,
+        tmp_path,
+        {"application": _unit("application")},
+        [{"application": "v1"}],
+    )
+    args = deploy_release.build_parser().parse_args(
+        [
+            "converge",
+            "--environment",
+            "dev",
+            "--source-revision",
+            "HEAD",
+            "--yes",
+            "--verbose",
+        ]
+    )
+
+    args.handler(args)
+
+    assert state["reconciled"] == ["application"]
+    output = capsys.readouterr().err
+    assert "DEPEND   application: none" in output
+    assert "Reconciliation status for dev" in output
+    assert "Convergence step 1 (limit 2): application" in output
+    assert "Convergence summary for dev" in output
 
 
 def test_converge_repeat_guard_fails_before_running_same_unit_again(tmp_path, monkeypatch, capsys):
