@@ -42,10 +42,31 @@ registry and live under `gitopsctr.contrib.driver`.
 
 ## GitHub Action
 
-The repository's root composite action wraps `reconcile`, `advance-desired`, and `promote`. It can
+The repository's root composite action wraps reconciliation preparation, `reconcile`, `advance-desired`, and
+`promote`. `operation: prepare` is action-only orchestration terminology: it selects an exact desired revision
+by calling `advance-desired` for a supplied source revision or `resolve-desired` otherwise. It does not add a
+CLI command or persisted controller state. The action can
 install the CLI from PyPI, from the checked-out action revision, or from an explicit Git repository
 and revision. Caller workflows retain responsibility for credentials, deployment tools, permissions,
 concurrency, and follow-up scheduling.
+
+Prepare one exact desired revision before fan-out reconciliation jobs:
+
+```yaml
+- id: prepare
+  uses: NiklasRosenstein/gitopsctr@<commit-or-ref>
+  with:
+    operation: prepare
+    package-source: action
+    environment: dev
+    source-revision: ${{ github.sha }}
+    require-source-ref: main
+```
+
+The outputs are `active`, `desired-revision`, `desired-changed`, and `advance-after-reconcile`. Supplying an
+exact `desired-revision` makes the run fixed (`advance-after-reconcile=false`); without one, later receipts may
+continue materializing desired state. A source revision superseded through `require-source-ref` returns
+`active=false`.
 
 Install the package bundled with the exact action revision while testing an unreleased change:
 

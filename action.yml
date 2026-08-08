@@ -1,9 +1,9 @@
 name: gitopsctr
-description: Reconcile, advance, or promote Git-backed deployment state
+description: Prepare, reconcile, advance, or promote Git-backed deployment state
 
 inputs:
   operation:
-    description: Operation to run (reconcile, advance, or promote)
+    description: Operation to run (prepare, reconcile, advance, or promote)
     required: true
   package-source:
     description: Install from pypi, this action revision, or an explicit git repository
@@ -99,6 +99,12 @@ inputs:
     default: 41898282+github-actions[bot]@users.noreply.github.com
 
 outputs:
+  active:
+    description: Whether prepare selected a desired revision that is still eligible
+    value: ${{ steps.run.outputs.active }}
+  advance-after-reconcile:
+    description: Whether reconciliation should continue advancing desired state
+    value: ${{ steps.run.outputs.advance_after_reconcile }}
   reconciled:
     description: Whether reconcile published a receipt
     value: ${{ steps.run.outputs.reconciled }}

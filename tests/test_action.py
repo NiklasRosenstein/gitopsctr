@@ -16,7 +16,14 @@ def test_action_metadata_exposes_the_supported_operations_and_install_modes() ->
     assert metadata["runs"]["using"] == "composite"
     assert metadata["inputs"]["operation"]["required"] is True
     assert metadata["inputs"]["package-source"]["default"] == "pypi"
-    assert {"reconciled", "desired-changed", "desired-revision", "change-revision"} <= set(metadata["outputs"])
+    assert {
+        "active",
+        "advance-after-reconcile",
+        "reconciled",
+        "desired-changed",
+        "desired-revision",
+        "change-revision",
+    } <= set(metadata["outputs"])
 
 
 def _fake_command(tmp_path: Path, name: str, body: str) -> Path:
@@ -38,6 +45,7 @@ def _action_environment(tmp_path: Path, **overrides: str) -> dict[str, str]:
         "DRY": "false",
         "ENVIRONMENT": "",
         "FROM_ENVIRONMENT": "",
+        "GITHUB_OUTPUT": str(tmp_path / "github-output"),
         "OBSERVED_REF": "",
         "OPERATION": "",
         "PATH": f"{binary_directory}:{os.environ['PATH']}",
@@ -55,10 +63,14 @@ def _action_environment(tmp_path: Path, **overrides: str) -> dict[str, str]:
     return environment
 
 
-def _run_action(tmp_path: Path, **overrides: str) -> subprocess.CompletedProcess[str]:
+def _run_action(
+    tmp_path: Path,
+    command_body: str = 'printf "%s\\0" "$@" > "${ACTION_LOG}"',
+    **overrides: str,
+) -> subprocess.CompletedProcess[str]:
     binary_directory = tmp_path / "bin"
     binary_directory.mkdir(exist_ok=True)
-    _fake_command(binary_directory, "gitopsctr", 'printf "%s\\0" "$@" > "${ACTION_LOG}"')
+    _fake_command(binary_directory, "gitopsctr", command_body)
     return subprocess.run(
         ("bash", str(ROOT / "action/run.sh")),
         check=False,
@@ -70,6 +82,106 @@ def _run_action(tmp_path: Path, **overrides: str) -> subprocess.CompletedProcess
 
 def _action_arguments(tmp_path: Path) -> list[str]:
     return [value.decode() for value in (tmp_path / "action.log").read_bytes().split(b"\0") if value]
+
+
+def _action_outputs(tmp_path: Path) -> dict[str, str]:
+    return dict(line.split("=", 1) for line in (tmp_path / "github-output").read_text().splitlines())
+
+
+def test_prepare_action_advances_a_source_tracked_environment(tmp_path: Path) -> None:
+    revision = "d" * 40
+    result = _run_action(
+        tmp_path,
+        command_body=(
+            'printf "%s\\0" "$@" > "${ACTION_LOG}"\n'
+            f'printf "{revision}\\n"\n'
+            'printf "desired_changed=true\\ndesired_revision=%s\\n" "' + revision + '" >> "${GITHUB_OUTPUT}"'
+        ),
+        OPERATION="prepare",
+        ENVIRONMENT="dev",
+        SOURCE_REVISION="s" * 40,
+        DESIRED_REF="deploy/dev",
+        OBSERVED_REF="observed/dev",
+        REQUIRE_SOURCE_REF="main",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _action_arguments(tmp_path) == [
+        "--repository",
+        str(tmp_path),
+        "advance-desired",
+        "--environment",
+        "dev",
+        "--desired-ref",
+        "deploy/dev",
+        "--observed-ref",
+        "observed/dev",
+        "--source-revision",
+        "s" * 40,
+        "--require-source-ref",
+        "main",
+    ]
+    assert _action_outputs(tmp_path) == {
+        "active": "true",
+        "advance_after_reconcile": "true",
+        "desired_changed": "true",
+        "desired_revision": revision,
+    }
+
+
+@pytest.mark.parametrize(
+    ("desired_revision", "advance_after_reconcile"),
+    [("d" * 40, "false"), ("", "true")],
+)
+def test_prepare_action_resolves_existing_desired_state(
+    tmp_path: Path,
+    desired_revision: str,
+    advance_after_reconcile: str,
+) -> None:
+    resolved = "e" * 40
+    result = _run_action(
+        tmp_path,
+        command_body='printf "%s\\0" "$@" > "${ACTION_LOG}"\nprintf "' + resolved + '\\n"',
+        OPERATION="prepare",
+        ENVIRONMENT="prod",
+        DESIRED_REVISION=desired_revision,
+    )
+
+    assert result.returncode == 0, result.stderr
+    expected = [
+        "--repository",
+        str(tmp_path),
+        "resolve-desired",
+        "--desired-ref",
+        "deploy/prod",
+    ]
+    if desired_revision:
+        expected += ["--desired-revision", desired_revision]
+    assert _action_arguments(tmp_path) == expected
+    assert _action_outputs(tmp_path) == {
+        "active": "true",
+        "advance_after_reconcile": advance_after_reconcile,
+        "desired_changed": "false",
+        "desired_revision": resolved,
+    }
+
+
+def test_prepare_action_reports_a_superseded_source_revision(tmp_path: Path) -> None:
+    result = _run_action(
+        tmp_path,
+        command_body='printf "%s\\0" "$@" > "${ACTION_LOG}"',
+        OPERATION="prepare",
+        ENVIRONMENT="dev",
+        SOURCE_REVISION="s" * 40,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _action_outputs(tmp_path) == {
+        "active": "false",
+        "advance_after_reconcile": "false",
+        "desired_changed": "false",
+        "desired_revision": "",
+    }
 
 
 def test_reconcile_action_maps_typed_inputs_to_cli_arguments(tmp_path: Path) -> None:
@@ -164,6 +276,15 @@ def test_promote_action_defaults_to_the_workflow_revision(tmp_path: Path) -> Non
         ({"OPERATION": "reconcile", "ENVIRONMENT": "dev"}, "unit is required"),
         ({"OPERATION": "unknown"}, "operation must be"),
         ({"OPERATION": "advance", "ENVIRONMENT": "dev", "DRY": "sometimes"}, "dry must be"),
+        (
+            {
+                "OPERATION": "prepare",
+                "ENVIRONMENT": "dev",
+                "SOURCE_REVISION": "s" * 40,
+                "DESIRED_REVISION": "d" * 40,
+            },
+            "source-revision and desired-revision are mutually exclusive",
+        ),
     ],
 )
 def test_action_rejects_invalid_operation_inputs(tmp_path: Path, overrides: dict[str, str], message: str) -> None:
