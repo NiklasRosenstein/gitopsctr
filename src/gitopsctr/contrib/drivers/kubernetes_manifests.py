@@ -213,7 +213,52 @@ def require_string(value: object, description: str) -> str:
     return value
 
 
-def delivery_configuration(unit: JsonObject) -> dict[str, Any]:
+def _argo_observer_configuration(value: object) -> ArgoApiObserver | ArgoKubernetesObserver:
+    observer = require_object(value, "kubernetes-manifests observer")
+    if observer.get("type") != "argocd":
+        raise DriverError("kubernetes-manifests supports only the argocd observer")
+    access = observer.get("access")
+    if access not in {"api", "kubernetes"}:
+        raise DriverError("kubernetes-manifests argocd observer access must be 'api' or 'kubernetes'")
+    common_fields = {
+        "type",
+        "access",
+        "application",
+        "applicationNamespace",
+        "timeoutSeconds",
+    }
+    access_field = "argocdContext" if access == "api" else "kubeContext"
+    if set(observer) - (common_fields | {access_field}):
+        raise DriverError("kubernetes-manifests argocd observer has unsupported fields")
+    application = require_string(observer.get("application"), "argocd observer application")
+    application_namespace = require_string(
+        observer.get("applicationNamespace"), "argocd observer applicationNamespace"
+    )
+    timeout = observer.get("timeoutSeconds", 600)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
+        raise DriverError("argocd observer timeoutSeconds must be a positive integer")
+    if access == "api":
+        argocd_context = require_string(observer.get("argocdContext"), "argocd observer argocdContext")
+        return ArgoApiObserver(
+            type="argocd",
+            access="api",
+            application=application,
+            applicationNamespace=application_namespace,
+            argocdContext=argocd_context,
+            timeoutSeconds=timeout,
+        )
+    kube_context = require_string(observer.get("kubeContext"), "argocd observer kubeContext")
+    return ArgoKubernetesObserver(
+        type="argocd",
+        access="kubernetes",
+        application=application,
+        applicationNamespace=application_namespace,
+        kubeContext=kube_context,
+        timeoutSeconds=timeout,
+    )
+
+
+def delivery_configuration(unit: JsonObject) -> DirectDelivery | ExternalDelivery:
     delivery = require_object(unit.get("delivery"), "kubernetes-manifests delivery")
     mode = delivery.get("mode")
     if mode not in {"direct", "external"}:
@@ -223,12 +268,14 @@ def delivery_configuration(unit: JsonObject) -> dict[str, Any]:
     if mode == "direct" and set(delivery) - {"mode", "kubeContext", "prune", "wait"}:
         raise DriverError("kubernetes-manifests direct delivery has unsupported fields")
     if mode == "direct":
-        require_string(delivery.get("kubeContext"), "direct delivery kubeContext")
-        if not isinstance(delivery.get("prune", False), bool):
+        kube_context = require_string(delivery.get("kubeContext"), "direct delivery kubeContext")
+        prune = delivery.get("prune", False)
+        if not isinstance(prune, bool):
             raise DriverError("direct delivery prune must be a boolean")
         waits = delivery.get("wait", [])
         if not isinstance(waits, list):
             raise DriverError("direct delivery wait must be a list")
+        readiness_waits: list[ReadinessWait] = []
         for item in waits:
             wait = require_object(item, "Kubernetes readiness wait")
             if set(wait) != {"resource", "namespace", "condition", "timeoutSeconds"}:
@@ -239,9 +286,22 @@ def delivery_configuration(unit: JsonObject) -> dict[str, Any]:
             timeout = wait["timeoutSeconds"]
             if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
                 raise DriverError("Kubernetes readiness wait timeoutSeconds must be a positive integer")
+            readiness_waits.append(
+                ReadinessWait(
+                    resource=cast(str, wait["resource"]),
+                    namespace=cast(str, wait["namespace"]),
+                    condition=cast(str, wait["condition"]),
+                    timeoutSeconds=timeout,
+                )
+            )
+        return DirectDelivery(mode="direct", kubeContext=kube_context, prune=prune, wait=readiness_waits)
     if mode == "external" and set(delivery) - {"mode", "observer"}:
         raise DriverError("kubernetes-manifests external delivery has unsupported fields")
-    return delivery
+    observer = delivery.get("observer")
+    return ExternalDelivery(
+        mode="external",
+        observer=None if observer is None else _argo_observer_configuration(observer),
+    )
 
 
 def materialization_configuration(unit: JsonObject) -> dict[str, Any]:
@@ -352,62 +412,40 @@ def kubectl_prefix(context_name: str) -> list[str]:
     return ["kubectl", "--context", context_name]
 
 
-def argo_observer(delivery: dict[str, Any]) -> dict[str, Any] | None:
-    observer = delivery.get("observer")
-    if observer is None:
+def argo_observer(
+    delivery: DirectDelivery | ExternalDelivery,
+) -> ArgoApiObserver | ArgoKubernetesObserver | None:
+    if isinstance(delivery, DirectDelivery):
         return None
-    observer = require_object(observer, "kubernetes-manifests observer")
-    if observer.get("type") != "argocd":
-        raise DriverError("kubernetes-manifests supports only the argocd observer")
-    if observer.get("access") not in {"api", "kubernetes"}:
-        raise DriverError("kubernetes-manifests argocd observer access must be 'api' or 'kubernetes'")
-    common_fields = {
-        "type",
-        "access",
-        "application",
-        "applicationNamespace",
-        "timeoutSeconds",
-    }
-    access_field = "argocdContext" if observer["access"] == "api" else "kubeContext"
-    if set(observer) - (common_fields | {access_field}):
-        raise DriverError("kubernetes-manifests argocd observer has unsupported fields")
-    require_string(observer.get("application"), "argocd observer application")
-    require_string(observer.get("applicationNamespace"), "argocd observer applicationNamespace")
-    timeout = observer.get("timeoutSeconds", 600)
-    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
-        raise DriverError("argocd observer timeoutSeconds must be a positive integer")
-    if observer["access"] == "api":
-        require_string(observer.get("argocdContext"), "argocd observer argocdContext")
-    else:
-        require_string(observer.get("kubeContext"), "argocd observer kubeContext")
-    return observer
+    return delivery.observer
 
 
-def read_argo_application(execution: DriverExecution, observer: dict[str, Any]) -> dict[str, Any]:
-    application = cast(str, observer["application"])
-    namespace = cast(str, observer["applicationNamespace"])
-    if observer["access"] == "api":
+def read_argo_application(
+    execution: DriverExecution,
+    observer: ArgoApiObserver | ArgoKubernetesObserver,
+) -> dict[str, Any]:
+    if isinstance(observer, ArgoApiObserver):
         result = execution.run(
             "argocd",
             "app",
             "get",
-            application,
+            observer.application,
             "--app-namespace",
-            namespace,
+            observer.applicationNamespace,
             "--argocd-context",
-            cast(str, observer["argocdContext"]),
+            observer.argocdContext,
             "--output",
             "json",
             output=CommandOutput.CAPTURE,
         )
     else:
         result = execution.run(
-            *kubectl_prefix(cast(str, observer["kubeContext"])),
+            *kubectl_prefix(observer.kubeContext),
             "--namespace",
-            namespace,
+            observer.applicationNamespace,
             "get",
             "application.argoproj.io",
-            application,
+            observer.application,
             "--output",
             "json",
             output=CommandOutput.CAPTURE,
@@ -476,7 +514,7 @@ class KubernetesManifestsDriver(
     def materialize(self, context: MaterializationContext) -> MaterializationResult:
         configuration = materialization_configuration(context.unit)
         delivery = delivery_configuration(context.unit)
-        if delivery["mode"] == "external":
+        if isinstance(delivery, ExternalDelivery):
             argo_observer(delivery)
         renderer = cast(str, configuration["type"])
         allow_secrets = configuration.get("allowSecrets", False)
@@ -538,7 +576,7 @@ class KubernetesManifestsDriver(
 
     def reconciliation_required(self, unit: JsonObject) -> bool:
         delivery = delivery_configuration(unit)
-        return delivery["mode"] == "direct" or argo_observer(delivery) is not None
+        return isinstance(delivery, DirectDelivery) or argo_observer(delivery) is not None
 
     def plan(self, context: PlanningContext) -> None:
         delivery = delivery_configuration(context.unit)
@@ -546,7 +584,7 @@ class KubernetesManifestsDriver(
         if observer is not None:
             self._observe_argo(context, observer, wait=True)
             return
-        if delivery["mode"] != "direct":
+        if not isinstance(delivery, DirectDelivery):
             raise DriverError("external Kubernetes delivery without an observer does not support planning")
         materialization_descriptor(context.unit)
 
@@ -555,15 +593,15 @@ class KubernetesManifestsDriver(
         observer = argo_observer(delivery)
         if observer is not None:
             return ReconciliationOutput(result=self._observe_argo(context, observer, wait=True))
-        if delivery["mode"] != "direct":
+        if not isinstance(delivery, DirectDelivery):
             raise DriverError("external Kubernetes delivery without an observer does not reconcile")
 
         materialization = materialization_descriptor(context.unit)
         digest = materialization.digest
         inventory = materialization.inventory
-        context_name = require_string(delivery.get("kubeContext"), "direct delivery kubeContext")
-        prune = cast(bool, delivery.get("prune", False))
-        waits = cast(list[object], delivery.get("wait", []))
+        context_name = delivery.kubeContext
+        prune = delivery.prune
+        waits = delivery.wait or []
         manager = field_manager(context.environment, context.unit.get("name"))
         context.execution.run(
             *kubectl_prefix(context_name),
@@ -574,20 +612,14 @@ class KubernetesManifestsDriver(
             str(context.desired_root / materialization.path),
         )
         for item in waits:
-            wait = require_object(item, "Kubernetes readiness wait")
-            resource = require_string(wait["resource"], "Kubernetes readiness wait resource")
-            namespace = require_string(wait["namespace"], "Kubernetes readiness wait namespace")
-            condition = require_string(wait["condition"], "Kubernetes readiness wait condition")
-            timeout = wait["timeoutSeconds"]
-            assert isinstance(timeout, int) and not isinstance(timeout, bool)
             context.execution.run(
                 *kubectl_prefix(context_name),
                 "--namespace",
-                namespace,
+                item.namespace,
                 "wait",
-                f"--for=condition={condition}",
-                f"--timeout={timeout}s",
-                resource,
+                f"--for=condition={item.condition}",
+                f"--timeout={item.timeoutSeconds}s",
+                item.resource,
             )
         if prune:
             self._prune_previous(context, context_name, inventory)
@@ -637,7 +669,7 @@ class KubernetesManifestsDriver(
 
     def verification_supported(self, unit: JsonObject) -> bool:
         delivery = delivery_configuration(unit)
-        return delivery["mode"] == "direct" or argo_observer(delivery) is not None
+        return isinstance(delivery, DirectDelivery) or argo_observer(delivery) is not None
 
     def verify(self, context: VerificationContext) -> VerificationResult:
         delivery = delivery_configuration(context.unit)
@@ -651,9 +683,9 @@ class KubernetesManifestsDriver(
                 else VerificationStatus.DRIFT
             )
             return VerificationResult(status)
-        if delivery["mode"] != "direct":
+        if not isinstance(delivery, DirectDelivery):
             raise DriverError("external Kubernetes delivery without an observer cannot be verified")
-        context_name = require_string(delivery.get("kubeContext"), "direct delivery kubeContext")
+        context_name = delivery.kubeContext
         materialization = materialization_descriptor(context.unit)
         result = context.execution.run(
             *kubectl_prefix(context_name),
@@ -675,11 +707,11 @@ class KubernetesManifestsDriver(
     @staticmethod
     def _observe_argo(
         context: PlanningContext | ReconciliationContext | VerificationContext,
-        observer: dict[str, Any],
+        observer: ArgoApiObserver | ArgoKubernetesObserver,
         *,
         wait: bool,
     ) -> ArgoResult:
-        deadline = time.monotonic() + cast(int, observer.get("timeoutSeconds", 600))
+        deadline = time.monotonic() + observer.timeoutSeconds
         while True:
             document = read_argo_application(context.execution, observer)
             revision, sync_status, health_status = argo_application_status(document)
@@ -687,7 +719,7 @@ class KubernetesManifestsDriver(
             if ready:
                 return {
                     "observed": {
-                        "application": cast(str, observer["application"]),
+                        "application": observer.application,
                         "desiredRevision": revision,
                         "syncStatus": sync_status,
                         "healthStatus": health_status,
