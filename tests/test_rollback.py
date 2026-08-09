@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import cli as deploy_release
-from tests.conftest import write_test_document
+from tests.conftest import receipt_document, write_test_document
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
@@ -87,17 +87,12 @@ def _materialized_desired_unit(name: str, revision: str, value: str) -> dict:
 
 
 def _receipt(unit_path: Path, unit_name: str, revision: str) -> dict:
-    return {
-        "schema": 1,
-        "unit": unit_name,
-        "driver": "terraform",
-        "desired": {
-            "revision": revision,
-            "unitBlob": deploy_release.file_blob(unit_path),
-        },
-        "applied": {"sourceRevision": revision},
-        "outputs": {},
-    }
+    return receipt_document(
+        "terraform",
+        unit_name,
+        {"revision": revision, "unitBlob": deploy_release.file_blob(unit_path)},
+        {"applied": {"sourceRevision": revision}, "outputs": {}},
+    )
 
 
 def _promotion_document(revision: str) -> dict:
@@ -528,15 +523,15 @@ def test_historical_rollback_evidence_rejects_invalid_receipts(corruption, tmp_p
     _write_json(unit_path, _desired_unit("base", "a" * 40, "stable"))
     receipt = _receipt(unit_path, "base", "b" * 40)
     if corruption == "schema":
-        receipt["schema"] = 2
+        receipt["apiVersion"] = "gitopsctr.io/v2"
     elif corruption == "unit":
-        receipt["unit"] = "other"
+        receipt["metadata"]["name"] = "other"
     elif corruption == "driver":
-        receipt["driver"] = "oci-images"
+        receipt["spec"]["subject"]["kind"] = "OciImages"
     elif corruption == "revision":
-        receipt["desired"]["revision"] = "not-a-revision"
+        receipt["spec"]["desired"]["revision"] = "not-a-revision"
     else:
-        receipt.pop("outputs")
+        receipt["status"]["result"].pop("outputs")
     _write_json(observed / "units/base.json", receipt)
 
     assert deploy_release.historical_receipt_matches(desired, observed, "base") is False

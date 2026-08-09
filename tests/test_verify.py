@@ -13,6 +13,7 @@ from gitopsctr.contrib.drivers.terraform import AppliedTerraformModel, Terraform
 from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import ReconciliationOutput, VerificationContext, VerificationResult, VerificationStatus
 from gitopsctr.resources import UnitResource
+from tests.conftest import receipt_document
 
 DESIRED_REVISION = "d" * 40
 
@@ -188,7 +189,7 @@ def test_verify_rejects_unmaterialized_desired_units_before_running_driver(monke
 def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, driver_runs):
     unit = _unit("infrastructure", "terraform", "a" * 40)
     calls: list[str] = []
-    publications: list[dict[str, object]] = []
+    publications = []
     outputs: list[tuple[bool, str]] = []
 
     monkeypatch.setattr(deploy_release, "load_environment", lambda *_args: {"schema": 1})
@@ -202,16 +203,14 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
     def observed_tree(_ref: str, output: Path):
         _write_json(
             output / "units/infrastructure.json",
-            {
-                "schema": 1,
-                "unit": "infrastructure",
-                "driver": "terraform",
-                "desired": {"revision": DESIRED_REVISION, "unitBlob": "same-unit"},
-                "resolvedInputs": {},
-                "controller": {"revision": "c" * 40},
-                "applied": {"sourceRevision": "a" * 40},
-                "outputs": {},
-            },
+            receipt_document(
+                "terraform",
+                "infrastructure",
+                {"revision": DESIRED_REVISION, "unitBlob": "same-unit"},
+                {"applied": {"sourceRevision": "a" * 40}, "outputs": {}},
+                resolved_inputs={},
+                controller={"revision": "c" * 40},
+            ),
         )
         return "o" * 40
 
@@ -271,7 +270,10 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
     assert calls == ["infrastructure"] * driver_runs
     assert len(publications) == driver_runs
     if publications:
-        assert publications[0]["$schema"] == deploy_release.driver_schema("terraform", "receipt")["$id"]
+        serialized = deploy_release.RESOURCE_CATALOG.serialize_receipt(publications[0])
+        assert serialized["$schema"] == deploy_release.resource_schema_url(
+            "unit.gitopsctr.io/v1", "Terraform", "receipt"
+        )
     assert changed is bool(driver_runs)
     assert outputs == [(bool(driver_runs), "")]
 

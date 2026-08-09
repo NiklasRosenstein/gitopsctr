@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import cache
 from importlib.metadata import version
@@ -28,7 +28,15 @@ import yaml
 
 from gitopsctr.api import GVK, ApiError
 from gitopsctr.artifacts import require_artifact_api
-from gitopsctr.contracts import CORE_CONTRACTS, DesiredSource, MaterializationDocument, StrictModel, with_schema
+from gitopsctr.contracts import (
+    CORE_CONTRACTS,
+    ArtifactDescriptor,
+    DesiredSource,
+    MaterializationDocument,
+    ReceiptDesired,
+    StrictModel,
+    with_schema,
+)
 from gitopsctr.dependencies import (
     convergence_order,
     convergence_scope,
@@ -88,8 +96,18 @@ from gitopsctr.resolution import (
 from gitopsctr.resolution import (
     resolve_template as resolve_template_value,
 )
-from gitopsctr.resources import CORE_API_VERSION, UNIT_API_VERSION, ResourceCatalog, ResourceMetadata, UnitResource
-from gitopsctr.schemas import driver_schema, encoded_schema, export_schemas, resource_schema_url, show_schema
+from gitopsctr.resources import (
+    CORE_API_VERSION,
+    UNIT_API_VERSION,
+    ReceiptResource,
+    ReceiptSpec,
+    ReceiptStatus,
+    ReceiptSubject,
+    ResourceCatalog,
+    ResourceMetadata,
+    UnitResource,
+)
+from gitopsctr.schemas import encoded_schema, export_schemas, resource_schema_url, show_schema
 from gitopsctr.state import GitStateStore
 from gitopsctr.templates import (
     ArtifactReference as ArtifactReferenceExpression,
@@ -496,16 +514,8 @@ def serialize_unit_document(
     return cast(dict[str, Any], RESOURCE_CATALOG.serialize_unit(unit, profile=profile))
 
 
-def normalize_receipt_document(document: dict[str, Any], expected_unit: str | None = None) -> dict[str, Any]:
-    return cast(dict[str, Any], RESOURCE_CATALOG.normalize_receipt(cast(JsonObject, document), expected_unit))
-
-
-def serialize_receipt_document(document: dict[str, Any]) -> dict[str, Any]:
-    return cast(dict[str, Any], RESOURCE_CATALOG.serialize_receipt(cast(JsonObject, document)))
-
-
-def load_receipt(path: Path, expected_unit: str | None = None) -> dict[str, Any]:
-    return cast(dict[str, Any], RESOURCE_CATALOG.load_receipt(path, expected_unit))
+def load_receipt(path: Path, expected_unit: str | None = None) -> ReceiptResource[Any]:
+    return RESOURCE_CATALOG.load_receipt(path, expected_unit)
 
 
 resource_documents_enabled = RESOURCE_CATALOG.resource_documents_enabled
@@ -565,8 +575,8 @@ def write_unit(path: Path, unit: UnitResource[Any], project_root: Path) -> Path:
 parse_artifact_document = RESOURCE_CATALOG.parse_artifact
 
 
-def validate_receipt_document(document: object, description: str) -> dict[str, Any]:
-    return cast(dict[str, Any], RESOURCE_CATALOG.validate_receipt(document, description))
+def validate_receipt_document(document: object, description: str) -> ReceiptResource[Any]:
+    return RESOURCE_CATALOG.validate_receipt(document, description)
 
 
 def validate_document(contract: DocumentContract, document: object, description: str) -> dict[str, Any]:
@@ -581,8 +591,8 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
-def write_preferred_document(path: Path, value: dict[str, Any], project_root: Path) -> Path:
-    return RESOURCE_CATALOG.write_preferred(path, cast(JsonObject, value), project_root)
+def write_preferred_document(path: Path, value: dict[str, Any] | ReceiptResource[Any], project_root: Path) -> Path:
+    return RESOURCE_CATALOG.write_preferred(path, value if isinstance(value, ReceiptResource) else cast(JsonObject, value), project_root)
 
 
 def canonical_json(value: Any) -> bytes:
@@ -865,22 +875,19 @@ def validate_artifact_output_identity(
 def load_artifact_document(
     observed: Path,
     unit: UnitResource[Any],
-    receipt: dict[str, Any],
+    receipt: ReceiptResource[Any],
     artifact_name: str,
 ) -> tuple[dict[str, Any], str]:
-    driver_name = receipt.get("driver")
-    if not isinstance(driver_name, str) or driver_name not in UNIT_DRIVERS:
-        raise ReferenceUnavailable("artifact receipt has an unknown driver")
+    driver_name = receipt.driver_name
     artifact_kind = UNIT_DRIVERS[driver_name].artifact_outputs.get(artifact_name)
     if artifact_kind is None:
         raise ReferenceUnavailable(f"unit does not produce artifact {artifact_name!r}")
     artifact_api = require_artifact_api(artifact_kind)
-    descriptors = receipt.get("artifacts")
-    descriptor = descriptors.get(artifact_name) if isinstance(descriptors, dict) else None
-    if not isinstance(descriptor, dict):
+    descriptor = receipt.status.artifacts.get(artifact_name) if receipt.status.artifacts is not None else None
+    if descriptor is None:
         raise ReferenceUnavailable(f"receipt does not describe artifact {artifact_name!r}")
-    expected_path = artifact_document_path(observed, str(receipt.get("unit")), artifact_name)
-    recorded_path = descriptor.get("path")
+    expected_path = artifact_document_path(observed, receipt.name, artifact_name)
+    recorded_path = descriptor.path
     if (
         not isinstance(recorded_path, str)
         or PurePosixPath(recorded_path).is_absolute()
@@ -891,15 +898,15 @@ def load_artifact_document(
     if path != expected_path or not path.is_file():
         raise ReferenceUnavailable(f"artifact {artifact_name!r} does not exist at its required path")
     if (
-        descriptor.get("apiVersion") != artifact_kind.gvk.api_version
-        or descriptor.get("kind") != artifact_kind.gvk.kind
+        descriptor.apiVersion != artifact_kind.gvk.api_version
+        or descriptor.kind != artifact_kind.gvk.kind
     ):
         raise ReferenceUnavailable(f"artifact {artifact_name!r} has the wrong contract identity")
     expected_media_type = f"{artifact_api.media_type}+{'json' if path.suffix == '.json' else 'yaml'}"
-    if descriptor.get("mediaType") != expected_media_type:
+    if descriptor.mediaType != expected_media_type:
         raise ReferenceUnavailable(f"artifact {artifact_name!r} has the wrong media type")
-    digest = descriptor.get("digest")
-    if not isinstance(digest, str) or sha256_file(path) != digest:
+    digest = descriptor.digest
+    if sha256_file(path) != digest:
         raise ReferenceUnavailable(f"artifact {artifact_name!r} does not match its digest")
     document = load_document(path)
     if not isinstance(document, dict):
@@ -938,17 +945,16 @@ def load_artifact_document(
 def validate_receipt_artifacts(
     observed: Path,
     unit: UnitResource[Any],
-    receipt: dict[str, Any],
+    receipt: ReceiptResource[Any],
 ) -> None:
     driver_name = unit.driver_name
-    receipt_driver = receipt.get("driver")
     expected = set(UNIT_DRIVERS[driver_name].artifact_outputs)
-    if receipt_driver != driver_name and (receipt_driver is not None or expected):
+    if receipt.driver_name != driver_name:
         raise OperationError(f"persisted receipt driver is not {driver_name!r}")
-    descriptors = receipt.get("artifacts", {})
-    if not isinstance(descriptors, dict) or set(descriptors) != expected:
+    descriptors = receipt.status.artifacts or {}
+    if set(descriptors) != expected:
         raise OperationError(
-            f"persisted {driver_name} receipt describes artifacts {sorted(descriptors) if isinstance(descriptors, dict) else []}; "
+            f"persisted {driver_name} receipt describes artifacts {sorted(descriptors)}; "
             f"expected {sorted(expected)}"
         )
     directory = observed / "artifacts" / unit.name
@@ -960,14 +966,13 @@ def validate_receipt_artifacts(
         load_artifact_document(observed, unit, receipt, artifact_name)
 
 
-def current_receipt(observed: Path, candidate_units: Path, unit_name: str) -> dict[str, Any] | None:
+def current_receipt(observed: Path, candidate_units: Path, unit_name: str) -> ReceiptResource[Any] | None:
     receipt_path = unit_document_path(observed, unit_name)
     unit_path = unit_document_path(candidate_units.parent, unit_name)
     if not receipt_path.is_file() or not unit_path.is_file():
         return None
     receipt = load_receipt(receipt_path, unit_name)
-    validate_receipt_document(receipt, f"persisted receipt for {unit_name}")
-    if receipt.get("desired", {}).get("unitBlob") != file_blob(unit_path):
+    if receipt.spec.desired.unitBlob != file_blob(unit_path):
         return None
     validate_receipt_artifacts(observed, load_desired_unit(unit_path, unit_name), receipt)
     return receipt
@@ -1037,8 +1042,7 @@ def resolve_template(
         receipt = current_receipt(observed, candidate / "units", reference.unit)
         if receipt is None:
             raise ReferenceUnavailable(f"receipt is stale: {reference.unit}")
-        reserved = {"$schema", "schema", "unit", "driver", "desired", "resolvedInputs", "controller", "artifacts"}
-        document = {key: item for key, item in receipt.items() if key not in reserved}
+        document = receipt.driver.result_contract.dump(receipt.status.result)
         return FingerprintedValue(
             json_pointer(document, reference.pointer), file_blob(unit_document_path(observed, reference.unit))
         )
@@ -1300,8 +1304,7 @@ def reconciliation_statuses(unit_names: Sequence[str], desired: Path, observed: 
             statuses.append((unit_name, "READY", "no observation receipt"))
             continue
         receipt = load_receipt(receipt_path, unit_name)
-        validate_receipt_document(receipt, f"persisted receipt for {unit_name}")
-        if receipt.get("desired", {}).get("unitBlob") == file_blob(unit_path):
+        if receipt.spec.desired.unitBlob == file_blob(unit_path):
             validate_receipt_artifacts(observed, unit, receipt)
             statuses.append((unit_name, "CLEAN", "observation matches desired state"))
         else:
@@ -1455,8 +1458,7 @@ def unit_change_explanation(unit_name: str, desired: Path, observed: Path) -> Un
     if not receipt_path.is_file() or not current_path.is_file():
         return None
     receipt = load_receipt(receipt_path, unit_name)
-    validate_receipt_document(receipt, f"persisted receipt for {unit_name}")
-    previous_revision = receipt.get("desired", {}).get("revision")
+    previous_revision = receipt.spec.desired.revision
     if not isinstance(previous_revision, str):
         return None
     previous_result = git("show", f"{previous_revision}:units/{unit_name}.json", check=False)
@@ -1922,24 +1924,22 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
         return False
     if not receipt_path.is_file():
         return False
-    receipt = load_receipt(receipt_path, unit_name)
     try:
-        validate_receipt_document(receipt, f"historical receipt for {unit_name}")
+        receipt = load_receipt(receipt_path, unit_name)
     except OperationError:
         return False
     driver = unit.driver_name
-    desired_evidence = receipt.get("desired")
+    desired_evidence = receipt.spec.desired
     if (
-        receipt.get("unit") != unit_name
-        or receipt.get("driver") != driver
-        or not isinstance(desired_evidence, dict)
-        or not re.fullmatch(r"[0-9a-f]{40}", str(desired_evidence.get("revision", "")))
-        or desired_evidence.get("unitBlob") != file_blob(unit_path)
+        receipt.name != unit_name
+        or receipt.driver_name != driver
+        or not re.fullmatch(r"[0-9a-f]{40}", str(desired_evidence.revision or ""))
+        or desired_evidence.unitBlob != file_blob(unit_path)
     ):
         return False
     try:
         validate_receipt_artifacts(observed, unit, receipt)
-        semantic_reconciliation_result(driver, receipt)
+        semantic_reconciliation_result(driver, receipt.status.result, receipt.status.artifacts)
     except DriverError:
         return False
     return True
@@ -2794,17 +2794,16 @@ def command_show_receipt(args: argparse.Namespace) -> None:
             raise OperationError(f"{observed_ref} has no receipt for {args.unit}")
         document = load_json(path)
         receipt = load_receipt(path, args.unit)
-        validate_receipt_document(receipt, f"observation receipt units/{path.name}")
         artifacts: dict[str, Any] = {}
-        for name, descriptor in (receipt.get("artifacts") or {}).items():
-            if not isinstance(descriptor, dict) or not isinstance(descriptor.get("path"), str):
+        for name, descriptor in (receipt.status.artifacts or {}).items():
+            if not isinstance(descriptor.path, str):
                 raise OperationError(f"receipt for {args.unit} has an invalid artifact descriptor {name!r}")
-            artifact_relative = PurePosixPath(descriptor["path"])
+            artifact_relative = PurePosixPath(descriptor.path)
             if artifact_relative.is_absolute() or ".." in artifact_relative.parts:
                 raise OperationError(f"receipt artifact {name!r} has an unsafe path")
             artifact_path = observed.joinpath(*artifact_relative.parts)
             if not artifact_path.is_file():
-                raise OperationError(f"receipt artifact {name!r} is missing at {descriptor['path']}")
+                raise OperationError(f"receipt artifact {name!r} is missing at {descriptor.path}")
             artifacts[name] = load_json(artifact_path)
     if args.artifact is not None:
         if args.artifact not in artifacts:
@@ -3031,7 +3030,7 @@ def nested_strings(value: Any) -> list[str]:
 def publish_observation_cas(
     observed_ref: str,
     unit_name: str,
-    receipt: dict[str, Any],
+    receipt: ReceiptResource[Any],
     unit: UnitResource[Any],
     artifact_documents: Mapping[str, JsonObject],
     desired_revision: str,
@@ -3042,28 +3041,44 @@ def publish_observation_cas(
         with tempfile.TemporaryDirectory() as temporary_directory:
             observed = Path(temporary_directory) / "observed"
             observed_revision = observed_tree(observed_ref, observed)
-            driver = receipt.get("driver")
-            if not isinstance(driver, str) or driver not in UNIT_DRIVERS:
-                raise OperationError(f"candidate receipt for {unit_name} has an unknown driver")
+            driver = receipt.driver_name
+            if receipt.name != unit_name:
+                raise OperationError(f"candidate receipt name is not {unit_name!r}")
             validate_artifact_output_identity(driver, unit, artifact_documents)
             receipt_path = unit_document_path(observed, unit_name)
             existing_receipt = load_receipt(receipt_path, unit_name) if receipt_path.is_file() else None
             if existing_receipt is not None:
-                validate_receipt_document(existing_receipt, f"persisted receipt for {unit_name}")
-                if existing_receipt.get("desired", {}).get("unitBlob") == receipt.get("desired", {}).get("unitBlob"):
+                if existing_receipt.spec.desired.unitBlob == receipt.spec.desired.unitBlob:
                     validate_receipt_artifacts(observed, unit, existing_receipt)
             descriptors = write_artifact_documents(observed, unit_name, driver, artifact_documents)
-            candidate_receipt = {**receipt, "artifacts": descriptors}
-            validate_receipt_document(candidate_receipt, f"candidate receipt for {unit_name}")
-            if existing_receipt is not None and existing_receipt.get("desired", {}).get(
-                "unitBlob"
-            ) == candidate_receipt.get("desired", {}).get("unitBlob"):
+            try:
+                typed_descriptors = {
+                    name: ArtifactDescriptor.from_dict(descriptor) for name, descriptor in descriptors.items()
+                }
+            except (TypeError, ValueError) as exc:
+                raise OperationError(f"candidate receipt has invalid artifact descriptors: {exc}") from exc
+            candidate_receipt = ReceiptResource(
+                gvk=receipt.gvk,
+                metadata=receipt.metadata,
+                driver=receipt.driver,
+                spec=receipt.spec,
+                status=replace(receipt.status, artifacts=typed_descriptors or None),
+            )
+            validate_receipt_document(
+                RESOURCE_CATALOG.serialize_receipt(candidate_receipt),
+                f"candidate receipt for {unit_name}",
+            )
+            if existing_receipt is not None and existing_receipt.spec.desired.unitBlob == candidate_receipt.spec.desired.unitBlob:
                 if observed_revision is None:
                     raise OperationError(f"{observed_ref} receipt has no revision")
-                if existing_receipt.get("driver") != driver:
+                if existing_receipt.driver_name != driver:
                     raise OperationError(f"duplicate {unit_name} receipt changed its reconciliation driver")
-                existing_result = semantic_reconciliation_result(driver, existing_receipt)
-                candidate_result = semantic_reconciliation_result(driver, candidate_receipt)
+                existing_result = semantic_reconciliation_result(
+                    driver, existing_receipt.status.result, existing_receipt.status.artifacts
+                )
+                candidate_result = semantic_reconciliation_result(
+                    driver, candidate_receipt.status.result, candidate_receipt.status.artifacts
+                )
                 if existing_result != candidate_result:
                     raise OperationError(
                         f"duplicate {unit_name} receipt for the same desired unit has a different semantic result"
@@ -3230,13 +3245,11 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         unit_blob = file_blob(unit_path)
         receipt_path = unit_document_path(observed, args.unit)
         previous_receipt = load_receipt(receipt_path, args.unit) if receipt_path.is_file() else None
-        if previous_receipt is not None:
-            validate_receipt_document(previous_receipt, f"persisted receipt for {args.unit}")
         if receipt_path.is_file():
             assert previous_receipt is not None
             receipt = previous_receipt
             skip_clean_unit = not args.plan or bool(UNIT_DRIVERS[driver_name].artifact_outputs)
-            receipt_is_current = receipt.get("desired", {}).get("unitBlob") == unit_blob
+            receipt_is_current = receipt.spec.desired.unitBlob == unit_blob
             if receipt_is_current:
                 validate_receipt_artifacts(observed, unit, receipt)
             if not getattr(args, "reapply", False) and skip_clean_unit and receipt_is_current:
@@ -3290,33 +3303,23 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         )
         if not isinstance(output, ReconciliationOutput):
             raise DriverError(f"{driver_name} reconciliation did not return ReconciliationOutput")
-        try:
-            result = UNIT_DRIVERS[driver_name].result_contract.dump(output.result)
-        except (TypeError, ValueError) as exc:
-            raise DriverError(f"{driver_name} returned an invalid typed reconciliation result: {exc}") from exc
-        validate_document(UNIT_DRIVERS[driver_name].result_contract, result, f"{driver_name} reconciliation result")
-        reserved = {
-            "schema",
-            "unit",
-            "driver",
-            "desired",
-            "controller",
-        }
-        overlap = reserved.intersection(result)
-        if overlap:
-            raise OperationError(f"driver returned reserved observation fields: {sorted(overlap)}")
-        receipt = with_schema(
-            {
-                "unit": args.unit,
-                "driver": driver_name,
-                "desired": {"revision": desired_revision, "unitBlob": unit_blob},
-                "resolvedInputs": (
-                    unit.spec.resolvedInputs.to_dict() if getattr(unit.spec, "resolvedInputs", None) is not None else {}
+        receipt = ReceiptResource(
+            gvk=unit.gvk,
+            metadata=unit.metadata,
+            driver=unit.driver,
+            spec=ReceiptSpec(
+                subject=ReceiptSubject(
+                    apiVersion=unit.gvk.api_version,
+                    kind=unit.gvk.kind,
+                    name=args.unit,
                 ),
-                "controller": controller_evidence(),
-                **result,
-            },
-            str(driver_schema(driver_name, "receipt")["$id"]),
+                desired=ReceiptDesired(revision=desired_revision, unitBlob=unit_blob),
+                resolvedInputs=getattr(unit.spec, "resolvedInputs", None),
+            ),
+            status=ReceiptStatus(
+                controller=JsonObjectValue(controller_evidence()),
+                result=output.result,
+            ),
         )
         revision = publish_observation_cas(
             observed_ref,

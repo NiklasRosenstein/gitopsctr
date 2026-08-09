@@ -190,8 +190,8 @@ def test_yaml_demo_documents_validate_against_published_resource_schemas():
 
 
 def test_receipt_result_cannot_override_envelope_identity():
-    with pytest.raises(cli.OperationError, match="reserved fields"):
-        cli.RESOURCE_CATALOG.normalize_receipt(
+    with pytest.raises(cli.OperationError, match="Additional properties"):
+        cli.RESOURCE_CATALOG.parse_receipt(
             {
                 "apiVersion": "gitopsctr.io/v1",
                 "kind": "Receipt",
@@ -204,7 +204,7 @@ def test_receipt_result_cannot_override_envelope_identity():
                     },
                     "desired": {"unitBlob": "f" * 40},
                 },
-                "status": {"result": {"driver": "oci-images"}},
+                "status": {"controller": {}, "result": {"driver": "oci-images"}},
             }
         )
 

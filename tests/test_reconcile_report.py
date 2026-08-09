@@ -11,7 +11,7 @@ import pytest
 from gitopsctr import cli as deploy_release
 from gitopsctr.contrib.drivers.terraform import AppliedTerraformModel, TerraformResultModel
 from gitopsctr.driver import ReconciliationOutput
-from tests.conftest import write_test_document
+from tests.conftest import receipt_document, write_test_document
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
@@ -83,11 +83,11 @@ def test_observation_reference_materializes_artifact_into_consumer(tmp_path):
     )
     _write_json(
         observed / "units/application-images.json",
-        {
-            "unit": "application-images",
-            "driver": "oci-images",
-            "desired": {"unitBlob": deploy_release.file_blob(producer)},
-            "artifacts": {
+        receipt_document(
+            "oci-images",
+            "application-images",
+            {"unitBlob": deploy_release.file_blob(producer)},
+            artifacts={
                 "containers": {
                     "apiVersion": "artifact.gitopsctr.io/v1",
                     "kind": "ContainerImages",
@@ -96,7 +96,7 @@ def test_observation_reference_materializes_artifact_into_consumer(tmp_path):
                     "mediaType": "application/vnd.gitopsctr.container-images.v1+yaml",
                 }
             },
-        },
+        ),
     )
 
     resolution = deploy_release.resolve_template(
@@ -147,20 +147,17 @@ def test_receipt_reference_normalizes_resource_receipt_before_applying_pointer(t
     receipt_path.parent.mkdir(parents=True)
     receipt_path.write_text(
         json.dumps(
-            deploy_release.serialize_receipt_document(
-                {
-                    "unit": "infrastructure",
-                    "driver": "terraform",
-                    "desired": {"revision": "d" * 40, "unitBlob": deploy_release.file_blob(producer)},
-                    "resolvedInputs": {},
-                    "controller": {
-                        "version": "0.1.0",
-                        "revision": "a" * 40,
-                        "observed_at": "2026-08-08T00:00:00Z",
-                    },
-                    "applied": {"sourceRevision": "a" * 40},
-                    "outputs": {"url": "https://example.invalid"},
-                }
+            receipt_document(
+                "terraform",
+                "infrastructure",
+                {"revision": "d" * 40, "unitBlob": deploy_release.file_blob(producer)},
+                {"applied": {"sourceRevision": "a" * 40}, "outputs": {"url": "https://example.invalid"}},
+                resolved_inputs={},
+                controller={
+                    "version": "0.1.0",
+                    "revision": "a" * 40,
+                    "observed_at": "2026-08-08T00:00:00Z",
+                },
             )
         )
     )
@@ -309,7 +306,7 @@ def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monke
         if ref == "observed/dev":
             _write_json(
                 output / "units/aws-application.json",
-                {"desired": {"unitBlob": "same-unit"}},
+                receipt_document("terraform", "aws-application", {"unitBlob": "same-unit"}),
             )
             return "b" * 40
         return None
@@ -373,7 +370,7 @@ def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_p
         if ref == "observed/dev":
             _write_json(
                 output / "units/application-images.json",
-                {"desired": {"unitBlob": "same-unit"}},
+                receipt_document("terraform", "application-images", {"unitBlob": "same-unit"}),
             )
             return "b" * 40
         return None

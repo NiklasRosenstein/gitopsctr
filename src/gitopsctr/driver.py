@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from gitopsctr.api import GVK, ApiKind, api_kinds
 from gitopsctr.artifacts import ArtifactApi, require_artifact_api
@@ -19,6 +19,9 @@ from gitopsctr.contracts import DesiredSource, MaterializationDocument, Resolved
 from gitopsctr.document import JsonObject, TypedDocumentContract
 from gitopsctr.execution import DriverExecution, default_driver_execution
 from gitopsctr.resolution import TemplateResolution
+
+if TYPE_CHECKING:
+    from gitopsctr.resources import ReceiptResource
 
 type ReconciliationResult = Mapping[str, object]
 
@@ -157,7 +160,7 @@ class PlanningContext[DesiredT: StrictModel](UnitExecutionContext[DesiredT]):
 
 @dataclass(frozen=True)
 class ReconciliationContext[DesiredT: StrictModel](UnitExecutionContext[DesiredT]):
-    previous_receipt: JsonObject | None = None
+    previous_receipt: ReceiptResource[Any] | None = None
 
 
 @dataclass(frozen=True)

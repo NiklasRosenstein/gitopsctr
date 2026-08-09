@@ -9,7 +9,13 @@ from typing import Any, cast
 
 from gitopsctr.api import GVK
 from gitopsctr.artifacts import ArtifactApi, require_artifact_api
-from gitopsctr.contracts import CORE_CONTRACTS, SCHEMA_ROOT, artifact_descriptors_schema, receipt_schema
+from gitopsctr.contracts import (
+    CORE_CONTRACTS,
+    SCHEMA_ROOT,
+    MashumaroContract,
+    ResolvedInputs,
+    artifact_descriptors_schema,
+)
 from gitopsctr.document import DocumentContract, JsonObject
 from gitopsctr.driver import UnitDriver
 from gitopsctr.formats import PROJECT_RESOURCE_SCHEMA
@@ -45,9 +51,11 @@ def _specification_schema(contract: DocumentContract) -> JsonObject:
 
 
 def _resolved_inputs_schema() -> JsonObject:
-    schema = CORE_CONTRACTS["receipt"].json_schema()
-    properties = cast(dict[str, JsonObject], schema["properties"])
-    return deepcopy(properties["resolvedInputs"])
+    schema = MashumaroContract(ResolvedInputs, f"{SCHEMA_ROOT}/core/v1/resolved-inputs.schema.json").json_schema()
+    schema.pop("$schema", None)
+    schema.pop("$id", None)
+    schema.pop("title", None)
+    return schema
 
 
 def _resource_schema(
@@ -176,23 +184,16 @@ def core_resource_schema(kind: str) -> JsonObject:
     elif kind == "Promotion":
         specification = _specification_schema(CORE_CONTRACTS["promotion"])
     elif kind == "Receipt":
-        specification = {
-            "type": "object",
-            "properties": {
-                "subject": {"type": "object"},
-                "desired": {"type": "object"},
-                "resolvedInputs": _resolved_inputs_schema(),
-            },
-            "required": ["subject", "desired"],
-            "additionalProperties": False,
-        }
+        schema = deepcopy(CORE_CONTRACTS["receipt"].json_schema())
+        schema["$id"] = resource_schema_url("gitopsctr.io/v1", kind)
+        return schema
     else:
         raise ValueError(f"unknown core resource kind: {kind}")
     return _resource_schema(
         schema_id=resource_schema_url("gitopsctr.io/v1", kind),
         api_version="gitopsctr.io/v1",
         kind=kind,
-        spec=cast(JsonObject, specification),
+        spec=specification,
     )
 
 
@@ -213,19 +214,7 @@ def driver_schema(driver: str, kind: str) -> JsonObject:
         "result": plugin.result_contract,
     }
     if kind == "receipt":
-        schema = receipt_schema(
-            driver,
-            plugin.version,
-            plugin.result_contract,
-            {
-                name: (
-                    artifact_kind.gvk.api_version,
-                    artifact_kind.gvk.kind,
-                    require_artifact_api(artifact_kind).media_type,
-                )
-                for name, artifact_kind in plugin.artifact_outputs.items()
-            },
-        )
+        schema = receipt_resource_schema(driver)
     else:
         try:
             schema = contracts[kind].json_schema()

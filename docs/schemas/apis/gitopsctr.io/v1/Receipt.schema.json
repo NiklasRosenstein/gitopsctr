@@ -4,7 +4,15 @@
   "additionalProperties": false,
   "properties": {
     "$schema": {
-      "type": "string"
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "apiVersion": {
       "const": "gitopsctr.io/v1"
@@ -16,19 +24,40 @@
       "additionalProperties": false,
       "properties": {
         "name": {
-          "minLength": 1,
           "type": "string"
         }
       },
       "required": [
         "name"
       ],
+      "title": "ReceiptMetadata",
       "type": "object"
     },
     "spec": {
       "additionalProperties": false,
       "properties": {
         "desired": {
+          "additionalProperties": false,
+          "properties": {
+            "revision": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "unitBlob": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "unitBlob"
+          ],
+          "title": "ReceiptDesired",
           "type": "object"
         },
         "resolvedInputs": {
@@ -98,6 +127,24 @@
           "default": null
         },
         "subject": {
+          "additionalProperties": false,
+          "properties": {
+            "apiVersion": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "apiVersion",
+            "kind",
+            "name"
+          ],
+          "title": "ReceiptSubjectDocument",
           "type": "object"
         }
       },
@@ -105,6 +152,35 @@
         "subject",
         "desired"
       ],
+      "title": "ReceiptSpecDocument",
+      "type": "object"
+    },
+    "status": {
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "controller": {
+          "type": "object"
+        },
+        "result": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "controller",
+        "result"
+      ],
+      "title": "ReceiptStatusDocument",
       "type": "object"
     }
   },
@@ -112,8 +188,9 @@
     "apiVersion",
     "kind",
     "metadata",
-    "spec"
+    "spec",
+    "status"
   ],
-  "title": "Receipt (gitopsctr.io/v1)",
+  "title": "ReceiptDocument",
   "type": "object"
 }

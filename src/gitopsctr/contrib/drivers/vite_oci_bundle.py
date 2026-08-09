@@ -270,7 +270,7 @@ class ViteOciBundleDriver(
         )
 
     def semantic_result(self, result: object) -> ReconciliationResult:
-        if result == {}:
+        if isinstance(result, EmptyResultModel) or result == {}:
             return {}
         raise DriverError("vite-oci-bundle receipt result must be empty")
 

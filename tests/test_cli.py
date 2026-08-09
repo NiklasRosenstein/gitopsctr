@@ -12,7 +12,7 @@ from gitopsctr import cli as deploy_release
 from gitopsctr.contracts import DesiredSource, ResolvedInputs
 from gitopsctr.contrib.drivers.frontend_s3_cloudfront import FrontendDesiredUnit
 from gitopsctr.driver import UnitResolution
-from tests.conftest import write_test_document
+from tests.conftest import receipt_document, receipt_resource, write_test_document
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
@@ -129,20 +129,17 @@ def test_desired_candidate_drops_legacy_artifact_catalogue(tmp_path, monkeypatch
 
 
 def test_show_receipt_reports_receipt_and_artifacts(monkeypatch, capsys):
+    expected = receipt_document(
+        "terraform",
+        "aws-application",
+        {"revision": "b" * 40, "unitBlob": "blob"},
+        {"applied": {"sourceRevision": "c" * 40}, "outputs": {"api_url": "https://api.example"}},
+        resolved_inputs={},
+        controller={"observed_at": "2026-08-07T00:00:00Z"},
+    )
+
     def materialize_observed(_ref, output):
-        _write_json(
-            output / "units/aws-application.json",
-            {
-                "schema": 1,
-                "unit": "aws-application",
-                "driver": "terraform",
-                "desired": {"revision": "b" * 40, "unitBlob": "blob"},
-                "resolvedInputs": {},
-                "controller": {"observed_at": "2026-08-07T00:00:00Z"},
-                "applied": {"sourceRevision": "c" * 40},
-                "outputs": {"api_url": "https://api.example"},
-            },
-        )
+        _write_json(output / "units/aws-application.json", expected)
         return "a" * 40
 
     monkeypatch.setattr(deploy_release, "observed_tree", materialize_observed)
@@ -153,16 +150,7 @@ def test_show_receipt_reports_receipt_and_artifacts(monkeypatch, capsys):
     args.handler(args)
 
     result = json.loads(capsys.readouterr().out)
-    assert result == {
-        "schema": 1,
-        "unit": "aws-application",
-        "driver": "terraform",
-        "desired": {"revision": "b" * 40, "unitBlob": "blob"},
-        "resolvedInputs": {},
-        "controller": {"observed_at": "2026-08-07T00:00:00Z"},
-        "applied": {"sourceRevision": "c" * 40},
-        "outputs": {"api_url": "https://api.example"},
-    }
+    assert result == expected
 
 
 def test_show_document_format_can_force_yaml_or_json():
@@ -531,7 +519,7 @@ def test_promotion_requires_every_source_unit_to_be_clean(tmp_path):
     _write_json(second, _unit("second"))
     _write_json(
         observed / "units/first.json",
-        {"desired": {"unitBlob": deploy_release.file_blob(first)}},
+        receipt_document("terraform", "first", {"unitBlob": deploy_release.file_blob(first)}),
     )
 
     with pytest.raises(deploy_release.OperationError, match=r"second \(ready\)"):
@@ -539,7 +527,7 @@ def test_promotion_requires_every_source_unit_to_be_clean(tmp_path):
 
     _write_json(
         observed / "units/second.json",
-        {"desired": {"unitBlob": deploy_release.file_blob(second)}},
+        receipt_document("terraform", "second", {"unitBlob": deploy_release.file_blob(second)}),
     )
     deploy_release.require_clean_source(desired, observed)
 
@@ -865,7 +853,7 @@ def test_reconciliation_statuses_identify_clean_ready_and_waiting_units(tmp_path
     _write_json(desired / "units/aws-application.json", _unit("aws-application"))
     _write_json(
         observed / "units/application-images.json",
-        {"desired": {"unitBlob": deploy_release.file_blob(clean_unit)}},
+        receipt_document("terraform", "application-images", {"unitBlob": deploy_release.file_blob(clean_unit)}),
     )
 
     statuses = deploy_release.reconciliation_statuses(
@@ -899,15 +887,13 @@ def test_desired_unit_rejects_an_incompatible_running_driver_version():
 
 
 def test_duplicate_receipt_reuses_identical_semantic_result_without_writing(tmp_path, monkeypatch):
-    existing = {
-        "schema": 1,
-        "unit": "aws-application",
-        "driver": "terraform",
-        "desired": {"unitBlob": "same"},
-        "controller": {"run": "old"},
-        "applied": {"sourceRevision": "a" * 40},
-        "outputs": {"url": "https://example.test"},
-    }
+    existing = receipt_document(
+        "terraform",
+        "aws-application",
+        {"unitBlob": "same"},
+        {"applied": {"sourceRevision": "a" * 40}, "outputs": {"url": "https://example.test"}},
+        controller={"run": "old"},
+    )
 
     def materialize(_ref, output):
         _write_json(output / "units/aws-application.json", existing)
@@ -919,11 +905,13 @@ def test_duplicate_receipt_reuses_identical_semantic_result_without_writing(tmp_
         "publish_tree",
         lambda *_args: (_ for _ in ()).throw(AssertionError("duplicate receipt was written")),
     )
-    candidate = {
-        **existing,
-        "controller": {"run": "new"},
-        "planEvidence": {"digest": "different-and-ignored"},
-    }
+    candidate = receipt_resource(
+        "terraform",
+        "aws-application",
+        {"unitBlob": "same"},
+        {"applied": {"sourceRevision": "a" * 40}, "outputs": {"url": "https://example.test"}},
+        controller={"run": "new"},
+    )
 
     assert (
         deploy_release.publish_observation_cas(
@@ -939,24 +927,24 @@ def test_duplicate_receipt_reuses_identical_semantic_result_without_writing(tmp_
 
 
 def test_duplicate_receipt_rejects_a_different_semantic_result(tmp_path, monkeypatch):
-    existing = {
-        "schema": 1,
-        "unit": "aws-application",
-        "driver": "terraform",
-        "desired": {"unitBlob": "same"},
-        "applied": {"sourceRevision": "a" * 40},
-        "outputs": {"url": "https://old.example.test"},
-    }
+    existing = receipt_document(
+        "terraform",
+        "aws-application",
+        {"unitBlob": "same"},
+        {"applied": {"sourceRevision": "a" * 40}, "outputs": {"url": "https://old.example.test"}},
+    )
 
     def materialize(_ref, output):
         _write_json(output / "units/aws-application.json", existing)
         return "b" * 40
 
     monkeypatch.setattr(deploy_release, "observed_tree", materialize)
-    candidate = {
-        **existing,
-        "outputs": {"url": "https://new.example.test"},
-    }
+    candidate = receipt_resource(
+        "terraform",
+        "aws-application",
+        {"unitBlob": "same"},
+        {"applied": {"sourceRevision": "a" * 40}, "outputs": {"url": "https://new.example.test"}},
+    )
 
     with pytest.raises(deploy_release.OperationError, match="different semantic result"):
         deploy_release.publish_observation_cas(
@@ -1527,7 +1515,14 @@ def _install_convergence_simulation(
         for unit_name, blob in state["receipts"].items():
             _write_json(
                 output / f"units/{unit_name}.json",
-                {"desired": {"unitBlob": blob}},
+                receipt_document(
+                    specifications[unit_name]["driver"],
+                    unit_name,
+                    {"unitBlob": blob},
+                    {"applied": {"sourceRevision": source_revision}, "outputs": {}}
+                    if specifications[unit_name]["driver"] == "terraform"
+                    else {},
+                ),
             )
         return state["observed"]
 
@@ -1846,7 +1841,7 @@ def test_promoted_converge_uses_merged_specification_without_source_revision(tmp
             return desired_revision
         _write_json(
             output / "units/application.json",
-            {"desired": {"unitBlob": "release-v1"}},
+            receipt_document("terraform", "application", {"unitBlob": "release-v1"}),
         )
         return "e" * 40
 

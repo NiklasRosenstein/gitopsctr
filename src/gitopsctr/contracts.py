@@ -375,14 +375,38 @@ class ReceiptDesired(StrictModel):
 
 
 @dataclass(frozen=True, kw_only=True)
-class ReceiptDocument(SchemaDocument):
-    unit: str
-    driver: str
+class ReceiptSubjectDocument(StrictModel):
+    apiVersion: str
+    kind: str
+    name: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReceiptSpecDocument(StrictModel):
+    subject: ReceiptSubjectDocument
     desired: ReceiptDesired
     resolvedInputs: ResolvedInputs | None = None
-    controller: JsonObjectValue | None = None
-    artifacts: dict[str, ArtifactDescriptor] | None = None
-    planEvidence: JsonObjectValue | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReceiptStatusDocument(StrictModel):
+    controller: JsonObjectValue
+    result: JsonObjectValue
+    artifacts: JsonObjectValue | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReceiptMetadata(StrictModel):
+    name: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReceiptDocument(SchemaDocument):
+    apiVersion: Literal["gitopsctr.io/v1"]
+    kind: Literal["Receipt"]
+    metadata: ReceiptMetadata
+    spec: ReceiptSpecDocument
+    status: ReceiptStatusDocument
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -444,7 +468,7 @@ def receipt_schema(
     result_contract: DocumentContract,
     artifacts: Mapping[str, tuple[str, str, str]] | None = None,
 ) -> JsonObject:
-    """Compose the generic receipt envelope with a plugin's flattened result."""
+    """Compose a driver receipt schema with the typed result nested in status."""
     core = deepcopy(CORE_CONTRACTS["receipt"].json_schema())
     result = deepcopy(result_contract.json_schema())
     for component in (core, result):
@@ -452,16 +476,25 @@ def receipt_schema(
         component.pop("$id", None)
         component.pop("title", None)
         component.pop("additionalProperties", None)
+    result.pop("additionalProperties", None)
     for variant in cast(list[dict[str, Any]], result.get("oneOf", [])):
         variant.pop("additionalProperties", None)
     if artifacts:
-        cast(dict[str, Any], core["properties"])["artifacts"] = artifact_descriptors_schema(artifacts)
-        cast(list[str], core["required"]).append("artifacts")
+        core_properties = cast(dict[str, Any], core["properties"])
+        status = cast(dict[str, Any], core_properties["status"])
+        status_properties = cast(dict[str, Any], status["properties"])
+        status_properties["artifacts"] = artifact_descriptors_schema(artifacts)
+        cast(list[str], status["required"]).append("artifacts")
+    core_properties = cast(dict[str, Any], core["properties"])
+    status = cast(dict[str, Any], core_properties["status"])
+    status_result = cast(dict[str, Any], status["properties"]["result"])
+    status_result.clear()
+    status_result.update(result)
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": schema_url(f"drivers/{driver}", version, "receipt"),
         "title": f"{driver} receipt v{version}",
-        "allOf": [core, result],
+        "allOf": [core],
         "unevaluatedProperties": False,
     }
 

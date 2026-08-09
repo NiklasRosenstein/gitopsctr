@@ -8,8 +8,8 @@ from typing import Any, Literal, cast
 
 from gitopsctr.api import GVK
 from gitopsctr.artifacts import ArtifactApi
-from gitopsctr.contracts import StrictModel
-from gitopsctr.document import ContractError, JsonObject, TypedDocumentContract
+from gitopsctr.contracts import ArtifactDescriptor, ReceiptDesired, ResolvedInputs, StrictModel
+from gitopsctr.document import ContractError, JsonObject, JsonObjectValue, TypedDocumentContract
 from gitopsctr.driver import InstalledUnitDriver
 from gitopsctr.errors import OperationError
 from gitopsctr.formats import (
@@ -20,7 +20,7 @@ from gitopsctr.formats import (
     load_project_config,
     write_document,
 )
-from gitopsctr.schemas import driver_schema, resource_schema_url
+from gitopsctr.schemas import receipt_resource_schema, resource_schema_url
 
 CORE_API_VERSION = "gitopsctr.io/v1"
 UNIT_API_VERSION = "unit.gitopsctr.io/v1"
@@ -50,6 +50,50 @@ class UnitResource[ModelT: StrictModel]:
 
     def with_spec[NextT: StrictModel](self, spec: NextT) -> UnitResource[NextT]:
         return UnitResource(self.gvk, self.metadata, self.driver, spec)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReceiptSubject(StrictModel):
+    apiVersion: str
+    kind: str
+    name: str
+
+    @property
+    def gvk(self) -> GVK:
+        return GVK(self.apiVersion, self.kind)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReceiptSpec(StrictModel):
+    subject: ReceiptSubject
+    desired: ReceiptDesired
+    resolvedInputs: ResolvedInputs | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReceiptStatus[ResultT: StrictModel]:
+    controller: JsonObjectValue
+    result: ResultT
+    artifacts: dict[str, ArtifactDescriptor] | None = None
+
+
+@dataclass(frozen=True)
+class ReceiptResource[ResultT: StrictModel]:
+    """A typed persisted receipt associated with its registered unit driver."""
+
+    gvk: GVK
+    metadata: ResourceMetadata
+    driver: InstalledUnitDriver
+    spec: ReceiptSpec
+    status: ReceiptStatus[ResultT]
+
+    @property
+    def name(self) -> str:
+        return self.metadata.name
+
+    @property
+    def driver_name(self) -> str:
+        return self.driver.driver_name
 
 
 class ResourceCatalog:
@@ -197,69 +241,120 @@ class ResourceCatalog:
             "spec": specification,
         }
 
-    def normalize_receipt(self, document: JsonObject, expected_unit: str | None = None) -> JsonObject:
-        if document.get("apiVersion") is None:
-            return self._without_legacy_schema(document)
+    @staticmethod
+    def _compact(value: JsonObject) -> JsonObject:
+        return {key: item for key, item in value.items() if item is not None}
+
+    def parse_receipt(self, document: JsonObject, expected_unit: str | None = None) -> ReceiptResource[Any]:
         if document.get("apiVersion") != CORE_API_VERSION or document.get("kind") != "Receipt":
             raise OperationError("receipt must use apiVersion gitopsctr.io/v1 and kind Receipt")
         metadata, specification, status = document.get("metadata"), document.get("spec"), document.get("status")
         if not isinstance(metadata, dict) or not isinstance(specification, dict) or not isinstance(status, dict):
             raise OperationError("receipt envelope requires metadata, spec, and status mappings")
-        name, subject = metadata.get("name"), specification.get("subject")
-        if not isinstance(name, str) or (expected_unit is not None and name != expected_unit):
+        name = metadata.get("name")
+        if not isinstance(name, str) or not name or (expected_unit is not None and name != expected_unit):
             raise OperationError(f"receipt metadata.name must be {expected_unit or 'a unit name'}")
-        if not isinstance(subject, dict):
+        subject_document = specification.get("subject")
+        if not isinstance(subject_document, dict):
             raise OperationError("receipt spec.subject is required")
-        driver = self.driver_names_by_gvk.get(f"{subject.get('apiVersion')}/{subject.get('kind')}")
+        try:
+            subject = ReceiptSubject.from_dict(subject_document)
+            subject_gvk = subject.gvk
+        except (TypeError, ValueError) as exc:
+            raise OperationError(f"receipt subject is invalid: {exc}") from exc
+        driver_name = self.driver_names_by_gvk.get(str(subject_gvk))
+        driver = self.drivers.get(driver_name) if driver_name is not None else None
         if driver is None:
-            raise OperationError("receipt subject does not identify an installed unit driver")
-        result = status.get("result", {})
-        if not isinstance(result, dict):
-            raise OperationError("receipt status.result must be a mapping")
-        reserved = {"unit", "driver", "desired", "resolvedInputs", "controller", "artifacts", "$schema", "schema"}
-        overlap = reserved.intersection(result)
-        if overlap:
-            raise OperationError(f"receipt result contains reserved fields: {sorted(overlap)}")
-        return {
-            "unit": name,
-            "driver": driver,
-            "desired": specification.get("desired", {}),
-            "resolvedInputs": specification.get("resolvedInputs", {}),
-            "controller": status.get("controller", {}),
-            "artifacts": status.get("artifacts", {}),
-            **result,
-        }
+            raise OperationError(f"receipt subject does not identify an installed unit driver: {subject_gvk}")
+        assert driver_name is not None
+        if subject.name != name:
+            raise OperationError("receipt subject name must match metadata.name")
+        if expected_unit is not None and subject.name != expected_unit:
+            raise OperationError(f"receipt subject.name must be {expected_unit!r}")
+        from jsonschema import Draft202012Validator
+        from jsonschema.exceptions import ValidationError
 
-    def serialize_receipt(self, receipt: JsonObject) -> JsonObject:
-        driver, unit = receipt.get("driver"), receipt.get("unit")
-        if not isinstance(driver, str) or driver not in self.drivers or not isinstance(unit, str):
-            raise OperationError("receipt is missing a known driver or unit")
-        api_version, kind = self.driver_gvks[driver].rsplit("/", 1)
-        reserved = {"schema", "unit", "driver", "desired", "resolvedInputs", "controller", "artifacts", "$schema"}
-        status: JsonObject = {
-            "controller": receipt.get("controller", {}),
-            "result": {key: value for key, value in receipt.items() if key not in reserved},
+        try:
+            Draft202012Validator(receipt_resource_schema(driver_name)).validate(
+                {key: value for key, value in document.items() if key != "$schema"}
+            )
+        except ValidationError as exc:
+            raise OperationError(f"invalid {driver_name} receipt: {exc.message}") from exc
+        try:
+            desired_document = specification.get("desired")
+            if not isinstance(desired_document, dict):
+                raise ValueError("receipt spec.desired must be an object")
+            desired = ReceiptDesired.from_dict(desired_document)
+            resolved_inputs_document = specification.get("resolvedInputs")
+            if resolved_inputs_document is not None and not isinstance(resolved_inputs_document, dict):
+                raise ValueError("receipt spec.resolvedInputs must be an object")
+            resolved_inputs = (
+                ResolvedInputs.from_dict(resolved_inputs_document)
+                if resolved_inputs_document is not None
+                else None
+            )
+            controller = JsonObjectValue._deserialize(status["controller"])
+            result = driver.result_contract.parse(status["result"])
+        except (ContractError, KeyError, TypeError, ValueError) as exc:
+            raise OperationError(f"invalid {driver_name} receipt: {exc}") from exc
+        artifacts_document = status.get("artifacts")
+        if artifacts_document is not None and not isinstance(artifacts_document, dict):
+            raise OperationError(f"invalid {driver_name} receipt: status.artifacts must be an object")
+        expected_artifacts = set(driver.artifact_outputs)
+        actual_artifacts = set(artifacts_document) if artifacts_document is not None else set()
+        if actual_artifacts != expected_artifacts:
+            raise OperationError(
+                f"persisted {driver_name} receipt describes artifacts {sorted(actual_artifacts)}; "
+                f"expected {sorted(expected_artifacts)}"
+            )
+        artifacts = None
+        if artifacts_document is not None:
+            try:
+                artifacts = {}
+                for artifact_name, descriptor in artifacts_document.items():
+                    if not isinstance(descriptor, dict):
+                        raise ValueError(f"artifact {artifact_name!r} must be an object")
+                    artifacts[artifact_name] = ArtifactDescriptor.from_dict(descriptor)
+            except (TypeError, ValueError) as exc:
+                raise OperationError(f"invalid {driver_name} receipt artifacts: {exc}") from exc
+        return ReceiptResource(
+            gvk=subject_gvk,
+            metadata=ResourceMetadata(name=name),
+            driver=driver,
+            spec=ReceiptSpec(subject=subject, desired=desired, resolvedInputs=resolved_inputs),
+            status=ReceiptStatus(controller=controller, result=result, artifacts=artifacts),
+        )
+
+    def serialize_receipt(self, receipt: ReceiptResource[Any]) -> JsonObject:
+        result = receipt.driver.result_contract.dump(receipt.status.result)
+        specification: JsonObject = {
+            "subject": receipt.spec.subject.to_dict(),
+            "desired": self._compact(receipt.spec.desired.to_dict()),
         }
-        if receipt.get("artifacts"):
-            status["artifacts"] = receipt["artifacts"]
+        if receipt.spec.resolvedInputs is not None:
+            specification["resolvedInputs"] = self._compact(receipt.spec.resolvedInputs.to_dict())
+        status: JsonObject = {
+            "controller": dict(receipt.status.controller),
+            "result": result,
+        }
+        if receipt.status.artifacts is not None:
+            status["artifacts"] = {
+                name: self._compact(descriptor.to_dict()) for name, descriptor in receipt.status.artifacts.items()
+            }
         return {
-            "$schema": resource_schema_url(api_version, kind, "receipt"),
+            "$schema": resource_schema_url(receipt.gvk.api_version, receipt.gvk.kind, "receipt"),
             "apiVersion": CORE_API_VERSION,
             "kind": "Receipt",
-            "metadata": {"name": unit},
-            "spec": {
-                "subject": {"apiVersion": api_version, "kind": kind, "name": unit},
-                "desired": receipt.get("desired", {}),
-                "resolvedInputs": receipt.get("resolvedInputs", {}),
-            },
+            "metadata": receipt.metadata.to_dict(),
+            "spec": specification,
             "status": status,
         }
 
-    def load_receipt(self, path: Path, expected_unit: str | None = None) -> JsonObject:
+    def load_receipt(self, path: Path, expected_unit: str | None = None) -> ReceiptResource[Any]:
         document = self.load_document(path)
         if self.strict_resource_documents(path) and document.get("apiVersion") is None:
             raise OperationError(f"legacy receipt document is not valid in a migrated project: {path}")
-        return self.normalize_receipt(document, expected_unit or path.stem)
+        return self.parse_receipt(document, expected_unit or path.stem)
 
     @staticmethod
     def resource_documents_enabled(root: Path) -> bool:
@@ -328,31 +423,21 @@ class ResourceCatalog:
         except ContractError as exc:
             raise OperationError(f"invalid {description}: {exc}") from exc
 
-    def validate_receipt(self, document: object, description: str) -> JsonObject:
+    def validate_receipt(self, document: object, description: str) -> ReceiptResource[Any]:
         if not isinstance(document, dict):
             raise OperationError(f"invalid {description}: expected a JSON object")
-        normalized = self.normalize_receipt(cast(JsonObject, document))
-        driver = normalized.get("driver")
-        if driver is None and "$schema" not in normalized:
-            return normalized
-        if not isinstance(driver, str) or driver not in self.drivers:
-            raise OperationError(f"invalid {description}: unknown driver {driver!r}")
-        from jsonschema import Draft202012Validator
-        from jsonschema.exceptions import ValidationError
-
         try:
-            Draft202012Validator(driver_schema(driver, "receipt")).validate({**normalized, "$schema": None})
-        except ValidationError as exc:
-            raise OperationError(f"invalid {description}: {exc.message}") from exc
-        return normalized
+            return self.parse_receipt(cast(JsonObject, document))
+        except OperationError as exc:
+            raise OperationError(f"invalid {description}: {exc}") from exc
 
-    def write_preferred(self, path: Path, value: JsonObject, project_root: Path) -> Path:
+    def write_preferred(self, path: Path, value: JsonObject | ReceiptResource[Any], project_root: Path) -> Path:
         try:
             selected = load_project_config(project_root).write_format
-            if value.get("source") is not None and value.get("specificationRevision") is not None:
-                value = self.serialize_promotion(value)
-            elif value.get("unit") is not None and value.get("driver") is not None:
+            if isinstance(value, ReceiptResource):
                 value = self.serialize_receipt(value)
+            elif value.get("source") is not None and value.get("specificationRevision") is not None:
+                value = self.serialize_promotion(value)
             return write_document(path.with_suffix(selected.suffix), value, format=selected)
         except DocumentFormatError as exc:
             raise OperationError(str(exc)) from exc

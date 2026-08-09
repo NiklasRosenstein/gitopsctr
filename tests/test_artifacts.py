@@ -30,6 +30,7 @@ from gitopsctr.driver import (
     unit_driver_api,
 )
 from gitopsctr.resources import ResourceMetadata, UnitResource
+from tests.conftest import receipt_document, receipt_resource
 
 
 def project(root: Path, write_format: str) -> None:
@@ -368,7 +369,7 @@ def test_artifact_validation_rejects_tampering_and_extra_files(
         "oci-images",
         {"containers": container_images()},
     )
-    receipt = {"unit": "images", "driver": "oci-images", "artifacts": descriptors}
+    receipt = receipt_resource("oci-images", "images", {"unitBlob": "unit-blob"}, artifacts=descriptors)
     artifact_path = observed / "artifacts/images/containers.json"
 
     cli.validate_receipt_artifacts(observed, unit, receipt)
@@ -382,7 +383,7 @@ def test_artifact_validation_rejects_tampering_and_extra_files(
         "oci-images",
         {"containers": container_images()},
     )
-    receipt["artifacts"] = descriptors
+    receipt = receipt_resource("oci-images", "images", {"unitBlob": "unit-blob"}, artifacts=descriptors)
     (observed / "artifacts/images/extra.json").write_text("{}\n")
     with pytest.raises(cli.OperationError, match="complete contract set"):
         cli.validate_receipt_artifacts(observed, unit, receipt)
@@ -420,11 +421,11 @@ def test_stale_artifact_receipt_does_not_block_reconciliation_status(tmp_path: P
     receipt_path.parent.mkdir(parents=True)
     receipt_path.write_text(
         json.dumps(
-            {
-                "unit": "images",
-                "driver": "oci-images",
-                "desired": {"unitBlob": "stale-unit-blob"},
-                "artifacts": {
+            receipt_document(
+                "oci-images",
+                "images",
+                {"unitBlob": "stale-unit-blob"},
+                artifacts={
                     "containers": {
                         "apiVersion": "artifact.gitopsctr.io/v1",
                         "kind": "ContainerImages",
@@ -433,7 +434,7 @@ def test_stale_artifact_receipt_does_not_block_reconciliation_status(tmp_path: P
                         "mediaType": "application/vnd.gitopsctr.container-images.v1+json",
                     }
                 },
-            }
+            )
         )
     )
 
@@ -465,12 +466,7 @@ def test_observation_publication_writes_receipt_and_artifact_atomically(
     revision = cli.publish_observation_cas(
         "observed/dev",
         "images",
-        {
-            "unit": "images",
-            "driver": "oci-images",
-            "desired": {"revision": "e" * 40, "unitBlob": "unit-blob"},
-            "controller": {},
-        },
+        receipt_resource("oci-images", "images", {"revision": "e" * 40, "unitBlob": "unit-blob"}),
         desired_images_unit(),
         {"containers": container_images()},
         "e" * 40,
@@ -521,12 +517,7 @@ def test_observation_publication_retries_without_losing_concurrent_state(
     revision = cli.publish_observation_cas(
         "observed/dev",
         "images",
-        {
-            "unit": "images",
-            "driver": "oci-images",
-            "desired": {"revision": "e" * 40, "unitBlob": "unit-blob"},
-            "controller": {},
-        },
+        receipt_resource("oci-images", "images", {"revision": "e" * 40, "unitBlob": "unit-blob"}),
         desired_images_unit(),
         {"containers": container_images()},
         "e" * 40,

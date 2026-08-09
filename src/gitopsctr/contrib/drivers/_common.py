@@ -16,11 +16,14 @@ def require_strings(values: JsonObject, names: tuple[str, ...], contract: str) -
 
 def select_result_fields(*names: str) -> SemanticResultSelector:
     def select(result: object) -> ReconciliationResult:
-        if not isinstance(result, Mapping):
-            raise DriverError("driver result must be an object")
-        missing = [name for name in names if name not in result]
+        if isinstance(result, Mapping):
+            missing = [name for name in names if name not in result]
+            if missing:
+                raise DriverError(f"driver result is missing semantic fields: {', '.join(missing)}")
+            return {name: result[name] for name in names}
+        missing = [name for name in names if not hasattr(result, name)]
         if missing:
             raise DriverError(f"driver result is missing semantic fields: {', '.join(missing)}")
-        return {name: result[name] for name in names}
+        return {name: getattr(result, name) for name in names}
 
     return select

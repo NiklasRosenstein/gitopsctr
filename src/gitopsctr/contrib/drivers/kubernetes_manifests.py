@@ -6,7 +6,6 @@ import json
 import shutil
 import tempfile
 import time
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypedDict, cast
@@ -769,9 +768,9 @@ class KubernetesManifestsDriver(
             time.sleep(5)
 
     def semantic_result(self, result: object) -> ReconciliationResult:
-        if isinstance(result, Mapping) and set(result) == {"applied"}:
+        if isinstance(result, KubernetesResultModel):
             return self._select_direct_result(result)
-        if isinstance(result, Mapping) and set(result) == {"observed"}:
+        if isinstance(result, ArgoResultModel):
             return self._select_argo_result(result)
         raise DriverError("kubernetes-manifests result must contain exactly applied or observed")
 

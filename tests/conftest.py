@@ -46,6 +46,78 @@ def write_test_document(path: Path, value: object) -> None:
     path.write_text(json.dumps(value))
 
 
+def receipt_document(
+    driver: str,
+    unit: str,
+    desired: dict[str, object],
+    result: dict[str, object] | None = None,
+    *,
+    resolved_inputs: dict[str, object] | None = None,
+    controller: dict[str, object] | None = None,
+    artifacts: dict[str, object] | None = None,
+) -> dict[str, object]:
+    plugin = cli.UNIT_DRIVERS[driver]
+    if result is None and driver == "terraform":
+        result = {"applied": {"sourceRevision": "0" * 40}, "outputs": {}}
+    typed_result = plugin.result_contract.parse(result or {})
+    document: dict[str, object] = {
+        "$schema": cli.resource_schema_url(plugin.api_version, plugin.kind, "receipt"),
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "Receipt",
+        "metadata": {"name": unit},
+        "spec": {
+            "subject": {"apiVersion": plugin.api_version, "kind": plugin.kind, "name": unit},
+            "desired": desired,
+        },
+        "status": {
+            "controller": controller or {},
+            "result": plugin.result_contract.dump(typed_result),
+        },
+    }
+    if resolved_inputs is not None:
+        document["spec"]["resolvedInputs"] = resolved_inputs  # type: ignore[index]
+    if artifacts is not None:
+        document["status"]["artifacts"] = artifacts  # type: ignore[index]
+    return document
+
+
+def receipt_resource(
+    driver: str,
+    unit: str,
+    desired: dict[str, object],
+    result: dict[str, object] | None = None,
+    *,
+    resolved_inputs: dict[str, object] | None = None,
+    controller: dict[str, object] | None = None,
+    artifacts: dict[str, object] | None = None,
+):
+    if artifacts is None:
+        plugin = cli.UNIT_DRIVERS[driver]
+        if plugin.artifact_outputs:
+            artifacts = {
+                name: {
+                    "apiVersion": artifact_kind.gvk.api_version,
+                    "kind": artifact_kind.gvk.kind,
+                    "path": f"artifacts/{unit}/{name}.json",
+                    "digest": "sha256:" + "0" * 64,
+                    "mediaType": f"{cli.require_artifact_api(artifact_kind).media_type}+json",
+                }
+                for name, artifact_kind in plugin.artifact_outputs.items()
+            }
+    return cli.RESOURCE_CATALOG.parse_receipt(
+        receipt_document(
+            driver,
+            unit,
+            desired,
+            result,
+            resolved_inputs=resolved_inputs,
+            controller=controller,
+            artifacts=artifacts,
+        ),
+        unit,
+    )
+
+
 @pytest.fixture(autouse=True)
 def repository_root(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep controller tests independent from the gitopsctr source checkout."""

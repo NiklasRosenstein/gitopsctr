@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from gitopsctr.api import api_kinds
+from gitopsctr.contracts import ArtifactDescriptor
 from gitopsctr.driver import (
     DriverError,
     MaterializationCapability,
@@ -32,33 +33,22 @@ VERIFICATION_DRIVERS = {
 }
 
 
-def semantic_reconciliation_result(driver_name: str, result: object) -> ReconciliationResult:
+def semantic_reconciliation_result(
+    driver_name: str,
+    result: object,
+    artifacts: Mapping[str, ArtifactDescriptor] | None = None,
+) -> ReconciliationResult:
     try:
         driver = RECONCILIATION_DRIVERS[driver_name]
     except KeyError as exc:
         raise DriverError(f"unit driver does not support reconciliation: {driver_name}") from exc
-    artifacts: object = None
-    candidate = result
-    if isinstance(result, Mapping) and "desired" in result and "driver" in result:
-        reserved = {
-            "$schema",
-            "schema",
-            "unit",
-            "driver",
-            "desired",
-            "resolvedInputs",
-            "controller",
-            "artifacts",
-        }
-        candidate = {key: value for key, value in result.items() if key not in reserved}
-        artifacts = result.get("artifacts")
-    semantic = dict(driver.semantic_result(candidate))
-    if isinstance(artifacts, Mapping) and artifacts:
+    semantic = dict(driver.semantic_result(result))
+    if artifacts:
         semantic["artifacts"] = {
             name: {
-                key: descriptor[key]
-                for key in ("apiVersion", "kind", "digest")
-                if isinstance(descriptor, Mapping) and key in descriptor
+                "apiVersion": descriptor.apiVersion,
+                "kind": descriptor.kind,
+                "digest": descriptor.digest,
             }
             for name, descriptor in artifacts.items()
         }
