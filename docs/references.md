@@ -27,6 +27,9 @@ Receipt and artifact evidence is usable only while its receipt matches the produ
 identity, declared type, descriptor, media type, and digest are checked before the value is read. If required evidence
 is unavailable or stale, the consumer waits.
 
+See [Receipt lookup](apis/receipt.md#how-fromreceipt-resolves) and
+[Artifact lookup](apis/artifacts.md#how-fromartifact-resolves) for the exact files, freshness checks, and pointer scope.
+
 ## Promotion selectors
 
 `fromPromotion` defaults to the target unit name and the containing field's JSON Pointer. Both selectors can be

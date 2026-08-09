@@ -9,14 +9,22 @@ theme:
     - navigation.sections
 nav:
   - Overview: index.md
+  - Concepts: concepts.md
   - Getting started:
       - Local Docker tutorial: tutorial.md
-  - Concepts: concepts.md
-  - Authoring and APIs:
+  - Authoring:
       - Resources and API kinds: documents.md
-      - Project configuration: project-configuration.md
       - Reference expressions: references.md
-  - Unit kinds:
+  - Controller APIs:
+      - Project: project-configuration.md
+      - Environment: apis/environment.md
+      - Promotion: apis/promotion.md
+      - Receipt: apis/receipt.md
+  - Artifact APIs:
+      - Overview: apis/artifacts.md
+      - Container images: apis/container-images.md
+      - Frontend bundle: apis/frontend-bundle.md
+  - Unit APIs:
       - Overview: drivers.md
       - Terraform: drivers/terraform.md
       - OCI images: drivers/oci-images.md

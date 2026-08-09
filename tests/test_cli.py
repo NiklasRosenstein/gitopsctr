@@ -1297,7 +1297,7 @@ def test_status_can_focus_on_one_unit(tmp_path, monkeypatch):
     assert captured == [("dev", [("web", "READY", "inputs changed")])]
 
 
-def test_environment_refs_use_convention_and_allow_configuration(tmp_path):
+def test_environment_refs_use_project_defaults_and_allow_environment_and_cli_overrides(tmp_path):
     environment = tmp_path / "deployment/environments/staging/environment.json"
     _write_json(environment, {"schema": 1, "name": "staging"})
 
@@ -1307,21 +1307,71 @@ def test_environment_refs_use_convention_and_allow_configuration(tmp_path):
     )
 
     _write_json(
+        tmp_path / "gitopsctr.yaml",
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Project",
+            "metadata": {"name": "test-project"},
+            "spec": {
+                "environmentDefaults": {
+                    "refs": {
+                        "desired": "deployments/{environment}",
+                        "observed": "observations/{environment}",
+                    }
+                }
+            },
+        },
+    )
+    assert deploy_release.deployment_refs(tmp_path, "staging") == (
+        "deployments/staging",
+        "observations/staging",
+    )
+
+    _write_json(
         environment,
         {
             "schema": 1,
             "name": "staging",
-            "refs": {"desired": "releases/staging", "observed": "receipts/staging"},
+            "refs": {"desired": "releases/staging"},
         },
     )
     assert deploy_release.deployment_refs(tmp_path, "staging") == (
         "releases/staging",
-        "receipts/staging",
+        "observations/staging",
     )
-    assert deploy_release.deployment_refs(tmp_path, "staging", desired_override="manual/desired") == (
+    assert deploy_release.deployment_refs(
+        tmp_path,
+        "staging",
+        desired_override="manual/desired",
+        observed_override="manual/observed",
+    ) == (
         "manual/desired",
-        "receipts/staging",
+        "manual/observed",
     )
+
+
+def test_environment_refs_must_differ_after_project_template_expansion(tmp_path):
+    environment = tmp_path / "deployment/environments/staging/environment.json"
+    _write_json(environment, {"schema": 1, "name": "staging"})
+    _write_json(
+        tmp_path / "gitopsctr.yaml",
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Project",
+            "metadata": {"name": "test-project"},
+            "spec": {
+                "environmentDefaults": {
+                    "refs": {
+                        "desired": "state/{environment}",
+                        "observed": "state/{environment}",
+                    }
+                }
+            },
+        },
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="desired and observed refs must differ"):
+        deploy_release.deployment_refs(tmp_path, "staging")
 
 
 @pytest.mark.parametrize(

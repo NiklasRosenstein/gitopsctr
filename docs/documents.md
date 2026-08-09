@@ -44,10 +44,10 @@ Controller resources use `gitopsctr.io/v1`.
 
 | Kind | Purpose and ownership | Location |
 | --- | --- | --- |
-| [`Project`](schemas/apis/gitopsctr.io/v1/Project.schema.json) | User-authored repository identity, document format, and environment path | `gitopsctr.yaml` |
-| [`Environment`](schemas/apis/gitopsctr.io/v1/Environment.schema.json) | User-authored refs, change gate, promotion sources, and evidence policy | `<environmentsPath>/<name>/environment.*` |
-| [`Promotion`](schemas/apis/gitopsctr.io/v1/Promotion.schema.json) | Controller-owned lineage pinning source desired, observed, and specification revisions | `promotion.*` on the target desired ref |
-| [`Receipt`](schemas/apis/gitopsctr.io/v1/Receipt.schema.json) | Controller- and driver-owned evidence for one exact desired unit | `units/<name>.*` on the observed ref |
+| [Project](project-configuration.md) | User-authored repository identity, document format, environment path, and ref defaults | `gitopsctr.yaml` |
+| [Environment](apis/environment.md) | User-authored refs, change gate, promotion sources, and evidence policy | `<environmentsPath>/<name>/environment.*` |
+| [Promotion](apis/promotion.md) | Controller-owned lineage pinning source desired, observed, and specification revisions | `promotion.*` on the target desired ref |
+| [Receipt](apis/receipt.md) | Controller- and driver-owned evidence for one exact desired unit | `units/<name>.*` on the observed ref |
 
 ## Unit resources
 
@@ -73,11 +73,12 @@ contracts are independent of the unit kinds that produce them.
 
 | Kind | Purpose and ownership | Location |
 | --- | --- | --- |
-| [`ContainerImages`](schemas/apis/artifact.gitopsctr.io/v1/ContainerImages.schema.json) | Driver-owned immutable image names, tags, and digests produced by `OciImages` | `artifacts/<unit>/<name>.*` on the observed ref |
-| [`FrontendBundle`](schemas/apis/artifact.gitopsctr.io/v1/FrontendBundle.schema.json) | Driver-owned immutable bundle URI and metadata produced by `ViteOciBundle` | `artifacts/<unit>/<name>.*` on the observed ref |
+| [ContainerImages](apis/container-images.md) | Driver-owned immutable image names, tags, and digests produced by `OciImages` | `artifacts/<unit>/<name>.*` on the observed ref |
+| [FrontendBundle](apis/frontend-bundle.md) | Driver-owned immutable bundle URI and metadata produced by `ViteOciBundle` | `artifacts/<unit>/<name>.*` on the observed ref |
 
-Receipts describe every artifact's GVK, path, media type, and serialized-byte digest. Consumers read these resources
-through [`fromArtifact`](references.md).
+Receipts describe every artifact's GVK, path, media type, and serialized-byte digest. The
+[artifact overview](apis/artifacts.md) explains how consumers find and validate these resources through
+[`fromArtifact`](references.md).
 
 ## Schemas and extensibility
 

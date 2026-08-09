@@ -12,6 +12,10 @@ import yaml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
+DEFAULT_DESIRED_REF_TEMPLATE = "deploy/{environment}"
+DEFAULT_OBSERVED_REF_TEMPLATE = "observed/{environment}"
+ENVIRONMENT_REF_TEMPLATE_PATTERN = r"^(?:[^{}]|\{environment\})*\{environment\}(?:[^{}]|\{environment\})*$"
+
 PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Project.schema.json",
@@ -44,6 +48,36 @@ PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
                     "pattern": r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+$",
                     "description": "Repository-relative directory containing authored environments.",
                 },
+                "environmentDefaults": {
+                    "type": "object",
+                    "properties": {
+                        "refs": {
+                            "type": "object",
+                            "properties": {
+                                "desired": {
+                                    "type": "string",
+                                    "pattern": ENVIRONMENT_REF_TEMPLATE_PATTERN,
+                                    "description": (
+                                        "Default desired-state ref template. Must contain {environment}; "
+                                        "no other placeholders are supported."
+                                    ),
+                                },
+                                "observed": {
+                                    "type": "string",
+                                    "pattern": ENVIRONMENT_REF_TEMPLATE_PATTERN,
+                                    "description": (
+                                        "Default observed-state ref template. Must contain {environment}; "
+                                        "no other placeholders are supported."
+                                    ),
+                                },
+                            },
+                            "minProperties": 1,
+                            "additionalProperties": False,
+                        }
+                    },
+                    "required": ["refs"],
+                    "additionalProperties": False,
+                },
             },
             "additionalProperties": False,
         },
@@ -69,10 +103,22 @@ class DocumentFormatError(ValueError):
 
 
 @dataclass(frozen=True)
+class EnvironmentRefTemplates:
+    desired: str = DEFAULT_DESIRED_REF_TEMPLATE
+    observed: str = DEFAULT_OBSERVED_REF_TEMPLATE
+
+
+@dataclass(frozen=True)
+class EnvironmentDefaults:
+    refs: EnvironmentRefTemplates = EnvironmentRefTemplates()
+
+
+@dataclass(frozen=True)
 class Project:
     name: str
     write_format: DocumentFormat = DocumentFormat.YAML
     environments_path: PurePosixPath = PurePosixPath("deployment/environments")
+    environment_defaults: EnvironmentDefaults = EnvironmentDefaults()
 
 
 def project_config_path(root: Path) -> Path:
@@ -109,10 +155,18 @@ def validate_project_document(value: object, path: Path) -> Project:
     environments_path = PurePosixPath(cast(str, specification.get("environmentsPath", "deployment/environments")))
     if environments_path.is_absolute() or ".." in environments_path.parts:
         raise DocumentFormatError(f"invalid project config {path}: environmentsPath must stay inside the source tree")
+    environment_defaults_document = cast(dict[str, Any], specification.get("environmentDefaults", {}))
+    refs_document = cast(dict[str, Any], environment_defaults_document.get("refs", {}))
     return Project(
         name=project_name,
         write_format=DocumentFormat.JSON if selected == "json" else DocumentFormat.YAML,
         environments_path=environments_path,
+        environment_defaults=EnvironmentDefaults(
+            refs=EnvironmentRefTemplates(
+                desired=cast(str, refs_document.get("desired", DEFAULT_DESIRED_REF_TEMPLATE)),
+                observed=cast(str, refs_document.get("observed", DEFAULT_OBSERVED_REF_TEMPLATE)),
+            )
+        ),
     )
 
 

@@ -67,6 +67,8 @@ from gitopsctr.forges import (
     ensure_change_request,
 )
 from gitopsctr.formats import (
+    DEFAULT_DESIRED_REF_TEMPLATE,
+    DEFAULT_OBSERVED_REF_TEMPLATE,
     PROJECT_CONFIG_NAMES,
     DocumentFormat,
     DocumentFormatError,
@@ -1244,8 +1246,15 @@ def deployment_refs(
     configured = environment.get("refs", {})
     if not isinstance(configured, dict) or set(configured) - {"desired", "observed"}:
         raise OperationError(f"{environment_name} refs must contain desired and observed only")
-    desired_ref = desired_override or configured.get("desired") or f"deploy/{environment_name}"
-    observed_ref = observed_override or configured.get("observed") or f"observed/{environment_name}"
+    project_refs = load_project_config(source_root).environment_defaults.refs
+    desired_ref = (
+        desired_override or configured.get("desired") or project_refs.desired.replace("{environment}", environment_name)
+    )
+    observed_ref = (
+        observed_override
+        or configured.get("observed")
+        or project_refs.observed.replace("{environment}", environment_name)
+    )
     if not all(isinstance(ref, str) and ref for ref in (desired_ref, observed_ref)):
         raise OperationError(f"{environment_name} desired and observed refs must be strings")
     if desired_ref == observed_ref:
@@ -3845,6 +3854,12 @@ def command_create_project(args: argparse.Namespace) -> None:
         "spec": {
             "writeFormat": args.write_format,
             "environmentsPath": args.environments_path,
+            "environmentDefaults": {
+                "refs": {
+                    "desired": args.desired_ref_template,
+                    "observed": args.observed_ref_template,
+                }
+            },
         },
     }
     try:
@@ -4185,6 +4200,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--environments-path",
         default="deployment/environments",
         help="repository-relative authored environments directory",
+    )
+    create_project.add_argument(
+        "--desired-ref-template",
+        default=DEFAULT_DESIRED_REF_TEMPLATE,
+        help="default desired-state ref template containing {environment}",
+    )
+    create_project.add_argument(
+        "--observed-ref-template",
+        default=DEFAULT_OBSERVED_REF_TEMPLATE,
+        help="default observed-state ref template containing {environment}",
     )
     create_project.add_argument("--force", action="store_true", help="replace an existing Project resource")
     create_project.set_defaults(handler=command_create_project)

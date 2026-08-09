@@ -33,6 +33,8 @@ def test_yaml_is_the_default_and_project_config_can_select_json(tmp_path: Path):
     assert config.name == "test-project"
     assert config.write_format is DocumentFormat.JSON
     assert config.environments_path.as_posix() == "deployment/environments"
+    assert config.environment_defaults.refs.desired == "deploy/{environment}"
+    assert config.environment_defaults.refs.observed == "observed/{environment}"
     write_document(tmp_path / "configured.json", value, format=DocumentFormat.JSON)
     assert cli.load_json(tmp_path / "configured.json") == value
 
@@ -65,6 +67,37 @@ def test_project_config_rejects_values_outside_its_published_schema(tmp_path: Pa
     (tmp_path / "gitopsctr.yaml").write_text(contents)
     with pytest.raises(DocumentFormatError, match=message):
         load_project_config(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "deploy/main",
+        "deploy/{env}",
+        "deploy/{environment",
+        "deploy/{environment}/{other}",
+    ],
+)
+def test_project_environment_ref_templates_require_only_the_environment_placeholder(tmp_path: Path, template: str):
+    specification = {
+        "environmentDefaults": {"refs": {"desired": template}},
+    }
+    (tmp_path / "gitopsctr.yaml").write_text(project_document(spec=json.dumps(specification)))
+
+    with pytest.raises(DocumentFormatError, match="environmentDefaults.refs.desired"):
+        load_project_config(tmp_path)
+
+
+def test_project_environment_ref_templates_can_be_configured_independently(tmp_path: Path):
+    specification = {
+        "environmentDefaults": {"refs": {"desired": "deployments/{environment}/{environment}"}},
+    }
+    (tmp_path / "gitopsctr.yaml").write_text(project_document(spec=json.dumps(specification)))
+
+    config = load_project_config(tmp_path)
+
+    assert config.environment_defaults.refs.desired == "deployments/{environment}/{environment}"
+    assert config.environment_defaults.refs.observed == "observed/{environment}"
 
 
 def test_project_resource_schema_is_published_and_deterministic():

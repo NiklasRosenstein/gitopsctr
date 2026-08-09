@@ -309,6 +309,9 @@ def test_schema_cli_can_show_resource_envelopes():
     assert project["$id"].endswith("/apis/gitopsctr.io/v1/Project.schema.json")
     assert project["properties"]["kind"]["const"] == "Project"
     assert project["properties"]["spec"]["properties"]["writeFormat"]["enum"] == ["yaml", "json"]
+    project_ref_defaults = project["properties"]["spec"]["properties"]["environmentDefaults"]["properties"]["refs"]
+    assert project_ref_defaults["minProperties"] == 1
+    assert "\\{environment\\}" in project_ref_defaults["properties"]["desired"]["pattern"]
     assert artifact["properties"]["kind"]["const"] == "ContainerImages"
     assert "images" in artifact["required"]
     assert unit["properties"]["kind"]["const"] == "Terraform"

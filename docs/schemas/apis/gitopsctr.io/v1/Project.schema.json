@@ -30,6 +30,32 @@
     "spec": {
       "additionalProperties": false,
       "properties": {
+        "environmentDefaults": {
+          "additionalProperties": false,
+          "properties": {
+            "refs": {
+              "additionalProperties": false,
+              "minProperties": 1,
+              "properties": {
+                "desired": {
+                  "description": "Default desired-state ref template. Must contain {environment}; no other placeholders are supported.",
+                  "pattern": "^(?:[^{}]|\\{environment\\})*\\{environment\\}(?:[^{}]|\\{environment\\})*$",
+                  "type": "string"
+                },
+                "observed": {
+                  "description": "Default observed-state ref template. Must contain {environment}; no other placeholders are supported.",
+                  "pattern": "^(?:[^{}]|\\{environment\\})*\\{environment\\}(?:[^{}]|\\{environment\\})*$",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "refs"
+          ],
+          "type": "object"
+        },
         "environmentsPath": {
           "description": "Repository-relative directory containing authored environments.",
           "minLength": 1,

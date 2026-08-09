@@ -3,13 +3,13 @@
 gitopsctr separates authored intent, resolved desired state, and observed evidence. Git records each transition, while
 unit drivers perform the external work.
 
-```text
-source commit ── advance-desired ──> deploy/<environment>
-                                            │
-                                      reconcile units
-                                            │
-                                            v
-                                   observed/<environment>
+```mermaid
+flowchart LR
+  source["Source commit<br/>authored intent"] -->|advance-desired| desired["Desired ref<br/>deploy/&lt;environment&gt;"]
+  desired -->|reconcile| driver["Unit driver"]
+  driver --> systems["External systems"]
+  driver -->|receipt and artifacts| observed["Observed ref<br/>observed/&lt;environment&gt;"]
+  observed -.->|unlock downstream inputs| desired
 ```
 
 ## Resources and units
@@ -47,7 +47,8 @@ it is stale and the unit needs reconciliation.
 
 Drivers may publish typed **artifacts** alongside their receipt, for example a `ContainerImages` resource containing
 immutable image URIs. Consumers use [reference expressions](references.md) to read receipt results, artifacts, or a
-promoted desired unit.
+promoted desired unit. The [Receipt](apis/receipt.md) and [artifact](apis/artifacts.md) API pages show how those lookups
+follow the desired and observed trees.
 
 ## Advance, reconcile, and converge
 

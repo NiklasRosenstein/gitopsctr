@@ -2,7 +2,7 @@
 
 Every GitOpsCTR source tree contains a `Project` resource. It identifies the
 project, locates authored environments, and selects the preferred format for
-generated documents.
+generated documents. It can also define default desired and observed ref templates for every environment.
 
 Create it from the root of an existing Git working tree:
 
@@ -23,6 +23,10 @@ metadata:
 spec:
   writeFormat: yaml
   environmentsPath: deployment/environments
+  environmentDefaults:
+    refs:
+      desired: deploy/{environment}
+      observed: observed/{environment}
 ```
 
 `metadata.name` is a DNS-1123 project name. `spec.writeFormat` accepts `yaml`
@@ -44,12 +48,33 @@ create a second copy of a logical document.
 rejected. Generated desired and observed branches continue to store documents
 under top-level `units/`.
 
+## Environment ref defaults
+
+`spec.environmentDefaults.refs` defines project-wide ref templates. Each configured template must contain the literal
+`{environment}` placeholder; no other placeholders or unmatched braces are accepted.
+
+```yaml
+spec:
+  environmentDefaults:
+    refs:
+      desired: deployments/{environment}
+      observed: observations/{environment}
+```
+
+The fields are independent. If only `desired` is configured, `observed` retains the built-in
+`observed/{environment}` convention. An [Environment](apis/environment.md#deployment-refs) can replace either template
+with an exact ref, and operation-specific CLI overrides take the highest priority. Expanded desired and observed refs
+must differ.
+
 Create an environment in that configured location with:
 
 ```console
 gitopsctr create environment --name dev
 gitopsctr create environment --name prod --change-gate pullRequest
 ```
+
+`gitopsctr create project` writes the built-in templates by default. Use `--desired-ref-template` and
+`--observed-ref-template` to choose different templates while scaffolding the Project.
 
 Use the canonical filename `gitopsctr.yaml`; `.yml`, `.gitopsctr.yaml`, and
 `.gitopsctr.yml` are also accepted. A source tree must contain exactly one of

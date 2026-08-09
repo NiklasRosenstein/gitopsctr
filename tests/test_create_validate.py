@@ -44,6 +44,10 @@ def create_project(root: Path, **overrides: str) -> None:
         arguments += ["--write-format", overrides["write_format"]]
     if "environments_path" in overrides:
         arguments += ["--environments-path", overrides["environments_path"]]
+    if "desired_ref_template" in overrides:
+        arguments += ["--desired-ref-template", overrides["desired_ref_template"]]
+    if "observed_ref_template" in overrides:
+        arguments += ["--observed-ref-template", overrides["observed_ref_template"]]
     run_command(root, arguments)
 
 
@@ -64,7 +68,16 @@ def test_create_project_writes_a_valid_canonical_resource(tmp_path: Path, capsys
         "apiVersion": "gitopsctr.io/v1",
         "kind": "Project",
         "metadata": {"name": "example.team"},
-        "spec": {"writeFormat": "yaml", "environmentsPath": "deployment/environments"},
+        "spec": {
+            "writeFormat": "yaml",
+            "environmentsPath": "deployment/environments",
+            "environmentDefaults": {
+                "refs": {
+                    "desired": "deploy/{environment}",
+                    "observed": "observed/{environment}",
+                }
+            },
+        },
     }
     assert text.startswith(
         "# yaml-language-server: "
@@ -89,6 +102,25 @@ def test_create_project_validates_before_writing_and_requires_force(tmp_path: Pa
             tmp_path,
             ["create", "project", "--name", "second", "--environments-path", "../outside", "--force"],
         )
+    with pytest.raises(cli.OperationError, match="desired"):
+        run_command(
+            tmp_path,
+            ["create", "project", "--name", "second", "--desired-ref-template", "deploy/main", "--force"],
+        )
+
+
+def test_create_project_accepts_environment_ref_templates(tmp_path: Path):
+    create_project(
+        tmp_path,
+        desired_ref_template="deployments/{environment}",
+        observed_ref_template="observations/{environment}",
+    )
+
+    specification = yaml.safe_load((tmp_path / "gitopsctr.yaml").read_text())["spec"]
+    assert specification["environmentDefaults"]["refs"] == {
+        "desired": "deployments/{environment}",
+        "observed": "observations/{environment}",
+    }
 
 
 def test_create_project_rejects_ambiguous_configuration_even_with_force(tmp_path: Path):
