@@ -368,6 +368,26 @@ def test_argo_observation_supports_both_read_only_transports(access, tmp_path, m
     assert "sync" not in command
 
 
+def test_argo_observation_ignores_unrelated_application_fields(tmp_path, monkeypatch):
+    desired_unit = argo_unit()
+    document = application()
+    document.update(
+        {
+            "metadata": {"name": "web", "labels": {"team": "platform"}},
+            "operationState": {"phase": "Succeeded", "message": "fully synced"},
+        }
+    )
+    document["spec"]["source"]["repoURL"] = "https://example.invalid/repository.git"
+    document["status"]["conditions"] = [{"type": "健康", "message": "ignored"}]
+
+    def runner(*args, **_kwargs):
+        return completed(args, stdout=json.dumps(document))
+
+    result = kubernetes.DRIVER.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
+
+    assert isinstance(result.result, kubernetes.ArgoResultModel)
+
+
 def test_argo_wrong_revision_times_out_without_a_receipt(tmp_path, monkeypatch):
     desired_unit = argo_unit()
 

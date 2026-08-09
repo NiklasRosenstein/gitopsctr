@@ -8,9 +8,10 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 
 import yaml
+from mashumaro.mixins.dict import DataClassDictMixin
 
 from gitopsctr.contracts import (
     AuthoredSource,
@@ -22,7 +23,7 @@ from gitopsctr.contracts import (
     StrictModel,
     schema_url,
 )
-from gitopsctr.document import JsonObject, ResolvedJsonObjectValue
+from gitopsctr.document import JsonObject, JsonObjectValue, JsonValue, ResolvedJsonObjectValue
 from gitopsctr.driver import (
     DriverError,
     MaterializationCapability,
@@ -75,6 +76,46 @@ class ObservedApplication(TypedDict):
 
 class ArgoResult(TypedDict):
     observed: ObservedApplication
+
+
+type ArgoSyncStatus = Literal["Synced", "OutOfSync", "Unknown"]
+type ArgoHealthStatus = Literal["Healthy", "Progressing", "Degraded", "Suspended", "Missing", "Unknown"]
+
+
+@dataclass
+class ArgoApplicationSpec(DataClassDictMixin):
+    source: JsonObjectValue | None = None
+    sources: list[JsonObjectValue] | None = None
+
+
+@dataclass
+class ArgoApplicationSync(DataClassDictMixin):
+    revision: str
+    status: str
+
+
+@dataclass
+class ArgoApplicationHealth(DataClassDictMixin):
+    status: str
+
+
+@dataclass
+class ArgoApplicationStatusPayload(DataClassDictMixin):
+    sync: ArgoApplicationSync
+    health: ArgoApplicationHealth
+
+
+@dataclass
+class ArgoApplicationDocument(DataClassDictMixin):
+    spec: ArgoApplicationSpec
+    status: ArgoApplicationStatusPayload
+
+
+@dataclass(frozen=True, kw_only=True)
+class ArgoApplicationStatus:
+    revision: str
+    syncStatus: ArgoSyncStatus
+    healthStatus: ArgoHealthStatus
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -217,10 +258,10 @@ class ArgoResultModel(StrictModel):
 type KubernetesDriverResult = KubernetesResultModel | ArgoResultModel
 
 
-def require_object(value: object, description: str) -> dict[str, Any]:
+def require_object(value: object, description: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise DriverError(f"{description} must be an object")
-    return value
+    return cast(dict[str, object], value)
 
 
 def require_string(value: object, description: str) -> str:
@@ -386,7 +427,7 @@ def argo_observer(
 def read_argo_application(
     execution: DriverExecution,
     observer: ArgoApiObserver | ArgoKubernetesObserver,
-) -> dict[str, Any]:
+) -> ArgoApplicationDocument:
     if isinstance(observer, ArgoApiObserver):
         result = execution.run(
             "argocd",
@@ -419,20 +460,26 @@ def read_argo_application(
         raise DriverError("Argo CD returned invalid Application JSON") from exc
     if not isinstance(document, dict):
         raise DriverError("Argo CD returned invalid Application JSON")
-    return document
+    try:
+        return ArgoApplicationDocument.from_dict(document)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DriverError("Argo CD returned an invalid Application document") from exc
 
 
-def argo_application_status(document: dict[str, Any]) -> tuple[str, str, str]:
-    specification = require_object(document.get("spec"), "Argo CD Application spec")
-    if specification.get("sources") is not None or not isinstance(specification.get("source"), dict):
+def argo_application_status(document: ArgoApplicationDocument) -> ArgoApplicationStatus:
+    if document.spec.sources is not None or document.spec.source is None:
         raise DriverError("kubernetes-manifests requires a single-source Argo CD Application")
-    status = require_object(document.get("status"), "Argo CD Application status")
-    sync = require_object(status.get("sync"), "Argo CD Application sync status")
-    health = require_object(status.get("health"), "Argo CD Application health status")
-    revision = require_string(sync.get("revision"), "Argo CD Application synced revision")
-    sync_status = require_string(sync.get("status"), "Argo CD Application sync status")
-    health_status = require_string(health.get("status"), "Argo CD Application health status")
-    return revision, sync_status, health_status
+    sync_status = document.status.sync.status
+    if sync_status not in {"Synced", "OutOfSync", "Unknown"}:
+        raise DriverError(f"Argo CD returned an unknown sync status: {sync_status!r}")
+    health_status = document.status.health.status
+    if health_status not in {"Healthy", "Progressing", "Degraded", "Suspended", "Missing", "Unknown"}:
+        raise DriverError(f"Argo CD returned an unknown health status: {health_status!r}")
+    return ArgoApplicationStatus(
+        revision=document.status.sync.revision,
+        syncStatus=sync_status,
+        healthStatus=health_status,
+    )
 
 
 class KubernetesManifestsDriver(
@@ -561,7 +608,7 @@ class KubernetesManifestsDriver(
         inventory = manifest_inventory(context.output_root, allow_secrets)
         if not inventory:
             raise DriverError("kubernetes-manifests materialization produced no Kubernetes resources")
-        metadata["inventory"] = cast(Any, inventory)
+        metadata["inventory"] = cast(JsonValue, inventory)
         return MaterializationResult("application/vnd.gitopsctr.kubernetes-manifests.v1", metadata)
 
     def finalize_materialization(
@@ -705,10 +752,12 @@ class KubernetesManifestsDriver(
         observer = argo_observer(delivery)
         if observer is not None:
             document = read_argo_application(context.execution, observer)
-            revision, sync_status, health_status = argo_application_status(document)
+            application_status = argo_application_status(document)
             status = (
                 VerificationStatus.CLEAN
-                if revision == context.desired_revision and sync_status == "Synced" and health_status == "Healthy"
+                if application_status.revision == context.desired_revision
+                and application_status.syncStatus == "Synced"
+                and application_status.healthStatus == "Healthy"
                 else VerificationStatus.DRIFT
             )
             return VerificationResult(status)
@@ -747,24 +796,29 @@ class KubernetesManifestsDriver(
         deadline = time.monotonic() + observer.timeoutSeconds
         while True:
             document = read_argo_application(context.execution, observer)
-            revision, sync_status, health_status = argo_application_status(document)
-            ready = revision == context.desired_revision and sync_status == "Synced" and health_status == "Healthy"
+            application_status = argo_application_status(document)
+            ready = (
+                application_status.revision == context.desired_revision
+                and application_status.syncStatus == "Synced"
+                and application_status.healthStatus == "Healthy"
+            )
             if ready:
                 return ArgoResultModel(
                     observed=ObservedApplicationModel(
                         application=observer.application,
-                        desiredRevision=revision,
+                        desiredRevision=application_status.revision,
                         syncStatus="Synced",
                         healthStatus="Healthy",
                     )
                 )
             if not wait:
                 raise DriverError(
-                    f"Argo CD Application is revision {revision!r}, {sync_status}, {health_status}; "
+                    f"Argo CD Application is revision {application_status.revision!r}, "
+                    f"{application_status.syncStatus}, {application_status.healthStatus}; "
                     f"expected {context.desired_revision}, Synced, Healthy"
                 )
-            if health_status in {"Degraded", "Missing"}:
-                raise DriverError(f"Argo CD Application health is {health_status}")
+            if application_status.healthStatus in {"Degraded", "Missing"}:
+                raise DriverError(f"Argo CD Application health is {application_status.healthStatus}")
             if time.monotonic() >= deadline:
                 raise DriverError("timed out waiting for Argo CD Application to reach the desired revision")
             time.sleep(5)
