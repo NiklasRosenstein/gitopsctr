@@ -7,7 +7,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import Literal, TypedDict
 
 from gitopsctr.contracts import (
     AuthoredSource,
@@ -17,7 +17,7 @@ from gitopsctr.contracts import (
     StrictModel,
     schema_url,
 )
-from gitopsctr.document import JsonObject, JsonValue, ResolvedJsonObjectValue
+from gitopsctr.document import JsonObject, JsonObjectValue, JsonValue, ResolvedJsonObjectValue, require_json_value
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -99,7 +99,11 @@ class AppliedTerraformModel(StrictModel):
 @dataclass(frozen=True, kw_only=True)
 class TerraformResultModel(StrictModel):
     applied: AppliedTerraformModel
-    outputs: dict[str, Any]
+    outputs: JsonObjectValue
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outputs, JsonObjectValue):
+            object.__setattr__(self, "outputs", JsonObjectValue(self.outputs))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -115,6 +119,23 @@ class TerraformRuntime:
     init_args: list[str]
     observed_output_names: list[str]
     checks: list[TerraformHttpCheck]
+
+
+def terraform_output_values(document: object, names: list[str]) -> dict[str, JsonValue]:
+    """Extract and validate selected values from Terraform's output JSON document."""
+
+    if not isinstance(document, dict):
+        raise DriverError("Terraform output must be a JSON object")
+    outputs: dict[str, JsonValue] = {}
+    for name in names:
+        raw_output = document.get(name)
+        if not isinstance(raw_output, dict) or "value" not in raw_output:
+            raise DriverError(f"Terraform output {name!r} is missing its value")
+        try:
+            outputs[name] = require_json_value(raw_output["value"])
+        except ValueError as exc:
+            raise DriverError(f"Terraform output {name!r} contains an invalid JSON value") from exc
+    return outputs
 
 
 def terraform_runtime(
@@ -340,11 +361,8 @@ class TerraformDriver(
                     output=CommandOutput.CAPTURE,
                 ).stdout
             )
-            outputs = cast(
-                dict[str, JsonValue],
-                {name: raw_outputs[name]["value"] for name in runtime.observed_output_names},
-            )
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            outputs = terraform_output_values(raw_outputs, runtime.observed_output_names)
+        except (DriverError, json.JSONDecodeError) as exc:
             raise DriverError(f"Terraform did not return the expected outputs: {exc}") from exc
 
         for check in runtime.checks:
@@ -373,7 +391,7 @@ class TerraformDriver(
                     sourceRevision=context.source_revision,
                     path=context.source_path,
                 ),
-                outputs=dict(outputs),
+                outputs=JsonObjectValue(outputs),
             )
         )
 
