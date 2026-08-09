@@ -878,9 +878,7 @@ def test_desired_unit_rejects_an_incompatible_running_driver_version():
             "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"] + 1,
         },
     }
-    resource = deploy_release.RESOURCE_CATALOG.parse_unit(
-        unit, profile="desired", expected_name="aws-application"
-    )
+    resource = deploy_release.RESOURCE_CATALOG.parse_unit(unit, profile="desired", expected_name="aws-application")
 
     with pytest.raises(deploy_release.OperationError, match="driver version"):
         deploy_release.require_unit(resource, "aws-application")

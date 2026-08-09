@@ -55,7 +55,9 @@ class RenderOnlyPlugin(
     def __init__(self) -> None:
         self.calls = 0
 
-    def resolve_unit(self, unit: RenderOnlyUnit, context: UnitResolutionContext) -> UnitResolution[RenderOnlyResolvedUnit]:
+    def resolve_unit(
+        self, unit: RenderOnlyUnit, context: UnitResolutionContext
+    ) -> UnitResolution[RenderOnlyResolvedUnit]:
         return UnitResolution(RenderOnlyResolvedUnit(source=context.source))
 
     def materialize(self, context: MaterializationContext[RenderOnlyResolvedUnit]) -> MaterializationResult:

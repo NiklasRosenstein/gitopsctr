@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Captured test output is asserted as plain text; individual tests explicitly
+  # opt into styling when they need to exercise terminal colors.
+  NO_COLOR: "1"
+
 jobs:
   quality:
     runs-on: ubuntu-latest

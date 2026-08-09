@@ -572,6 +572,8 @@ reference_document_path = RESOURCE_CATALOG.reference_document_path
 
 def write_unit(path: Path, unit: UnitResource[Any], project_root: Path) -> Path:
     return RESOURCE_CATALOG.write_unit(path, unit, project_root)
+
+
 parse_artifact_document = RESOURCE_CATALOG.parse_artifact
 
 
@@ -592,7 +594,9 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def write_preferred_document(path: Path, value: dict[str, Any] | ReceiptResource[Any], project_root: Path) -> Path:
-    return RESOURCE_CATALOG.write_preferred(path, value if isinstance(value, ReceiptResource) else cast(JsonObject, value), project_root)
+    return RESOURCE_CATALOG.write_preferred(
+        path, value if isinstance(value, ReceiptResource) else cast(JsonObject, value), project_root
+    )
 
 
 def canonical_json(value: Any) -> bytes:
@@ -728,9 +732,7 @@ def copy_unit_materialization(source: Path, destination: Path, unit_name: str, u
         shutil.copytree(source / relative_path, target)
 
 
-def require_unit_specification(
-    specification: UnitResource[Any], expected_name: str | None = None
-) -> tuple[str, Any]:
+def require_unit_specification(specification: UnitResource[Any], expected_name: str | None = None) -> tuple[str, Any]:
     if expected_name is not None and specification.name != expected_name:
         raise OperationError(f"invalid unit specification: {expected_name!r}")
     source = getattr(specification.spec, "source", None)
@@ -897,10 +899,7 @@ def load_artifact_document(
     path = observed / recorded_path
     if path != expected_path or not path.is_file():
         raise ReferenceUnavailable(f"artifact {artifact_name!r} does not exist at its required path")
-    if (
-        descriptor.apiVersion != artifact_kind.gvk.api_version
-        or descriptor.kind != artifact_kind.gvk.kind
-    ):
+    if descriptor.apiVersion != artifact_kind.gvk.api_version or descriptor.kind != artifact_kind.gvk.kind:
         raise ReferenceUnavailable(f"artifact {artifact_name!r} has the wrong contract identity")
     expected_media_type = f"{artifact_api.media_type}+{'json' if path.suffix == '.json' else 'yaml'}"
     if descriptor.mediaType != expected_media_type:
@@ -954,8 +953,7 @@ def validate_receipt_artifacts(
     descriptors = receipt.status.artifacts or {}
     if set(descriptors) != expected:
         raise OperationError(
-            f"persisted {driver_name} receipt describes artifacts {sorted(descriptors)}; "
-            f"expected {sorted(expected)}"
+            f"persisted {driver_name} receipt describes artifacts {sorted(descriptors)}; expected {sorted(expected)}"
         )
     directory = observed / "artifacts" / unit.name
     actual_paths = {path for path in directory.rglob("*") if path.is_file()} if directory.is_dir() else set()
@@ -1439,12 +1437,8 @@ def classify_unit_change(
         causes.append("desired unit content changed")
     return UnitChangeExplanation(
         previous_desired_revision=previous_desired_revision,
-        previous_source_revision=(
-            previous_source.revision
-        ),
-        current_source_revision=(
-            current_source.revision
-        ),
+        previous_source_revision=(previous_source.revision),
+        current_source_revision=(current_source.revision),
         causes=tuple(causes),
         commits=commits,
         files=files,
@@ -3068,7 +3062,10 @@ def publish_observation_cas(
                 RESOURCE_CATALOG.serialize_receipt(candidate_receipt),
                 f"candidate receipt for {unit_name}",
             )
-            if existing_receipt is not None and existing_receipt.spec.desired.unitBlob == candidate_receipt.spec.desired.unitBlob:
+            if (
+                existing_receipt is not None
+                and existing_receipt.spec.desired.unitBlob == candidate_receipt.spec.desired.unitBlob
+            ):
                 if observed_revision is None:
                     raise OperationError(f"{observed_ref} receipt has no revision")
                 if existing_receipt.driver_name != driver:

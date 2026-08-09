@@ -145,11 +145,13 @@ def _oci_context(
         source_revision="a" * 40,
         source_path=".",
         unit_name="application-images",
-        unit=oci_images.OciImagesDesiredUnit.from_dict({
-            "source": {"path": ".", "revision": "a" * 40, "inputHash": "sha256:" + "b" * 64},
-            "build": {"dockerfile": "Dockerfile", "platform": "linux/amd64"},
-            "publish": publication,
-        }),
+        unit=oci_images.OciImagesDesiredUnit.from_dict(
+            {
+                "source": {"path": ".", "revision": "a" * 40, "inputHash": "sha256:" + "b" * 64},
+                "build": {"dockerfile": "Dockerfile", "platform": "linux/amd64"},
+                "publish": publication,
+            }
+        ),
     )
 
 
@@ -452,14 +454,16 @@ def test_frontend_bundle_reuses_matching_oci_artifact_without_building(tmp_path,
         source_revision="a" * 40,
         source_path="frontend",
         unit_name="frontend-bundle",
-        unit=vite_oci_bundle.ViteOciBundleDesiredUnit.from_dict({
-            "source": {"path": "frontend", "revision": "a" * 40, "inputHash": "sha256:" + "b" * 64},
-            "build": {"nodeVersion": "24"},
-            "publish": {
-                "repository": f"{REGISTRY}/example-application-frontend",
-                "credentialProvider": {"type": "aws-ecr"},
-            },
-        }),
+        unit=vite_oci_bundle.ViteOciBundleDesiredUnit.from_dict(
+            {
+                "source": {"path": "frontend", "revision": "a" * 40, "inputHash": "sha256:" + "b" * 64},
+                "build": {"nodeVersion": "24"},
+                "publish": {
+                    "repository": f"{REGISTRY}/example-application-frontend",
+                    "credentialProvider": {"type": "aws-ecr"},
+                },
+            }
+        ),
     )
     monkeypatch.setattr(
         vite_oci_bundle,
@@ -601,14 +605,16 @@ def _terraform_context(
         source_revision="a" * 40,
         source_path="infra/deploy",
         unit_name="terraform",
-        unit=terraform.TerraformDesiredUnit.from_dict({
-            "source": {"path": "infra/deploy", "revision": "a" * 40},
-            "terraform": {
-                "backend": backend or {"key": "application/dev.tfstate"},
-                "variables": {"environment": "dev"},
-                "observeOutputs": [],
+        unit=terraform.TerraformDesiredUnit.from_dict(
+            {
+                "source": {"path": "infra/deploy", "revision": "a" * 40},
+                "terraform": {
+                    "backend": backend or {"key": "application/dev.tfstate"},
+                    "variables": {"environment": "dev"},
+                    "observeOutputs": [],
+                },
             }
-        }),
+        ),
         report=report,
     )
 

@@ -170,9 +170,7 @@ class ResourceCatalog:
             if driver is None:
                 raise OperationError(f"unit uses an unknown driver: {driver_name!r}")
             specification: object = {
-                key: value
-                for key, value in legacy.items()
-                if key not in {"$schema", "schema", "name", "driver"}
+                key: value for key, value in legacy.items() if key not in {"$schema", "schema", "name", "driver"}
             }
             gvk = GVK(driver.api_version, driver.kind)
         else:
@@ -225,7 +223,9 @@ class ResourceCatalog:
             "spec": specification,
         }
 
-    def serialize_unit(self, unit: UnitResource[Any], *, profile: Literal["authored", "desired"] = "desired") -> JsonObject:
+    def serialize_unit(
+        self, unit: UnitResource[Any], *, profile: Literal["authored", "desired"] = "desired"
+    ) -> JsonObject:
         driver = unit.driver
         contract = driver.unit_contract if profile == "authored" else driver.desired_unit_contract
         try:
@@ -289,9 +289,7 @@ class ResourceCatalog:
             if resolved_inputs_document is not None and not isinstance(resolved_inputs_document, dict):
                 raise ValueError("receipt spec.resolvedInputs must be an object")
             resolved_inputs = (
-                ResolvedInputs.from_dict(resolved_inputs_document)
-                if resolved_inputs_document is not None
-                else None
+                ResolvedInputs.from_dict(resolved_inputs_document) if resolved_inputs_document is not None else None
             )
             controller = JsonObjectValue._deserialize(status["controller"])
             result = driver.result_contract.parse(status["result"])

@@ -483,7 +483,9 @@ class KubernetesManifestsDriver(
             "delivery": {"mode": "external"},
         }
 
-    def resolve_unit(self, unit: KubernetesUnit, context: UnitResolutionContext) -> UnitResolution[KubernetesResolvedUnit]:
+    def resolve_unit(
+        self, unit: KubernetesUnit, context: UnitResolutionContext
+    ) -> UnitResolution[KubernetesResolvedUnit]:
         resolved = ()
         materialize: HelmMaterialization | PlainMaterialization
         if isinstance(unit.materialize, AuthoredHelmMaterialization):

@@ -64,28 +64,30 @@ def unit(
     delivery: dict | None = None,
     inventory: list[dict[str, str]] | None = None,
 ) -> kubernetes.KubernetesDesiredUnit:
-    return kubernetes.KubernetesDesiredUnit.from_dict({
-        "source": {"path": "charts/web", "revision": REVISION},
-        "materialize": renderer or {"type": "plain", "paths": ["*.yaml"]},
-        "delivery": delivery or {"mode": "external"},
-        "materialization": {
-            "path": "materialized/web",
-            "digest": DIGEST,
-            "mediaType": "application/vnd.gitopsctr.kubernetes-manifests.v1",
-            "metadata": {
-                "renderer": "plain",
-                "inventory": inventory
-                or [
-                    {
-                        "apiVersion": "v1",
-                        "kind": "ConfigMap",
-                        "namespace": "web",
-                        "name": "web",
-                    }
-                ],
+    return kubernetes.KubernetesDesiredUnit.from_dict(
+        {
+            "source": {"path": "charts/web", "revision": REVISION},
+            "materialize": renderer or {"type": "plain", "paths": ["*.yaml"]},
+            "delivery": delivery or {"mode": "external"},
+            "materialization": {
+                "path": "materialized/web",
+                "digest": DIGEST,
+                "mediaType": "application/vnd.gitopsctr.kubernetes-manifests.v1",
+                "metadata": {
+                    "renderer": "plain",
+                    "inventory": inventory
+                    or [
+                        {
+                            "apiVersion": "v1",
+                            "kind": "ConfigMap",
+                            "namespace": "web",
+                            "name": "web",
+                        }
+                    ],
+                },
             },
-        },
-    })
+        }
+    )
 
 
 def materialization_context(
