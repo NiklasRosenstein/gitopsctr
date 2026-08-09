@@ -402,6 +402,33 @@ def test_argo_wrong_revision_times_out_without_a_receipt(tmp_path, monkeypatch):
         kubernetes.DRIVER.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
 
 
+def test_argo_observation_waits_for_initial_status_and_missing_health(tmp_path, monkeypatch):
+    desired_unit = argo_unit()
+    responses = iter([{"spec": {"source": {}}}, application(health="Missing"), application()])
+
+    def runner(*args, **_kwargs):
+        return completed(args, stdout=json.dumps(next(responses)))
+
+    monkeypatch.setattr(kubernetes.time, "monotonic", lambda: 0)
+    monkeypatch.setattr(kubernetes.time, "sleep", lambda _seconds: None)
+
+    result = kubernetes.DRIVER.reconcile(reconciliation_context(tmp_path, desired_unit, runner=runner))
+
+    assert isinstance(result.result, kubernetes.ArgoResultModel)
+
+
+def test_argo_verification_reports_pending_status_as_drift(tmp_path):
+    desired_unit = argo_unit()
+
+    def runner(*args, **_kwargs):
+        return completed(args, stdout=json.dumps({"spec": {"source": {}}}))
+
+    assert (
+        kubernetes.DRIVER.verify(verification_context(tmp_path, desired_unit, runner)).status
+        is VerificationStatus.DRIFT
+    )
+
+
 def test_argo_degraded_and_multi_source_applications_fail(tmp_path, monkeypatch):
     desired_unit = argo_unit()
     responses = iter([application(health="Degraded"), application(multi_source=True)])

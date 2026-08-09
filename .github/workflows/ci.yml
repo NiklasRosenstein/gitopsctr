@@ -85,3 +85,23 @@ jobs:
       - name: Clean up Kubernetes resources
         if: always()
         run: mise run kubernetes-demo-clean -- ${{ matrix.provider }}
+
+  argocd-acceptance:
+    name: Argo CD Kubernetes demo (${{ matrix.provider }})
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [kind, minikube]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: python uv helm kind minikube kubectl
+      - run: uv sync --locked --all-groups
+      - name: Build, materialize, observe, and prove clean convergence
+        run: mise run argocd-acceptance -- ${{ matrix.provider }}
+      - name: Clean up Argo CD Kubernetes resources
+        if: always()
+        run: mise run argocd-demo-clean -- ${{ matrix.provider }}

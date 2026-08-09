@@ -90,25 +90,25 @@ class ArgoApplicationSpec(DataClassDictMixin):
 
 @dataclass
 class ArgoApplicationSync(DataClassDictMixin):
-    revision: str
-    status: str
+    revision: str | None = None
+    status: str | None = None
 
 
 @dataclass
 class ArgoApplicationHealth(DataClassDictMixin):
-    status: str
+    status: str | None = None
 
 
 @dataclass
 class ArgoApplicationStatusPayload(DataClassDictMixin):
-    sync: ArgoApplicationSync
-    health: ArgoApplicationHealth
+    sync: ArgoApplicationSync | None = None
+    health: ArgoApplicationHealth | None = None
 
 
 @dataclass
 class ArgoApplicationDocument(DataClassDictMixin):
     spec: ArgoApplicationSpec
-    status: ArgoApplicationStatusPayload
+    status: ArgoApplicationStatusPayload | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -466,17 +466,26 @@ def read_argo_application(
         raise DriverError("Argo CD returned an invalid Application document") from exc
 
 
-def argo_application_status(document: ArgoApplicationDocument) -> ArgoApplicationStatus:
+def argo_application_status(document: ArgoApplicationDocument) -> ArgoApplicationStatus | None:
     if document.spec.sources is not None or document.spec.source is None:
         raise DriverError("kubernetes-manifests requires a single-source Argo CD Application")
+    if document.status is None or document.status.sync is None or document.status.health is None:
+        return None
     sync_status = document.status.sync.status
+    if sync_status is None:
+        return None
     if sync_status not in {"Synced", "OutOfSync", "Unknown"}:
         raise DriverError(f"Argo CD returned an unknown sync status: {sync_status!r}")
     health_status = document.status.health.status
+    if health_status is None:
+        return None
     if health_status not in {"Healthy", "Progressing", "Degraded", "Suspended", "Missing", "Unknown"}:
         raise DriverError(f"Argo CD returned an unknown health status: {health_status!r}")
+    revision = document.status.sync.revision
+    if revision is None:
+        return None
     return ArgoApplicationStatus(
-        revision=document.status.sync.revision,
+        revision=revision,
         syncStatus=sync_status,
         healthStatus=health_status,
     )
@@ -757,6 +766,8 @@ class KubernetesManifestsDriver(
         if observer is not None:
             document = read_argo_application(context.execution, observer)
             application_status = argo_application_status(document)
+            if application_status is None:
+                return VerificationResult(VerificationStatus.DRIFT)
             status = (
                 VerificationStatus.CLEAN
                 if application_status.revision == context.desired_revision
@@ -798,33 +809,37 @@ class KubernetesManifestsDriver(
         wait: bool,
     ) -> ArgoResultModel:
         deadline = time.monotonic() + observer.timeoutSeconds
+        last_status = "Application has not reported sync and health status"
         while True:
             document = read_argo_application(context.execution, observer)
             application_status = argo_application_status(document)
-            ready = (
-                application_status.revision == context.desired_revision
-                and application_status.syncStatus == "Synced"
-                and application_status.healthStatus == "Healthy"
-            )
-            if ready:
-                return ArgoResultModel(
-                    observed=ObservedApplicationModel(
-                        application=observer.application,
-                        desiredRevision=application_status.revision,
-                        syncStatus="Synced",
-                        healthStatus="Healthy",
+            if application_status is not None:
+                last_status = (
+                    f"Application is revision {application_status.revision!r}, "
+                    f"{application_status.syncStatus}, {application_status.healthStatus}"
+                )
+                ready = (
+                    application_status.revision == context.desired_revision
+                    and application_status.syncStatus == "Synced"
+                    and application_status.healthStatus == "Healthy"
+                )
+                if ready:
+                    return ArgoResultModel(
+                        observed=ObservedApplicationModel(
+                            application=observer.application,
+                            desiredRevision=application_status.revision,
+                            syncStatus="Synced",
+                            healthStatus="Healthy",
+                        )
                     )
-                )
+                if application_status.healthStatus == "Degraded":
+                    raise DriverError("Argo CD Application health is Degraded")
             if not wait:
-                raise DriverError(
-                    f"Argo CD Application is revision {application_status.revision!r}, "
-                    f"{application_status.syncStatus}, {application_status.healthStatus}; "
-                    f"expected {context.desired_revision}, Synced, Healthy"
-                )
-            if application_status.healthStatus in {"Degraded", "Missing"}:
-                raise DriverError(f"Argo CD Application health is {application_status.healthStatus}")
+                raise DriverError(f"{last_status}; expected {context.desired_revision}, Synced, Healthy")
             if time.monotonic() >= deadline:
-                raise DriverError("timed out waiting for Argo CD Application to reach the desired revision")
+                raise DriverError(
+                    "timed out waiting for Argo CD Application to reach the desired revision; " + last_status
+                )
             time.sleep(5)
 
     def semantic_result(self, result: object) -> ReconciliationResult:

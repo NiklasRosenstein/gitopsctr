@@ -2,8 +2,8 @@
 actionlint = "latest"
 oras = "latest"
 helm = "latest"
-kind = "latest"
-minikube = "latest"
+kind = "0.32.0"
+minikube = "1.38.1"
 kubectl = "latest"
 python = "3.12"
 terraform = "latest"
@@ -77,3 +77,15 @@ run = "uv run python -m demo.kubernetes.run clean"
 [tasks.kubernetes-acceptance]
 description = "Build, deploy, verify, prove clean convergence, and clean the selected Kubernetes demo"
 run = "uv run python -m demo.kubernetes.run acceptance"
+
+[tasks.argocd-demo]
+description = "Build, materialize, and observe the selected Kubernetes demo through Argo CD"
+run = "uv run python -m demo.kubernetes.run run --delivery argocd"
+
+[tasks.argocd-demo-clean]
+description = "Remove the selected Argo CD Kubernetes demo cluster and state"
+run = "uv run python -m demo.kubernetes.run clean --delivery argocd"
+
+[tasks.argocd-acceptance]
+description = "Build, materialize, observe through Argo CD, and clean the selected Kubernetes demo"
+run = "uv run python -m demo.kubernetes.run acceptance --delivery argocd"

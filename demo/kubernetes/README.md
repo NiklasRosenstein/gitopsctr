@@ -26,4 +26,19 @@ mise run kubernetes-acceptance -- kind
 mise run kubernetes-acceptance -- minikube
 ```
 
+## Argo CD acceptance
+
+The Argo CD variant keeps the same image build and Helm materialization, but it creates an automated Argo CD
+Application before `materialized/web` exists. Its first `web --advance` reconciliation commits the rendered YAML to
+`gitopsctr/desired/dev` and waits for Argo CD to sync that exact commit. Argo CD applies the workload; gitopsctr only
+observes its Application resource through Kubernetes.
+
+```console
+mise run argocd-acceptance -- kind
+mise run argocd-acceptance -- minikube
+```
+
+The test installs a pinned, headless Argo CD Core instance plus an isolated in-cluster Git daemon. Both are removed
+with the cluster. The Git daemon is intentionally unauthenticated and is only suitable for this disposable test.
+
 Docker must be running. Mise provides Helm, kind, minikube, kubectl, Python, and the other project tools.

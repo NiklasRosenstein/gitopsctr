@@ -169,3 +169,32 @@ def test_kubernetes_acceptance_cleans_after_a_failed_invariant(monkeypatch):
         kubernetes_demo.acceptance("minikube")
 
     assert events == [("clean", "minikube"), ("clean", "minikube")]
+
+
+@pytest.mark.parametrize("provider", ("kind", "minikube"))
+def test_argocd_demo_uses_the_external_observer_and_materialized_payload(tmp_path, monkeypatch, provider):
+    worktree = tmp_path / provider / "repository"
+    shutil.copytree(kubernetes_demo.TEMPLATE, worktree)
+    monkeypatch.setattr(kubernetes_demo, "docker_platform", lambda: "linux/amd64")
+
+    kubernetes_demo.configure_template(provider, worktree, "argocd")
+
+    specification = cli.load_environment_specifications(worktree, "dev")["web"]
+    assert specification.driver.unit_contract.dump(specification.spec)["delivery"] == {
+        "mode": "external",
+        "observer": {
+            "type": "argocd",
+            "access": "kubernetes",
+            "application": kubernetes_demo.ARGO_APPLICATION,
+            "applicationNamespace": kubernetes_demo.ARGO_NAMESPACE,
+            "kubeContext": kubernetes_demo.kube_context(provider, "argocd"),
+            "timeoutSeconds": 600,
+        },
+    }
+    application = kubernetes_demo.argo_application_document()
+    assert application["spec"]["source"] == {
+        "repoURL": f"git://{kubernetes_demo.ARGO_GIT_SERVICE}.{kubernetes_demo.ARGO_NAMESPACE}.svc.cluster.local:9418/origin.git",
+        "targetRevision": "gitopsctr/desired/dev",
+        "path": "materialized/web",
+    }
+    assert application["spec"]["syncPolicy"] == {"automated": {}}

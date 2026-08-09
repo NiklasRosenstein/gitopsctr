@@ -112,6 +112,10 @@ Use `access: "api"` for the `argocd` CLI or `access: "kubernetes"` with `kubeCon
 through `kubectl`. Authentication is supplied by the environment. A receipt is written only when a single-source
 Application reports the exact desired commit, `Synced`, and `Healthy`. The controller never triggers a sync.
 
+An Application can be created before its target desired branch or materialized path exists. During reconciliation,
+initial absent status, `Unknown`, and `Missing` health are treated as pending until `timeoutSeconds`; `Degraded` fails
+immediately. Verification reports any pending or unhealthy Application as drift.
+
 ## Promotion evidence
 
 Promotion requires receipts by default. An environment containing intentional materialization-only units can opt in:
@@ -142,6 +146,11 @@ mise run kubernetes-demo-clean -- minikube
 `mise run kubernetes-acceptance -- PROVIDER` starts from empty state, exports the built image to the selected cluster,
 renders and applies the workload, verifies the running application through the CLI, proves a second convergence moves
 no Git refs, and always removes the cluster.
+
+`mise run argocd-acceptance -- PROVIDER` exercises external delivery. It installs an isolated Argo CD Core instance,
+creates an automated Application before the first materialized payload exists, and uses one `web --advance`
+reconciliation to commit Helm-rendered YAML and observe Argo CD syncing that exact desired revision. Argo CD, not
+gitopsctr, applies the workload.
 
 ## Schemas
 

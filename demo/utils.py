@@ -16,8 +16,9 @@ def run(
     check: bool = True,
     capture: bool = False,
     env: Mapping[str, str] | None = None,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, cwd=cwd, check=check, text=True, capture_output=capture, env=env)
+    return subprocess.run(args, cwd=cwd, check=check, text=True, capture_output=capture, env=env, input=input_text)
 
 
 def require_commands(*names: str, installation_hint: str = "run 'mise install'") -> None:
@@ -69,7 +70,7 @@ class DemoRepository:
     template: Path
     state_root: Path
     worktree: Path
-    remote: Path
+    remote: Path | str
     identity: str
 
     def prepare(self, configure: Callable[[], None] | None = None) -> None:
@@ -79,10 +80,14 @@ class DemoRepository:
         shutil.copytree(self.template, self.worktree)
         if configure is not None:
             configure()
-        run("git", "init", "--bare", str(self.remote))
+        if isinstance(self.remote, Path):
+            run("git", "init", "--bare", str(self.remote))
         run("git", "init", "--initial-branch=main", cwd=self.worktree)
         run("git", "config", "user.name", self.identity, cwd=self.worktree)
         run("git", "config", "user.email", "demo@localhost", cwd=self.worktree)
+        # Demos must not inherit a developer's mandatory commit-signing policy:
+        # their temporary identity has no signing key or agent.
+        run("git", "config", "commit.gpgsign", "false", cwd=self.worktree)
         run("git", "add", ".", cwd=self.worktree)
         run("git", "commit", "-m", f"Initialize {self.identity}", cwd=self.worktree)
         run("git", "remote", "add", "origin", str(self.remote), cwd=self.worktree)
@@ -90,6 +95,11 @@ class DemoRepository:
 
     def heads(self) -> RefHeads:
         def head(ref: str) -> str:
+            if not isinstance(self.remote, Path):
+                output = run("git", "ls-remote", self.remote, f"refs/heads/{ref}", capture=True).stdout.split()
+                if len(output) != 2:
+                    raise RuntimeError(f"remote {self.remote!r} has no {ref} head")
+                return output[0]
             return run(
                 "git",
                 "--git-dir",
