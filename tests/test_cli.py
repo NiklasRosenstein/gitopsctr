@@ -31,6 +31,20 @@ def _terraform_desired_resource(name: str = "aws-application"):
     )
 
 
+def test_root_help_groups_commands_and_describes_each_command():
+    help_text = deploy_release.build_parser().format_help()
+
+    assert "usage: " in help_text and " COMMAND ..." in help_text
+    assert "commands:\n" in help_text
+    assert "positional arguments:" not in help_text
+    assert "Project:\n" in help_text
+    assert "Deployment:\n" in help_text
+    assert "Inspection:\n" in help_text
+    assert "Git data:\n" in help_text
+    assert "    promote             promote reviewed desired state" in help_text
+    assert "    reconcile           reconcile one deployment unit" in help_text
+
+
 def test_desired_resolution_logs_unit_and_observation_decision(tmp_path, monkeypatch, capsys):
     source = tmp_path / "source"
     current = tmp_path / "current"

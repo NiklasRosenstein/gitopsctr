@@ -4071,15 +4071,57 @@ def command_validate(args: argparse.Namespace) -> None:
     )
 
 
+class GroupedHelpFormatter(argparse.HelpFormatter):
+    """Render the root command list in functional groups."""
+
+    COMMAND_GROUPS = (
+        ("Project", ("create", "validate")),
+        ("Schemas", ("schemas",)),
+        ("Deployment", ("advance-desired", "promote", "rollback", "resolve-desired")),
+        ("Inspection", ("status", "list", "show", "verify", "dependencies")),
+        ("Reconciliation", ("reconcile", "converge")),
+        ("Git data", ("read-tree", "publish-tree")),
+    )
+
+    def _format_action(self, action: argparse.Action) -> str:
+        if not isinstance(action, argparse._SubParsersAction) or action.dest != "command":
+            return super()._format_action(action)
+
+        choices = {choice.dest: choice for choice in action._choices_actions}
+        sections: list[str] = []
+        for title, command_names in self.COMMAND_GROUPS:
+            entries = [choices[name] for name in command_names if name in choices]
+            if not entries:
+                continue
+            if sections:
+                sections.append("\n")
+            sections.append(f"{title}:\n")
+            self._indent()
+            try:
+                format_action = super()._format_action
+                sections.extend(format_action(entry) for entry in entries)
+            finally:
+                self._dedent()
+        return "".join(sections)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        formatter_class=GroupedHelpFormatter,
+    )
     parser.add_argument(
         "--repository",
         help="Git working tree; defaults to the repository containing the current directory",
     )
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(
+        title="commands",
+        dest="command",
+        metavar="COMMAND",
+        required=True,
+    )
 
-    create = commands.add_parser("create", help="create an authored Project, Environment, or Unit resource")
+    create = commands.add_parser("create", help="create a Project, Environment, or Unit resource")
     create_commands = create.add_subparsers(dest="create_command", required=True)
     create_project = create_commands.add_parser("project", help="create the repository Project resource")
     create_project.add_argument("--name", required=True, help="DNS-1123 project name")
@@ -4110,7 +4152,7 @@ def build_parser() -> argparse.ArgumentParser:
     create_unit.add_argument("--force", action="store_true", help="replace an existing Unit resource")
     create_unit.set_defaults(handler=command_create_unit)
 
-    validate = commands.add_parser("validate", help="validate authored Project, Environment, and Unit resources")
+    validate = commands.add_parser("validate", help="validate Project, Environment, and Unit resources")
     validate.add_argument(
         "files",
         nargs="*",
@@ -4125,7 +4167,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--fail-fast", action="store_true", help="stop after the first validation error")
     validate.set_defaults(handler=command_validate)
 
-    schemas = commands.add_parser("schemas", help="show or export public JSON Schemas")
+    schemas = commands.add_parser("schemas", help="show or export public schemas")
     schema_commands = schemas.add_subparsers(dest="schema_command", required=True)
     schemas_show = schema_commands.add_parser("show", help="print one core or driver schema")
     schemas_show.add_argument("driver", help="driver name or 'core'")
@@ -4136,7 +4178,7 @@ def build_parser() -> argparse.ArgumentParser:
     schemas_export.add_argument("--check", action="store_true", help="fail if generated files differ")
     schemas_export.set_defaults(handler=command_schemas_export)
 
-    read = commands.add_parser("read-tree", help="materialize a data-only Git ref")
+    read = commands.add_parser("read-tree", help="materialize a Git data ref")
     read.add_argument("--ref", required=True)
     read.add_argument("--revision")
     read.add_argument("--require-ancestor", action="store_true")
@@ -4144,7 +4186,7 @@ def build_parser() -> argparse.ArgumentParser:
     read.add_argument("--output", required=True)
     read.set_defaults(handler=command_read_tree)
 
-    publish = commands.add_parser("publish-tree", help="commit and push a supplied data tree")
+    publish = commands.add_parser("publish-tree", help="commit and push a Git data tree")
     publish.add_argument("--ref", required=True)
     publish.add_argument("--directory", required=True)
     publish.add_argument("--parent")
@@ -4153,7 +4195,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     advance = commands.add_parser(
         "advance-desired",
-        help="materialize ready units and atomically advance desired state",
+        help="advance desired state with ready units",
     )
     advance.add_argument("--environment", required=True)
     advance.add_argument("--source-revision")
@@ -4165,7 +4207,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     promote = commands.add_parser(
         "promote",
-        help="materialize and publish a reviewed environment promotion candidate",
+        help="promote reviewed desired state",
     )
     promote.add_argument("--from-environment", required=True)
     promote.add_argument("--to-environment", required=True)
@@ -4185,7 +4227,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rollback = commands.add_parser(
         "rollback",
-        help="publish a forward-only rollback of desired deployment state",
+        help="publish a forward-only rollback",
     )
     rollback.add_argument("--environment", required=True)
     rollback.add_argument("--to-desired-revision", required=True)
@@ -4202,7 +4244,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     resolve = commands.add_parser(
         "resolve-desired",
-        help="resolve an exact commit from desired-ref history",
+        help="resolve a commit from desired history",
     )
     resolve.add_argument("--desired-ref", required=True)
     resolve.add_argument("--desired-revision")
@@ -4210,7 +4252,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = commands.add_parser(
         "status",
-        help="show deployment status for all environments, one environment, or one unit",
+        help="show deployment status",
     )
     status.add_argument("--environment", help="environment to inspect; omit for all environments")
     status.add_argument("--unit", help="limit detailed status to one unit in the selected environment")
@@ -4223,7 +4265,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--verbose", action="store_true")
     status.set_defaults(handler=command_status)
 
-    list_command = commands.add_parser("list", help="list project environments or deployment units")
+    list_command = commands.add_parser("list", help="list environments or units")
     list_commands = list_command.add_subparsers(dest="list_command", required=True)
     list_environments = list_commands.add_parser("environments", help="list environments and their deployment summary")
     list_environments.add_argument("--json", action="store_true", help="emit one machine-readable document")
@@ -4233,7 +4275,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_units.add_argument("--json", action="store_true", help="emit one machine-readable document")
     list_units.set_defaults(handler=command_list_units)
 
-    show = commands.add_parser("show", help="show a desired unit or observation receipt")
+    show = commands.add_parser("show", help="show desired state or a receipt")
     show_commands = show.add_subparsers(dest="show_command", required=True)
     desired = show_commands.add_parser("desired", aliases=("desired-unit",), help="show one desired unit")
     desired.add_argument("--environment", required=True)
@@ -4262,7 +4304,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify = commands.add_parser(
         "verify",
-        help="check current desired units for external drift without changing state",
+        help="check desired units for drift",
     )
     verify.add_argument("--environment", required=True)
     verify.add_argument(
@@ -4274,7 +4316,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     reconcile = commands.add_parser(
         "reconcile",
-        help="reconcile one deployment unit against desired and observed Git refs",
+        help="reconcile one deployment unit",
     )
     reconcile.add_argument(
         "--unit",
@@ -4308,7 +4350,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     dependencies = commands.add_parser(
         "dependencies",
-        help="show a unit's transitive observation dependencies",
+        help="show unit dependencies",
     )
     dependencies.add_argument("--environment", required=True)
     dependencies.add_argument("--source-revision", default="HEAD")
@@ -4338,7 +4380,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     converge = commands.add_parser(
         "converge",
-        help="reconcile selected units and their dependencies until clean",
+        help="reconcile units and dependencies until clean",
     )
     converge.add_argument("--environment", required=True)
     converge.add_argument("--source-revision")
