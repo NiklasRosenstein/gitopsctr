@@ -1,8 +1,8 @@
 # Project configuration
 
 Every GitOpsCTR source tree contains a `Project` resource. It identifies the
-project, locates authored environments, and selects the preferred format for
-generated documents. It can also define default desired and observed ref templates for every environment.
+project, locates authored environments, and selects the preferred format for generated documents. It can also define
+default desired, observed, and candidate ref templates for every environment.
 
 Create it from the root of an existing Git working tree:
 
@@ -25,8 +25,9 @@ spec:
   environmentsPath: deployment/environments
   environmentDefaults:
     refs:
-      desired: deploy/{environment}
-      observed: observed/{environment}
+      desired: gitopsctr/desired/{environment}
+      observed: gitopsctr/observed/{environment}
+      candidate: gitopsctr/candidates/{environment}/{id}
 ```
 
 `metadata.name` is a DNS-1123 project name. `spec.writeFormat` accepts `yaml`
@@ -50,8 +51,9 @@ under top-level `units/`.
 
 ## Environment ref defaults
 
-`spec.environmentDefaults.refs` defines project-wide ref templates. Each configured template must contain the literal
-`{environment}` placeholder; no other placeholders or unmatched braces are accepted.
+`spec.environmentDefaults.refs` defines project-wide ref templates. Every template must contain `{environment}`.
+Desired and observed templates support no other placeholders; the candidate template may also contain `{id}` and
+`{operation}`.
 
 ```yaml
 spec:
@@ -59,12 +61,13 @@ spec:
     refs:
       desired: deployments/{environment}
       observed: observations/{environment}
+      candidate: changes/{environment}/{operation}/{id}
 ```
 
-The fields are independent. If only `desired` is configured, `observed` retains the built-in
-`observed/{environment}` convention. An [Environment](apis/environment.md#deployment-refs) can replace either template
-with an exact ref, and operation-specific CLI overrides take the highest priority. Expanded desired and observed refs
-must differ.
+The fields are independent. Omitted fields retain the built-ins: `gitopsctr/desired/{environment}`,
+`gitopsctr/observed/{environment}`, and `gitopsctr/candidates/{environment}/{id}`. An
+[Environment](apis/environment.md#deployment-refs) can replace them, and operation-specific CLI overrides take the
+highest priority. Expanded desired and observed refs must differ.
 
 Create an environment in that configured location with:
 
@@ -73,8 +76,8 @@ gitopsctr create environment --name dev
 gitopsctr create environment --name prod --change-gate pullRequest
 ```
 
-`gitopsctr create project` writes the built-in templates by default. Use `--desired-ref-template` and
-`--observed-ref-template` to choose different templates while scaffolding the Project.
+`gitopsctr create project` writes the built-in templates by default. Use `--desired-ref-template`,
+`--observed-ref-template`, and `--candidate-ref-template` to choose different templates while scaffolding the Project.
 
 Use the canonical filename `gitopsctr.yaml`; `.yml`, `.gitopsctr.yaml`, and
 `.gitopsctr.yml` are also accepted. A source tree must contain exactly one of

@@ -5,10 +5,10 @@ unit drivers perform the external work.
 
 ```mermaid
 flowchart LR
-  source["Source commit<br/>authored intent"] -->|advance-desired| desired["Desired ref<br/>deploy/&lt;environment&gt;"]
+  source["Source commit<br/>authored intent"] -->|advance-desired| desired["Desired ref<br/>gitopsctr/desired/&lt;environment&gt;"]
   desired -->|reconcile| driver["Unit driver"]
   driver --> systems["External systems"]
-  driver -->|receipt and artifacts| observed["Observed ref<br/>observed/&lt;environment&gt;"]
+  driver -->|receipt and artifacts| observed["Observed ref<br/>gitopsctr/observed/&lt;environment&gt;"]
   observed -.->|unlock downstream inputs| desired
 ```
 
@@ -28,8 +28,8 @@ artifact kinds by full group/version/kind. See [Resources and API kinds](documen
 | State | Owner | Typical contents |
 | --- | --- | --- |
 | Source commit | User | `Project`, authored `Environment` and Unit resources, deployment source files |
-| Desired ref | Controller | Fully resolved units and materialized payloads under `deploy/<environment>` by default |
-| Observed ref | Controller and drivers | Receipts and artifacts under `observed/<environment>` by default |
+| Desired ref | Controller | Fully resolved units and materialized payloads under `gitopsctr/desired/<environment>` by default |
+| Observed ref | Controller and drivers | Receipts and artifacts under `gitopsctr/observed/<environment>` by default |
 
 An environment may override the desired and observed ref names, but they must remain distinct. Separating them allows
 desired state to advance independently while receipts continue to describe the exact desired revision a driver

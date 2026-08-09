@@ -81,7 +81,7 @@ case "${OPERATION}" in
       desired_changed=$(sed -n 's/^desired_changed=//p' "${prepare_outputs}" | tail -n 1)
       desired_changed="${desired_changed:-false}"
     else
-      desired_ref="${DESIRED_REF:-deploy/${ENVIRONMENT}}"
+      desired_ref="${DESIRED_REF:-gitopsctr/desired/${ENVIRONMENT}}"
       args+=(resolve-desired --desired-ref "${desired_ref}")
       if [[ -n "${DESIRED_REVISION}" ]]; then
         args+=(--desired-revision "${DESIRED_REVISION}")
@@ -135,6 +135,7 @@ case "${OPERATION}" in
     )
     [[ -n "${DESIRED_REF}" ]] && args+=(--desired-ref "${DESIRED_REF}")
     [[ -n "${OBSERVED_REF}" ]] && args+=(--observed-ref "${OBSERVED_REF}")
+    [[ -n "${CANDIDATE_REF}" ]] && args+=(--candidate-ref "${CANDIDATE_REF}")
     if [[ -n "${ROLLBACK_UNITS}" ]]; then
       IFS=',' read -ra rollback_units <<< "${ROLLBACK_UNITS}"
       for raw_unit in "${rollback_units[@]}"; do

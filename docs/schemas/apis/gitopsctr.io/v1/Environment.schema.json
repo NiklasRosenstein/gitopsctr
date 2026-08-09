@@ -86,6 +86,19 @@
             {
               "additionalProperties": false,
               "properties": {
+                "candidate": {
+                  "anyOf": [
+                    {
+                      "pattern": "^(?:[^{}]|\\{id\\}|\\{operation\\})*\\{environment\\}(?:[^{}]|\\{environment\\}|\\{id\\}|\\{operation\\})*$",
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Candidate ref template for reviewed promotions and rollbacks. Must contain {environment}; may also contain {id} and {operation}."
+                },
                 "desired": {
                   "anyOf": [
                     {

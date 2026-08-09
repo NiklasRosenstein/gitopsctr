@@ -49,8 +49,8 @@ mise run demo-reset
 ```
 
 The runner creates an isolated Git repository, starts a local registry, then runs `converge`. Convergence advances
-`deploy/dev`, reconciles `demo-image`, publishes its receipt and artifact to `observed/dev`, advances the service with
-the resolved image URI, and finally reconciles `demo-service`.
+`gitopsctr/desired/dev`, reconciles `demo-image`, publishes its receipt and artifact to `gitopsctr/observed/dev`,
+advances the service with the resolved image URI, and finally reconciles `demo-service`.
 
 The command finishes with the application URL and response. Verify it directly:
 
@@ -60,7 +60,7 @@ curl http://127.0.0.1:18080
 
 ## Inspect desired and observed state
 
-Change into the demo's isolated repository, then use the normal CLI without repeating its path:
+Change into the demo's isolated repository:
 
 ```console
 cd .docker-demo-state/repository
@@ -72,7 +72,8 @@ uv run gitopsctr show receipt --environment dev demo-image --artifact containers
 git log --all --oneline --decorate
 ```
 
-The source commit contains authored resources. `deploy/dev` contains resolved desired units; `observed/dev` contains
+The source commit contains authored resources. `gitopsctr/desired/dev` contains resolved desired units;
+`gitopsctr/observed/dev` contains
 receipts and artifacts proving what was applied. See [Concepts](concepts.md) for the full state model.
 
 ## Prove clean convergence

@@ -119,7 +119,17 @@ def write_project(tree: Path, project_name: str) -> None:
             "apiVersion": "gitopsctr.io/v1",
             "kind": "Project",
             "metadata": {"name": project_name},
-            "spec": {"writeFormat": "yaml", "environmentsPath": "deployment/environments"},
+            "spec": {
+                "writeFormat": "yaml",
+                "environmentsPath": "deployment/environments",
+                "environmentDefaults": {
+                    "refs": {
+                        "desired": "deploy/{environment}",
+                        "observed": "observed/{environment}",
+                        "candidate": "gitopsctr/candidates/{environment}/{id}",
+                    }
+                },
+            },
         },
         format=DocumentFormat.YAML,
     )

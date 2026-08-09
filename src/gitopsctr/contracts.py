@@ -5,12 +5,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from mashumaro.config import BaseConfig
 from mashumaro.jsonschema import build_json_schema
+from mashumaro.jsonschema.annotations import Pattern
 from mashumaro.jsonschema.models import Context, JSONSchema, JSONSchemaInstanceType
 from mashumaro.jsonschema.plugins import BasePlugin
 from mashumaro.jsonschema.schema import Instance
@@ -25,6 +26,7 @@ from gitopsctr.document import (
     ResolvedJsonObjectValue,
     TypedDocumentContract,
 )
+from gitopsctr.formats import CANDIDATE_REF_TEMPLATE_PATTERN
 from gitopsctr.templates import (
     REFERENCE_KEYS,
     ArtifactReference,
@@ -339,6 +341,15 @@ class MashumaroUnionContract[ModelT: StrictModel](TypedDocumentContract[ModelT])
 class EnvironmentRefs(StrictModel):
     desired: str | None = None
     observed: str | None = None
+    candidate: Annotated[str, Pattern(CANDIDATE_REF_TEMPLATE_PATTERN)] | None = field(
+        default=None,
+        metadata={
+            "description": (
+                "Candidate ref template for reviewed promotions and rollbacks. Must contain {environment}; "
+                "may also contain {id} and {operation}."
+            )
+        },
+    )
 
 
 @dataclass(frozen=True, kw_only=True)

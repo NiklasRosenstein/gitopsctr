@@ -513,6 +513,64 @@ def test_pull_request_gate_routes_rollback_through_candidate_submission(tmp_path
 
 
 @pytest.mark.parametrize(
+    ("override", "expected_ref"),
+    [
+        (None, "gitopsctr/candidates/dev/candidate123"),
+        ("manual/rollback", "manual/rollback"),
+    ],
+)
+def test_gated_rollback_uses_candidate_template_or_exact_override(
+    override, expected_ref, monkeypatch
+):
+    revisions, _publications = _install_rollback_simulation(monkeypatch, gate="pullRequest")
+    captured = []
+    outcome = deploy_release.ChangeRequestResult(status="created", url="https://github.example/pull/1")
+    monkeypatch.setattr(deploy_release, "candidate_identifier", lambda *_args, **_kwargs: "candidate123")
+
+    def publish(candidate, candidate_ref, target_ref, target_revision, *_args):
+        captured.append((candidate_ref, target_ref, target_revision, deploy_release.directory_files(candidate)))
+        return revisions["published"], outcome
+
+    monkeypatch.setattr(deploy_release, "publish_change_candidate", publish)
+    arguments = [
+        "rollback",
+        "--environment",
+        "dev",
+        "--to-desired-revision",
+        revisions["target"],
+        "--reason",
+        "Known-bad release",
+    ]
+    if override:
+        arguments.extend(("--candidate-ref", override))
+
+    args = deploy_release.build_parser().parse_args(arguments)
+    args.handler(args)
+
+    assert captured[0][:3] == (expected_ref, "deploy/dev", revisions["current"])
+
+
+def test_direct_rollback_rejects_candidate_ref_override(monkeypatch):
+    revisions, _publications = _install_rollback_simulation(monkeypatch, gate="none")
+    args = deploy_release.build_parser().parse_args(
+        [
+            "rollback",
+            "--environment",
+            "dev",
+            "--to-desired-revision",
+            revisions["target"],
+            "--reason",
+            "Known-bad release",
+            "--candidate-ref",
+            "manual/rollback",
+        ]
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="requires changeGate pullRequest"):
+        args.handler(args)
+
+
+@pytest.mark.parametrize(
     "corruption",
     ["schema", "unit", "driver", "revision", "semantic-result"],
 )

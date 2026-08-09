@@ -792,7 +792,7 @@ def _install_promotion_simulation(monkeypatch, gate: str):
 
     def observed_tree(ref, output):
         output.mkdir(parents=True, exist_ok=True)
-        return target_revision if ref == "deploy/prod" else None
+        return target_revision if ref == "gitopsctr/desired/prod" else None
 
     def publish(ref, _directory, parent, message):
         publications.append((ref, parent, message))
@@ -803,7 +803,9 @@ def _install_promotion_simulation(monkeypatch, gate: str):
     monkeypatch.setattr(
         deploy_release,
         "resolve_ref",
-        lambda ref, _revision=None: source_desired_revision if ref == "deploy/dev" else source_observed_revision,
+        lambda ref, _revision=None: (
+            source_desired_revision if ref == "gitopsctr/desired/dev" else source_observed_revision
+        ),
     )
     monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
     monkeypatch.setattr(deploy_release, "require_clean_source", lambda *_args: None)
@@ -814,6 +816,7 @@ def _install_promotion_simulation(monkeypatch, gate: str):
     )
     monkeypatch.setattr(deploy_release, "publish_tree", publish)
     monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: None)
+    monkeypatch.setattr(deploy_release, "candidate_identifier", lambda *_args, **_kwargs: "candidate123")
     return publications
 
 
@@ -830,7 +833,7 @@ def test_promotion_without_a_change_gate_publishes_target_directly(monkeypatch, 
 
     args.handler(args)
 
-    assert publications == [("deploy/prod", "d" * 40, "Promote dev to prod from " + "b" * 40)]
+    assert publications == [("gitopsctr/desired/prod", "d" * 40, "Promote dev to prod from " + "b" * 40)]
     assert capsys.readouterr().out == "e" * 40 + "\n"
 
 
@@ -851,13 +854,13 @@ def test_promotion_with_a_change_gate_creates_a_pull_request(monkeypatch):
 
     assert publications == [
         (
-            "promotion/prod/bbbbbbbbbbbb-aaaaaaaaaaaa",
+            "gitopsctr/candidates/prod/candidate123",
             "d" * 40,
             "Promote dev to prod from " + "b" * 40,
         )
     ]
-    assert requests[0].base == "deploy/prod"
-    assert requests[0].head == "promotion/prod/bbbbbbbbbbbb-aaaaaaaaaaaa"
+    assert requests[0].base == "gitopsctr/desired/prod"
+    assert requests[0].head == "gitopsctr/candidates/prod/candidate123"
 
 
 def test_progress_helpers_keep_result_stdout_clean(capsys):
@@ -1302,8 +1305,8 @@ def test_environment_refs_use_project_defaults_and_allow_environment_and_cli_ove
     _write_json(environment, {"schema": 1, "name": "staging"})
 
     assert deploy_release.deployment_refs(tmp_path, "staging") == (
-        "deploy/staging",
-        "observed/staging",
+        "gitopsctr/desired/staging",
+        "gitopsctr/observed/staging",
     )
 
     _write_json(
@@ -1372,6 +1375,139 @@ def test_environment_refs_must_differ_after_project_template_expansion(tmp_path)
 
     with pytest.raises(deploy_release.OperationError, match="desired and observed refs must differ"):
         deploy_release.deployment_refs(tmp_path, "staging")
+
+
+def test_candidate_ref_templates_use_project_and_environment_configuration(tmp_path):
+    environment = tmp_path / "deployment/environments/staging/environment.json"
+    _write_json(environment, {"schema": 1, "name": "staging"})
+
+    assert deploy_release.candidate_ref_template(tmp_path, "staging") == (
+        "gitopsctr/candidates/{environment}/{id}"
+    )
+    assert deploy_release.resolve_candidate_ref(tmp_path, "staging", "promotion", "abc123") == (
+        "gitopsctr/candidates/staging/abc123"
+    )
+
+    _write_json(
+        tmp_path / "gitopsctr.yaml",
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Project",
+            "metadata": {"name": "test-project"},
+            "spec": {
+                "environmentDefaults": {
+                    "refs": {"candidate": "changes/{environment}/{operation}/{id}"}
+                }
+            },
+        },
+    )
+    assert deploy_release.resolve_candidate_ref(tmp_path, "staging", "rollback", "def456") == (
+        "changes/staging/rollback/def456"
+    )
+
+    _write_json(
+        environment,
+        {
+            "schema": 1,
+            "name": "staging",
+            "refs": {"candidate": "candidate/{environment}"},
+        },
+    )
+    assert deploy_release.resolve_candidate_ref(tmp_path, "staging", "promotion", "ignored") == (
+        "candidate/staging"
+    )
+    assert deploy_release.resolve_candidate_ref(
+        tmp_path,
+        "staging",
+        "promotion",
+        "ignored",
+        "manual/candidate",
+    ) == "manual/candidate"
+
+
+def test_environment_candidate_ref_template_rejects_unknown_placeholders(tmp_path):
+    _write_json(
+        tmp_path / "deployment/environments/staging/environment.json",
+        {
+            "schema": 1,
+            "name": "staging",
+            "refs": {"candidate": "candidate/{environment}/{unknown}"},
+        },
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="candidate"):
+        deploy_release.load_environment(tmp_path, "staging")
+
+
+def test_candidate_identifier_covers_operation_target_context_and_tree(tmp_path):
+    candidate = tmp_path / "candidate"
+    _write_json(candidate / "units/application.json", {"value": "one"})
+    arguments = ("dev", candidate, "gitopsctr/desired/dev", "a" * 40, {"source": "main"})
+
+    first = deploy_release.candidate_identifier("promotion", *arguments)
+
+    assert first == deploy_release.candidate_identifier("promotion", *arguments)
+    assert first != deploy_release.candidate_identifier("rollback", *arguments)
+    assert first != deploy_release.candidate_identifier(
+        "promotion", "dev", candidate, "gitopsctr/desired/dev", "b" * 40, {"source": "main"}
+    )
+    _write_json(candidate / "units/application.json", {"value": "two"})
+    assert first != deploy_release.candidate_identifier("promotion", *arguments)
+
+
+def test_occupied_candidate_slot_reuses_only_the_same_proposal(tmp_path, monkeypatch):
+    candidate = tmp_path / "candidate"
+    _write_json(candidate / "units/application.json", {"value": "one"})
+    target_revision = "b" * 40
+    existing_revision = "c" * 40
+    outcome = deploy_release.ChangeRequestResult(status="existing", url="https://github.example/pull/1")
+
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: existing_revision)
+
+    def materialize(_revision, output):
+        _write_json(output / "units/application.json", {"value": "one"})
+
+    monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
+
+    def fake_git(*args, **_kwargs):
+        if args[0] == "check-ref-format":
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[0] == "rev-parse":
+            return subprocess.CompletedProcess(args, 0, target_revision + "\n", "")
+        if args[0] == "show":
+            return subprocess.CompletedProcess(args, 0, "Candidate message\n", "")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(deploy_release, "git", fake_git)
+    monkeypatch.setattr(deploy_release, "ensure_change_request", lambda *_args, **_kwargs: outcome)
+    monkeypatch.setattr(
+        deploy_release,
+        "publish_tree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("candidate was republished")),
+    )
+
+    revision, actual = deploy_release.publish_change_candidate(
+        candidate,
+        "gitopsctr/candidates/dev",
+        "gitopsctr/desired/dev",
+        target_revision,
+        "Candidate message",
+        "Candidate",
+        "Candidate body",
+    )
+
+    assert (revision, actual) == (existing_revision, outcome)
+
+    with pytest.raises(deploy_release.OperationError, match="occupied by a different proposal"):
+        deploy_release.publish_change_candidate(
+            candidate,
+            "gitopsctr/candidates/dev",
+            "gitopsctr/desired/dev",
+            target_revision,
+            "Different message",
+            "Candidate",
+            "Candidate body",
+        )
 
 
 @pytest.mark.parametrize(

@@ -14,6 +14,7 @@ spec:
   refs:
     desired: releases/staging
     observed: receipts/staging
+    candidate: changes/{environment}/{id}
   changeGate: pullRequest
   promotion:
     allowedSources: [dev]
@@ -23,24 +24,40 @@ spec:
 
 ## Deployment refs
 
-`spec.refs.desired` and `spec.refs.observed` are exact ref names for this environment. They are optional and can be
-set independently. Resolution is field-by-field:
+`spec.refs.desired` and `spec.refs.observed` are optional exact ref names for this environment. Resolution is
+field-by-field:
 
 | Priority | Source |
 | --- | --- |
 | 1 | Operation-specific CLI `--desired-ref` or `--observed-ref` override |
 | 2 | Exact value in `Environment.spec.refs` |
 | 3 | Expanded `Project.spec.environmentDefaults.refs` template |
-| 4 | Built-in `deploy/<environment>` or `observed/<environment>` convention |
+| 4 | Built-in `gitopsctr/desired/<environment>` or `gitopsctr/observed/<environment>` convention |
 
-Project templates substitute the literal `{environment}` placeholder. Environment-level refs are literal and are
-never templated. The final desired and observed refs must be non-empty and different. See
+Project templates substitute the literal `{environment}` placeholder. Environment-level desired and observed refs are
+literal; the candidate ref remains a template because each proposal may have its own `{id}`. The final desired and
+observed refs must be non-empty and different. See
 [Project configuration](../project-configuration.md#environment-ref-defaults).
+
+### Candidate refs
+
+With `changeGate: pullRequest`, promotions and rollbacks are published to a candidate ref for review. The default
+template is `gitopsctr/candidates/{environment}/{id}`. `spec.refs.candidate` can replace the project template for one
+environment; an operation-specific `--candidate-ref` exact override has highest priority.
+
+| Placeholder | Meaning |
+| --- | --- |
+| `{environment}` | Target environment; required |
+| `{id}` | Deterministic proposal identifier; optional |
+| `{operation}` | `promotion` or `rollback`; optional |
+
+Omitting `{id}` creates one candidate slot for each expanded template. An identical retry reuses that branch and pull
+request; a different proposal fails until the occupied branch is removed, rather than rewriting reviewed content.
 
 ## Promotion and change gates
 
 - `changeGate: none` publishes promotion and rollback commits directly.
-- `changeGate: pullRequest` publishes a candidate ref for review.
+- `changeGate: pullRequest` publishes promotions and rollbacks to a candidate ref for review.
 - `promotion.allowedSources` makes the environment promotion-tracked and lists the permitted source environments.
   Without `promotion`, the environment is source-tracked.
 - `promotionPolicy.minimumEvidence` defaults to `reconciled`. `materialized` permits promotion when every unit has

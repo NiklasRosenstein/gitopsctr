@@ -33,8 +33,9 @@ def test_yaml_is_the_default_and_project_config_can_select_json(tmp_path: Path):
     assert config.name == "test-project"
     assert config.write_format is DocumentFormat.JSON
     assert config.environments_path.as_posix() == "deployment/environments"
-    assert config.environment_defaults.refs.desired == "deploy/{environment}"
-    assert config.environment_defaults.refs.observed == "observed/{environment}"
+    assert config.environment_defaults.refs.desired == "gitopsctr/desired/{environment}"
+    assert config.environment_defaults.refs.observed == "gitopsctr/observed/{environment}"
+    assert config.environment_defaults.refs.candidate == "gitopsctr/candidates/{environment}/{id}"
     write_document(tmp_path / "configured.json", value, format=DocumentFormat.JSON)
     assert cli.load_json(tmp_path / "configured.json") == value
 
@@ -97,7 +98,43 @@ def test_project_environment_ref_templates_can_be_configured_independently(tmp_p
     config = load_project_config(tmp_path)
 
     assert config.environment_defaults.refs.desired == "deployments/{environment}/{environment}"
-    assert config.environment_defaults.refs.observed == "observed/{environment}"
+    assert config.environment_defaults.refs.observed == "gitopsctr/observed/{environment}"
+    assert config.environment_defaults.refs.candidate == "gitopsctr/candidates/{environment}/{id}"
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "gitopsctr/candidates/static",
+        "gitopsctr/candidates/{id}",
+        "gitopsctr/candidates/{environment}/{unknown}",
+        "gitopsctr/candidates/{environment",
+    ],
+)
+def test_project_candidate_ref_template_requires_environment_and_known_placeholders(
+    tmp_path: Path, template: str
+):
+    specification = {"environmentDefaults": {"refs": {"candidate": template}}}
+    (tmp_path / "gitopsctr.yaml").write_text(project_document(spec=json.dumps(specification)))
+
+    with pytest.raises(DocumentFormatError, match="environmentDefaults.refs.candidate"):
+        load_project_config(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "gitopsctr/candidates/{environment}",
+        "gitopsctr/candidates/{environment}/{id}",
+        "gitopsctr/candidates/{environment}/{operation}",
+        "gitopsctr/candidates/{environment}/{operation}/{id}",
+    ],
+)
+def test_project_candidate_ref_template_accepts_supported_forms(tmp_path: Path, template: str):
+    specification = {"environmentDefaults": {"refs": {"candidate": template}}}
+    (tmp_path / "gitopsctr.yaml").write_text(project_document(spec=json.dumps(specification)))
+
+    assert load_project_config(tmp_path).environment_defaults.refs.candidate == template
 
 
 def test_project_resource_schema_is_published_and_deterministic():

@@ -99,7 +99,10 @@ class DemoRepository:
                 capture=True,
             ).stdout.strip()
 
-        return RefHeads(desired=head("deploy/dev"), observed=head("observed/dev"))
+        return RefHeads(
+            desired=head("gitopsctr/desired/dev"),
+            observed=head("gitopsctr/observed/dev"),
+        )
 
     def clean(self) -> None:
         if self.state_root.exists():

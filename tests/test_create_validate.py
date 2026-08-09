@@ -48,6 +48,8 @@ def create_project(root: Path, **overrides: str) -> None:
         arguments += ["--desired-ref-template", overrides["desired_ref_template"]]
     if "observed_ref_template" in overrides:
         arguments += ["--observed-ref-template", overrides["observed_ref_template"]]
+    if "candidate_ref_template" in overrides:
+        arguments += ["--candidate-ref-template", overrides["candidate_ref_template"]]
     run_command(root, arguments)
 
 
@@ -73,8 +75,9 @@ def test_create_project_writes_a_valid_canonical_resource(tmp_path: Path, capsys
             "environmentsPath": "deployment/environments",
             "environmentDefaults": {
                 "refs": {
-                    "desired": "deploy/{environment}",
-                    "observed": "observed/{environment}",
+                    "desired": "gitopsctr/desired/{environment}",
+                    "observed": "gitopsctr/observed/{environment}",
+                    "candidate": "gitopsctr/candidates/{environment}/{id}",
                 }
             },
         },
@@ -107,6 +110,19 @@ def test_create_project_validates_before_writing_and_requires_force(tmp_path: Pa
             tmp_path,
             ["create", "project", "--name", "second", "--desired-ref-template", "deploy/main", "--force"],
         )
+    with pytest.raises(cli.OperationError, match="candidate"):
+        run_command(
+            tmp_path,
+            [
+                "create",
+                "project",
+                "--name",
+                "second",
+                "--candidate-ref-template",
+                "changes/{id}",
+                "--force",
+            ],
+        )
 
 
 def test_create_project_accepts_environment_ref_templates(tmp_path: Path):
@@ -114,12 +130,14 @@ def test_create_project_accepts_environment_ref_templates(tmp_path: Path):
         tmp_path,
         desired_ref_template="deployments/{environment}",
         observed_ref_template="observations/{environment}",
+        candidate_ref_template="changes/{environment}/{operation}/{id}",
     )
 
     specification = yaml.safe_load((tmp_path / "gitopsctr.yaml").read_text())["spec"]
     assert specification["environmentDefaults"]["refs"] == {
         "desired": "deployments/{environment}",
         "observed": "observations/{environment}",
+        "candidate": "changes/{environment}/{operation}/{id}",
     }
 
 

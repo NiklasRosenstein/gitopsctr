@@ -192,7 +192,11 @@ def acceptance(provider: Provider) -> None:
         second_heads = deployment_heads(provider)
         if second_heads != first_heads:
             raise RuntimeError("clean Kubernetes convergence moved desired or observed refs")
-        print(f"Acceptance passed: deploy/dev={second_heads.desired[:12]} observed/dev={second_heads.observed[:12]}")
+        print(
+            "Acceptance passed: "
+            f"gitopsctr/desired/dev={second_heads.desired[:12]} "
+            f"gitopsctr/observed/dev={second_heads.observed[:12]}"
+        )
     finally:
         clean(provider)
 

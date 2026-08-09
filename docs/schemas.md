@@ -6,7 +6,7 @@ resources use `unit.gitopsctr.io/v1`. Each unit kind publishes schemas for:
 
 - `authored`: source input owned by the user;
 - `desired`: the fully resolved resource stored under
-  `deploy/<environment>/units/`;
+  `gitopsctr/desired/<environment>/units/`;
 - `receipt`: the applied result and controller evidence stored under the
   observed ref.
 

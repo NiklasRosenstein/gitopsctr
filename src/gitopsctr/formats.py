@@ -12,9 +12,14 @@ import yaml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
-DEFAULT_DESIRED_REF_TEMPLATE = "deploy/{environment}"
-DEFAULT_OBSERVED_REF_TEMPLATE = "observed/{environment}"
+DEFAULT_DESIRED_REF_TEMPLATE = "gitopsctr/desired/{environment}"
+DEFAULT_OBSERVED_REF_TEMPLATE = "gitopsctr/observed/{environment}"
+DEFAULT_CANDIDATE_REF_TEMPLATE = "gitopsctr/candidates/{environment}/{id}"
 ENVIRONMENT_REF_TEMPLATE_PATTERN = r"^(?:[^{}]|\{environment\})*\{environment\}(?:[^{}]|\{environment\})*$"
+CANDIDATE_REF_TEMPLATE_PATTERN = (
+    r"^(?:[^{}]|\{id\}|\{operation\})*\{environment\}"
+    r"(?:[^{}]|\{environment\}|\{id\}|\{operation\})*$"
+)
 
 PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -70,6 +75,14 @@ PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
                                         "no other placeholders are supported."
                                     ),
                                 },
+                                "candidate": {
+                                    "type": "string",
+                                    "pattern": CANDIDATE_REF_TEMPLATE_PATTERN,
+                                    "description": (
+                                        "Default reviewed-change candidate ref template. Must contain {environment}; "
+                                        "may also contain {id} and {operation}."
+                                    ),
+                                },
                             },
                             "minProperties": 1,
                             "additionalProperties": False,
@@ -106,6 +119,7 @@ class DocumentFormatError(ValueError):
 class EnvironmentRefTemplates:
     desired: str = DEFAULT_DESIRED_REF_TEMPLATE
     observed: str = DEFAULT_OBSERVED_REF_TEMPLATE
+    candidate: str = DEFAULT_CANDIDATE_REF_TEMPLATE
 
 
 @dataclass(frozen=True)
@@ -165,6 +179,7 @@ def validate_project_document(value: object, path: Path) -> Project:
             refs=EnvironmentRefTemplates(
                 desired=cast(str, refs_document.get("desired", DEFAULT_DESIRED_REF_TEMPLATE)),
                 observed=cast(str, refs_document.get("observed", DEFAULT_OBSERVED_REF_TEMPLATE)),
+                candidate=cast(str, refs_document.get("candidate", DEFAULT_CANDIDATE_REF_TEMPLATE)),
             )
         ),
     )

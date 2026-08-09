@@ -157,7 +157,7 @@ def test_prepare_action_resolves_existing_desired_state(
         str(tmp_path),
         "resolve-desired",
         "--desired-ref",
-        "deploy/prod",
+        "gitopsctr/desired/prod",
     ]
     if desired_revision:
         expected += ["--desired-revision", desired_revision]
@@ -272,6 +272,7 @@ def test_rollback_action_maps_full_or_targeted_change(
         ROLLBACK_REASON="Incident mitigation",
         DESIRED_REF="deploy/prod",
         OBSERVED_REF="observed/prod",
+        CANDIDATE_REF="changes/prod/rollback",
         DRY="true",
     )
 
@@ -290,6 +291,8 @@ def test_rollback_action_maps_full_or_targeted_change(
         "deploy/prod",
         "--observed-ref",
         "observed/prod",
+        "--candidate-ref",
+        "changes/prod/rollback",
         *unit_arguments,
         "--dry",
     ]

@@ -12,9 +12,9 @@ metadata:
 spec:
   source:
     environment: dev
-    desiredRef: deploy/dev
+    desiredRef: gitopsctr/desired/dev
     desiredRevision: 0123456789abcdef0123456789abcdef01234567
-    observedRef: observed/dev
+    observedRef: gitopsctr/observed/dev
     observedRevision: 89abcdef0123456789abcdef0123456789abcdef
   specificationRevision: fedcba9876543210fedcba9876543210fedcba98
 ```

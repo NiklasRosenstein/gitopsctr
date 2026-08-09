@@ -37,6 +37,11 @@
               "additionalProperties": false,
               "minProperties": 1,
               "properties": {
+                "candidate": {
+                  "description": "Default reviewed-change candidate ref template. Must contain {environment}; may also contain {id} and {operation}.",
+                  "pattern": "^(?:[^{}]|\\{id\\}|\\{operation\\})*\\{environment\\}(?:[^{}]|\\{environment\\}|\\{id\\}|\\{operation\\})*$",
+                  "type": "string"
+                },
                 "desired": {
                   "description": "Default desired-state ref template. Must contain {environment}; no other placeholders are supported.",
                   "pattern": "^(?:[^{}]|\\{environment\\})*\\{environment\\}(?:[^{}]|\\{environment\\})*$",

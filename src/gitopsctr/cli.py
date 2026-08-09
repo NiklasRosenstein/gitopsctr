@@ -67,6 +67,7 @@ from gitopsctr.forges import (
     ensure_change_request,
 )
 from gitopsctr.formats import (
+    DEFAULT_CANDIDATE_REF_TEMPLATE,
     DEFAULT_DESIRED_REF_TEMPLATE,
     DEFAULT_OBSERVED_REF_TEMPLATE,
     PROJECT_CONFIG_NAMES,
@@ -1244,8 +1245,8 @@ def deployment_refs(
 ) -> tuple[str, str]:
     environment = load_environment(source_root, environment_name)
     configured = environment.get("refs", {})
-    if not isinstance(configured, dict) or set(configured) - {"desired", "observed"}:
-        raise OperationError(f"{environment_name} refs must contain desired and observed only")
+    if not isinstance(configured, dict) or set(configured) - {"desired", "observed", "candidate"}:
+        raise OperationError(f"{environment_name} refs must contain desired, observed, and candidate only")
     project_refs = load_project_config(source_root).environment_defaults.refs
     desired_ref = (
         desired_override or configured.get("desired") or project_refs.desired.replace("{environment}", environment_name)
@@ -1260,6 +1261,58 @@ def deployment_refs(
     if desired_ref == observed_ref:
         raise OperationError(f"{environment_name} desired and observed refs must differ")
     return desired_ref, observed_ref
+
+
+def candidate_ref_template(source_root: Path, environment_name: str) -> str:
+    environment = load_environment(source_root, environment_name)
+    configured = environment.get("refs", {})
+    if not isinstance(configured, dict) or set(configured) - {"desired", "observed", "candidate"}:
+        raise OperationError(f"{environment_name} refs must contain desired, observed, and candidate only")
+    template = configured.get("candidate") or load_project_config(source_root).environment_defaults.refs.candidate
+    if not isinstance(template, str):
+        raise OperationError(f"{environment_name} candidate ref template must be a string")
+    return template
+
+
+def candidate_identifier(
+    operation: Literal["promotion", "rollback"],
+    environment_name: str,
+    candidate: Path,
+    target_ref: str,
+    target_revision: str,
+    context: Mapping[str, Any],
+) -> str:
+    files = [
+        {"path": path, "contentHash": hashlib.sha256(content).hexdigest()}
+        for path, content in sorted(directory_files(candidate).items())
+    ]
+    payload = {
+        "candidateIdVersion": 1,
+        "operation": operation,
+        "environment": environment_name,
+        "targetRef": target_ref,
+        "targetRevision": target_revision,
+        "context": dict(context),
+        "files": files,
+    }
+    return hashlib.sha256(canonical_json(payload)).hexdigest()[:12]
+
+
+def resolve_candidate_ref(
+    source_root: Path,
+    environment_name: str,
+    operation: Literal["promotion", "rollback"],
+    candidate_id: str,
+    override: str | None = None,
+) -> str:
+    if override:
+        return override
+    template = candidate_ref_template(source_root, environment_name)
+    return (
+        template.replace("{environment}", environment_name)
+        .replace("{operation}", operation)
+        .replace("{id}", candidate_id)
+    )
 
 
 def load_environment_specifications(source_root: Path, environment_name: str) -> dict[str, UnitResource[Any]]:
@@ -2235,8 +2288,16 @@ def publish_change_candidate(
         with tempfile.TemporaryDirectory() as existing_directory:
             existing_root = Path(existing_directory) / "candidate"
             materialize_revision(existing_candidate, existing_root)
-            if directory_files(existing_root) != directory_files(candidate):
-                raise OperationError(f"change candidate ref exists with different state: {candidate_ref}")
+            parent_result = git("rev-parse", f"{existing_candidate}^", check=False)
+            message_result = git("show", "-s", "--format=%B", existing_candidate, check=False)
+            if (
+                parent_result.returncode != 0
+                or message_result.returncode != 0
+                or directory_files(existing_root) != directory_files(candidate)
+                or parent_result.stdout.strip() != target_revision
+                or message_result.stdout.rstrip("\n") != commit_message.rstrip("\n")
+            ):
+                raise OperationError(f"change candidate ref is occupied by a different proposal: {candidate_ref}")
         candidate_revision = existing_candidate
         log_status("KEEP", f"reuse existing candidate {style_branch(candidate_ref)}")
     else:
@@ -2371,10 +2432,28 @@ def command_promote(args: argparse.Namespace) -> None:
         )
         outcome: ChangeRequestResult | ManualChangeRequest | None = None
         if gate == "pullRequest":
-            candidate_ref = args.candidate_ref or (
-                f"promotion/{args.to_environment}/{source_desired_revision[:12]}-{specification_revision[:12]}"
+            assert target_revision is not None
+            candidate_id = candidate_identifier(
+                "promotion",
+                args.to_environment,
+                candidate,
+                target_desired_ref,
+                target_revision,
+                promotion.document(),
             )
-            if candidate_ref in {source_desired_ref, target_observed_ref}:
+            candidate_ref = resolve_candidate_ref(
+                source_root,
+                args.to_environment,
+                "promotion",
+                candidate_id,
+                args.candidate_ref,
+            )
+            if candidate_ref in {
+                source_desired_ref,
+                source_observed_ref,
+                target_desired_ref,
+                target_observed_ref,
+            }:
                 raise OperationError("promotion candidate ref conflicts with deployment state")
             change_revision, outcome = publish_change_candidate(
                 candidate,
@@ -2515,6 +2594,8 @@ def command_rollback(args: argparse.Namespace) -> None:
         args.desired_ref,
         args.observed_ref,
     )
+    if args.candidate_ref and change_gate(REPOSITORY_ROOT, args.environment) != "pullRequest":
+        raise OperationError("--candidate-ref requires changeGate pullRequest")
     log_heading(f"Roll back {style_environment(args.environment)}")
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
@@ -2668,8 +2749,23 @@ def command_rollback(args: argparse.Namespace) -> None:
             f"Materialized-Units: {materialized_label}\n"
             f"Reason: {reason}"
         )
-        candidate_hash = hashlib.sha256(canonical_json(provenance)).hexdigest()[:12]
-        candidate_ref = f"rollback/{args.environment}/{target_revision[:12]}-{candidate_hash}"
+        candidate_id = candidate_identifier(
+            "rollback",
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            provenance,
+        )
+        candidate_ref = resolve_candidate_ref(
+            REPOSITORY_ROOT,
+            args.environment,
+            "rollback",
+            candidate_id,
+            args.candidate_ref,
+        )
+        if candidate_ref in {desired_ref, observed_ref}:
+            raise OperationError("rollback candidate ref conflicts with deployment state")
         title = f"Roll back {args.environment} to {target_revision[:12]}"
         body = (
             f"Forward rollback to desired revision `{target_revision}`.\n\n"
@@ -3858,6 +3954,7 @@ def command_create_project(args: argparse.Namespace) -> None:
                 "refs": {
                     "desired": args.desired_ref_template,
                     "observed": args.observed_ref_template,
+                    "candidate": args.candidate_ref_template,
                 }
             },
         },
@@ -4211,6 +4308,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OBSERVED_REF_TEMPLATE,
         help="default observed-state ref template containing {environment}",
     )
+    create_project.add_argument(
+        "--candidate-ref-template",
+        default=DEFAULT_CANDIDATE_REF_TEMPLATE,
+        help="default candidate ref template containing {environment}; supports {id} and {operation}",
+    )
     create_project.add_argument("--force", action="store_true", help="replace an existing Project resource")
     create_project.set_defaults(handler=command_create_project)
 
@@ -4319,6 +4421,10 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.add_argument("--reason", required=True)
     rollback.add_argument("--desired-ref", help="override the environment's desired ref")
     rollback.add_argument("--observed-ref", help="override the environment's observed ref")
+    rollback.add_argument(
+        "--candidate-ref",
+        help="exact candidate ref override when the environment uses a pull-request change gate",
+    )
     rollback.add_argument("--dry", action="store_true")
     rollback.set_defaults(handler=command_rollback)
 

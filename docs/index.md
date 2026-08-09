@@ -37,11 +37,12 @@ For source development, run `mise install`, `mise run sync`, and `mise run check
 ```mermaid
 flowchart LR
   source["Authored source"] --> advance["Resolve ready inputs"]
-  advance --> desired["Desired ref<br/>deploy/&lt;environment&gt;"]
+  advance --> desired["Desired ref<br/>gitopsctr/desired/&lt;environment&gt;"]
   desired --> driver["Reconcile unit<br/>with its driver"]
-  driver --> observed["Observed ref<br/>observed/&lt;environment&gt;"]
+  driver --> observed["Observed ref<br/>gitopsctr/observed/&lt;environment&gt;"]
   observed -.->|receipts and artifacts unlock inputs| advance
 ```
 
-Desired state defaults to `deploy/<environment>`; receipts and artifacts default to `observed/<environment>`. See
+Desired state defaults to `gitopsctr/desired/<environment>`; receipts and artifacts default to
+`gitopsctr/observed/<environment>`. See
 [Concepts](concepts.md) for ownership, freshness, promotion, and rollback semantics.

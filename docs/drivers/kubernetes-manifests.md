@@ -10,7 +10,7 @@ desired tree and can optionally deliver those manifests to a cluster.
 resolved unit JSON form one atomic desired-state component:
 
 ```text
-deploy/dev
+gitopsctr/desired/dev
 ├── units/web.yaml
 └── materialized/web/
     └── manifest.yaml
@@ -72,7 +72,8 @@ delivery:
 ```
 
 Advancement publishes manifests and finishes the unit as `MATERIALIZED`. No external action or receipt occurs. This
-fits Argo CD or Flux setups that already watch `deploy/<environment>` but do not need the controller to observe them.
+fits Argo CD or Flux setups that already watch `gitopsctr/desired/<environment>` but do not need the controller to
+observe them.
 
 ### Direct
 

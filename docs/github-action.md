@@ -48,7 +48,8 @@ Reconcile one selected unit with the prepared revision:
 ```
 
 Direct and gated changes expose `change-revision`, `change-status`, `change-url`, `candidate-ref`, and `target-ref`.
-Gated changes require `contents: write` and `pull-requests: write`; receipt publication requires `contents: write`.
+The optional `candidate-ref` input is an exact override for either a gated promotion or rollback. Gated changes require
+`contents: write` and `pull-requests: write`; receipt publication requires `contents: write`.
 
 ## Roll back
 

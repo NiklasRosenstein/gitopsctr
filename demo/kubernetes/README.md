@@ -3,7 +3,7 @@
 This demo exercises observation-driven convergence without an OCI registry:
 
 1. `demo-image` builds the HTTP application and exports its deterministic local tag to the selected cluster.
-2. Its receipt describes the external `containers` artifact on `observed/dev`.
+2. Its receipt describes the external `containers` artifact on `gitopsctr/observed/dev`.
 3. `web` consumes that reference through `fromArtifact`, renders the Helm chart, and applies it directly.
 4. The runner waits for the Deployment, calls the application inside the Pod, and runs `gitopsctr verify`.
 
