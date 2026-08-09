@@ -163,6 +163,8 @@ class ViteOciBundleDriver(
         unit: ViteOciBundleUnit,
         context: UnitResolutionContext,
     ) -> UnitResolution[ViteOciBundleDesiredUnit]:
+        if context.source is None:
+            raise DriverError("vite-oci-bundle requires a source")
         return UnitResolution(
             ViteOciBundleDesiredUnit(
                 source=context.source,
@@ -173,6 +175,8 @@ class ViteOciBundleDriver(
 
     @staticmethod
     def _runtime(context: UnitExecutionContext[ViteOciBundleDesiredUnit]) -> ViteRuntime:
+        if context.source_root is None or context.source_path is None:
+            raise DriverError("vite-oci-bundle requires a source")
         specification = context.unit
         build = specification.build
         publication = specification.publish

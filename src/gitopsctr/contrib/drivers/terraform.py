@@ -145,6 +145,8 @@ def terraform_runtime(
         | VerificationContext[TerraformDesiredUnit]
     ),
 ) -> TerraformRuntime:
+    if context.source_root is None or context.source_path is None:
+        raise DriverError("terraform requires a source")
     configuration = context.unit.terraform
     if configuration is None:
         raise DriverError("terraform driver requires a terraform configuration")
@@ -211,6 +213,8 @@ class TerraformDriver(
         }
 
     def resolve_unit(self, unit: TerraformUnit, context: UnitResolutionContext) -> UnitResolution[TerraformDesiredUnit]:
+        if context.source is None:
+            raise DriverError("terraform requires a source")
         resolutions = []
         configuration: TerraformConfiguration | None = None
         if unit.terraform is not None:
@@ -257,6 +261,8 @@ class TerraformDriver(
         local_plan_name: str,
     ) -> tuple[Path, Path | None]:
         if context.report is None:
+            if context.source_root is None:
+                raise DriverError("terraform requires a source")
             return context.source_root / local_plan_name, None
         context.report.mkdir(parents=True, exist_ok=True)
         plan = context.report / plan_name
@@ -311,6 +317,8 @@ class TerraformDriver(
         self,
         context: ReconciliationContext[TerraformDesiredUnit],
     ) -> ReconciliationOutput[TerraformResultModel]:
+        if context.source_revision is None or context.source_path is None:
+            raise DriverError("terraform requires a source")
         runtime = terraform_runtime(context)
         plan, report_text = self._prepare_plan_artifacts(
             context,

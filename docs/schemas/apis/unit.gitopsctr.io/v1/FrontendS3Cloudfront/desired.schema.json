@@ -204,71 +204,77 @@
           "default": null
         },
         "source": {
-          "additionalProperties": false,
-          "properties": {
-            "driverVersion": {
-              "anyOf": [
-                {
-                  "type": "integer"
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "driverVersion": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
                 },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null
-            },
-            "inputHash": {
-              "anyOf": [
-                {
+                "inputHash": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "inputs": {
+                  "anyOf": [
+                    {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Input paths or glob patterns resolved relative to source.path."
+                },
+                "path": {
+                  "description": "Repository-relative path resolved from the root of the selected source revision.",
                   "type": "string"
                 },
-                {
-                  "type": "null"
+                "revision": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
                 }
+              },
+              "required": [
+                "path"
               ],
-              "default": null
+              "title": "DesiredSource",
+              "type": "object"
             },
-            "inputs": {
-              "anyOf": [
-                {
-                  "items": {
-                    "type": "string"
-                  },
-                  "type": "array"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "description": "Input paths or glob patterns resolved relative to source.path."
-            },
-            "path": {
-              "description": "Repository-relative path resolved from the root of the selected source revision.",
-              "type": "string"
-            },
-            "revision": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null
+            {
+              "type": "null"
             }
-          },
-          "required": [
-            "path"
           ],
-          "title": "DesiredSource",
-          "type": "object"
+          "default": null
         }
       },
-      "required": [
-        "source"
-      ],
+      "required": [],
       "type": "object"
     }
   },

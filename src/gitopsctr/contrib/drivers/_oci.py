@@ -28,6 +28,12 @@ PRIVATE_ECR_REGISTRY_RE = re.compile(
 )
 
 
+def required_source_revision(context: UnitExecutionContext) -> str:
+    if context.source_revision is None:
+        raise DriverError("OCI publishing requires a source revision")
+    return context.source_revision
+
+
 @dataclass(frozen=True)
 class RegistryCredentials:
     username: str
@@ -49,7 +55,7 @@ def artifact_producer_identity(
         driverVersion=driver_version,
         inputHashVersion=1,
         inputHash=input_hash,
-        sourceRevision=context.source_revision,
+        sourceRevision=required_source_revision(context),
     )
 
 

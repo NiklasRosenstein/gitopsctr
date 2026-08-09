@@ -42,7 +42,7 @@ class ReconciliationOutput[ResultT: StrictModel]:
 class UnitResolutionContext:
     """Controller-owned facts and the intentionally open template boundary."""
 
-    source: DesiredSource
+    source: DesiredSource | None
     resolve_template: Callable[[object], TemplateResolution]
 
 
@@ -124,9 +124,9 @@ def unit_driver_api(driver: InstalledUnitDriver) -> ApiKind[InstalledUnitDriver]
 @dataclass(frozen=True)
 class MaterializationContext[ResolvedT: StrictModel]:
     environment: str
-    source_root: Path
-    source_revision: str
-    source_path: str
+    source_root: Path | None
+    source_revision: str | None
+    source_path: str | None
     unit_name: str
     unit: ResolvedT
     output_root: Path
@@ -144,9 +144,9 @@ class UnitExecutionContext[DesiredT: StrictModel]:
     environment: str
     desired_root: Path
     desired_revision: str
-    source_root: Path
-    source_revision: str
-    source_path: str
+    source_root: Path | None
+    source_revision: str | None
+    source_path: str | None
     unit_name: str
     unit: DesiredT
     report: Path | None = None
@@ -168,9 +168,9 @@ class VerificationContext[DesiredT: StrictModel]:
     environment: str
     desired_root: Path
     desired_revision: str
-    source_root: Path
-    source_revision: str
-    source_path: str
+    source_root: Path | None
+    source_revision: str | None
+    source_path: str | None
     unit_name: str
     unit: DesiredT
     report: Path | None = None

@@ -502,6 +502,31 @@ def test_frontend_bundle_archive_is_deterministic_and_contains_dist_tree(tmp_pat
         assert set(archive.getnames()) == {"assets", "assets/app.js", "index.html"}
 
 
+def test_frontend_s3_cloudfront_accepts_source_less_units():
+    authored = frontend_s3_cloudfront.FrontendUnit.from_dict(
+        {
+            "inputs": {
+                "bundle": f"{REGISTRY}/example-application-frontend@{DIGEST}",
+                "bucket": "frontend-bucket",
+                "distributionId": "distribution-id",
+                "url": "https://frontend.example.test",
+                "runtimeConfig": {
+                    "schema": 1,
+                    "apiBase": "https://api.example.test",
+                    "auth": {
+                        "mode": "cognito",
+                        "issuer": "https://issuer.example.test",
+                        "clientId": "client-id",
+                    },
+                },
+            }
+        }
+    )
+
+    assert authored.source is None
+    frontend_s3_cloudfront.DRIVER.unit_contract.validate(authored.to_dict())
+
+
 @pytest.mark.parametrize("stale_index", [False, True])
 def test_frontend_deploy_overwrites_index_and_verifies_cloudfront(tmp_path, monkeypatch, stale_index):
     distribution = tmp_path / "dist"

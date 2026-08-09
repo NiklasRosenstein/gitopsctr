@@ -134,13 +134,7 @@
                 "bundle": {
                   "type": "string"
                 },
-                "path": {
-                  "type": "string"
-                },
                 "runtimeConfigHash": {
-                  "type": "string"
-                },
-                "sourceRevision": {
                   "type": "string"
                 },
                 "url": {
@@ -148,8 +142,6 @@
                 }
               },
               "required": [
-                "sourceRevision",
-                "path",
                 "bundle",
                 "artifactDigest",
                 "runtimeConfigHash",

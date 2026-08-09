@@ -139,8 +139,6 @@ RESULTS = {
     "vite-oci-bundle": {},
     "frontend-s3-cloudfront": {
         "published": {
-            "sourceRevision": REVISION,
-            "path": "web",
             "bundle": f"registry.example/web@{DIGEST}",
             "artifactDigest": DIGEST,
             "runtimeConfigHash": DIGEST,

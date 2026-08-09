@@ -179,6 +179,8 @@ class OciImagesDriver(
         return {"source": {"path": source_path}}
 
     def resolve_unit(self, unit: OciImagesUnit, context: UnitResolutionContext) -> UnitResolution[OciImagesDesiredUnit]:
+        if context.source is None:
+            raise DriverError("oci-images requires a source")
         return UnitResolution(
             OciImagesDesiredUnit(
                 source=context.source,
@@ -266,6 +268,8 @@ class OciImagesDriver(
         context: PlanningContext[OciImagesDesiredUnit] | ReconciliationContext[OciImagesDesiredUnit],
         runtime: OciRuntime,
     ) -> None:
+        if context.source_root is None:
+            raise DriverError("oci-images requires a source")
         context.execution.run(
             "docker",
             "build",

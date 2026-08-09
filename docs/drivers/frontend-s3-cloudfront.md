@@ -17,8 +17,6 @@ kind: FrontendS3Cloudfront
 metadata:
   name: frontend
 spec:
-  source:
-    path: web
   inputs:
     bundle: registry.example/frontend@sha256:0000000000000000000000000000000000000000000000000000000000000000
     bucket: example-frontend
@@ -35,6 +33,9 @@ spec:
     credentialProvider:
       type: aws-ecr
 ```
+
+This driver does not read files from the source revision, so `spec.source` is
+optional. The bundle reference and deployment inputs are sufficient.
 
 `inputs.bundle` must be an immutable OCI digest URI. In promotion-tracked
 environments it is commonly a `fromPromotion` reference to the bundle unit.

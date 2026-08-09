@@ -533,6 +533,8 @@ class KubernetesManifestsDriver(
     def resolve_unit(
         self, unit: KubernetesUnit, context: UnitResolutionContext
     ) -> UnitResolution[KubernetesResolvedUnit]:
+        if context.source is None:
+            raise DriverError("kubernetes-manifests requires a source")
         resolved = ()
         materialize: HelmMaterialization | PlainMaterialization
         if isinstance(unit.materialize, AuthoredHelmMaterialization):
@@ -561,6 +563,8 @@ class KubernetesManifestsDriver(
         )
 
     def materialize(self, context: MaterializationContext[KubernetesResolvedUnit]) -> MaterializationResult:
+        if context.source_root is None or context.source_path is None:
+            raise DriverError("kubernetes-manifests requires a source")
         configuration = materialization_configuration(context.unit)
         delivery = delivery_configuration(context.unit)
         if isinstance(delivery, ExternalDelivery):

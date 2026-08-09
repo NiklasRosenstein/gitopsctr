@@ -137,14 +137,14 @@ class FrontendDesiredInputs(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class FrontendUnit(StrictModel):
-    source: AuthoredSource
+    source: AuthoredSource | None = None
     inputs: FrontendAuthoredInputs | None = None
     pull: FrontendPull | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
 class FrontendDesiredUnit(StrictModel):
-    source: DesiredSource
+    source: DesiredSource | None = None
     inputs: FrontendDesiredInputs | None = None
     pull: FrontendPull | None = None
     resolvedInputs: ResolvedInputs | None = None
@@ -152,8 +152,6 @@ class FrontendDesiredUnit(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class PublishedFrontendModel(StrictModel):
-    sourceRevision: str
-    path: str
     bundle: str
     artifactDigest: str
     runtimeConfigHash: str
@@ -401,8 +399,6 @@ class FrontendS3CloudfrontDriver(
         return ReconciliationOutput(
             result=FrontendResultModel(
                 published=PublishedFrontendModel(
-                    sourceRevision=context.source_revision,
-                    path=context.source_path,
                     bundle=inputs.bundle,
                     artifactDigest=runtime.artifact_digest,
                     runtimeConfigHash=runtime.runtime_digest,

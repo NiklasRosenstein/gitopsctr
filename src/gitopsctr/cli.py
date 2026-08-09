@@ -31,6 +31,7 @@ from gitopsctr.artifacts import require_artifact_api
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
     ArtifactDescriptor,
+    AuthoredSource,
     DesiredSource,
     MaterializationDocument,
     ReceiptDesired,
@@ -732,18 +733,23 @@ def copy_unit_materialization(source: Path, destination: Path, unit_name: str, u
         shutil.copytree(source / relative_path, target)
 
 
-def require_unit_specification(specification: UnitResource[Any], expected_name: str | None = None) -> tuple[str, Any]:
+def require_unit_specification(
+    specification: UnitResource[Any], expected_name: str | None = None
+) -> tuple[str, AuthoredSource | None]:
     if expected_name is not None and specification.name != expected_name:
         raise OperationError(f"invalid unit specification: {expected_name!r}")
     source = getattr(specification.spec, "source", None)
-    if source is None:
-        raise OperationError(f"{specification.name} requires a source object")
-    safe_source_path(source.path, f"{specification.name} source path")
+    if source is not None:
+        if not isinstance(source, AuthoredSource):
+            raise OperationError(f"{specification.name} has an invalid source")
+        safe_source_path(source.path, f"{specification.name} source path")
     return specification.driver_name, source
 
 
-def unit_input_hash(specification: UnitResource[Any], source_root: Path) -> str:
+def unit_input_hash(specification: UnitResource[Any], source_root: Path) -> str | None:
     driver, source = require_unit_specification(specification)
+    if source is None:
+        return None
     inputs = source.inputs
     if inputs is None:
         source_path = "."
@@ -1075,8 +1081,10 @@ def resolved_unit_source(
     source_revision: str,
     current_desired: Path,
     legacy: dict[str, Any] | None,
-) -> tuple[DesiredSource, bool]:
+) -> tuple[DesiredSource | None, bool]:
     driver, source = require_unit_specification(specification)
+    if source is None:
+        return None, False
     input_hash = unit_input_hash(specification, source_root)
     revision = source_revision
     prior = prior_unit_source(specification.name, current_desired, legacy)
@@ -1385,14 +1393,21 @@ def classify_unit_change(
     current: UnitResource[Any],
     previous_desired_revision: str,
 ) -> UnitChangeExplanation:
-    previous_source = previous.spec.source
-    current_source = current.spec.source
+    previous_source = getattr(previous.spec, "source", None)
+    current_source = getattr(current.spec, "source", None)
     causes = []
-    if previous.driver_name != current.driver_name or previous_source.driverVersion != current_source.driverVersion:
+    if previous.driver_name != current.driver_name or getattr(previous_source, "driverVersion", None) != getattr(
+        current_source, "driverVersion", None
+    ):
         causes.append("reconciliation driver changed")
-    source_fingerprint_changed = previous_source.inputHash != current_source.inputHash
+    source_fingerprint_changed = getattr(previous_source, "inputHash", None) != getattr(
+        current_source, "inputHash", None
+    )
     commits, files = (
-        source_change_evidence(previous_source.to_dict(), current_source.to_dict())
+        source_change_evidence(
+            previous_source.to_dict() if previous_source is not None else {},
+            current_source.to_dict() if current_source is not None else {},
+        )
         if source_fingerprint_changed
         else ((), ())
     )
@@ -1437,8 +1452,8 @@ def classify_unit_change(
         causes.append("desired unit content changed")
     return UnitChangeExplanation(
         previous_desired_revision=previous_desired_revision,
-        previous_source_revision=(previous_source.revision),
-        current_source_revision=(current_source.revision),
+        previous_source_revision=getattr(previous_source, "revision", None),
+        current_source_revision=getattr(current_source, "revision", None),
         causes=tuple(causes),
         commits=commits,
         files=files,
@@ -1739,7 +1754,7 @@ def build_desired_candidate(
     if promotion is not None:
         write_preferred_document(candidate / "promotion.json", promotion.document(), source_root)
 
-    prepared: dict[str, tuple[UnitResource[Any], DesiredSource]] = {}
+    prepared: dict[str, tuple[UnitResource[Any], DesiredSource | None]] = {}
     for unit_name, specification in specifications.items():
         resolved_source, source_changed = resolved_unit_source(
             specification, source_root, source_revision, current_desired, legacy
@@ -1750,6 +1765,8 @@ def build_desired_candidate(
             source_resolution = "new unit; use candidate revision"
         elif source_changed:
             source_resolution = "inputs changed; use candidate revision"
+        elif resolved_source is None:
+            source_resolution = "source-less unit"
         else:
             source_resolution = f"inputs unchanged; retain {describe_revision(resolved_source.revision)}"
         if verbose:
@@ -2838,7 +2855,7 @@ def command_verify(args: argparse.Namespace) -> None:
         if not selected:
             raise OperationError(f"{desired_ref} has no materialized units")
 
-        prepared: list[tuple[str, str, UnitResource[Any], DesiredSource]] = []
+        prepared: list[tuple[str, str, UnitResource[Any], DesiredSource | None]] = []
         for unit_name in selected:
             if raw_unit_contains_reference(load_json(available[unit_name])):
                 raise OperationError(f"{unit_name} desired state is not fully materialized")
@@ -2854,17 +2871,19 @@ def command_verify(args: argparse.Namespace) -> None:
         drifted: list[str] = []
         for unit_name, driver_name, unit, source in prepared:
             log_status("VERIFY", f"{style_unit(unit_name)} ({driver_name})")
-            source_root = temporary / "sources" / unit_name
-            assert source.revision is not None
-            materialize_revision(source.revision, source_root)
+            source_root = temporary / "sources" / unit_name if source is not None else None
+            if source is not None:
+                assert source.revision is not None
+                assert source_root is not None
+                materialize_revision(source.revision, source_root)
             result = VERIFICATION_DRIVERS[driver_name].verify(
                 VerificationContext(
                     environment=args.environment,
                     desired_root=desired,
                     desired_revision=desired_revision,
                     source_root=source_root,
-                    source_revision=source.revision,
-                    source_path=source.path,
+                    source_revision=source.revision if source is not None else None,
+                    source_path=source.path if source is not None else None,
                     unit_name=unit_name,
                     unit=unit.spec,
                     execution=DriverExecution.console(),
@@ -2884,17 +2903,18 @@ def command_verify(args: argparse.Namespace) -> None:
     log_status("RESULT", "CLEAN")
 
 
-def require_unit(unit: UnitResource[Any], unit_name: str) -> tuple[str, DesiredSource]:
+def require_unit(unit: UnitResource[Any], unit_name: str) -> tuple[str, DesiredSource | None]:
     if unit.name != unit_name:
         raise OperationError(f"invalid desired unit: {unit_name}")
     driver = unit.driver_name
     source = getattr(unit.spec, "source", None)
-    if not isinstance(source, DesiredSource):
+    if source is not None and not isinstance(source, DesiredSource):
         raise OperationError(f"{unit_name} has an invalid source")
-    safe_source_path(source.path, f"{unit_name} source path")
-    if not re.fullmatch(r"[0-9a-f]{40}", str(source.revision or "")):
-        raise OperationError(f"{unit_name} has an invalid source revision")
-    recorded_version = source.driverVersion
+    if source is not None:
+        safe_source_path(source.path, f"{unit_name} source path")
+        if not re.fullmatch(r"[0-9a-f]{40}", str(source.revision or "")):
+            raise OperationError(f"{unit_name} has an invalid source revision")
+    recorded_version = source.driverVersion if source is not None else None
     if recorded_version is not None and recorded_version != DRIVER_VERSIONS[driver]:
         raise OperationError(
             f"{unit_name} requires {driver} driver version {recorded_version}; "
@@ -3213,8 +3233,11 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         driver_name, source = require_unit(unit, args.unit)
         validate_unit_materialization(desired, args.unit, unit)
         log_status("DRIVER", driver_name)
-        assert source.revision is not None
-        log_status("SOURCE", f"{describe_revision(source.revision)} ({source.path})")
+        if source is not None:
+            assert source.revision is not None
+            log_status("SOURCE", f"{describe_revision(source.revision)} ({source.path})")
+        else:
+            log_status("SOURCE", "none (source-less unit)")
         if unit_contains_reference(unit):
             raise OperationError(f"{args.unit} desired state is not fully materialized")
         if not unit_requires_reconciliation(unit):
@@ -3262,15 +3285,18 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 return False
 
         log_status("RUN", f"execute {driver_name} {'planning' if args.plan else 'reconciliation'}")
-        source_root = temporary / "source"
-        materialize_revision(source.revision, source_root)
+        source_root = temporary / "source" if source is not None else None
+        if source is not None:
+            assert source.revision is not None
+            assert source_root is not None
+            materialize_revision(source.revision, source_root)
         execution: dict[str, Any] = {
             "environment": args.environment,
             "desired_root": desired,
             "desired_revision": desired_revision,
             "source_root": source_root,
-            "source_revision": source.revision,
-            "source_path": source.path,
+            "source_revision": source.revision if source is not None else None,
+            "source_path": source.path if source is not None else None,
             "unit_name": args.unit,
             "unit": unit.spec,
             "report": report,
