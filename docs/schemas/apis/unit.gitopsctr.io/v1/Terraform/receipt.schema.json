@@ -150,9 +150,6 @@
               "type": "object"
             },
             "outputs": {
-              "propertyNames": {
-                "type": "string"
-              },
               "type": "object"
             }
           },
