@@ -29,6 +29,12 @@ image:
     pointer: /images/application/uri
 ```
 
+```mermaid
+flowchart LR
+  image["demo-image<br/>OciImages"] -->|publishes| artifact["containers artifact<br/>ContainerImages"]
+  artifact -->|fromArtifact| service["demo-service<br/>Terraform"]
+```
+
 This reference creates a dependency: `demo-image` must publish its receipt and `containers` artifact before
 `demo-service` can be resolved.
 

@@ -65,6 +65,17 @@ A **source-tracked environment** resolves authored units from an explicit source
 environment** instead accepts reviewed desired state from one of its configured source environments. Promotion records
 the exact source desired, observed, and specification revisions in a controller-owned `Promotion` resource.
 
+```mermaid
+flowchart LR
+  desired["Source desired ref"] --> promotion["Promotion candidate"]
+  observed["Source observed ref<br/>fresh evidence"] --> promotion
+  specification["Target specification<br/>allowed source and policy"] --> promotion
+  promotion --> gate{"Target change gate"}
+  gate -->|none| target["Target desired ref"]
+  gate -->|pullRequest| review["Candidate ref<br/>pull request"]
+  review -->|merge| target
+```
+
 `changeGate: pullRequest` publishes promotion and rollback candidates for review; `changeGate: none` publishes them
 directly. Promotion normally requires every source unit to have a current receipt. Environments that contain only
 materialized units may opt into materialized promotion evidence.

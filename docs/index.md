@@ -34,8 +34,13 @@ For source development, run `mise install`, `mise run sync`, and `mise run check
 
 ## Main workflow
 
-```text
-authored source ── advance ──> desired ref ── reconcile ──> observed ref
+```mermaid
+flowchart LR
+  source["Authored source"] --> advance["Resolve ready inputs"]
+  advance --> desired["Desired ref<br/>deploy/&lt;environment&gt;"]
+  desired --> driver["Reconcile unit<br/>with its driver"]
+  driver --> observed["Observed ref<br/>observed/&lt;environment&gt;"]
+  observed -.->|receipts and artifacts unlock inputs| advance
 ```
 
 Desired state defaults to `deploy/<environment>`; receipts and artifacts default to `observed/<environment>`. See
