@@ -60,15 +60,16 @@ curl http://127.0.0.1:18080
 
 ## Inspect desired and observed state
 
-Use the normal CLI against the isolated repository:
+Change into the demo's isolated repository, then use the normal CLI without repeating its path:
 
 ```console
-uv run gitopsctr --repository .docker-demo-state/repository status --environment dev
-uv run gitopsctr --repository .docker-demo-state/repository list units --environment dev
-uv run gitopsctr --repository .docker-demo-state/repository show desired --environment dev demo-service
-uv run gitopsctr --repository .docker-demo-state/repository show receipt --environment dev demo-image
-uv run gitopsctr --repository .docker-demo-state/repository show receipt --environment dev demo-image --artifact containers
-git -C .docker-demo-state/repository log --all --oneline --decorate
+cd .docker-demo-state/repository
+uv run gitopsctr status --environment dev
+uv run gitopsctr list units --environment dev
+uv run gitopsctr show desired --environment dev demo-service
+uv run gitopsctr show receipt --environment dev demo-image
+uv run gitopsctr show receipt --environment dev demo-image --artifact containers
+git log --all --oneline --decorate
 ```
 
 The source commit contains authored resources. `deploy/dev` contains resolved desired units; `observed/dev` contains
@@ -76,9 +77,10 @@ receipts and artifacts proving what was applied. See [Concepts](concepts.md) for
 
 ## Prove clean convergence
 
-Run the demo again:
+Return to the source checkout and run the demo again:
 
 ```console
+cd ../..
 mise run demo
 ```
 
