@@ -18,6 +18,18 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
     write_test_document(path, value)
 
 
+def _promotion_context(root: Path) -> deploy_release.PromotionContext:
+    return deploy_release.PromotionContext(
+        source_environment="staging",
+        desired_ref="deploy/staging",
+        desired_revision="b" * 40,
+        observed_ref="observed/staging",
+        observed_revision="c" * 40,
+        specification_revision="a" * 40,
+        desired_root=root,
+    )
+
+
 def test_reconcile_parser_exposes_plan_without_a_dry_alias():
     parser = deploy_release.build_parser()
 
@@ -27,7 +39,7 @@ def test_reconcile_parser_exposes_plan_without_a_dry_alias():
         parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--dry"])
 
 
-def test_reference_rejects_removed_dry_fallback(tmp_path):
+def test_dry_plan_uses_artifact_fallback_when_observation_is_unavailable(tmp_path):
     template = {
         "image": {
             "fromArtifact": {
@@ -43,8 +55,10 @@ def test_reference_rejects_removed_dry_fallback(tmp_path):
     candidate = tmp_path / "candidate"
     observed = tmp_path / "observed"
 
-    with pytest.raises(deploy_release.OperationError, match="dryFallback"):
-        deploy_release.resolve_template(template, candidate, observed, None)
+    resolution = deploy_release.resolve_template(template, candidate, observed, None, dry=True)
+
+    assert resolution.value == {"image": "preview.invalid/control@sha256:" + "0" * 64}
+    assert resolution.artifacts == {}
 
 
 def test_observation_reference_materializes_artifact_into_consumer(tmp_path):
@@ -213,11 +227,13 @@ def test_promotion_reference_reads_typed_resource_spec_before_applying_pointer(t
         tmp_path / "candidate",
         tmp_path / "observed",
         None,
-        promotion=promotion,
+        promotion=_promotion_context(promotion),
     )
 
     assert resolution.value == {"image": "registry.example/control@sha256:" + "1" * 64}
-    assert resolution.promotions == {"aws-application": deploy_release.file_blob(source_unit)}
+    assert resolution.promotions == {
+        "aws-application#/terraform/variables/control_image_uri": deploy_release.file_blob(source_unit)
+    }
     assert resolution.receipts == {}
     assert resolution.artifacts == {}
 

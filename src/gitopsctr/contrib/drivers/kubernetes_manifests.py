@@ -538,7 +538,7 @@ class KubernetesManifestsDriver(
         resolved = ()
         materialize: HelmMaterialization | PlainMaterialization
         if isinstance(unit.materialize, AuthoredHelmMaterialization):
-            values = context.resolve_template(unit.materialize.values._serialize())
+            values = context.resolve_template(unit.materialize.values._serialize(), "/materialize/values")
             if not isinstance(values.value, dict):
                 raise DriverError("resolved Helm values must be an object")
             materialize = HelmMaterialization(

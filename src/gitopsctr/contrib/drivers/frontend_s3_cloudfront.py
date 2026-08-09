@@ -240,7 +240,7 @@ class FrontendS3CloudfrontDriver(
         inputs = None
         if unit.inputs is None:
             raise ReferenceUnavailable("frontend-s3-cloudfront inputs are not available")
-        input_resolution = context.resolve_template(unit.inputs.to_dict())
+        input_resolution = context.resolve_template(unit.inputs.to_dict(), "/inputs")
         if not isinstance(input_resolution.value, dict):
             raise DriverError("resolved frontend inputs must be an object")
         try:

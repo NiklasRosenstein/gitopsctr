@@ -19,6 +19,18 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
     write_test_document(path, value)
 
 
+def _promotion_context(root: Path) -> deploy_release.PromotionContext:
+    return deploy_release.PromotionContext(
+        source_environment="staging",
+        desired_ref="deploy/staging",
+        desired_revision="b" * 40,
+        observed_ref="observed/staging",
+        observed_revision="c" * 40,
+        specification_revision="a" * 40,
+        desired_root=root,
+    )
+
+
 def _terraform_desired_resource(name: str = "aws-application"):
     return deploy_release.RESOURCE_CATALOG.parse_unit(
         {
@@ -395,6 +407,33 @@ def test_source_input_globs_become_git_glob_pathspecs():
     ]
 
 
+def test_change_explanation_lists_only_promotion_selectors_whose_fingerprint_changed():
+    base = {
+        "name": "application",
+        "driver": "terraform",
+        "source": {"path": ".", "revision": "a" * 40},
+        "terraform": {"variables": {}},
+    }
+    previous = deploy_release.parse_desired_unit_document(
+        {
+            **base,
+            "resolvedInputs": {"promotions": {"application#/image": "same", "application#/tag": "old"}},
+        },
+        "application",
+    )
+    current = deploy_release.parse_desired_unit_document(
+        {
+            **base,
+            "resolvedInputs": {"promotions": {"application#/image": "same", "application#/tag": "new"}},
+        },
+        "application",
+    )
+
+    explanation = deploy_release.classify_unit_change(previous, current, "b" * 40)
+
+    assert explanation.causes == ("reviewed promotion inputs changed: application#/tag",)
+
+
 def test_promotion_reference_materializes_from_source_desired_unit(tmp_path):
     promotion = tmp_path / "promotion"
     source_unit = promotion / "units/aws-application.json"
@@ -409,24 +448,116 @@ def test_promotion_reference_materializes_from_source_desired_unit(tmp_path):
     )
 
     resolution = deploy_release.resolve_template(
-        {
-            "image": {
-                "fromPromotion": {
-                    "unit": "aws-application",
-                    "pointer": "/terraform/variables/control_image_uri",
-                },
-            }
-        },
+        {"control_image_uri": {"fromPromotion": {}}},
         tmp_path / "candidate",
         tmp_path / "observed",
         None,
-        promotion=promotion,
+        promotion=_promotion_context(promotion),
+        target_unit="aws-application",
+        target_gvk=deploy_release.GVK("unit.gitopsctr.io/v1", "Terraform"),
+        pointer="/terraform/variables",
     )
 
-    assert resolution.value == {"image": "registry.example/control@sha256:" + "1" * 64}
-    assert resolution.promotions == {"aws-application": deploy_release.file_blob(source_unit)}
+    assert resolution.value == {"control_image_uri": "registry.example/control@sha256:" + "1" * 64}
+    assert resolution.promotions == {
+        "aws-application#/terraform/variables/control_image_uri": deploy_release.file_blob(source_unit)
+    }
     assert resolution.receipts == {}
     assert resolution.artifacts == {}
+
+
+def test_explicit_empty_promotion_pointer_selects_public_spec_and_allows_cross_gvk(tmp_path):
+    promotion = tmp_path / "promotion"
+    source_unit = promotion / "units/aws-application.json"
+    _write_json(
+        source_unit,
+        {
+            "name": "aws-application",
+            "driver": "terraform",
+            "source": {"path": ".", "revision": "a" * 40},
+            "terraform": {"variables": {"environment": "prod"}},
+        },
+    )
+
+    resolution = deploy_release.resolve_template(
+        {"fromPromotion": {"unit": "aws-application", "pointer": ""}},
+        tmp_path / "candidate",
+        tmp_path / "observed",
+        None,
+        promotion=_promotion_context(promotion),
+        target_unit="frontend",
+        target_gvk=deploy_release.GVK("unit.gitopsctr.io/v1", "FrontendS3Cloudfront"),
+    )
+
+    source = deploy_release.load_desired_unit(source_unit, "aws-application")
+    assert resolution.value == source.driver.desired_unit_contract.dump(source.spec)
+    assert "name" not in resolution.value
+    assert "driver" not in resolution.value
+    assert resolution.promotions == {"aws-application#": deploy_release.file_blob(source_unit)}
+
+
+def test_implicit_promotion_pointer_requires_matching_gvk_even_with_dry_fallback(tmp_path):
+    promotion = tmp_path / "promotion"
+    _write_json(
+        promotion / "units/aws-application.json",
+        {
+            "name": "aws-application",
+            "driver": "terraform",
+            "source": {"path": ".", "revision": "a" * 40},
+            "terraform": {"variables": {"image": "release"}},
+        },
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="requires matching GVKs"):
+        deploy_release.resolve_template(
+            {"image": {"fromPromotion": {"unit": "aws-application", "dryFallback": "preview"}}},
+            tmp_path / "candidate",
+            tmp_path / "observed",
+            None,
+            promotion=_promotion_context(promotion),
+            target_unit="frontend",
+            target_gvk=deploy_release.GVK("unit.gitopsctr.io/v1", "FrontendS3Cloudfront"),
+            pointer="/inputs",
+            dry=True,
+        )
+
+
+def test_active_promotion_missing_unit_or_pointer_is_fatal_despite_dry_fallback(tmp_path):
+    promotion = tmp_path / "promotion"
+    promotion.mkdir()
+    context = _promotion_context(promotion)
+    arguments = (
+        tmp_path / "candidate",
+        tmp_path / "observed",
+        None,
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="does not contain source unit"):
+        deploy_release.resolve_template(
+            {"fromPromotion": {"unit": "missing", "pointer": "/image", "dryFallback": "preview"}},
+            *arguments,
+            promotion=context,
+            target_unit="application",
+            dry=True,
+        )
+
+    _write_json(
+        promotion / "units/application.json",
+        {
+            "name": "application",
+            "driver": "terraform",
+            "source": {"path": ".", "revision": "a" * 40},
+            "terraform": {"variables": {}},
+        },
+    )
+    with pytest.raises(deploy_release.OperationError, match="cannot resolve pointer"):
+        deploy_release.resolve_template(
+            {"fromPromotion": {"pointer": "/missing", "dryFallback": "preview"}},
+            *arguments,
+            promotion=context,
+            target_unit="application",
+            dry=True,
+        )
 
 
 def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path, monkeypatch):
@@ -443,10 +574,7 @@ def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path
         "terraform": {
             "variables": {
                 "control_image_uri": {
-                    "fromPromotion": {
-                        "unit": "aws-application",
-                        "pointer": "/terraform/variables/control_image_uri",
-                    },
+                    "fromPromotion": {},
                 }
             }
         },
@@ -512,7 +640,9 @@ def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path
     )
     unit = deploy_release.load_desired_unit(unit_path, "aws-application")
     assert unit.spec.terraform.variables["control_image_uri"].endswith("1" * 64)
-    assert unit.spec.resolvedInputs.promotions == {"aws-application": deploy_release.file_blob(promoted_unit)}
+    assert unit.spec.resolvedInputs.promotions == {
+        "aws-application#/terraform/variables/control_image_uri": deploy_release.file_blob(promoted_unit)
+    }
     promotion_path = deploy_release.document_candidates(candidate, "promotion")[0]
     assert promotion_path.read_text().startswith(
         "# yaml-language-server: $schema="

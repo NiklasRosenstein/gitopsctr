@@ -220,7 +220,9 @@ class TerraformDriver(
         if unit.terraform is not None:
             variables = None
             if unit.terraform.variables is not None:
-                variable_resolution = context.resolve_template(unit.terraform.variables._serialize())
+                variable_resolution = context.resolve_template(
+                    unit.terraform.variables._serialize(), "/terraform/variables"
+                )
                 if not isinstance(variable_resolution.value, dict):
                     raise DriverError("resolved Terraform variables must be an object")
                 variables = ResolvedJsonObjectValue(variable_resolution.value)
@@ -233,7 +235,7 @@ class TerraformDriver(
             )
         inputs = None
         if unit.inputs is not None:
-            input_resolution = context.resolve_template(unit.inputs._serialize())
+            input_resolution = context.resolve_template(unit.inputs._serialize(), "/inputs")
             if not isinstance(input_resolution.value, dict):
                 raise DriverError("resolved Terraform inputs must be an object")
             inputs = ResolvedJsonObjectValue(input_resolution.value)

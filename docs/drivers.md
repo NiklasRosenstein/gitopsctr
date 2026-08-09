@@ -14,6 +14,9 @@ publishes resource schemas for its authored unit, desired unit, and receipt.
 Use the pinned authored schema in source repositories and keep the generated
 desired and receipt documents under controller ownership.
 
+These are the drivers bundled with the current alpha release, not an exhaustive set. Plugins can register additional
+unit and artifact kinds; see [Resources and API kinds](documents.md).
+
 ## Built-in drivers
 
 | Driver | Kind | Capabilities | Typical effect |

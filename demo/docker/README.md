@@ -1,5 +1,8 @@
 # Local demo
 
+For a guided explanation of the resources, dependency graph, desired and observed refs, and inspection commands, see
+the [Local Docker tutorial](../../docs/tutorial.md). This page is the concise run and cleanup reference.
+
 This demo exercises the real reconciliation path without cloud credentials:
 
 1. `demo-image` builds a small HTTP server image and publishes it to a local OCI registry.
@@ -18,6 +21,12 @@ You need Docker running locally. Mise supplies Python, uv, Terraform, ORAS, and 
 mise install
 mise run sync
 mise run demo
+```
+
+Override the default local ports when necessary:
+
+```console
+GITOPSCTR_DEMO_REGISTRY_PORT=5001 GITOPSCTR_DEMO_APP_PORT=18081 mise run demo
 ```
 
 Run `mise run demo` again to demonstrate a clean convergence. Use `mise run demo-reset` after changing the

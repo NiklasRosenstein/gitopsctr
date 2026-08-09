@@ -38,7 +38,8 @@ This driver does not read files from the source revision, so `spec.source` is
 optional. The bundle reference and deployment inputs are sufficient.
 
 `inputs.bundle` must be an immutable OCI digest URI. In promotion-tracked
-environments it is commonly a `fromPromotion` reference to the bundle unit.
+environments it is commonly `fromPromotion: {}`: the same-named source unit's
+`/inputs/bundle` value is inferred from the field containing the reference.
 `bucket`, `distributionId`, and `url` select the publication target. The
 runtime configuration is an exact schema-1 object and currently uses Cognito
 authentication. `pull.credentialProvider` supports AWS ECR.

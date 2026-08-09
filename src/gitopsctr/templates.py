@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Annotated, TypeAlias, TypeVar, cast
+from dataclasses import dataclass, field, replace
+from typing import Annotated, Any, TypeAlias, TypeVar, cast
 
 from mashumaro.config import BaseConfig
 from mashumaro.exceptions import MissingField
@@ -13,7 +13,7 @@ from mashumaro.mixins.dict import DataClassDictMixin
 from mashumaro.types import SerializableType
 
 from gitopsctr.api import GVK
-from gitopsctr.document import REFERENCE_KEYS, JsonScalar, JsonValue
+from gitopsctr.document import REFERENCE_KEYS, JsonObject, JsonScalar, JsonValue
 
 type ResourceName = Annotated[str, Pattern("^[a-z0-9][a-z0-9-]*$")]
 type JsonPointer = Annotated[str, Pattern("^(?:$|/(?:[^~]|~[01])*)$")]
@@ -32,14 +32,38 @@ class TemplateError(ValueError):
     """An authored value does not conform to the reference expression language."""
 
 
+@dataclass(frozen=True)
+class DryFallbackValue(SerializableType):
+    """Distinguish an omitted fallback from an explicitly authored JSON null."""
+
+    value: JsonValue
+    specified: bool = True
+
+    def _serialize(self) -> JsonValue:
+        return self.value
+
+    @classmethod
+    def _deserialize(cls, value: object) -> DryFallbackValue:
+        return cls(cast(JsonValue, value))
+
+
+_NO_DRY_FALLBACK = DryFallbackValue(None, specified=False)
+
+
 @dataclass(frozen=True, kw_only=True)
 class ReceiptReferenceTarget(TemplateModel):
     unit: ResourceName
     pointer: JsonPointer = ""
+    dryFallback: DryFallbackValue = field(default=_NO_DRY_FALLBACK, repr=False, compare=False, hash=False)
 
     def __post_init__(self) -> None:
         _validate_unit(self.unit, "fromReceipt")
         _validate_pointer(self.pointer)
+
+    def __post_serialize__(self, d: dict[Any, Any]) -> dict[Any, Any]:
+        if not has_dry_fallback(self):
+            d.pop("dryFallback", None)
+        return d
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -49,6 +73,7 @@ class ArtifactReferenceTarget(TemplateModel):
     apiVersion: ApiVersion
     kind: Kind
     pointer: JsonPointer = ""
+    dryFallback: DryFallbackValue = field(default=_NO_DRY_FALLBACK, repr=False, compare=False, hash=False)
 
     def __post_init__(self) -> None:
         _validate_unit(self.unit, "fromArtifact")
@@ -59,6 +84,11 @@ class ArtifactReferenceTarget(TemplateModel):
         _validate_pointer(self.pointer)
         _ = self.gvk
 
+    def __post_serialize__(self, d: dict[Any, Any]) -> dict[Any, Any]:
+        if not has_dry_fallback(self):
+            d.pop("dryFallback", None)
+        return d
+
     @property
     def gvk(self) -> GVK:
         return GVK(self.apiVersion, self.kind)
@@ -66,12 +96,24 @@ class ArtifactReferenceTarget(TemplateModel):
 
 @dataclass(frozen=True, kw_only=True)
 class PromotionReferenceTarget(TemplateModel):
-    unit: ResourceName
-    pointer: JsonPointer = ""
+    unit: ResourceName | None = None
+    pointer: JsonPointer | None = None
+    dryFallback: DryFallbackValue = field(default=_NO_DRY_FALLBACK, repr=False, compare=False, hash=False)
 
     def __post_init__(self) -> None:
-        _validate_unit(self.unit, "fromPromotion")
-        _validate_pointer(self.pointer)
+        if self.unit is not None:
+            _validate_unit(self.unit, "fromPromotion")
+        if self.pointer is not None:
+            _validate_pointer(self.pointer)
+
+    def __post_serialize__(self, d: dict[Any, Any]) -> dict[Any, Any]:
+        if self.unit is None:
+            d.pop("unit", None)
+        if self.pointer is None:
+            d.pop("pointer", None)
+        if not has_dry_fallback(self):
+            d.pop("dryFallback", None)
+        return d
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -138,6 +180,31 @@ def _child_pointer(pointer: str, child: str | int) -> str:
     return f"{pointer}/{token}"
 
 
+def child_pointer(pointer: str, child: str | int) -> str:
+    """Append one RFC 6901 token to a JSON Pointer."""
+
+    return _child_pointer(pointer, child)
+
+
+def has_dry_fallback(
+    target: ReceiptReferenceTarget | ArtifactReferenceTarget | PromotionReferenceTarget,
+) -> bool:
+    return target.dryFallback.specified
+
+
+def _parse_dry_fallback(target: TemplateModel, value: dict[str, object], pointer: str) -> TemplateModel:
+    if "dryFallback" not in value:
+        return target
+    fallback = parse_template_value(value["dryFallback"], _child_pointer(pointer, "dryFallback"))
+    return cast(
+        TemplateModel,
+        replace(
+            cast(Any, target),
+            dryFallback=DryFallbackValue(dump_template_value(fallback)),
+        ),
+    )
+
+
 def _parse_reference(value: dict[str, object], pointer: str) -> ReferenceExpression:
     keys = REFERENCE_KEYS.intersection(value)
     if len(keys) != 1 or len(value) != 1:
@@ -150,22 +217,35 @@ def _parse_reference(value: dict[str, object], pointer: str) -> ReferenceExpress
         if key == "fromReceipt":
             if "unit" not in target:
                 raise TemplateError("fromReceipt requires unit")
-            parsed = ReceiptReferenceTarget.from_dict(target)
+            parsed = cast(
+                ReceiptReferenceTarget,
+                _parse_dry_fallback(ReceiptReferenceTarget.from_dict(target), target, _child_pointer(pointer, key)),
+            )
             _validate_unit(parsed.unit, key)
             _validate_pointer(parsed.pointer)
             return ReceiptReference(fromReceipt=parsed)
         if key == "fromPromotion":
-            if "unit" not in target:
-                raise TemplateError("fromPromotion requires unit")
-            parsed = PromotionReferenceTarget.from_dict(target)
-            _validate_unit(parsed.unit, key)
-            _validate_pointer(parsed.pointer)
+            if "unit" in target and not isinstance(target["unit"], str):
+                raise TemplateError("fromPromotion unit must be a string")
+            if "pointer" in target and not isinstance(target["pointer"], str):
+                raise TemplateError("fromPromotion pointer must be a string")
+            parsed = cast(
+                PromotionReferenceTarget,
+                _parse_dry_fallback(PromotionReferenceTarget.from_dict(target), target, _child_pointer(pointer, key)),
+            )
+            if parsed.unit is not None:
+                _validate_unit(parsed.unit, key)
+            if parsed.pointer is not None:
+                _validate_pointer(parsed.pointer)
             return PromotionReference(fromPromotion=parsed)
         if "unit" not in target or "name" not in target:
             raise TemplateError("fromArtifact requires unit and name")
         if not isinstance(target.get("apiVersion"), str) or not isinstance(target.get("kind"), str):
             raise TemplateError("fromArtifact requires string apiVersion and kind")
-        parsed = ArtifactReferenceTarget.from_dict(target)
+        parsed = cast(
+            ArtifactReferenceTarget,
+            _parse_dry_fallback(ArtifactReferenceTarget.from_dict(target), target, _child_pointer(pointer, key)),
+        )
         _validate_unit(parsed.unit, key)
         if not _RESOURCE_NAME.fullmatch(parsed.name):
             raise TemplateError(f"invalid {key} name: {parsed.name!r}")
@@ -204,11 +284,36 @@ def dump_template_value(value: TemplateValue) -> JsonValue:
     """Serialize an authored expression tree to its public JSON representation."""
 
     if isinstance(value, ReceiptReference):
-        return cast(JsonValue, value.to_dict())
+        target: JsonObject = {"unit": value.fromReceipt.unit}
+        if value.fromReceipt.pointer:
+            target["pointer"] = value.fromReceipt.pointer
+        if has_dry_fallback(value.fromReceipt):
+            target["dryFallback"] = value.fromReceipt.dryFallback.value
+        return {"fromReceipt": target}
     if isinstance(value, ArtifactReference):
-        return cast(JsonValue, value.to_dict())
+        target = cast(
+            JsonObject,
+            {
+                "unit": value.fromArtifact.unit,
+                "name": value.fromArtifact.name,
+                "apiVersion": value.fromArtifact.apiVersion,
+                "kind": value.fromArtifact.kind,
+            },
+        )
+        if value.fromArtifact.pointer:
+            target["pointer"] = value.fromArtifact.pointer
+        if has_dry_fallback(value.fromArtifact):
+            target["dryFallback"] = value.fromArtifact.dryFallback.value
+        return {"fromArtifact": target}
     if isinstance(value, PromotionReference):
-        return cast(JsonValue, value.to_dict())
+        target = cast(JsonObject, {})
+        if value.fromPromotion.unit is not None:
+            target["unit"] = value.fromPromotion.unit
+        if value.fromPromotion.pointer is not None:
+            target["pointer"] = value.fromPromotion.pointer
+        if has_dry_fallback(value.fromPromotion):
+            target["dryFallback"] = value.fromPromotion.dryFallback.value
+        return {"fromPromotion": target}
     if isinstance(value, list):
         return [dump_template_value(item) for item in value]
     if isinstance(value, dict):

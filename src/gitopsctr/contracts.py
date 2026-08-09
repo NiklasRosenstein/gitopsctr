@@ -25,7 +25,13 @@ from gitopsctr.document import (
     ResolvedJsonObjectValue,
     TypedDocumentContract,
 )
-from gitopsctr.templates import REFERENCE_KEYS, TemplateObject
+from gitopsctr.templates import (
+    REFERENCE_KEYS,
+    ArtifactReference,
+    PromotionReference,
+    ReceiptReference,
+    TemplateObject,
+)
 
 SCHEMA_ROOT = "https://niklasrosenstein.github.io/gitopsctr/schemas"
 
@@ -41,6 +47,13 @@ class _ContractSchemaPlugin(BasePlugin):
     ) -> JSONSchema | None:
         if instance.type is TemplateObject:
             return JSONSchema(title="__gitopsctr_template_object__")
+        reference_type = {
+            ReceiptReference: "fromReceipt",
+            ArtifactReference: "fromArtifact",
+            PromotionReference: "fromPromotion",
+        }.get(instance.type)
+        if reference_type is not None:
+            return JSONSchema(title=f"__gitopsctr_reference_{reference_type}__")
         if instance.type is JsonObjectValue:
             return JSONSchema(type=JSONSchemaInstanceType.OBJECT)
         if instance.type is ResolvedJsonObjectValue:
@@ -48,13 +61,42 @@ class _ContractSchemaPlugin(BasePlugin):
         return None
 
 
-def _reference_target_schema(*, artifact: bool = False) -> JsonObject:
-    properties: JsonObject = {
-        "unit": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
-        "pointer": {"type": "string", "pattern": "^(?:$|/(?:[^~]|~[01])*)$", "default": ""},
+def _reference_target_schema(reference_type: str) -> JsonObject:
+    unit_description = (
+        "Promoted source unit name; omit it to use the target unit name."
+        if reference_type == "fromPromotion"
+        else "Logical name of the unit that provides the referenced value."
+    )
+    pointer_descriptions = {
+        "fromReceipt": "JSON Pointer relative to the producer's typed receipt result; empty selects the whole result.",
+        "fromArtifact": "JSON Pointer relative to the complete artifact resource; empty selects the whole resource.",
+        "fromPromotion": (
+            "JSON Pointer relative to the promoted unit's public spec; omit it to use the containing field path, "
+            "or set it to an empty string to select the whole spec."
+        ),
     }
-    required = ["unit"]
-    if artifact:
+    properties: JsonObject = {
+        "unit": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$",
+            "description": unit_description,
+        },
+        "pointer": {
+            "type": "string",
+            "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+            "description": pointer_descriptions[reference_type],
+        },
+        "dryFallback": {
+            "$ref": "#/$defs/TemplateValue",
+            "description": (
+                "Type-correct speculative value used only during dry resolution when the reference is unavailable."
+            ),
+        },
+    }
+    required = [] if reference_type == "fromPromotion" else ["unit"]
+    if reference_type != "fromPromotion":
+        properties["pointer"]["default"] = ""
+    if reference_type == "fromArtifact":
         properties.update(
             {
                 "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
@@ -63,10 +105,22 @@ def _reference_target_schema(*, artifact: bool = False) -> JsonObject:
             }
         )
         required.extend(("name", "apiVersion", "kind"))
+    return cast(
+        JsonObject,
+        {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        },
+    )
+
+
+def _reference_expression_schema(reference_type: str) -> JsonObject:
     return {
         "type": "object",
-        "properties": properties,
-        "required": required,
+        "properties": {reference_type: _reference_target_schema(reference_type)},
+        "required": [reference_type],
         "additionalProperties": False,
     }
 
@@ -74,14 +128,7 @@ def _reference_target_schema(*, artifact: bool = False) -> JsonObject:
 def _template_definitions() -> JsonObject:
     variants: list[JsonObject] = []
     for key in sorted(REFERENCE_KEYS):
-        variants.append(
-            {
-                "type": "object",
-                "properties": {key: _reference_target_schema(artifact=key == "fromArtifact")},
-                "required": [key],
-                "additionalProperties": False,
-            }
-        )
+        variants.append(_reference_expression_schema(key))
     variants.extend(
         cast(
             list[JsonObject],
@@ -123,6 +170,11 @@ def _expand_special_schemas(schema: JsonObject) -> JsonObject:
                     "additionalProperties": {"$ref": "#/$defs/TemplateValue"},
                 },
             )
+        reference_marker = value.get("title")
+        if isinstance(reference_marker, str) and reference_marker.startswith("__gitopsctr_reference_"):
+            used_template = True
+            reference_type = reference_marker.removeprefix("__gitopsctr_reference_").removesuffix("__")
+            return _reference_expression_schema(reference_type)
         if value.get("title") == "__gitopsctr_resolved_json_object__":
             used_resolved_json = True
             return cast(

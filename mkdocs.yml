@@ -9,17 +9,27 @@ theme:
     - navigation.sections
 nav:
   - Overview: index.md
-  - Documents and unit drivers: documents.md
-  - Available unit drivers:
+  - Getting started:
+      - Local Docker tutorial: tutorial.md
+  - Concepts: concepts.md
+  - Authoring and APIs:
+      - Resources and API kinds: documents.md
+      - Project configuration: project-configuration.md
+      - Reference expressions: references.md
+  - Unit kinds:
       - Overview: drivers.md
       - Terraform: drivers/terraform.md
       - OCI images: drivers/oci-images.md
       - Vite OCI bundle: drivers/vite-oci-bundle.md
       - Frontend S3/CloudFront: drivers/frontend-s3-cloudfront.md
       - Kubernetes manifests: drivers/kubernetes-manifests.md
-  - Project configuration: project-configuration.md
-  - JSON Schemas: schemas.md
-  - Driver execution: driver-execution.md
+  - Operations:
+      - Workflow guide: operations.md
+      - GitHub Action: github-action.md
+  - Extending gitopsctr:
+      - Driver execution: driver-execution.md
+  - Reference:
+      - JSON Schemas: schemas.md
 markdown_extensions:
   - admonition
   - pymdownx.highlight:

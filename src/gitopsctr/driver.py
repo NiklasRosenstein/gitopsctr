@@ -43,7 +43,7 @@ class UnitResolutionContext:
     """Controller-owned facts and the intentionally open template boundary."""
 
     source: DesiredSource | None
-    resolve_template: Callable[[object], TemplateResolution]
+    resolve_template: Callable[[object, str], TemplateResolution]
 
 
 @dataclass(frozen=True)

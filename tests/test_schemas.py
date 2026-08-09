@@ -41,13 +41,15 @@ def desired_example(unit: UnitResource) -> UnitResource:
         unit.spec,
         UnitResolutionContext(
             source=source,
-            resolve_template=lambda value: resolve_template(
+            resolve_template=lambda value, pointer: resolve_template(
                 value,
                 ResolutionContext(
                     receipt=lambda _target: FingerprintedValue("resolved", DIGEST),
                     artifact=lambda _target: FingerprintedValue("resolved", DIGEST),
                     promotion=lambda _target: FingerprintedValue("resolved", DIGEST),
+                    unit=unit.name,
                 ),
+                pointer,
             ),
         ),
     )
@@ -123,6 +125,30 @@ def test_template_schema_accepts_integer_values():
         "terraform": {"variables": {"replicas": 2}},
     }
     UNIT_DRIVERS["terraform"].unit_contract.validate(document)
+
+
+def test_template_schema_accepts_implicit_promotion_and_recursive_dry_fallback():
+    document = {
+        "source": {"path": "."},
+        "terraform": {
+            "variables": {
+                "image": {"fromPromotion": {"dryFallback": {"fromReceipt": {"unit": "images", "pointer": "/image"}}}}
+            }
+        },
+    }
+
+    UNIT_DRIVERS["terraform"].unit_contract.validate(document)
+
+
+@pytest.mark.parametrize("target", [{"unit": None}, {"pointer": None}])
+def test_template_schema_rejects_null_promotion_selectors(target):
+    document = {
+        "source": {"path": "."},
+        "terraform": {"variables": {"image": {"fromPromotion": target}}},
+    }
+
+    with pytest.raises(ContractError):
+        UNIT_DRIVERS["terraform"].unit_contract.validate(document)
 
 
 def test_resource_contracts_use_api_version_instead_of_envelope_schema_field():

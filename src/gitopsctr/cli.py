@@ -91,6 +91,7 @@ from gitopsctr.registry import (
 )
 from gitopsctr.resolution import (
     FingerprintedValue,
+    PromotionReferenceSelection,
     ResolutionContext,
     TemplateResolution,
 )
@@ -1026,17 +1027,45 @@ def resolve_template(
     candidate: Path,
     observed: Path,
     observed_revision: str | None,
-    promotion: Path | None = None,
+    promotion: PromotionContext | None = None,
+    target_unit: str | None = None,
+    target_gvk: GVK | None = None,
+    pointer: str = "",
+    dry: bool = False,
 ) -> TemplateResolution:
-    def resolve_promotion(reference):
+    def resolve_promotion(reference: PromotionReferenceSelection) -> FingerprintedValue:
         if promotion is None:
-            raise ReferenceUnavailable(f"promotion does not exist: {reference.unit}")
-        path = unit_document_path(promotion, reference.unit)
+            raise ReferenceUnavailable(f"promotion context does not exist for source unit {reference.unit!r}")
+        source = f"{promotion.source_environment} ({promotion.desired_ref}@{promotion.desired_revision[:12]})"
+        target = target_unit or "<unknown>"
+        path = unit_document_path(promotion.desired_root, reference.unit)
         if not path.is_file():
-            raise ReferenceUnavailable(f"promoted unit does not exist: {reference.unit}")
+            raise OperationError(
+                f"promotion from {source} for target unit {target!r} does not contain source unit {reference.unit!r}"
+            )
         unit = load_desired_unit(path, reference.unit)
+        if reference.pointer_inferred:
+            if target_gvk is None:
+                raise OperationError(
+                    f"implicit fromPromotion at {reference.pointer!r} for target unit {target!r} "
+                    "requires the target GVK"
+                )
+            if unit.gvk != target_gvk:
+                raise OperationError(
+                    f"implicit fromPromotion at {reference.pointer!r} for target unit {target!r} "
+                    f"requires matching GVKs; source unit {reference.unit!r} is {unit.gvk}, "
+                    f"target is {target_gvk}; set pointer explicitly to allow a cross-GVK reference"
+                )
+        document = unit.driver.desired_unit_contract.dump(unit.spec)
+        try:
+            resolved = json_pointer(document, reference.pointer)
+        except OperationError as exc:
+            raise OperationError(
+                f"promotion from {source} source unit {reference.unit!r} cannot resolve pointer "
+                f"{reference.pointer!r} for target unit {target!r}: {exc}"
+            ) from exc
         return FingerprintedValue(
-            json_pointer(unit.driver.desired_unit_contract.dump(unit.spec), reference.pointer),
+            resolved,
             file_blob(path),
         )
 
@@ -1071,7 +1100,15 @@ def resolve_template(
         return FingerprintedValue(json_pointer(document, reference.pointer), digest)
 
     return resolve_template_value(
-        value, ResolutionContext(receipt=resolve_receipt, artifact=resolve_artifact, promotion=resolve_promotion)
+        value,
+        ResolutionContext(
+            receipt=resolve_receipt,
+            artifact=resolve_artifact,
+            promotion=resolve_promotion,
+            unit=target_unit,
+            dry=dry,
+        ),
+        pointer,
     )
 
 
@@ -1436,7 +1473,11 @@ def classify_unit_change(
     if not isinstance(current_promotion, dict):
         current_promotion = {}
     if previous_promotion != current_promotion:
-        changed = sorted(set(previous_promotion) | set(current_promotion))
+        changed = sorted(
+            key
+            for key in set(previous_promotion) | set(current_promotion)
+            if previous_promotion.get(key) != current_promotion.get(key)
+        )
         causes.append("reviewed promotion inputs changed: " + ", ".join(changed))
     ignored = {"source", "resolvedInputs"}
     previous_document = previous.driver.desired_unit_contract.dump(previous.spec)
@@ -1736,6 +1777,7 @@ def build_desired_candidate(
     observed_revision: str | None,
     candidate: Path,
     promotion: PromotionContext | None = None,
+    dry: bool = False,
     verbose: bool = True,
 ) -> BuildDesiredResult:
     if verbose:
@@ -1784,12 +1826,18 @@ def build_desired_candidate(
                     authored.spec,
                     UnitResolutionContext(
                         source=resolved_source,
-                        resolve_template=lambda value: resolve_template(
-                            value,
-                            candidate,
-                            observed,
-                            observed_revision,
-                            promotion.desired_root if promotion is not None else None,
+                        resolve_template=lambda value, pointer, target_unit=authored.name, target_gvk=authored.gvk: (
+                            resolve_template(
+                                value,
+                                candidate,
+                                observed,
+                                observed_revision,
+                                promotion=promotion,
+                                target_unit=target_unit,
+                                target_gvk=target_gvk,
+                                pointer=pointer,
+                                dry=dry,
+                            )
                         ),
                     ),
                 )
@@ -2107,6 +2155,7 @@ def advance_desired(
                 observed_revision,
                 candidate,
                 promotion=promotion,
+                dry=dry,
                 verbose=verbose,
             )
             if current_revision and directory_files(current_desired) == directory_files(candidate):
@@ -2985,23 +3034,27 @@ def raw_unit_contains_reference(document: object) -> bool:
     return contains_reference(document)
 
 
-def reference_paths(value: object, reference_type: str, pointer: str = "") -> set[str]:
+def reference_paths(
+    value: object,
+    reference_type: str,
+    pointer: str = "",
+    current_unit: str | None = None,
+) -> set[str]:
     """Collect validated logical unit names referenced by one reference type."""
     if reference_type not in {"fromReceipt", "fromArtifact", "fromPromotion"}:
         raise OperationError(f"unknown reference type: {reference_type}")
-    return {
-        (
-            reference.fromReceipt.unit
-            if isinstance(reference, ReceiptReference)
-            else reference.fromArtifact.unit
-            if isinstance(reference, ArtifactReferenceExpression)
-            else reference.fromPromotion.unit
-        )
-        for reference in template_references(_template(value, pointer))
-        if (isinstance(reference, ReceiptReference) and reference_type == "fromReceipt")
-        or (isinstance(reference, ArtifactReferenceExpression) and reference_type == "fromArtifact")
-        or (isinstance(reference, PromotionReference) and reference_type == "fromPromotion")
-    }
+    found: set[str] = set()
+    for reference in template_references(_template(value, pointer)):
+        if isinstance(reference, ReceiptReference) and reference_type == "fromReceipt":
+            found.add(reference.fromReceipt.unit)
+        elif isinstance(reference, ArtifactReferenceExpression) and reference_type == "fromArtifact":
+            found.add(reference.fromArtifact.unit)
+        elif isinstance(reference, PromotionReference) and reference_type == "fromPromotion":
+            unit = reference.fromPromotion.unit or current_unit
+            if unit is None:
+                raise OperationError("implicit fromPromotion unit requires the current unit name")
+            found.add(unit)
+    return found
 
 
 def _json_pointer_child(pointer: str, child: str | int) -> str:
@@ -3200,6 +3253,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 observed,
                 observed_revision,
                 desired,
+                dry=True,
             )
             if args.unit in candidate_result.blocked:
                 log_status("WAIT", candidate_result.blocked[args.unit])
@@ -3564,6 +3618,7 @@ def command_converge(args: argparse.Namespace) -> None:
             if reference_paths(
                 specifications[unit_name].driver.unit_contract.dump(specifications[unit_name].spec),
                 "fromPromotion",
+                current_unit=unit_name,
             )
         )
         if promotion_units and promotion is None:

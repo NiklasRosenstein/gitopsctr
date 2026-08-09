@@ -1,28 +1,27 @@
 # gitopsctr
 
-`gitopsctr` is a local-first deployment reconciler. It materializes desired state from a source revision, records
-deployment receipts in Git, promotes clean desired state between environments, and creates forward-only rollback
-commits.
+gitopsctr is a local-first deployment reconciler. You author environments and deployable units in a source repository;
+gitopsctr resolves them into immutable desired-state commits, asks typed unit drivers to perform external work, and
+records receipts and artifacts in a separate observed-state history.
 
-The command line is the complete operational interface. CI and the reusable GitHub Action invoke the same commands an
-operator can run locally.
+It is useful when you want Git-audited deployments without making a long-running controller the sole owner of state.
+The same CLI runs locally and in CI, promotes clean state between environments, verifies drift, and publishes
+forward-only rollback commits.
 
-## Main operations
+!!! warning "Alpha and actively developed"
 
-- `advance-desired` resolves source, observation, and promotion inputs into an immutable desired-state commit.
-- `reconcile --plan` runs a unit driver's speculative plan without applying or writing a receipt.
-- `reconcile` applies one desired unit and publishes its typed receipt.
-- `converge` advances and reconciles a dependency closure until every unit is terminal.
-- `list environments` and `list units` summarize deployment state for exploration.
-- `status` shows all environments, one environment, or one unit within an environment.
-- `show desired` and `show receipt` print resolved units and observation receipts in the project's format; receipt
-  artifacts are opt-in with `--artifact` or `--artifacts`, and `--json`/`--yaml` override the format.
-- `promote` and `rollback` publish direct changes or pull-request candidates according to `changeGate`.
-- `verify` asks supported unit drivers to check external state without changing Git or external state.
+    gitopsctr is not yet production-stable. APIs may change before production as the resource model evolves. The
+    bundled API kinds are not exhaustive: plugins can register additional unit and artifact kinds.
 
-Human-readable progress output uses semantic ANSI colors on terminals and in CI logs. It stays plain when redirected
-to a file or captured for automation. Set `NO_COLOR=1` to disable styling or `FORCE_COLOR=1` to enable it explicitly;
-machine-readable output remains uncolored.
+## Start here
+
+1. Run the [local Docker tutorial](tutorial.md) for a real image-to-Terraform deployment.
+2. Read [Concepts](concepts.md) to understand source, desired, and observed Git state.
+3. Use [Resources and API kinds](documents.md) when authoring a Project, Environment, or Unit.
+4. Follow [Operations](operations.md) for planning, convergence, promotion, verification, and rollback.
+
+The [unit kind overview](drivers.md) describes the current built-in drivers. The [JSON Schema catalog](schemas.md) and
+`gitopsctr COMMAND --help` remain the exhaustive authorities for resource fields and CLI flags.
 
 ## Install
 
@@ -31,12 +30,13 @@ uv tool install gitopsctr
 gitopsctr --help
 ```
 
-For development, run `mise install`, `mise run sync`, and `mise run check`.
+For source development, run `mise install`, `mise run sync`, and `mise run check`.
 
-## Contracts
+## Main workflow
 
-Every built-in unit kind publishes resource schemas for its authored unit,
-materialized desired unit, and receipt. Start with the
-[available unit drivers](drivers.md), the
-[project configuration](project-configuration.md), or the
-[JSON Schema catalog](schemas.md).
+```text
+authored source ── advance ──> desired ref ── reconcile ──> observed ref
+```
+
+Desired state defaults to `deploy/<environment>`; receipts and artifacts default to `observed/<environment>`. See
+[Concepts](concepts.md) for ownership, freshness, promotion, and rollback semantics.

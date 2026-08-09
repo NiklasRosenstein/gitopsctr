@@ -8,10 +8,7 @@
   "spec": {
     "inputs": {
       "bundle": {
-        "fromPromotion": {
-          "unit": "frontend",
-          "pointer": "/inputs/bundle"
-        }
+        "fromPromotion": {}
       }
     },
     "source": {

@@ -1,133 +1,87 @@
-# Documents and unit drivers
+# Resources and API kinds
 
-GitOpsCTR accepts both YAML and JSON. Every source tree has a Project resource;
-YAML is the default write format and a repository can select JSON in its spec:
+gitopsctr accepts YAML and JSON resources identified by `apiVersion` and `kind`. YAML is preferred for authored and
+generated state; the repository `Project` can select JSON instead. Runtime validation uses the registered typed
+contract and never fetches the document's `$schema` editor hint.
 
-```yaml
-apiVersion: gitopsctr.io/v1
-kind: Project
-metadata:
-  name: example
-spec:
-  writeFormat: json
+!!! warning "Alpha API"
+
+    gitopsctr is under active development. APIs may change before the project reaches production. The kinds below are
+    the current built-ins, not an exhaustive ecosystem: plugins can register additional unit and artifact kinds by
+    full group/version/kind.
+
+## Repository layout
+
+Every source tree contains `gitopsctr.yaml` and one authored `Environment` directory per environment:
+
+```text
+gitopsctr.yaml
+deployment/environments/
+└── dev/
+    ├── environment.yaml
+    └── units/
+        └── application.yaml
 ```
 
-The file is named `gitopsctr.yaml`; generated desired state, promotions,
-receipts, and artifacts follow its setting. Readers accept either extension. See the
-[`Project` resource documentation](project-configuration.md) and its published
-[`Project.schema.json`](schemas/apis/gitopsctr.io/v1/Project.schema.json).
+`spec.environmentsPath` may change the authored environment directory. Generated desired and observed refs always use
+top-level `units/`, with artifacts under `artifacts/<unit>/` and materialized payloads under `materialized/<unit>/`.
 
-Controller-owned resources use `gitopsctr.io/v1`:
-
-```yaml
-apiVersion: gitopsctr.io/v1
-kind: Environment
-metadata:
-  name: dev
-spec: {}
-```
-
-Unit resources use `unit.gitopsctr.io/v1` and the driver kind:
-
-```yaml
-apiVersion: unit.gitopsctr.io/v1
-kind: Terraform
-metadata:
-  name: infrastructure
-spec:
-  source:
-    path: infrastructure
-```
-
-`source.path` is a POSIX path relative to the root of the selected source
-revision. It is not relative to the unit file or its environment directory.
-Optional `source.inputs` paths and glob patterns are resolved relative to
-`source.path`; absolute paths and `..` are rejected.
-
-## Create and validate authored resources
-
-The create commands write pinned schema hints and follow the Project's
-configured environment location and document format:
+Create and validate authored resources with:
 
 ```console
 gitopsctr create project --name example
 gitopsctr create environment --name dev
 gitopsctr create unit --environment dev --name infrastructure --driver terraform --source-path infrastructure
-```
-
-Existing resources are never replaced unless `--force` is explicit. Drivers
-may opt into unit creation through `UnitDriver.scaffold_unit_spec()`; every
-built-in driver provides a schema-valid starter.
-
-With no target, `validate` checks the Project and every authored environment.
-Files and environments can also be selected or combined:
-
-```console
 gitopsctr validate
-gitopsctr validate --environment dev --environment prod
-gitopsctr validate gitopsctr.yaml deployment/environments/dev/units/infrastructure.yaml
-gitopsctr validate --environment dev --fail-fast
 ```
 
-Multi-target validation reports all errors before failing unless
-`--fail-fast` is used. Environment and Project validation includes duplicate
-representation, resource identity, driver contract, safe-path, and cross-unit
-observation checks.
+Creation follows the Project's configured document format and never replaces an existing resource unless `--force` is
+explicit. See [Project configuration](project-configuration.md) and [Operations](operations.md).
 
-## Desired payloads, artifacts, and references
+## Controller resources
 
-Materialization drivers commit desired payloads below `materialized/<unit>/` and record that exact path and digest in
-the desired unit. Reconciliation drivers may instead publish typed observed-state resources below
-`artifacts/<unit>/<logical-name>.yaml|json`. Receipt `status.artifacts` contains the resource identity, path, media
-type, and serialized-byte digest. Artifact names and contracts are defined by the driver, not by the authored unit.
+Controller resources use `gitopsctr.io/v1`.
 
-References are self-contained objects. Their JSON Pointer is relative to the typed driver result, the complete
-artifact resource, or the promoted desired unit respectively:
+| Kind | Purpose and ownership | Location |
+| --- | --- | --- |
+| [`Project`](schemas/apis/gitopsctr.io/v1/Project.schema.json) | User-authored repository identity, document format, and environment path | `gitopsctr.yaml` |
+| [`Environment`](schemas/apis/gitopsctr.io/v1/Environment.schema.json) | User-authored refs, change gate, promotion sources, and evidence policy | `<environmentsPath>/<name>/environment.*` |
+| [`Promotion`](schemas/apis/gitopsctr.io/v1/Promotion.schema.json) | Controller-owned lineage pinning source desired, observed, and specification revisions | `promotion.*` on the target desired ref |
+| [`Receipt`](schemas/apis/gitopsctr.io/v1/Receipt.schema.json) | Controller- and driver-owned evidence for one exact desired unit | `units/<name>.*` on the observed ref |
 
-```yaml
-receiptValue:
-  fromReceipt: {unit: infrastructure, pointer: /outputs/url}
-image:
-  fromArtifact:
-    unit: application-images
-    name: containers
-    apiVersion: artifact.gitopsctr.io/v1
-    kind: ContainerImages
-    pointer: /images/application/uri
-promotedValue:
-  fromPromotion: {unit: infrastructure, pointer: /terraform/variables/environment}
-```
+## Unit resources
 
-`fromArtifact` pins the producer output's expected `apiVersion` and `kind`. The controller verifies that type against
-the producer driver's declared output, the receipt descriptor, and the registered API kind before parsing the complete
-artifact resource and applying the pointer. The resolved consumer resource is then validated by its desired-unit type.
+Unit resources use `unit.gitopsctr.io/v1`. A unit is authored by the user, resolved into desired state by the
+controller, and implemented by its registered unit driver.
 
-A receipt or artifact is usable only while it matches the producer's current desired unit; artifacts are additionally
-checked against their descriptor, digest, identity, and registered contract. If referenced evidence is unavailable or
-stale, the consumer remains waiting, including during speculative planning.
+| Kind | Purpose and ownership | Location | Guide |
+| --- | --- | --- | --- |
+| `Terraform` | User-authored Terraform deployment; the driver plans, applies, and verifies it | Authored below `<environment>/units/`; resolved at `units/<name>.*` | [Terraform](drivers/terraform.md) |
+| `OciImages` | User-authored image build; the driver publishes immutable OCI images | Authored below `<environment>/units/`; resolved at `units/<name>.*` | [OCI images](drivers/oci-images.md) |
+| `ViteOciBundle` | User-authored frontend build; the driver publishes an OCI bundle | Authored below `<environment>/units/`; resolved at `units/<name>.*` | [Vite OCI bundle](drivers/vite-oci-bundle.md) |
+| `FrontendS3Cloudfront` | User-authored publication; the driver deploys a bundle to S3 and CloudFront | Authored below `<environment>/units/`; resolved at `units/<name>.*` | [Frontend S3/CloudFront](drivers/frontend-s3-cloudfront.md) |
+| `KubernetesManifests` | User-authored delivery; the driver renders and optionally applies Kubernetes resources | Authored below `<environment>/units/`; resolved at `units/<name>.*` | [Kubernetes manifests](drivers/kubernetes-manifests.md) |
 
-The generic receipt points back to the unit kind:
+Each kind publishes `authored`, `desired`, and `receipt` schema profiles. These are lifecycle views of the unit and its
+generic receipt, not separate unit GVKs. Use the authored schema in source repositories; desired units and receipts are
+controller-owned. The [unit kind overview](drivers.md) compares their capabilities.
 
-```yaml
-apiVersion: gitopsctr.io/v1
-kind: Receipt
-metadata:
-  name: infrastructure
-spec:
-  subject:
-    apiVersion: unit.gitopsctr.io/v1
-    kind: Terraform
-    name: infrastructure
-status:
-  controller: {}
-  result: {}
-```
+## Artifact resources
 
-All extensible resource kinds are discovered through full-GVK `gitopsctr.apis`
-entry points, for example `unit.gitopsctr.io/v1/Terraform` and
-`artifact.gitopsctr.io/v1/ContainerImages`. Each entry point returns a typed
-`ApiKind`. A unit API's specification is its `UnitDriver`; capabilities such as
-planning, materialization, reconciliation, and verification remain independent
-traits. Artifact API specifications own typed parsing and schema generation,
-independently of the drivers that produce them. The artifact document media
-type is part of that Artifact API specification; the GVK carries identity only.
+Artifact resources use `artifact.gitopsctr.io/v1` and are published by drivers on the observed ref. Their typed
+contracts are independent of the unit kinds that produce them.
+
+| Kind | Purpose and ownership | Location |
+| --- | --- | --- |
+| [`ContainerImages`](schemas/apis/artifact.gitopsctr.io/v1/ContainerImages.schema.json) | Driver-owned immutable image names, tags, and digests produced by `OciImages` | `artifacts/<unit>/<name>.*` on the observed ref |
+| [`FrontendBundle`](schemas/apis/artifact.gitopsctr.io/v1/FrontendBundle.schema.json) | Driver-owned immutable bundle URI and metadata produced by `ViteOciBundle` | `artifacts/<unit>/<name>.*` on the observed ref |
+
+Receipts describe every artifact's GVK, path, media type, and serialized-byte digest. Consumers read these resources
+through [`fromArtifact`](references.md).
+
+## Schemas and extensibility
+
+The [schema catalog](schemas.md) is the exhaustive structural reference for the built-ins. Extensible API kinds are
+discovered through full-GVK `gitopsctr.apis` Python entry points. Unit API registrations provide a `UnitDriver`;
+artifact API registrations provide typed parsing, media type, and schema generation. Driver capabilities such as
+planning, materialization, reconciliation, and verification remain independent.
