@@ -472,7 +472,7 @@ class StackInstantiationProvenance(StrictModel):
     templateRevision: Annotated[str, Pattern(r"^[0-9a-f]{40}$")]
     templatePath: Annotated[str, Pattern(r"^[^/].*")]
     templateDigest: Annotated[str, Pattern(r"^[0-9a-f]{64}$")]
-    requestIdentity: Annotated[str, Pattern(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")]
+    requestIdentity: Annotated[str, Pattern(r"^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,127}$")]
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[0-9a-f]{40}", self.templateRevision):
@@ -481,7 +481,7 @@ class StackInstantiationProvenance(StrictModel):
             raise ValueError("templatePath must be repository-relative")
         if not re.fullmatch(r"[0-9a-f]{64}", self.templateDigest):
             raise ValueError("templateDigest must be a SHA-256 digest")
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", self.requestIdentity):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/#-]{0,127}", self.requestIdentity):
             raise ValueError("requestIdentity has an invalid format")
 
 

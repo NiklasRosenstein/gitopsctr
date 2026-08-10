@@ -746,7 +746,8 @@ def stack_dependency_edges(
         template = templates.get(stack.spec.template)
         if template is None or not isinstance(template.spec, StackTemplateSpec):
             continue
-        for generated in template.spec.expand(stack.spec.parameters):
+        expanded_by_name = {resource.name: resource for resource in template.spec.expand(stack.spec.parameters)}
+        for generated in expanded_by_name.values():
             generated_key = (generated.apiVersion, generated.kind, generated.name)
             if not include_missing and generated_key not in resources:
                 # An active deletion intent may intentionally omit a child;
@@ -756,12 +757,11 @@ def stack_dependency_edges(
                 dependency
                 for dependency in generated.dependsOn
                 if include_missing
-                or (generated.apiVersion, generated.kind, dependency) in resources
-                or any(
-                    candidate.gvk.kind == generated.kind and candidate.name == dependency
-                    for candidate in resources.values()
-                    if isinstance(candidate, UnitResource)
-                )
+                or (
+                    expanded_by_name[dependency].apiVersion,
+                    expanded_by_name[dependency].kind,
+                    dependency,
+                ) in resources
             )
     return {name: tuple(sorted(dependencies)) for name, dependencies in sorted(edges.items())}
 
@@ -6256,9 +6256,9 @@ def command_request_delete_direct_unit(args: argparse.Namespace) -> bool:
         return _command_request_delete_direct_unit(args)
 
 
-def _direct_stack_uid(environment: str, stack_name: str, request_identity: str) -> str:
+def _direct_stack_uid(environment: str, stack_name: str, request_identity: str, desired_revision: str) -> str:
     digest = hashlib.sha256(
-        f"gitopsctr/direct-stack-uid/v1\0{environment}\0{stack_name}\0{request_identity}".encode()
+        f"gitopsctr/direct-stack-uid/v2\0{environment}\0{stack_name}\0{request_identity}\0{desired_revision}".encode()
     ).hexdigest()[:32]
     return f"d1-{digest}"
 
@@ -6283,7 +6283,7 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
     _resource_name(args.stack, "Stack name")
     _resource_name(args.template, "StackTemplate name")
     parameters = _parse_stack_parameters(args.parameters)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", args.request_id):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/#-]{0,127}", args.request_id):
         raise OperationError("--request-id has an invalid format")
     desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
     current_revision = fetch_ref(desired_ref)
@@ -6371,7 +6371,11 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
             candidate,
             dry=args.dry,
         )
-        direct_uid = _direct_stack_uid(args.environment, args.stack, args.request_id)
+        # The desired head is part of the incarnation identity. Retries against
+        # the same head remain replay-idempotent, while a same-name request
+        # after a finalized root has a new desired head and therefore cannot
+        # reuse the old UID or its teardown evidence.
+        direct_uid = _direct_stack_uid(args.environment, args.stack, args.request_id, current_revision)
         direct_metadata = ResourceMetadata(
             name=args.stack,
             uid=direct_uid,
@@ -6551,7 +6555,7 @@ def _command_recover_orphaned_stacks(args: argparse.Namespace) -> bool:
             log_status("KEEP", f"{style_environment(args.environment)}: no direct Stack roots")
             return False
 
-        pins = {pin.name: pin for pin in state_store().list_controller_pins()} if not args.dry else {}
+        pins = {pin.name: pin for pin in state_store().list_controller_pins()}
         changed = False
         now = effect_lease_now()
         for stack in direct_stacks:

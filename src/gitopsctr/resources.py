@@ -245,8 +245,28 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
         expanded_by_name = {resource.name: resource for resource in expanded}
         for generated in expanded:
             generated_key = (generated.apiVersion, generated.kind, generated.name)
-            if generated_key not in identities:
+            generated_resource = identities.get(generated_key)
+            if generated_resource is None:
                 raise ValueError(f"Stack {stack.name!r} expansion is missing generated Unit {generated.name!r}")
+            if not isinstance(generated_resource, UnitResource):
+                raise ValueError(f"Stack {stack.name!r} expansion {generated.name!r} is not a Unit")
+            generated_lifecycle = generated_resource.metadata.lifecycle
+            owner = generated_lifecycle.owner if generated_lifecycle is not None else None
+            expected_owner = (
+                stack.gvk.api_version,
+                stack.gvk.kind,
+                stack.name,
+                stack.metadata.uid,
+            )
+            actual_owner = (
+                (owner.apiVersion, owner.kind, owner.name, owner.uid)
+                if owner is not None
+                else None
+            )
+            if actual_owner != expected_owner:
+                raise ValueError(
+                    f"Stack {stack.name!r} generated Unit {generated.name!r} has an invalid owner reference"
+                )
             for dependency in generated.dependsOn:
                 dependency_resource = expanded_by_name.get(dependency)
                 if dependency_resource is None:

@@ -117,6 +117,16 @@ def test_direct_stack_provenance_is_desired_only_and_round_trips():
         )
 
 
+def test_direct_stack_provenance_accepts_canonical_github_request_identity():
+    provenance = StackInstantiationProvenance(
+        templateRevision="a" * 40,
+        templatePath="deployment/environments/dev/stack-templates/preview.yaml",
+        templateDigest="b" * 64,
+        requestIdentity="github:example-org/application#123",
+    )
+    assert provenance.requestIdentity == "github:example-org/application#123"
+
+
 @pytest.mark.parametrize(
     ("parameter_type", "value"),
     [
