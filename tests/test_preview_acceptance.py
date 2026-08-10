@@ -62,8 +62,11 @@ def test_source_tracked_stack_cleanup_is_durable_across_restart(tmp_path: Path):
     assert first.blocked == {}
     assert initial_stack.metadata.uid is not None
     assert first_intent.uid == initial_stack.metadata.uid
-    assert [identity.unit_name for identity in first_intent.owned_unit_closure] == ["preview-app"]
-    assert cli.load_desired_unit(candidate / "units/preview-app.json", "preview-app").metadata.uid == "d1-preview-app"
+    assert [identity.unit_name for identity in first_intent.owned_unit_closure] == ["web--preview-app"]
+    assert (
+        cli.load_desired_unit(candidate / "units/web--preview-app.json", "web--preview-app").metadata.uid
+        == "d1-web--preview-app"
+    )
 
     restarted = tmp_path / "restarted"
     second = cli.build_desired_candidate(
@@ -81,6 +84,44 @@ def test_source_tracked_stack_cleanup_is_durable_across_restart(tmp_path: Path):
     assert second.blocked == {}
     assert second_intent == first_intent
     assert cli.load_desired_resource_graph(restarted)
+
+
+def test_two_stacks_from_one_template_have_independent_generated_units(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = _project(source)
+    _write_stack_source(environment)
+    (environment / "stacks/api.json").write_text(
+        json.dumps(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "Stack",
+                "metadata": {"name": "api"},
+                "spec": {"template": "preview", "parameters": {"source-path": "."}},
+            }
+        )
+    )
+
+    candidate = tmp_path / "candidate"
+    projection = cli.project_stack_resources(source, "dev", "a" * 40, candidate, source)
+    assert sorted(projection.generated_units) == ["api--preview-app", "web--preview-app"]
+    assert projection.owners["api--preview-app"].name == "api"
+    assert projection.owners["web--preview-app"].name == "web"
+    for name, unit in projection.generated_units.items():
+        cli.write_desired_candidate_unit(
+            candidate / "units" / f"{name}.json",
+            unit.with_metadata(
+                ResourceMetadata(
+                    name=name,
+                    uid=f"d1-{name}",
+                    lifecycle=cli.DesiredLifecycle(owner=projection.owners[name]),
+                )
+            ),
+            source,
+        )
+
+    graph = cli.load_desired_resource_graph(candidate)
+    assert ("unit.gitopsctr.io/v1", "Terraform", "api--preview-app") in graph
+    assert ("unit.gitopsctr.io/v1", "Terraform", "web--preview-app") in graph
 
 
 def test_direct_stack_finalization_retries_after_injected_publication_failure(tmp_path: Path, monkeypatch):
@@ -173,7 +214,7 @@ def test_dependencies_cli_preserves_explicit_stack_order_after_restart(tmp_path:
             "--source-revision",
             "HEAD",
             "--unit",
-            "preview-app",
+            "web--preview-app",
             "--json",
         ]
     )
@@ -184,5 +225,5 @@ def test_dependencies_cli_preserves_explicit_stack_order_after_restart(tmp_path:
     restarted = json.loads(capsys.readouterr().out)
 
     assert first == restarted
-    assert [unit["name"] for unit in first["units"]] == ["preview-db", "preview-app"]
-    assert first["units"][-1]["dependencies"] == ["preview-db"]
+    assert [unit["name"] for unit in first["units"]] == ["web--preview-db", "web--preview-app"]
+    assert first["units"][-1]["dependencies"] == ["web--preview-db"]

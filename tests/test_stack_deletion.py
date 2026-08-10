@@ -75,7 +75,7 @@ def _stack_tree(root: Path) -> tuple[str, str]:
             "apiVersion": cli.UNIT_API_VERSION,
             "kind": "Terraform",
             "metadata": {
-                "name": "preview-app",
+                "name": "preview--preview-app",
                 "uid": "d1-preview-app",
                 "lifecycle": {
                     "owner": {
@@ -97,10 +97,10 @@ def _stack_tree(root: Path) -> tuple[str, str]:
             },
         },
         profile="desired",
-        expected_name="preview-app",
+        expected_name="preview--preview-app",
     )
-    cli.write_desired_candidate_unit(root / "units/preview-app.json", unit, root)
-    return stack_uid, "preview-app"
+    cli.write_desired_candidate_unit(root / "units/preview--preview-app.json", unit, root)
+    return stack_uid, "preview--preview-app"
 
 
 def _args(**overrides: object) -> Namespace:
@@ -154,9 +154,9 @@ def test_request_delete_direct_stack_retains_children_and_creates_fenced_intents
 
     candidate = published[0]
     intent = cli.load_desired_stack_deletion_intents(candidate)["preview"]
-    child_intent = cli.load_desired_deletion_intents(candidate)["preview-app"]
+    child_intent = cli.load_desired_deletion_intents(candidate)["preview--preview-app"]
     assert intent.uid == "d1-stack-direct"
-    assert intent.owned_unit_closure[0].unit_name == "preview-app"
+    assert intent.owned_unit_closure[0].unit_name == "preview--preview-app"
     assert child_intent.retained_owner is not None
     assert child_intent.retained_owner.uid == intent.uid
     assert pin_calls == [("stacks/dev/preview/d1-stack-direct", "a" * 40)]
@@ -181,13 +181,18 @@ def test_finalize_stack_removes_root_and_releases_pin_after_children(tmp_path: P
         ),
         current / "stacks/preview.json",
         current,
-        [cli.load_desired_unit(current / "units/preview-app.json", "preview-app")],
+        [cli.load_desired_unit(current / "units/preview--preview-app.json", "preview--preview-app")],
         dry=True,
     )
     cli.write_stack_deletion_intent(request_candidate, intent)
-    cli.write_desired_transition_blocks(request_candidate, {"preview": "deleting", "preview-app": "deleting"})
-    (request_candidate / "units/preview-app.json").unlink()
-    for path in cli.document_candidates(request_candidate / ".gitopsctr/deletion-intents/units", "preview-app"):
+    cli.write_desired_transition_blocks(
+        request_candidate,
+        {"preview": "deleting", "preview--preview-app": "deleting"},
+    )
+    (request_candidate / "units/preview--preview-app.json").unlink()
+    for path in cli.document_candidates(
+        request_candidate / ".gitopsctr/deletion-intents/units", "preview--preview-app"
+    ):
         path.unlink()
 
     published: list[Path] = []

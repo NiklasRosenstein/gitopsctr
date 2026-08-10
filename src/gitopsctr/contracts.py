@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal, cast
 
@@ -300,6 +301,16 @@ class LifecycleManagement(StrictModel):
 DESIRED_UID_PATTERN = r"^[a-z0-9][a-z0-9-]{0,62}$"
 
 
+def stack_generated_unit_name(stack_name: str, resource_name: str) -> str:
+    """Return the deterministic desired Unit name for one Stack-local resource."""
+
+    raw = f"{stack_name}--{resource_name}"
+    if len(raw) <= 63:
+        return raw
+    digest = hashlib.sha256(f"gitopsctr/stack-unit-name/v1\0{stack_name}\0{resource_name}".encode()).hexdigest()[:10]
+    return f"{raw[:52].rstrip('-')}-{digest}"
+
+
 @dataclass(frozen=True, kw_only=True)
 class DesiredOwnerReference(StrictModel):
     """A UID-fenced owner in the same desired-resource graph."""
@@ -396,6 +407,42 @@ class StackTemplateResource(StrictModel):
             spec=ParameterTemplateObject(cast(Any, resolved)),
             dependsOn=list(self.dependsOn),
         )
+
+
+def _scope_stack_template_value(value: object, names: Mapping[str, str]) -> object:
+    if isinstance(value, ReceiptReference):
+        target = value.fromReceipt
+        return ReceiptReference(fromReceipt=replace(target, unit=names.get(target.unit, target.unit)))
+    if isinstance(value, ArtifactReference):
+        target = value.fromArtifact
+        return ArtifactReference(fromArtifact=replace(target, unit=names.get(target.unit, target.unit)))
+    if isinstance(value, PromotionReference):
+        target = value.fromPromotion
+        return PromotionReference(fromPromotion=replace(target, unit=names.get(target.unit, target.unit)))
+    if isinstance(value, list):
+        return [_scope_stack_template_value(item, names) for item in value]
+    if isinstance(value, dict):
+        return {key: _scope_stack_template_value(item, names) for key, item in value.items()}
+    return value
+
+
+def scope_stack_template_resources(
+    stack_name: str,
+    resources: tuple[StackTemplateResource, ...],
+) -> tuple[StackTemplateResource, ...]:
+    """Resolve one template expansion into names isolated to a concrete Stack."""
+
+    names = {resource.name: stack_generated_unit_name(stack_name, resource.name) for resource in resources}
+    return tuple(
+        StackTemplateResource(
+            apiVersion=resource.apiVersion,
+            kind=resource.kind,
+            name=names[resource.name],
+            spec=ParameterTemplateObject(cast(Any, _scope_stack_template_value(resource.spec, names))),
+            dependsOn=[names[dependency] for dependency in resource.dependsOn],
+        )
+        for resource in resources
+    )
 
 
 @dataclass(frozen=True, kw_only=True)

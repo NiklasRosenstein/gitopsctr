@@ -92,9 +92,9 @@ def test_stack_projection_is_deterministic_and_templates_are_inert(tmp_path: Pat
     first = cli.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate-a", source)
     second = cli.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate-b", source)
 
-    assert sorted(first.generated_units) == ["preview-app"]
+    assert sorted(first.generated_units) == ["web--preview-app"]
     assert first.owners == second.owners
-    assert first.generated_units["preview-app"].spec == second.generated_units["preview-app"].spec
+    assert first.generated_units["web--preview-app"].spec == second.generated_units["web--preview-app"].spec
     assert list((tmp_path / "candidate-a/stack-templates").glob("preview.*"))
     assert not list((tmp_path / "candidate-a/units").glob("*"))
 
@@ -199,7 +199,7 @@ def test_expanded_stack_dependencies_are_retained_and_validated(tmp_path: Path):
 
     candidate = tmp_path / "candidate"
     projection = cli.project_stack_resources(source, "dev", "a" * 40, candidate, source)
-    assert projection.dependencies["preview-app"] == ("preview-db",)
+    assert projection.dependencies["web--preview-app"] == ("web--preview-db",)
     for name, unit in projection.generated_units.items():
         cli.write_desired_candidate_unit(
             candidate / "units" / f"{name}.json",
@@ -222,11 +222,14 @@ def test_expanded_stack_dependencies_are_retained_and_validated(tmp_path: Path):
         "a" * 40,
         tmp_path / "convergence-projection",
     )
-    selection = cli.convergence_scope(specifications, ["preview-app"], additional_dependencies=dependencies)
-    assert selection.scope == ("preview-app", "preview-db")
-    assert cli.convergence_order(specifications, selection.scope, dependencies) == ("preview-db", "preview-app")
-    next(path for path in (candidate / "units").glob("preview-db.*")).unlink()
-    with pytest.raises(OperationError, match="dependency 'preview-db' is absent"):
+    selection = cli.convergence_scope(specifications, ["web--preview-app"], additional_dependencies=dependencies)
+    assert selection.scope == ("web--preview-app", "web--preview-db")
+    assert cli.convergence_order(specifications, selection.scope, dependencies) == (
+        "web--preview-db",
+        "web--preview-app",
+    )
+    next(path for path in (candidate / "units").glob("web--preview-db.*")).unlink()
+    with pytest.raises(OperationError, match="dependency 'web--preview-db' is absent"):
         cli.load_desired_resource_graph(candidate)
 
 
@@ -236,21 +239,21 @@ def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path:
     _write_stack_source(environment)
     candidate = tmp_path / "candidate"
     projection = cli.project_stack_resources(source, "dev", "a" * 40, candidate, source)
-    owner = projection.owners["preview-app"]
-    unit = projection.generated_units["preview-app"].with_metadata(
+    owner = projection.owners["web--preview-app"]
+    unit = projection.generated_units["web--preview-app"].with_metadata(
         ResourceMetadata(
-            name="preview-app",
+            name="web--preview-app",
             uid="d1-generated-preview-app",
             lifecycle=DesiredLifecycle(owner=owner),
         )
     )
-    cli.write_desired_candidate_unit(candidate / "units/preview-app.json", unit, source)
+    cli.write_desired_candidate_unit(candidate / "units/web--preview-app.json", unit, source)
 
     graph = cli.load_desired_resource_graph(candidate)
-    assert cli.desired_unit_names(candidate) == ("preview-app",)
+    assert cli.desired_unit_names(candidate) == ("web--preview-app",)
     assert ("gitopsctr.io/v1", "StackTemplate", "preview") in graph
     assert ("gitopsctr.io/v1", "Stack", "web") in graph
-    assert graph[("unit.gitopsctr.io/v1", "Terraform", "preview-app")].metadata.lifecycle is not None
+    assert graph[("unit.gitopsctr.io/v1", "Terraform", "web--preview-app")].metadata.lifecycle is not None
 
     bad_owner = DesiredOwnerReference(
         apiVersion=owner.apiVersion,
@@ -268,7 +271,7 @@ def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path:
                         lifecycle=DesiredLifecycle(owner=bad_owner),
                     )
                 )
-                if key[2] == "preview-app"
+                if key[2] == "web--preview-app"
                 else value
                 for key, value in graph.items()
                 if not isinstance(value, StackResource) or value.gvk.kind != "StackTemplate"
@@ -311,9 +314,9 @@ def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
     (desired / "stacks/web.json").write_text(
         json.dumps(cli.RESOURCE_CATALOG.serialize_stack_resource(stack, profile="desired"))
     )
-    unit = projection.generated_units["preview-app"].with_metadata(
+    unit = projection.generated_units["web--preview-app"].with_metadata(
         ResourceMetadata(
-            name="preview-app",
+            name="web--preview-app",
             uid="d1-unit-preview-app",
             lifecycle=DesiredLifecycle(
                 owner=DesiredOwnerReference(
@@ -325,7 +328,7 @@ def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
             ),
         )
     )
-    cli.write_desired_candidate_unit(desired / "units/preview-app.json", unit, source)
+    cli.write_desired_candidate_unit(desired / "units/web--preview-app.json", unit, source)
 
     specifications, dependencies = cli.load_convergence_specifications(
         source,
@@ -334,9 +337,9 @@ def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
         "a" * 40,
         tmp_path / "projection",
     )
-    assert specifications["preview-app"].metadata.lifecycle is not None
-    assert specifications["preview-app"].metadata.lifecycle.owner is not None
-    assert dependencies == {"preview-app": ()}
+    assert specifications["web--preview-app"].metadata.lifecycle is not None
+    assert specifications["web--preview-app"].metadata.lifecycle.owner is not None
+    assert dependencies == {"web--preview-app": ()}
 
 
 def test_stack_rejects_missing_template_during_projection(tmp_path: Path):
@@ -451,7 +454,7 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
     assert stack.metadata.lifecycle.management.mode == "direct"
     assert isinstance(stack.spec, cli.DesiredStackSpec)
     assert stack.spec.provenance is not None
-    unit = cli.load_desired_unit(next((candidate / "units").glob("preview-app.*")), "preview-app")
+    unit = cli.load_desired_unit(next((candidate / "units").glob("web--preview-app.*")), "web--preview-app")
     assert unit.metadata.lifecycle is not None
     assert unit.metadata.lifecycle.owner is not None
     assert unit.metadata.lifecycle.owner.uid == stack.metadata.uid

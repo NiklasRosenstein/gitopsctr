@@ -46,6 +46,7 @@ from gitopsctr.contracts import (
     StackSpec,
     StackTemplateSpec,
     StrictModel,
+    scope_stack_template_resources,
     with_schema,
 )
 from gitopsctr.dependencies import (
@@ -708,7 +709,10 @@ def load_desired_resource_graph(root: Path) -> dict[tuple[str, str, str], UnitRe
             ):
                 missing_units = {
                     resource.name
-                    for resource in template_resource.spec.expand(stack_resource.spec.parameters)
+                    for resource in scope_stack_template_resources(
+                        stack_name,
+                        template_resource.spec.expand(stack_resource.spec.parameters),
+                    )
                     if (resource.apiVersion, resource.kind, resource.name) not in resources
                 }
                 closure_names = {identity.unit_name for identity in stack_intent.owned_unit_closure}
@@ -747,7 +751,13 @@ def stack_dependency_edges(
         template = templates.get(stack.spec.template)
         if template is None or not isinstance(template.spec, StackTemplateSpec):
             continue
-        expanded_by_name = {resource.name: resource for resource in template.spec.expand(stack.spec.parameters)}
+        expanded_by_name = {
+            resource.name: resource
+            for resource in scope_stack_template_resources(
+                stack.name,
+                template.spec.expand(stack.spec.parameters),
+            )
+        }
         for generated in expanded_by_name.values():
             generated_key = (generated.apiVersion, generated.kind, generated.name)
             if not include_missing and generated_key not in resources:
@@ -1820,7 +1830,10 @@ def project_stack_resources(
         )
         _write_desired_stack_resource(candidate / "stacks" / f"{name}.json", stack, project_root)
         assert isinstance(template.spec, StackTemplateSpec)
-        for resource in template.spec.expand(authored_stack.spec.parameters):
+        for resource in scope_stack_template_resources(
+            name,
+            template.spec.expand(authored_stack.spec.parameters),
+        ):
             document: JsonObject = {
                 "apiVersion": resource.apiVersion,
                 "kind": resource.kind,
@@ -6437,7 +6450,7 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
         )
         if not isinstance(template.spec, StackTemplateSpec):
             raise OperationError(f"StackTemplate {args.template!r} has an invalid specification")
-        expanded = template.spec.expand(parameters)
+        expanded = scope_stack_template_resources(args.stack, template.spec.expand(parameters))
         template_provenance = StackInstantiationProvenance(
             templateRevision=source_revision,
             templatePath=template_path.relative_to(source).as_posix(),

@@ -28,6 +28,7 @@ from gitopsctr.contracts import (
     StackTemplateDocument,
     StackTemplateSpec,
     StrictModel,
+    scope_stack_template_resources,
 )
 from gitopsctr.document import ContractError, JsonObject, JsonObjectValue, TypedDocumentContract
 from gitopsctr.driver import InstalledUnitDriver
@@ -233,7 +234,7 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
                 f"Stack {stack.name!r} references missing StackTemplate {stack.spec.template!r} in this ref"
             )
         assert isinstance(template.spec, StackTemplateSpec)
-        expanded = template.spec.expand(stack.spec.parameters)
+        expanded = scope_stack_template_resources(stack.name, template.spec.expand(stack.spec.parameters))
         lifecycle = stack.metadata.lifecycle
         if lifecycle is None or lifecycle.management is None:
             raise ValueError(f"Stack {stack.name!r} must be a root resource")
@@ -258,11 +259,7 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
                 stack.name,
                 stack.metadata.uid,
             )
-            actual_owner = (
-                (owner.apiVersion, owner.kind, owner.name, owner.uid)
-                if owner is not None
-                else None
-            )
+            actual_owner = (owner.apiVersion, owner.kind, owner.name, owner.uid) if owner is not None else None
             if actual_owner != expected_owner:
                 raise ValueError(
                     f"Stack {stack.name!r} generated Unit {generated.name!r} has an invalid owner reference"
