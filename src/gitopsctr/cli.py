@@ -716,6 +716,68 @@ def load_desired_resource_graph(root: Path) -> dict[tuple[str, str, str], UnitRe
     return resources
 
 
+def stack_dependency_edges(
+    resources: Mapping[tuple[str, str, str], UnitResource[Any] | StackResource],
+    *,
+    include_missing: bool = False,
+) -> dict[str, tuple[str, ...]]:
+    """Return explicit StackTemplate dependency edges for materialized Units.
+
+    These edges are controller-owned graph metadata, not driver input. They are
+    normalized by Unit name because the existing convergence and teardown APIs
+    operate on Unit names, while resource identity and UID fencing remain
+    validated by ``load_desired_resource_graph``.
+    """
+
+    templates = {
+        resource.name: resource
+        for resource in resources.values()
+        if isinstance(resource, StackResource) and resource.gvk.kind == "StackTemplate"
+    }
+    edges: dict[str, set[str]] = {}
+    for stack in (
+        resource
+        for resource in resources.values()
+        if isinstance(resource, StackResource) and resource.gvk.kind == "Stack"
+    ):
+        if not isinstance(stack.spec, (StackSpec, DesiredStackSpec)):
+            continue
+        template = templates.get(stack.spec.template)
+        if template is None or not isinstance(template.spec, StackTemplateSpec):
+            continue
+        for generated in template.spec.expand(stack.spec.parameters):
+            generated_key = (generated.apiVersion, generated.kind, generated.name)
+            if not include_missing and generated_key not in resources:
+                # An active deletion intent may intentionally omit a child;
+                # its deletion intent and closure fence remain authoritative.
+                continue
+            edges.setdefault(generated.name, set()).update(
+                dependency
+                for dependency in generated.dependsOn
+                if include_missing
+                or (generated.apiVersion, generated.kind, dependency) in resources
+                or any(
+                    candidate.gvk.kind == generated.kind and candidate.name == dependency
+                    for candidate in resources.values()
+                    if isinstance(candidate, UnitResource)
+                )
+            )
+    return {name: tuple(sorted(dependencies)) for name, dependencies in sorted(edges.items())}
+
+
+def desired_unit_names(root: Path) -> tuple[str, ...]:
+    """Return materialized desired Unit names, including Stack-owned Units."""
+
+    names = {path.stem for path in (root / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}}
+    if _current_desired_stack_paths(root, "Stack"):
+        names.update(
+            resource.name
+            for resource in load_desired_resource_graph(root).values()
+            if isinstance(resource, UnitResource)
+        )
+    return tuple(sorted(names))
+
+
 def ensure_desired_units_materialized(root: Path) -> None:
     for unit_name, path in _current_desired_unit_paths(root).items():
         if raw_unit_contains_reference(load_json(path)):
@@ -1786,6 +1848,63 @@ def project_stack_resources(
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(previous_path, target)
     return StackProjection(generated, owners, dependencies)
+
+
+def load_convergence_specifications(
+    source_root: Path,
+    environment_name: str,
+    current_desired: Path,
+    projection_revision: str,
+    projection_root: Path,
+) -> tuple[dict[str, UnitResource[Any]], dict[str, tuple[str, ...]]]:
+    """Load source and desired-only Units participating in convergence.
+
+    Source Unit documents remain the authored authority. Stack-generated and
+    directly managed Units are added from the desired snapshot so the normal
+    driver path can reconcile them without pretending that they are authored
+    source roots.
+    """
+
+    specifications = load_environment_specifications(source_root, environment_name)
+    projection = project_stack_resources(
+        source_root,
+        environment_name,
+        projection_revision,
+        projection_root,
+        source_root,
+        current_desired,
+    )
+    for name, generated in projection.generated_units.items():
+        if name in specifications:
+            raise OperationError(f"generated Stack Unit {name!r} collides with a source Unit")
+        specifications[name] = generated
+    dependency_edges = dict(projection.dependencies)
+
+    if _current_desired_stack_paths(current_desired, "Stack"):
+        resources = load_desired_resource_graph(current_desired)
+        dependency_edges.update(stack_dependency_edges(resources))
+        deletion_intents = load_desired_deletion_intents(current_desired)
+        transition_blocks = load_desired_transition_blocks(current_desired)
+        for resource in resources.values():
+            if not isinstance(resource, UnitResource) or resource.name in deletion_intents:
+                continue
+            if resource.name in transition_blocks:
+                continue
+            lifecycle = resource.metadata.lifecycle
+            if lifecycle is None:
+                continue
+            is_stack_owned = lifecycle.owner is not None and lifecycle.owner.kind == "Stack"
+            is_direct_root = (
+                lifecycle.owner is None and lifecycle.management is not None and lifecycle.management.mode == "direct"
+            )
+            if not (is_stack_owned or is_direct_root):
+                continue
+            existing = specifications.get(resource.name)
+            if existing is not None and existing.gvk != resource.gvk:
+                raise OperationError(f"desired-only Unit {resource.name!r} collides with a source Unit")
+            specifications[resource.name] = resource
+
+    return specifications, {name: tuple(sorted(values)) for name, values in dependency_edges.items()}
 
 
 def require_environment_unit(source_root: Path, environment_name: str, unit_name: str) -> None:
@@ -5733,6 +5852,7 @@ def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[s
     """Find active owned or observation-dependent descendants of a teardown target."""
 
     resources = load_desired_resource_graph(root)
+    explicit_dependencies = stack_dependency_edges(resources, include_missing=True)
     intents = load_desired_deletion_intents(root)
     opaque_roots = load_desired_cleanup_roots(root)
     target_identity = (target.gvk.api_version, target.gvk.kind, target.name, target.metadata.uid or "")
@@ -5761,7 +5881,8 @@ def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[s
                 == parent_identity
             )
             dependency_matches = isinstance(child, UnitResource) and bool(
-                desired_observation_reference_units(child) & parent_names
+                (desired_observation_reference_units(child) | set(explicit_dependencies.get(child.name, ())))
+                & parent_names
             )
             if owner_matches or dependency_matches:
                 dependents.add(child.name)
@@ -5783,7 +5904,9 @@ def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[s
                 )
                 == parent_identity
             )
-            dependency_matches = bool(set(intent.retained_dependencies) & parent_names)
+            dependency_matches = bool(
+                (set(intent.retained_dependencies) | set(explicit_dependencies.get(child_name, ()))) & parent_names
+            )
             if owner_matches or dependency_matches:
                 dependents.add(child_name)
                 pending.append(
@@ -7043,7 +7166,11 @@ def command_status(args: argparse.Namespace) -> None:
             else f"{style_branch(observed_ref)} has no receipts yet",
         )
         specifications = load_environment_specifications(REPOSITORY_ROOT, args.environment)
-        statuses = reconciliation_statuses(sorted(specifications), desired, observed)
+        statuses = reconciliation_statuses(
+            sorted(set(specifications) | set(desired_unit_names(desired))),
+            desired,
+            observed,
+        )
         if args.unit is not None:
             status_names = {unit_name for unit_name, _status, _reason in statuses}
             if args.unit not in status_names:
@@ -7078,7 +7205,11 @@ def _unit_status_snapshot(environment: str, desired_ref: str, observed_ref: str)
         desired_revision = observed_tree(desired_ref, desired)
         observed_revision = observed_tree(observed_ref, observed)
         specifications = load_environment_specifications(REPOSITORY_ROOT, environment)
-        statuses = reconciliation_statuses(sorted(specifications), desired, observed)
+        statuses = reconciliation_statuses(
+            sorted(set(specifications) | set(desired_unit_names(desired))),
+            desired,
+            observed,
+        )
         return {
             "desired": {"ref": desired_ref, "revision": desired_revision},
             "observed": {"ref": observed_ref, "revision": observed_revision},
@@ -8045,11 +8176,19 @@ def command_dependencies(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory() as temporary_directory:
         source_root = Path(temporary_directory) / "source"
         materialize_revision(source_revision, source_root)
-        specifications = load_environment_specifications(source_root, args.environment)
-        selection = convergence_scope(specifications, args.unit, args.depth)
+        current_desired = Path(temporary_directory) / "current-desired"
+        current_desired.mkdir()
+        specifications, stack_dependencies = load_convergence_specifications(
+            source_root,
+            args.environment,
+            current_desired,
+            source_revision,
+            Path(temporary_directory) / "stack-projection",
+        )
+        selection = convergence_scope(specifications, args.unit, args.depth, stack_dependencies)
         targets, scope = selection.targets, selection.scope
-        graph = dependency_graph(specifications, scope)
-        order = convergence_order(specifications, scope)
+        graph = dependency_graph(specifications, scope, stack_dependencies)
+        order = convergence_order(specifications, scope, stack_dependencies)
     if args.json:
         print(
             json.dumps(
@@ -8130,15 +8269,24 @@ def command_converge(args: argparse.Namespace) -> None:
             assert source_revision is not None
             effective_source_revision = source_revision
             source_root = probe_source
-        specifications = load_environment_specifications(source_root, args.environment)
-        selection = convergence_scope(specifications, args.unit)
+        projection_revision = (
+            effective_source_revision or start_desired or git("rev-parse", "HEAD^{commit}").stdout.strip()
+        )
+        specifications, stack_dependencies = load_convergence_specifications(
+            source_root,
+            args.environment,
+            current_desired,
+            projection_revision,
+            temporary / "stack-projection",
+        )
+        selection = convergence_scope(specifications, args.unit, additional_dependencies=stack_dependencies)
         targets, scope = selection.targets, selection.scope
-        order = convergence_order(specifications, scope)
+        order = convergence_order(specifications, scope, stack_dependencies)
         if args.verbose:
             log_status("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
             log_status("TARGET", style_units(targets))
             log_status("SCOPE", style_units(scope))
-            log_dependency_graph(dependency_graph(specifications, scope).dependencies)
+            log_dependency_graph(dependency_graph(specifications, scope, stack_dependencies).dependencies)
         else:
             log_status("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(start_desired)}")
             log_status("OBSERVED", f"{style_branch(observed_ref)} at {describe_revision(start_observed)}")

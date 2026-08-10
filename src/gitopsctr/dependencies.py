@@ -90,10 +90,30 @@ def _authored_document(unit: UnitResource) -> object:
     return unit.driver.unit_contract.dump(unit.spec)
 
 
+def _unit_dependencies(
+    specifications: Mapping[str, UnitResource],
+    unit_name: str,
+    additional_dependencies: Mapping[str, Sequence[str]] | None = None,
+) -> frozenset[str]:
+    """Return observation and controller-provided dependency edges for one Unit.
+
+    StackTemplate edges are supplied separately because they live in the desired
+    Stack graph rather than in a driver-owned Unit spec. Keeping them as an
+    explicit input prevents authored Unit documents from acquiring controller
+    metadata while allowing the same ordering algorithms to cover both forms.
+    """
+
+    dependencies = set(observation_reference_units(_authored_document(specifications[unit_name])))
+    if additional_dependencies is not None:
+        dependencies.update(additional_dependencies.get(unit_name, ()))
+    return frozenset(dependencies)
+
+
 def convergence_scope(
     specifications: Mapping[str, UnitResource],
     targets: Sequence[str] | None,
     max_depth: int | None = None,
+    additional_dependencies: Mapping[str, Sequence[str]] | None = None,
 ) -> ConvergenceSelection:
     if max_depth is not None and max_depth < 0:
         raise OperationError("--depth must be zero or a positive integer")
@@ -107,7 +127,7 @@ def convergence_scope(
     while pending:
         unit_name = pending.pop()
         depth = depths[unit_name]
-        dependencies = observation_reference_units(_authored_document(specifications[unit_name]))
+        dependencies = _unit_dependencies(specifications, unit_name, additional_dependencies)
         missing = sorted(dependencies - specifications.keys())
         if missing:
             raise OperationError(f"{unit_name} references unknown observation unit(s): {', '.join(missing)}")
@@ -121,7 +141,11 @@ def convergence_scope(
     return ConvergenceSelection(tuple(selected), tuple(sorted(depths)))
 
 
-def convergence_order(specifications: Mapping[str, UnitResource], scope: Sequence[str]) -> tuple[str, ...]:
+def convergence_order(
+    specifications: Mapping[str, UnitResource],
+    scope: Sequence[str],
+    additional_dependencies: Mapping[str, Sequence[str]] | None = None,
+) -> tuple[str, ...]:
     included = set(scope)
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -131,7 +155,7 @@ def convergence_order(specifications: Mapping[str, UnitResource], scope: Sequenc
         if unit_name in visited or unit_name in visiting:
             return
         visiting.add(unit_name)
-        for dependency in sorted(observation_reference_units(_authored_document(specifications[unit_name])) & included):
+        for dependency in sorted(_unit_dependencies(specifications, unit_name, additional_dependencies) & included):
             visit(dependency)
         visiting.remove(unit_name)
         visited.add(unit_name)
@@ -142,22 +166,28 @@ def convergence_order(specifications: Mapping[str, UnitResource], scope: Sequenc
     return tuple(ordered)
 
 
-def dependency_graph(specifications: Mapping[str, UnitResource], scope: Sequence[str]) -> DependencyGraph:
+def dependency_graph(
+    specifications: Mapping[str, UnitResource],
+    scope: Sequence[str],
+    additional_dependencies: Mapping[str, Sequence[str]] | None = None,
+) -> DependencyGraph:
     included = set(scope)
     return DependencyGraph(
         {
-            unit_name: tuple(
-                sorted(observation_reference_units(_authored_document(specifications[unit_name])) & included)
-            )
+            unit_name: tuple(sorted(_unit_dependencies(specifications, unit_name, additional_dependencies) & included))
             for unit_name in sorted(scope)
         }
     )
 
 
-def downstream_unit_closure(specifications: Mapping[str, UnitResource], selected: Sequence[str]) -> tuple[str, ...]:
+def downstream_unit_closure(
+    specifications: Mapping[str, UnitResource],
+    selected: Sequence[str],
+    additional_dependencies: Mapping[str, Sequence[str]] | None = None,
+) -> tuple[str, ...]:
     consumers: dict[str, set[str]] = {unit: set() for unit in specifications}
-    for consumer, specification in specifications.items():
-        for producer in observation_reference_units(_authored_document(specification)):
+    for consumer in specifications:
+        for producer in _unit_dependencies(specifications, consumer, additional_dependencies):
             if producer not in specifications:
                 raise OperationError(f"{consumer} references unknown observation unit {producer!r}")
             consumers[producer].add(consumer)

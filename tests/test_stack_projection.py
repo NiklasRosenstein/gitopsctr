@@ -8,7 +8,13 @@ from types import SimpleNamespace
 import pytest
 
 from gitopsctr import cli
-from gitopsctr.contracts import DesiredLifecycle, DesiredOwnerReference
+from gitopsctr.contracts import (
+    DesiredLifecycle,
+    DesiredOwnerReference,
+    DesiredStackSpec,
+    LifecycleManagement,
+    StackInstantiationProvenance,
+)
 from gitopsctr.errors import OperationError
 from gitopsctr.resources import ResourceMetadata, StackResource, validate_desired_resource_graph
 from gitopsctr.state import ControllerPin
@@ -176,6 +182,18 @@ def test_expanded_stack_dependencies_are_retained_and_validated(tmp_path: Path):
             source,
         )
     cli.load_desired_resource_graph(candidate)
+    current_desired = tmp_path / "empty-desired"
+    current_desired.mkdir()
+    specifications, dependencies = cli.load_convergence_specifications(
+        source,
+        "dev",
+        current_desired,
+        "a" * 40,
+        tmp_path / "convergence-projection",
+    )
+    selection = cli.convergence_scope(specifications, ["preview-app"], additional_dependencies=dependencies)
+    assert selection.scope == ("preview-app", "preview-db")
+    assert cli.convergence_order(specifications, selection.scope, dependencies) == ("preview-db", "preview-app")
     next(path for path in (candidate / "units").glob("preview-db.*")).unlink()
     with pytest.raises(OperationError, match="dependency 'preview-db' is absent"):
         cli.load_desired_resource_graph(candidate)
@@ -198,6 +216,7 @@ def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path:
     cli.write_desired_candidate_unit(candidate / "units/preview-app.json", unit, source)
 
     graph = cli.load_desired_resource_graph(candidate)
+    assert cli.desired_unit_names(candidate) == ("preview-app",)
     assert ("gitopsctr.io/v1", "StackTemplate", "preview") in graph
     assert ("gitopsctr.io/v1", "Stack", "web") in graph
     assert graph[("unit.gitopsctr.io/v1", "Terraform", "preview-app")].metadata.lifecycle is not None
@@ -224,6 +243,69 @@ def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path:
                 if not isinstance(value, StackResource) or value.gvk.kind != "StackTemplate"
             }
         )
+
+
+def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = _project(source)
+    _write_stack_source(environment)
+    authored_stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(environment / "stacks/web.json"),
+        profile="authored",
+        expected_name="web",
+    )
+    desired = tmp_path / "desired"
+    projection = cli.project_stack_resources(source, "dev", "a" * 40, desired, source)
+    (environment / "stacks/web.json").unlink()
+    stack = StackResource(
+        cli.GVK(cli.CORE_API_VERSION, "Stack"),
+        ResourceMetadata(
+            name="web",
+            uid="d1-stack-web",
+            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
+        ),
+        DesiredStackSpec(
+            template="preview",
+            parameters=authored_stack.spec.parameters,  # type: ignore[union-attr]
+            provenance=StackInstantiationProvenance(
+                templateRevision="a" * 40,
+                templatePath="deployment/environments/dev/stack-templates/preview.json",
+                templateDigest="b" * 64,
+                requestIdentity="pull-123",
+            ),
+        ),
+    )
+    for path in cli.document_candidates(desired / "stacks", "web"):
+        path.unlink()
+    (desired / "stacks/web.json").write_text(
+        json.dumps(cli.RESOURCE_CATALOG.serialize_stack_resource(stack, profile="desired"))
+    )
+    unit = projection.generated_units["preview-app"].with_metadata(
+        ResourceMetadata(
+            name="preview-app",
+            uid="d1-unit-preview-app",
+            lifecycle=DesiredLifecycle(
+                owner=DesiredOwnerReference(
+                    apiVersion=cli.CORE_API_VERSION,
+                    kind="Stack",
+                    name="web",
+                    uid="d1-stack-web",
+                )
+            ),
+        )
+    )
+    cli.write_desired_candidate_unit(desired / "units/preview-app.json", unit, source)
+
+    specifications, dependencies = cli.load_convergence_specifications(
+        source,
+        "dev",
+        desired,
+        "a" * 40,
+        tmp_path / "projection",
+    )
+    assert specifications["preview-app"].metadata.lifecycle is not None
+    assert specifications["preview-app"].metadata.lifecycle.owner is not None
+    assert dependencies == {"preview-app": ()}
 
 
 def test_stack_rejects_missing_template_during_projection(tmp_path: Path):
