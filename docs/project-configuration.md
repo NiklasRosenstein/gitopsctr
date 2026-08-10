@@ -79,7 +79,7 @@ highest priority. Expanded desired and observed refs must differ.
 refreshed or rejected for each operation. It defaults to:
 
 | Field | Default | Behavior |
-| --- | --- |
+| --- | --- | --- |
 | `unavailableWhen` | `outside-candidate-history` | A retained revision is available only when its commit is an ancestor of the candidate revision. `missing` checks only whether Git can resolve the commit object. |
 | `whenUnavailableDuringAdvance` | `refresh` | `advance-desired`, including `advance-desired --dry`, replaces the retained revision with the candidate revision. `error` leaves desired state unchanged. |
 | `whenUnavailableDuringPlan` | `error` | `reconcile --plan` fails before invoking the driver. `refresh` uses a refreshed source only in the dry candidate. |
