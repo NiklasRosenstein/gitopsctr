@@ -45,6 +45,18 @@ Final verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-
 remaining blockers for this implemented slice. Stack/StackTemplate, direct Stack operations, forge/source-pin
 orchestration, and full acceptance scenarios remain future milestones.
 
+### 2.1 Unit lifecycle hardening — complete for this increment
+
+Commit `118429d` closed the reviewed Unit defects for effect-lease completion and pre-effect failure cleanup,
+incarnation/tombstone migration and rollback fencing, and parseable GVK/driver transition finalization. It also made
+pull-request finalization reporting truthful when only a candidate advances and added focused regression coverage.
+
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 424 tests,
+lint, typecheck, schema freshness, strict docs, actionlint, and formatting. Sol High final review returned no
+confirmed or plausible findings. Remaining Unit backlog: resolved dependency preservation and post-lease
+revalidation, legacy/opaque-root operator recovery, teardown evidence plumbing, direct-root deletion, source pins,
+and the remaining acceptance scenarios.
+
 ### 3. StackTemplate and Stack resolution — pending
 
 ### 4. Direct Stack operations and source pins — pending

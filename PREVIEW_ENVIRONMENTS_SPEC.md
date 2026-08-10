@@ -19,7 +19,7 @@ The current branch is a Unit-focused foundation rather than an end-to-end previe
 | Area | Status | Reconciliation |
 | --- | --- | --- |
 | Desired Unit identity, lifecycle authority, ownership, legacy retention, rollback, and schema profiles | **Implemented for Unit** | Keep the generic semantic model; extend it to Stack and StackTemplate later. |
-| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented, hardening required** | Complete the correctness backlog below before calling the Unit milestone production-ready. |
+| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit; hardening in progress** | Commit `118429d` closes lease, incarnation, and parseable-transition defects; remaining dependency, recovery, evidence, direct-root, source-pin, and acceptance work is still open. |
 | StackTemplate contracts, Stack contracts, parameter expansion, and generated ownership graphs | **Pending** | Milestone 3. |
 | Direct Stack operations and UID-fenced deletion | **Pending** | Milestone 4. |
 | Controller-owned source pins, forge eligibility/expiry/orphan recovery, and Argo integration | **Pending** | Milestones 4–5. |
@@ -146,14 +146,14 @@ this Unit slice is complete is listed in [Unit lifecycle hardening](#unit-lifecy
 The 2026-08-10 correctness review found the following work items in the implemented Unit slice. These are required
 to close the Unit milestone; they are not changes to the settled lifecycle model.
 
-- **Lease completion and recovery:** Make finalization remove or complete its effect lease in the same UID- and
+- **Done in `118429d` — lease completion and recovery:** Finalization removes or completes its effect lease in the same UID- and
   revision-fenced publication as the Unit removal, or otherwise release it against the correct completion snapshot.
   Every known failure before an external effect begins (including retained-source materialization and driver lookup)
   MUST leave a retryable or explicitly recoverable state without an unintended permanent lease.
-- **Incarnation fencing:** Persist monotonic incarnation state, a tombstone, or an equivalent durable nonce so that
+- **Done in `118429d` — incarnation fencing:** Persist monotonic incarnation state, a tombstone, or an equivalent durable nonce so that
   recreating a finalized name receives a new UID. Old teardown evidence MUST never satisfy a later incarnation, even
   when GVK, name, source, and source revision are identical.
-- **Identity transitions:** A parseable GVK or driver transition MUST create a durable cleanup/finalization path for
+- **Done in `118429d` — identity transitions:** A parseable GVK or driver transition MUST create a durable cleanup/finalization path for
   the old identity, or a durable migration record that makes the replacement safe. Repeated advance MUST not retain
   the old Unit forever without an intent or actionable operator path.
 - **Resolved dependency preservation:** Teardown ordering MUST retain receipt/artifact dependencies after resolution,
@@ -306,6 +306,10 @@ Before declaring the Unit implementation milestone complete, the harness MUST co
 Shared recovery coverage MUST prove that one destroy failure retains cleanup inputs across restart and that a stale
 delete request for an old UID cannot affect a recreated same-name resource.
 
+The first four Unit hardening scenarios above—finalization lease completion, pre-effect failure cleanup, same-name
+incarnation fencing, and parseable GVK/driver replacement—are covered by commit `118429d`. The concurrent dependency,
+legacy, opaque-root, teardown-evidence, direct-root, and source-pin scenarios remain pending.
+
 ## Implementation checklist
 
 ### Completed in the current Unit slice
@@ -321,7 +325,8 @@ delete request for an old UID cannot affect a recreated same-name resource.
 
 ### Required to complete the Unit milestone
 
-- [ ] Close every item in [Unit lifecycle hardening](#unit-lifecycle-hardening).
+- [ ] Close the remaining items in [Unit lifecycle hardening](#unit-lifecycle-hardening); lease, incarnation, and
+  parseable-transition items are complete in `118429d`.
 - [ ] Add controller-owned source-pin creation, retention, and UID-/revision-fenced release.
 - [ ] Add the Unit hardening acceptance scenarios and recovery cases.
 
