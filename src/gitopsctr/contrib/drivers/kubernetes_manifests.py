@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
@@ -35,6 +36,9 @@ from gitopsctr.driver import (
     ReconciliationContext,
     ReconciliationOutput,
     ReconciliationResult,
+    TeardownCapability,
+    TeardownContext,
+    TeardownResult,
     UnitDriver,
     UnitResolution,
     UnitResolutionContext,
@@ -496,6 +500,7 @@ class KubernetesManifestsDriver(
     MaterializationCapability[KubernetesResolvedUnit, KubernetesDesiredUnit],
     PlanningCapability[KubernetesDesiredUnit],
     ReconciliationCapability[KubernetesDesiredUnit, KubernetesDriverResult],
+    TeardownCapability[KubernetesDesiredUnit],
     VerificationCapability[KubernetesDesiredUnit],
 ):
     api_version = "unit.gitopsctr.io/v1"
@@ -713,6 +718,28 @@ class KubernetesManifestsDriver(
                 )
             )
         )
+
+    def teardown(self, context: TeardownContext[KubernetesDesiredUnit]) -> TeardownResult:
+        """Wait until an externally managed Argo Application no longer exists."""
+
+        delivery = delivery_configuration(context.unit)
+        observer = argo_observer(delivery)
+        if observer is None:
+            raise DriverError(
+                "direct Kubernetes delivery has no controller-owned teardown; use provider cleanup before finalization"
+            )
+        deadline = time.monotonic() + observer.timeoutSeconds
+        while True:
+            try:
+                read_argo_application(context.execution, observer)
+            except subprocess.CalledProcessError as exc:
+                output = " ".join(part for part in (exc.stdout, exc.stderr) if part).lower()
+                if "not found" in output or "notfound" in output:
+                    return TeardownResult(details={"application": observer.application, "status": "absent"})
+                raise DriverError("Argo CD Application lookup failed during teardown") from exc
+            if time.monotonic() >= deadline:
+                raise DriverError(f"timed out waiting for Argo CD Application {observer.application!r} to be absent")
+            time.sleep(5)
 
     @staticmethod
     def _prune_previous(
