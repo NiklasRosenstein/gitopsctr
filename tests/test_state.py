@@ -137,6 +137,20 @@ def test_controller_pin_create_and_repeat_are_idempotent(bare_repository: BareRe
     assert _remote_revision(bare_repository, pin.ref) == revision
 
 
+def test_controller_pin_listing_is_sorted_and_read_only(bare_repository: BareRepository):
+    first = _git(bare_repository.working, "rev-parse", "HEAD")
+    second = _commit(bare_repository.working, "state", "second\n", "second")
+    _git(bare_repository.working, "push", "origin", "main")
+    store = GitStateStore(bare_repository.working)
+    store.create_controller_pin("stacks/prod/z", first)
+    store.create_controller_pin("stacks/prod/a", second)
+
+    assert store.list_controller_pins() == (
+        store.create_controller_pin("stacks/prod/a", second),
+        store.create_controller_pin("stacks/prod/z", first),
+    )
+
+
 def test_controller_pin_mismatched_create_fails_closed(bare_repository: BareRepository):
     first = _git(bare_repository.working, "rev-parse", "HEAD")
     second = _commit(bare_repository.working, "state", "second\n", "second")

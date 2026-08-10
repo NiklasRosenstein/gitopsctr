@@ -217,3 +217,44 @@ def test_finalize_stack_removes_root_and_releases_pin_after_children(tmp_path: P
     assert cli.load_desired_stack_deletion_intents(published[0]) == {}
     assert list((published[0] / "stack-templates").glob("preview.*"))
     assert released == [("stacks/dev/preview/d1-stack-direct", "a" * 40)]
+
+
+def test_recover_orphaned_stack_requests_cleanup_for_forge_ineligible_preview(tmp_path: Path, monkeypatch):
+    current = tmp_path / "current"
+    _stack_tree(current)
+    pin = ControllerPin(
+        "stacks/dev/preview/d1-stack-direct",
+        "refs/heads/gitopsctr/pins/stacks/dev/preview/d1-stack-direct",
+        "a" * 40,
+    )
+    published: list[Path] = []
+    store = SimpleNamespace(
+        list_controller_pins=lambda: [pin],
+        create_controller_pin=lambda name, revision: pin,
+    )
+    monkeypatch.setattr(cli, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(cli, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(cli, "materialize_revision", lambda _revision, output: shutil.copytree(current, output))
+    monkeypatch.setattr(cli, "state_store", lambda: store)
+    monkeypatch.setattr(cli, "git", _fake_git)
+    monkeypatch.setattr(
+        cli,
+        "preview_eligibility",
+        lambda *_args, **_kwargs: SimpleNamespace(status="ineligible", reason="pull request is closed"),
+    )
+    monkeypatch.setattr(cli, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+
+    def publish(_environment, candidate, *_args, **_kwargs):
+        snapshot = tmp_path / "published"
+        shutil.copytree(candidate, snapshot)
+        published.append(snapshot)
+        return "d" * 40, None
+
+    monkeypatch.setattr(cli, "publish_desired_change", publish)
+    args = cli.build_parser().parse_args(
+        ["recover-orphaned-stacks", "--environment", "dev", "--desired-ref", "deploy/dev"]
+    )
+
+    assert args.handler(args) is True
+    assert cli.load_desired_stack_deletion_intents(published[0])["preview"].uid == "d1-stack-direct"

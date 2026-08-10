@@ -79,6 +79,7 @@ from gitopsctr.forges import (
     ChangeRequestSpec,
     ManualChangeRequest,
     ensure_change_request,
+    preview_eligibility,
 )
 from gitopsctr.formats import (
     DEFAULT_CANDIDATE_REF_TEMPLATE,
@@ -6508,6 +6509,114 @@ def _stack_intent_for_resource(
     )
 
 
+def direct_stack_expiry(stack: StackResource) -> int | None:
+    """Read the optional controller-recognized ``expiresAt`` Stack parameter."""
+
+    if not isinstance(stack.spec, DesiredStackSpec):
+        return None
+    value = stack.spec.parameters.get("expiresAt")
+    if value is None:
+        return None
+    if type(value) is not int or value < 1:
+        raise OperationError(f"direct Stack {stack.name!r} has an invalid expiresAt parameter")
+    return value
+
+
+def _command_recover_orphaned_stacks(args: argparse.Namespace) -> bool:
+    _resource_name(args.environment, "environment name")
+    desired_ref, _observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, None)
+    current_revision = fetch_ref(desired_ref)
+    if current_revision is None:
+        log_status("KEEP", f"{style_environment(args.environment)}: no desired state")
+        return False
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        current = Path(temporary_directory) / "current"
+        materialize_revision(current_revision, current)
+        resources = load_desired_resource_graph(current)
+        intents = load_desired_stack_deletion_intents(current)
+        direct_stacks = sorted(
+            (
+                resource
+                for resource in resources.values()
+                if isinstance(resource, StackResource)
+                and resource.gvk.kind == "Stack"
+                and resource.metadata.lifecycle is not None
+                and resource.metadata.lifecycle.owner is None
+                and resource.metadata.lifecycle.management is not None
+                and resource.metadata.lifecycle.management.mode == "direct"
+            ),
+            key=lambda resource: resource.name,
+        )
+        if not direct_stacks:
+            log_status("KEEP", f"{style_environment(args.environment)}: no direct Stack roots")
+            return False
+
+        pins = {pin.name: pin for pin in state_store().list_controller_pins()} if not args.dry else {}
+        changed = False
+        now = effect_lease_now()
+        for stack in direct_stacks:
+            assert isinstance(stack.spec, DesiredStackSpec)
+            assert stack.metadata.uid is not None
+            intent = intents.get(stack.name)
+            if intent is not None:
+                log_status("WAIT", f"{stack.name}: deletion intent already active")
+                continue
+            if stack.spec.provenance is None:
+                raise OperationError(f"direct Stack {stack.name!r} is missing instantiation provenance")
+            pin_name = _stack_pin_name(args.environment, stack.name, stack.metadata.uid)
+            pin = pins.get(pin_name)
+            if args.dry:
+                if pin is None:
+                    log_status("WAIT", f"{stack.name}: source pin is not present; recovery would create it")
+                    continue
+            else:
+                if pin is not None and pin.revision != stack.spec.provenance.templateRevision:
+                    raise OperationError(
+                        f"source pin for Stack {stack.name!r} is fenced at {pin.revision}, "
+                        f"not template revision {stack.spec.provenance.templateRevision}"
+                    )
+                if pin is None:
+                    state_store().create_controller_pin(pin_name, stack.spec.provenance.templateRevision)
+
+            expiry = direct_stack_expiry(stack)
+            if expiry is not None and expiry <= now:
+                reason = f"expiresAt {expiry} has passed"
+            else:
+                eligibility = preview_eligibility(
+                    stack.spec.provenance.requestIdentity,
+                    required_label=args.required_label,
+                    cwd=REPOSITORY_ROOT,
+                )
+                reason = eligibility.reason
+                if eligibility.status == "unknown":
+                    log_status("WAIT", f"{stack.name}: forge eligibility unknown; {reason}")
+                    continue
+                if eligibility.status == "eligible":
+                    log_status("KEEP", f"{stack.name}: preview remains eligible; {reason}")
+                    continue
+
+            log_status("REQUEST", f"{stack.name}: preview is ineligible; {reason}")
+            changed = (
+                _command_request_delete_direct_stack(
+                    argparse.Namespace(
+                        environment=args.environment,
+                        stack=stack.name,
+                        uid=stack.metadata.uid,
+                        desired_ref=args.desired_ref,
+                        candidate_ref=args.candidate_ref,
+                        dry=args.dry,
+                    )
+                )
+                or changed
+            )
+        return changed
+
+
+def command_recover_orphaned_stacks(args: argparse.Namespace) -> bool:
+    with unit_effect_lock(args.environment, "stack-garbage-collector"):
+        return _command_recover_orphaned_stacks(args)
+
+
 def _command_request_delete_direct_stack(args: argparse.Namespace) -> bool:
     _resource_name(args.environment, "environment name")
     _resource_name(args.stack, "Stack name")
@@ -8837,6 +8946,7 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
             "Recovery",
             (
                 "recover-opaque-unit",
+                "recover-orphaned-stacks",
                 "request-delete-direct-unit",
                 "request-delete-direct-stack",
                 "finalize",
@@ -9081,6 +9191,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recover_opaque.add_argument("--dry", action="store_true")
     recover_opaque.set_defaults(handler=command_recover_opaque_unit)
+
+    recover_stacks = commands.add_parser(
+        "recover-orphaned-stacks",
+        help="request cleanup for direct Stacks whose preview is expired or forge-ineligible",
+    )
+    recover_stacks.add_argument("--environment", required=True)
+    recover_stacks.add_argument(
+        "--required-label",
+        help="GitHub pull-request label required for preview eligibility",
+    )
+    recover_stacks.add_argument("--desired-ref", help="override the environment's desired ref")
+    recover_stacks.add_argument(
+        "--candidate-ref",
+        help="exact candidate ref override when the environment uses a pull-request change gate",
+    )
+    recover_stacks.add_argument("--dry", action="store_true")
+    recover_stacks.set_defaults(handler=command_recover_orphaned_stacks)
 
     request_delete_direct = commands.add_parser(
         "request-delete-direct-unit",

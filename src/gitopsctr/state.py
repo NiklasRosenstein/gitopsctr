@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -153,6 +154,26 @@ class GitStateStore:
                 f"controller pin {name!r} changed during release to unexpected revision {remaining_revision}"
             )
         raise OperationError(released.stderr.strip() or f"could not release controller pin {name!r}")
+
+    def list_controller_pins(self) -> tuple[ControllerPin, ...]:
+        """List controller-owned pins from the remote without mutating refs."""
+
+        prefix = "refs/heads/gitopsctr/pins/"
+        result = self.git("ls-remote", "--refs", "origin", f"{prefix}*", check=False)
+        if result.returncode != 0:
+            raise OperationError(result.stderr.strip() or "could not inspect controller pins")
+        pins: list[ControllerPin] = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 2:
+                raise OperationError("controller pin inspection returned an invalid result")
+            revision, ref = fields
+            if not re.fullmatch(r"[0-9a-f]{40}", revision) or not ref.startswith(prefix):
+                raise OperationError("controller pin inspection returned an invalid ref")
+            name = ref.removeprefix(prefix)
+            self._controller_pin_ref(name)
+            pins.append(ControllerPin(name, ref, revision))
+        return tuple(sorted(pins, key=lambda pin: pin.name))
 
     def _controller_pin_ref(self, name: str) -> str:
         ref = f"refs/heads/gitopsctr/pins/{name}"

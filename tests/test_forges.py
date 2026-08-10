@@ -187,6 +187,59 @@ def test_unavailable_or_unauthenticated_github_cli_returns_manual_fallback():
     assert "gh auth login" in unauthenticated.reason
 
 
+@pytest.mark.parametrize(
+    ("payload", "label", "status"),
+    [
+        ({"state": "OPEN", "labels": []}, None, "eligible"),
+        ({"state": "OPEN", "labels": [{"name": "preview"}]}, "preview", "eligible"),
+        ({"state": "OPEN", "labels": []}, "preview", "ineligible"),
+        ({"state": "MERGED", "labels": [{"name": "preview"}]}, "preview", "ineligible"),
+    ],
+)
+def test_github_preview_eligibility_is_fail_closed_and_label_aware(payload, label, status):
+    result = deployment_forges.github_preview_eligibility(payload, label)
+
+    assert result.status == status
+
+
+def test_github_preview_adapter_reads_pull_request_state(tmp_path):
+    runner = FakeRunner(_completed(stdout='{"state":"OPEN","mergedAt":null,"labels":[]}\n'))
+
+    result = deployment_forges.preview_eligibility(
+        "github:example-org/example-deployment#17",
+        remote_url="git@github.com:example-org/example-deployment.git",
+        runner=runner,
+        cwd=tmp_path,
+    )
+
+    assert result.status == "eligible"
+    assert runner.calls == [
+        (
+            (
+                "gh",
+                "pr",
+                "view",
+                "17",
+                "--repo",
+                "example-org/example-deployment",
+                "--json",
+                "state,mergedAt,labels",
+            ),
+            tmp_path,
+        )
+    ]
+
+
+def test_opaque_preview_identity_does_not_guess_forge_state():
+    result = deployment_forges.preview_eligibility(
+        "pull-123",
+        remote_url="git@github.com:example-org/example-deployment.git",
+        runner=FakeRunner(),
+    )
+
+    assert result.status == "unknown"
+
+
 def test_explicit_adapter_is_the_plugin_seam_for_other_forges():
     expected = deployment_forges.ChangeRequestResult(
         status="created", url="https://gitlab.example/group/project/-/merge_requests/3"
