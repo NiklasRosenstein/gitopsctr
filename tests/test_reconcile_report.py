@@ -240,6 +240,8 @@ def test_promotion_reference_reads_typed_resource_spec_before_applying_pointer(t
 
 def test_unknown_unit_fails_before_advancing_desired_state(monkeypatch):
     def fake_git(*args, **_kwargs):
+        if args[0] == "status":
+            return subprocess.CompletedProcess(args, 0, "", "")
         assert args == ("rev-parse", "HEAD^{commit}")
         return subprocess.CompletedProcess(args, 0, "a" * 40 + "\n", "")
 
@@ -268,6 +270,48 @@ def test_unknown_unit_fails_before_advancing_desired_state(monkeypatch):
                 require_source_ref=None,
             )
         )
+
+
+@pytest.mark.parametrize("plan", [False, True])
+def test_reconcile_source_revision_requests_dirty_source_warning(monkeypatch, plan):
+    warnings = []
+
+    monkeypatch.setattr(
+        deploy_release,
+        "git",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(args, 0, "a" * 40 + "\n", ""),
+    )
+    monkeypatch.setattr(deploy_release, "warn_if_source_revision_excludes_changes", warnings.append)
+    if plan:
+        monkeypatch.setattr(
+            deploy_release,
+            "materialize_revision",
+            lambda *_args: (_ for _ in ()).throw(deploy_release.OperationError("stop after warning")),
+        )
+    else:
+        monkeypatch.setattr(
+            deploy_release,
+            "advance_desired",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(deploy_release.OperationError("stop after warning")),
+        )
+
+    with pytest.raises(deploy_release.OperationError, match="stop after warning"):
+        deploy_release.command_reconcile(
+            Namespace(
+                unit="aws-application",
+                environment="dev",
+                desired_ref="deploy/dev",
+                desired_revision=None,
+                observed_ref="observed/dev",
+                plan=plan,
+                report=None,
+                source_revision="HEAD",
+                advance=not plan,
+                require_source_ref=None,
+            )
+        )
+
+    assert warnings == ["a" * 40]
 
 
 def test_known_unmaterialized_unit_remains_a_successful_wait(monkeypatch):
@@ -454,6 +498,8 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
     advance_results = iter([("d" * 40, True), ("d" * 40, False)])
 
     def fake_git(*args, **_kwargs):
+        if args[0] == "status":
+            return subprocess.CompletedProcess(args, 0, "", "")
         assert args == ("rev-parse", "HEAD^{commit}")
         return subprocess.CompletedProcess(args, 0, "a" * 40 + "\n", "")
 

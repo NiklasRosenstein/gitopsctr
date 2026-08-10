@@ -759,6 +759,24 @@ def test_promote_parser_exposes_environment_and_revision_contract():
     assert args.source_desired_revision == "a" * 40
 
 
+def test_advance_desired_command_requests_dirty_source_warning(monkeypatch, capsys):
+    calls = []
+
+    def fake_advance(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "a" * 40, False
+
+    monkeypatch.setattr(deploy_release, "advance_desired", fake_advance)
+    args = deploy_release.build_parser().parse_args(
+        ["advance-desired", "--environment", "dev", "--source-revision", "HEAD", "--dry"]
+    )
+
+    args.handler(args)
+
+    assert calls[0][1]["warn_uncommitted"] is True
+    assert capsys.readouterr().out == "a" * 40 + "\n"
+
+
 def _install_promotion_simulation(monkeypatch, gate: str):
     specification_revision = "a" * 40
     source_desired_revision = "b" * 40
@@ -870,6 +888,46 @@ def test_progress_helpers_keep_result_stdout_clean(capsys):
     output = capsys.readouterr()
     assert output.out == ""
     assert output.err == "\n==> Reconcile frontend\n    DONE     frontend: clean\n"
+
+
+@pytest.mark.parametrize("change", ["unstaged", "staged", "untracked", "ignored"])
+def test_working_tree_change_detection_matches_git_status(tmp_path, monkeypatch, change):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repository, check=True)
+    tracked = repository / "tracked.txt"
+    tracked.write_text("initial\n")
+    if change == "ignored":
+        (repository / ".gitignore").write_text("ignored.txt\n")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=repository, check=True, capture_output=True)
+
+    if change in {"unstaged", "staged"}:
+        tracked.write_text("changed\n")
+    elif change == "untracked":
+        (repository / "untracked.txt").write_text("new\n")
+    else:
+        (repository / "ignored.txt").write_text("ignored\n")
+    if change == "staged":
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", repository)
+    assert deploy_release.working_tree_has_uncommitted_changes() == (change != "ignored")
+
+
+def test_source_revision_warning_is_actionable(monkeypatch, capsys):
+    monkeypatch.setattr(deploy_release, "working_tree_has_uncommitted_changes", lambda: True)
+    monkeypatch.setattr(deploy_release, "describe_revision", lambda revision: revision[:12])
+
+    deploy_release.warn_if_source_revision_excludes_changes("a" * 40)
+
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "WARN" in output.err
+    assert "uncommitted working-tree changes are excluded from source revision aaaaaaaaaaaa" in output.err
+    assert "commit them and select the resulting commit" in output.err
 
 
 class _FakeStream(io.StringIO):
@@ -1793,11 +1851,12 @@ def _install_convergence_simulation(
         "advance_summarize": [],
     }
 
-    monkeypatch.setattr(
-        deploy_release,
-        "git",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(_args, 0, source_revision + "\n", ""),
-    )
+    def fake_git(*args, **_kwargs):
+        if args[0] == "status":
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, source_revision + "\n", "")
+
+    monkeypatch.setattr(deploy_release, "git", fake_git)
 
     def write_source(output: Path):
         _write_json(
@@ -1931,6 +1990,24 @@ def test_converge_runs_dependency_first_and_ignores_unselected_unit(tmp_path, mo
     assert "RUN      consumer" in output
     assert "RESULT   CLEAN: 2/2 units" in output
     assert "DEPEND" not in output
+    assert "WARN" not in output
+
+
+def test_converge_warns_once_for_uncommitted_source_changes(tmp_path, monkeypatch, capsys):
+    _install_convergence_simulation(
+        monkeypatch,
+        tmp_path,
+        {"application": _unit("application")},
+        [{"application": "v1"}],
+    )
+    monkeypatch.setattr(deploy_release, "working_tree_has_uncommitted_changes", lambda: True)
+    args = deploy_release.build_parser().parse_args(
+        ["converge", "--environment", "dev", "--source-revision", "HEAD", "--yes"]
+    )
+
+    args.handler(args)
+
+    assert capsys.readouterr().err.count("WARN") == 1
 
 
 def test_converge_requires_approval_before_each_reconciliation(tmp_path, monkeypatch, capsys):
@@ -2187,4 +2264,6 @@ def test_promoted_converge_uses_merged_specification_without_source_revision(tmp
 
     args.handler(args)
 
-    assert "RESULT   CLEAN" in capsys.readouterr().err
+    output = capsys.readouterr().err
+    assert "RESULT   CLEAN" in output
+    assert "WARN" not in output

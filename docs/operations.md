@@ -36,6 +36,10 @@ gitopsctr reconcile --environment dev --unit application --plan --source-revisio
 gitopsctr reconcile --environment dev --unit application
 ```
 
+When a source revision is selected, advance-desired, reconcile, and converge use its committed snapshot. If the working
+tree has staged, unstaged, or untracked changes, gitopsctr warns that they are excluded; commit and select the resulting
+commit if they should affect the operation.
+
 The dry advance previews controller-owned Git changes. A reconciliation plan lets the selected driver inspect its
 prospective work without applying or publishing a receipt. Real reconciliation publishes a receipt only after the
 driver succeeds.

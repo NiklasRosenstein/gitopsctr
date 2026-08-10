@@ -238,6 +238,7 @@ STATUS_ROLES = {
     "DRIFT": "warning",
     "UNSCOPED": "warning",
     "APPROVE": "warning",
+    "WARN": "warning",
     "FAILED": "error",
     "INVALID": "error",
     "READY": "focus",
@@ -393,6 +394,22 @@ def describe_revision(revision: str | None, stream: TextIO | None = None) -> str
 
 def git(*args: str, check: bool = True, input_text: str | None = None, env=None):
     return state_store().git(*args, check=check, input_text=input_text, env=env)
+
+
+def working_tree_has_uncommitted_changes() -> bool:
+    """Return whether tracked, staged, or untracked work is absent from a commit snapshot."""
+    status = git("status", "--porcelain=v1", "--untracked-files=normal")
+    return bool(status.stdout)
+
+
+def warn_if_source_revision_excludes_changes(source_revision: str | None) -> None:
+    if source_revision is None or not working_tree_has_uncommitted_changes():
+        return
+    log_status(
+        "WARN",
+        f"uncommitted working-tree changes are excluded from source revision "
+        f"{describe_revision(source_revision)}; commit them and select the resulting commit to include them",
+    )
 
 
 @cache
@@ -2143,6 +2160,7 @@ def advance_desired(
     dry: bool = False,
     summarize: bool = True,
     verbose: bool = True,
+    warn_uncommitted: bool = False,
 ) -> tuple[str | None, bool]:
     desired_override = desired_ref
     observed_override = observed_ref
@@ -2159,6 +2177,8 @@ def advance_desired(
                 else f"environment {style_environment(environment)} from its merged promotion"
             ),
         )
+    if warn_uncommitted:
+        warn_if_source_revision_excludes_changes(requested_source_revision)
     if requested_source_revision is None:
         desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, environment, desired_ref, observed_ref)
     else:
@@ -2261,6 +2281,7 @@ def command_advance_desired(args: argparse.Namespace) -> None:
         args.observed_ref,
         args.require_source_ref,
         args.dry,
+        warn_uncommitted=True,
     )
     if revision:
         print(revision)
@@ -3313,6 +3334,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 log_status("DONE", f"{style_unit(args.unit)}: no changes")
                 write_reconcile_outputs(False)
                 return False
+        warn_if_source_revision_excludes_changes(source_revision)
         candidate_source_root: Path | None = None
         if source_revision and args.plan:
             candidate_source_root = temporary / "candidate-source"
@@ -3651,6 +3673,7 @@ def command_converge(args: argparse.Namespace) -> None:
         "SOURCE",
         describe_revision(source_revision) if source_revision else "merged promotion",
     )
+    warn_if_source_revision_excludes_changes(source_revision)
 
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
