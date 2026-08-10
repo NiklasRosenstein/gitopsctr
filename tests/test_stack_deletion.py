@@ -264,3 +264,35 @@ def test_recover_orphaned_stack_requests_cleanup_for_forge_ineligible_preview(tm
 
     assert args.handler(args) is True
     assert cli.load_desired_stack_deletion_intents(published[0])["preview"].uid == "d1-stack-direct"
+
+
+def test_recover_orphan_pin_releases_only_after_finalized_stack_tombstone(tmp_path: Path, monkeypatch):
+    current = tmp_path / "current"
+    _stack_tree(current)
+    (current / "stacks/preview.json").unlink()
+    (current / "units/preview--preview-app.json").unlink()
+    cli.write_stack_incarnation_tombstone(
+        current,
+        cli.StackIncarnationTombstone(stack_name="preview", uid="d1-stack-direct"),
+    )
+    pin = ControllerPin(
+        "stacks/dev/preview/d1-stack-direct",
+        "refs/heads/gitopsctr/pins/stacks/dev/preview/d1-stack-direct",
+        "a" * 40,
+    )
+    released: list[tuple[str, str]] = []
+    store = SimpleNamespace(
+        list_controller_pins=lambda: [pin],
+        release_controller_pin=lambda name, revision: released.append((name, revision)) or True,
+    )
+    monkeypatch.setattr(cli, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(cli, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(cli, "materialize_revision", lambda _revision, output: shutil.copytree(current, output))
+    monkeypatch.setattr(cli, "state_store", lambda: store)
+    args = cli.build_parser().parse_args(
+        ["recover-orphaned-stacks", "--environment", "dev", "--desired-ref", "deploy/dev"]
+    )
+
+    assert args.handler(args) is True
+    assert released == [(pin.name, pin.revision)]

@@ -6383,6 +6383,18 @@ def _stack_pin_name(environment: str, stack_name: str, uid: str) -> str:
     return f"stacks/{environment}/{stack_name}/{uid}"
 
 
+def _parse_stack_pin_name(environment: str, name: str) -> tuple[str, str] | None:
+    parts = name.split("/")
+    if len(parts) != 4 or parts[0] != "stacks" or parts[1] != environment:
+        return None
+    stack_name, uid = parts[2], parts[3]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", stack_name):
+        return None
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", uid):
+        return None
+    return stack_name, uid
+
+
 def _parse_stack_parameters(raw: str) -> JsonObjectValue:
     try:
         value = json.loads(raw)
@@ -6520,10 +6532,6 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
             name=args.stack,
             uid=direct_uid,
         )
-        if not args.dry:
-            state_store().create_controller_pin(
-                _stack_pin_name(args.environment, args.stack, direct_uid), source_revision
-            )
         for resource in expanded:
             unit_path = unit_document_path(candidate, resource.name)
             if not unit_path.is_file():
@@ -6557,18 +6565,35 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
             candidate_id,
             args.candidate_ref,
         )
-        revision, outcome = publish_desired_change(
-            args.environment,
-            candidate,
-            desired_ref,
-            current_revision,
-            candidate_ref,
-            f"Instantiate direct Stack {args.stack}",
-            f"Instantiate direct Stack {args.stack}",
-            f"Create a UID-fenced direct Stack `{args.stack}` from StackTemplate `{args.template}`.",
-            args.dry,
-            current,
-        )
+        pin_name = _stack_pin_name(args.environment, args.stack, direct_uid)
+        if not args.dry:
+            state_store().create_controller_pin(pin_name, source_revision)
+        try:
+            revision, outcome = publish_desired_change(
+                args.environment,
+                candidate,
+                desired_ref,
+                current_revision,
+                candidate_ref,
+                f"Instantiate direct Stack {args.stack}",
+                f"Instantiate direct Stack {args.stack}",
+                f"Create a UID-fenced direct Stack `{args.stack}` from StackTemplate `{args.template}`.",
+                args.dry,
+                current,
+            )
+        except OperationError:
+            # A pin created for a candidate that was never published is not a
+            # cleanup source. Release it only when both target and candidate
+            # refs still prove that no desired Stack became reachable.
+            if not args.dry:
+                candidate_exists = fetch_ref(candidate_ref) is not None
+                target_unchanged = fetch_ref(desired_ref) == current_revision
+                if not candidate_exists and target_unchanged:
+                    try:
+                        state_store().release_controller_pin(pin_name, source_revision)
+                    except OperationError:
+                        pass
+            raise
         if args.dry:
             return False
         print(revision)
@@ -6661,6 +6686,8 @@ def _command_recover_orphaned_stacks(args: argparse.Namespace) -> bool:
         materialize_revision(current_revision, current)
         resources = load_desired_resource_graph(current)
         intents = load_desired_stack_deletion_intents(current)
+        pins = {pin.name: pin for pin in state_store().list_controller_pins()}
+        tombstones = load_desired_stack_incarnation_tombstones(current)
         direct_stacks = sorted(
             (
                 resource
@@ -6674,11 +6701,6 @@ def _command_recover_orphaned_stacks(args: argparse.Namespace) -> bool:
             ),
             key=lambda resource: resource.name,
         )
-        if not direct_stacks:
-            log_status("KEEP", f"{style_environment(args.environment)}: no direct Stack roots")
-            return False
-
-        pins = {pin.name: pin for pin in state_store().list_controller_pins()}
         changed = False
         now = effect_lease_now()
         for stack in direct_stacks:
@@ -6736,6 +6758,25 @@ def _command_recover_orphaned_stacks(args: argparse.Namespace) -> bool:
                 )
                 or changed
             )
+        direct_uids = {(stack.name, stack.metadata.uid) for stack in direct_stacks if stack.metadata.uid is not None}
+        for pin in pins.values():
+            parsed = _parse_stack_pin_name(args.environment, pin.name)
+            if parsed is None:
+                log_status("WAIT", f"controller pin {pin.name}: identity is not recoverable")
+                continue
+            stack_name, uid = parsed
+            if (stack_name, uid) in direct_uids:
+                continue
+            tombstone = tombstones.get(stack_name)
+            if tombstone is None or tombstone.uid != uid:
+                log_status("WAIT", f"{stack_name}: orphan pin has no finalized Stack tombstone; retaining source")
+                continue
+            log_status("RELEASE", f"{stack_name}: finalized Stack tombstone confirms pin is no longer needed")
+            if not args.dry:
+                state_store().release_controller_pin(pin.name, pin.revision)
+            changed = True
+        if not direct_stacks and not pins:
+            log_status("KEEP", f"{style_environment(args.environment)}: no direct Stack roots or controller pins")
         return changed
 
 
