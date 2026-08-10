@@ -3,7 +3,7 @@
 ## Run configuration
 
 - Work source: `PREVIEW_ENVIRONMENTS_SPEC.md` (named by the user; no separate roadmap exists).
-- Operating mode: Mode B intended; feature-branch creation is currently blocked by checkout permissions, so work is remaining in the current working tree.
+- Operating mode: Mode B intended; work is isolated on the `codex/preview-environments` feature branch.
 - Dispatch: native parallel sub-agents; implementation uses Luna High with high reasoning; advisory/review uses Sol High only.
 - Status medium: this file plus concise milestone recaps in the task.
 - Deployment: CI-driven only if configured; no manual deployment.
@@ -68,6 +68,21 @@ Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache 
 lint, typecheck, schema freshness, strict docs, actionlint, and formatting. Sol High review returned no confirmed or
 plausible findings. Remaining Unit backlog: legacy/opaque-root operator recovery, teardown evidence plumbing,
 direct-root deletion, controller-owned source pins, forge-side merge enforcement, and the remaining acceptance cases.
+
+### 2.3 Unit compatibility recovery — complete for this increment
+
+Commit `816a8a4` closes the legacy/opaque recovery gap. Reconciliation now blocks legacy desired Units before driver or
+effect execution until `advance-desired` adopts them against an authoritative source revision. The new
+`recover-opaque-unit` operation restores parseable opaque cleanup roots under an exact UID fence, preserves immutable
+deletion-intent identity and dependencies, migrates generation-one intents, validates/copies materialization payloads,
+handles source absence and identity transitions, and rejects stale same-identity source state. It is publication-gated
+and does not reconcile, tear down, or write observed evidence.
+
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 437 tests,
+lint, typecheck, schema freshness, strict docs, actionlint, and formatting. Sol High found six confirmed defects in the
+initial recovery patch; Luna High addressed all six and the regression suite passed. Remaining Unit backlog:
+teardown-evidence plumbing, direct-root deletion, controller-owned source pins, permanently unparseable-root operator
+resolution, forge-side merge enforcement, and the remaining acceptance cases.
 
 ### 3. StackTemplate and Stack resolution — pending
 

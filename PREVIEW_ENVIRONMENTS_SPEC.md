@@ -1,9 +1,9 @@
 # Stacks and preview environments — living implementation spec
 
-> **Status:** Living implementation design. The lifecycle-aware desired-resource envelope and a Unit-specific
-> finalization slice are implemented, but the Unit slice still has correctness hardening work and the Stack,
-> direct-management, forge, and acceptance layers remain pending. Field names, document layouts, and command names
-> are illustrative unless explicitly marked **Settled**.
+> **Status:** Living implementation design. The lifecycle-aware desired-resource envelope and a hardened Unit-specific
+> finalization slice are implemented. Teardown-evidence plumbing, direct-management, source pins, Stack, forge, and
+> end-to-end acceptance remain pending. Field names, document layouts, and command names are illustrative unless
+> explicitly marked **Settled**.
 
 Last updated: 2026-08-10
 
@@ -19,15 +19,16 @@ The current branch is a Unit-focused foundation rather than an end-to-end previe
 | Area | Status | Reconciliation |
 | --- | --- | --- |
 | Desired Unit identity, lifecycle authority, ownership, legacy retention, rollback, and schema profiles | **Implemented for Unit** | Keep the generic semantic model; extend it to Stack and StackTemplate later. |
-| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit; hardening in progress** | Commits `118429d` and `22d7814` close lease, incarnation, transition, resolved-dependency, and pre-lease-race defects; remaining recovery, evidence, direct-root, source-pin, and acceptance work is still open. |
+| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit; final hardening in progress** | Commits `118429d`, `22d7814`, and `816a8a4` close lease, incarnation, transition, dependency, legacy-safety, and opaque-recovery defects; teardown-evidence, direct-root, source-pin, and acceptance work remains. |
 | StackTemplate contracts, Stack contracts, parameter expansion, and generated ownership graphs | **Pending** | Milestone 3. |
 | Direct Stack operations and UID-fenced deletion | **Pending** | Milestone 4. |
 | Controller-owned source pins, forge eligibility/expiry/orphan recovery, and Argo integration | **Pending** | Milestones 4–5. |
 | End-to-end acceptance, security, operations, and legacy retirement | **Pending** | Milestones 6–7. |
 
-The repository verification suite currently passes, but the suite does not yet cover the concurrency, recovery, and
-incarnation scenarios in the hardening backlog. Passing verification is therefore necessary, not sufficient, for the
-Unit finalization milestone.
+The repository verification suite currently passes (`437` tests), including the landed concurrency, recovery, and
+incarnation regressions. Passing verification is therefore necessary, not sufficient, for the remaining Unit
+finalization milestone because teardown-evidence, direct-root, source-pin, and end-to-end acceptance contracts are
+still open.
 
 ## Problem and scope
 
@@ -162,12 +163,13 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
 - **Done in `22d7814` — post-lease dependency revalidation:** Recheck the owned/dependent closure after acquiring the effect lease, or
   include the closure in the lease snapshot and reject changes to it. Candidate publication and external forge merges
   MUST not be able to introduce a new dependent into an already-running teardown without invalidating the operation.
-- **Legacy reconciliation safety:** Applying a legacy desired Unit without an authoritative advance MUST produce an
-  actionable migration block or perform the explicitly authorized adoption. It MUST never reach an unconditional UID
-  assertion or invoke an effect with implicit authority.
-- **Opaque-root recovery:** Add an explicit, UID-fenced adoption or cleanup operation for opaque roots, including
-  source-absent roots. A persisted opaque cleanup envelope MUST have a documented path to finalization or safe
-  operator resolution.
+- **Done in `816a8a4` — legacy reconciliation safety:** Applying a legacy desired Unit without an authoritative advance
+  now stops before driver loading or effect-lease acquisition with migration guidance. `advance-desired` remains the
+  adoption path and never infers direct management or ownership.
+- **Done in `816a8a4` — opaque-root recovery:** `recover-opaque-unit` provides an explicit, UID-fenced, change-gated
+  recovery path for parseable opaque roots, including source-absent roots and identity transitions. It preserves
+  deletion intent and immutable cleanup fences, migrates generation-one intents, validates retained materialization,
+  rejects stale source state, and never invokes reconciliation, teardown, or observed-evidence writes.
 - **Teardown evidence contract:** Extend `TeardownContext` with the prior receipt and relevant prior teardown
   evidence, and define how `TeardownResult.details` are persisted or superseded. Controller evidence remains fenced
   by resource UID and deletion generation; driver-specific evidence MUST be available for idempotent retries.
@@ -297,18 +299,22 @@ Before declaring the Unit implementation milestone complete, the harness MUST co
   the original expressions.
 - Add a dependent concurrently between dependency inspection and lease acquisition, and prove teardown revalidates
   the closure or fences the operation.
-- Apply a legacy desired Unit without `--advance` and prove it blocks safely with migration guidance.
+- Apply a legacy desired Unit without `--advance` and prove it blocks safely with migration guidance. **Covered by
+  `816a8a4`.**
 - Create an opaque cleanup root, remove its source, restart, and prove the documented adoption or cleanup operation
-  can resolve it.
+  can resolve it. **Covered for parseable roots by `816a8a4`; permanently unparseable roots remain an explicit
+  operator-resolution case.**
 - Pass prior receipt/evidence into teardown and prove driver result details survive restart and remain UID/generation
   fenced.
 
 Shared recovery coverage MUST prove that one destroy failure retains cleanup inputs across restart and that a stale
 delete request for an old UID cannot affect a recreated same-name resource.
 
-Commits `118429d` and `22d7814` cover finalization lease completion, pre-effect failure cleanup, same-name incarnation
-fencing, parseable GVK/driver replacement, resolved dependency preservation, and pre-lease dependency revalidation.
-The legacy, opaque-root, teardown-evidence, direct-root, source-pin, and remaining acceptance scenarios remain pending.
+Commits `118429d`, `22d7814`, and `816a8a4` cover finalization lease completion, pre-effect failure cleanup,
+same-name incarnation fencing, parseable GVK/driver replacement, resolved dependency preservation, pre-lease
+dependency revalidation, legacy application blocking, and parseable opaque-root recovery. Teardown evidence,
+direct-root, source-pin, permanently unparseable-root operator resolution, and remaining acceptance scenarios remain
+pending.
 
 ## Implementation checklist
 
@@ -322,11 +328,14 @@ The legacy, opaque-root, teardown-evidence, direct-root, source-pin, and remaini
 - [x] Add Unit driver teardown and Terraform destroy capability.
 - [x] Add UID/generation-fenced observed teardown evidence and retry-safe effect-lease publication.
 - [x] Add Unit reconciliation/status diagnostics and generated schema coverage.
+- [x] Block legacy reconciliation without authoritative adoption and add UID-/generation-fenced recovery for parseable
+  opaque cleanup roots, including source-absent and identity-transition cases.
 
 ### Required to complete the Unit milestone
 
-- [ ] Close the remaining items in [Unit lifecycle hardening](#unit-lifecycle-hardening); lease, incarnation, and
-  parseable-transition items are complete in `118429d`.
+- [ ] Close the remaining items in [Unit lifecycle hardening](#unit-lifecycle-hardening); lease, incarnation,
+  parseable-transition, legacy-safety, and parseable-opaque-recovery items are complete in `118429d`, `22d7814`, and
+  `816a8a4`.
 - [ ] Add controller-owned source-pin creation, retention, and UID-/revision-fenced release.
 - [ ] Add the Unit hardening acceptance scenarios and recovery cases.
 
