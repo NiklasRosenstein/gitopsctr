@@ -126,21 +126,32 @@ race and advised this narrow verifier. Repository branch-protection or required-
 still needed for an authoritative merge-time guarantee; source pins, permanently unparseable-root operator
 resolution, and the remaining acceptance cases are also pending.
 
-### 3. StackTemplate and Stack contract foundation — complete; projection pending
+### 3. StackTemplate and Stack resolution — creation/projection complete; deletion pending
 
-Commit `eb0bcb9` adds typed authored/desired StackTemplate and Stack contracts, public schema publication, strict
+Commits `eb0bcb9`, `b441941`, and `84d7ddb` add typed authored/desired StackTemplate and Stack contracts, public schema publication, strict
 parameter declarations for string/integer/number/boolean/object/array values, recursive `fromParameter` expansion,
-and deterministic dependency-graph validation. StackTemplates are represented as inert reusable definitions; this
-increment does not yet project Stack-owned Units or execute lifecycle effects.
+and deterministic dependency-graph validation. StackTemplates are represented as inert reusable definitions; source
+and direct Stack projection now emits UID-fenced owned Units, and direct instantiation persists exact template
+provenance with replay/collision fencing. Stack deletion/finalization remains pending.
 
-Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 483 tests,
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 496 tests,
 lint, typecheck, schema freshness, strict docs, actionlint, formatting, and diff checks. Remaining Milestone 3 work is
-source/candidate projection, generated Unit ownership, and generic desired-graph validation.
+generic desired-graph validation, and direct Stack owner-graph acceptance.
 
-### 4. Direct Stack operations and source pins — pending
+### 4. Controller-owned source-pin primitive — complete; lifecycle wiring pending
 
-### 5. Terraform/observed cleanup and Argo/forge integrations — pending
+Commit `5d3a5a0` adds idempotent controller-owned Git pin creation and UID/revision-fenced release without force-push,
+with bare-repository coverage for create, repeat, mismatched create, matching release, stale release, and missing
+release. Stack instantiation/finalization and orphan recovery still need to call this primitive.
 
-### 6. Acceptance harness and security/operations documentation — pending
+### 5. Direct Stack instantiation — complete; deletion pending
 
-### 7. Remove legacy compatibility after migration condition — pending
+Commit `84d7ddb` adds `instantiate-stack`, exact template revision/path/digest provenance, request replay fencing,
+direct management metadata, and Stack-owned generated Units. The focused CLI/contract/graph tests and full 496-test
+repository check pass. Direct deletion, child finalization, pin lifecycle wiring, and restart acceptance remain open.
+
+### 6. Terraform/observed cleanup and Argo/forge integrations — pending
+
+### 7. Acceptance harness and security/operations documentation — pending
+
+### 8. Remove legacy compatibility after migration condition — pending
