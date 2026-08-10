@@ -10,6 +10,8 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -452,6 +454,62 @@ def git_port_forward(provider: Provider) -> Iterator[str]:
             process.wait()
 
 
+@contextmanager
+def application_port_forward(provider: Provider) -> Iterator[int]:
+    context = kube_context(provider, "argocd")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    process = subprocess.Popen(
+        [
+            "kubectl",
+            "--context",
+            context,
+            "--namespace",
+            "default",
+            "port-forward",
+            f"deployment/{RESOURCE_NAME}",
+            f"{port}:8080",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        for _ in range(30):
+            if process.poll() is not None:
+                detail = process.stderr.read() if process.stderr is not None else ""
+                raise RuntimeError(f"Application port-forward exited early: {detail.strip()}")
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    break
+            except OSError:
+                time.sleep(0.25)
+        else:
+            raise RuntimeError("timed out waiting for application port-forward")
+        yield port
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def verify_forwarded_application(provider: Provider) -> None:
+    with application_port_forward(provider) as port:
+        url = f"http://127.0.0.1:{port}/"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                body = response.read().decode().strip()
+        except (OSError, urllib.error.URLError) as exc:
+            raise RuntimeError(f"request to forwarded application failed at {url}") from exc
+    if body != EXPECTED_RESPONSE:
+        raise RuntimeError(f"unexpected forwarded application response: {body!r}")
+    print(f"Port-forwarded application check passed: {body}", flush=True)
+
+
 def application_status(provider: Provider) -> dict[str, object]:
     output = run(
         "kubectl",
@@ -602,6 +660,7 @@ def acceptance(provider: Provider, delivery: Delivery = "direct") -> None:
                 first_heads = deployment_heads(provider, delivery, remote)
                 verify_argo_revision(provider, first_heads.desired)
                 verify_resource(provider, delivery, materialized_workload(provider, remote, first_heads.desired))
+                verify_forwarded_application(provider)
                 converge(provider, delivery, expect_clean=True)
                 second_heads = deployment_heads(provider, delivery, remote)
         if second_heads != first_heads:
