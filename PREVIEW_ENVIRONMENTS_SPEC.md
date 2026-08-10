@@ -19,7 +19,7 @@ The current branch is a Unit-focused foundation rather than an end-to-end previe
 | Area | Status | Reconciliation |
 | --- | --- | --- |
 | Desired Unit identity, lifecycle authority, ownership, legacy retention, rollback, and schema profiles | **Implemented for Unit** | Keep the generic semantic model; extend it to Stack and StackTemplate later. |
-| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit; final hardening in progress** | Commits `118429d`, `22d7814`, and `816a8a4` close lease, incarnation, transition, dependency, legacy-safety, and opaque-recovery defects; teardown-evidence, direct-root, source-pin, and acceptance work remains. |
+| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit; final hardening in progress** | Commits `118429d`, `22d7814`, `816a8a4`, and `26982bf` close lease, incarnation, transition, dependency, legacy-safety, opaque-recovery, and evidence-contract defects; direct-root, source-pin, and acceptance work remains. |
 | StackTemplate contracts, Stack contracts, parameter expansion, and generated ownership graphs | **Pending** | Milestone 3. |
 | Direct Stack operations and UID-fenced deletion | **Pending** | Milestone 4. |
 | Controller-owned source pins, forge eligibility/expiry/orphan recovery, and Argo integration | **Pending** | Milestones 4–5. |
@@ -126,16 +126,20 @@ new UID after the old lifecycle finalizes.
 
 ### Driver teardown — Proposed; Unit capability implemented
 
-Teardown should be an independent Unit-driver capability, parallel to planning, reconciliation, and verification. It
-receives the retained desired Unit, its pinned source, prior evidence, resource UID, and deletion generation. It MUST
-be idempotent.
+Teardown is an independent Unit-driver capability, parallel to planning, reconciliation, and verification. It
+receives the retained desired Unit, its pinned source, a relevance-fenced prior receipt when one exists, the resource
+UID, and the deletion generation. It MUST be idempotent. A matching terminal teardown-evidence record suppresses a
+repeat driver call; terminal evidence is controller-owned and is not passed to a driver that will not be invoked.
 
 A driver that may have external effects but cannot tear them down blocks finalization with an actionable status. A
 successful Terraform destroy is sufficient confirmation that Terraform-managed resources are absent; gitopsctr does
 not require deletion of the backend state object.
 
-Receipt identity must eventually distinguish resource incarnation and semantic desired generation. Whether this
-replaces the current whole-document blob identity immediately or through a compatibility period is **Open**.
+Successful `TeardownResult.details` are persisted in UID-/generation-fenced observed teardown evidence, with legacy
+evidence documents interpreted as empty details. A crash before that evidence publication may retry the idempotent
+driver operation; the current contract does not invent a separate in-progress evidence record. Receipt identity must
+eventually distinguish resource incarnation and semantic desired generation. Whether this replaces the current
+whole-document blob identity immediately or through a compatibility period is **Open**.
 
 The current implementation covers source-tracked Unit deletion intents, retained cleanup inputs, owned-child
 obligations, UID/generation-fenced teardown evidence, effect leases, and Terraform destroy. It does not yet implement
@@ -170,9 +174,10 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
   recovery path for parseable opaque roots, including source-absent roots and identity transitions. It preserves
   deletion intent and immutable cleanup fences, migrates generation-one intents, validates retained materialization,
   rejects stale source state, and never invokes reconciliation, teardown, or observed-evidence writes.
-- **Teardown evidence contract:** Extend `TeardownContext` with the prior receipt and relevant prior teardown
-  evidence, and define how `TeardownResult.details` are persisted or superseded. Controller evidence remains fenced
-  by resource UID and deletion generation; driver-specific evidence MUST be available for idempotent retries.
+- **Done in `26982bf` — teardown evidence contract:** `TeardownContext` receives only a relevance-fenced prior receipt;
+  terminal evidence is controller-owned and suppresses repeat teardown. `TeardownResult.details` are validated as
+  strict JSON and persisted in UID-/generation-fenced observed evidence, with legacy evidence defaulting to empty
+  details. A pre-publication crash remains a normal idempotent driver retry rather than an in-progress evidence state.
 - **Direct-root lifecycle:** Add explicit UID-fenced deletion intent and finalization for directly managed roots. A
   direct root MUST not be inferred as source-tracked merely because its source is absent.
 - **Acceptance coverage:** Add restart and failure-injection tests for every item above, including lease recovery,
@@ -304,17 +309,18 @@ Before declaring the Unit implementation milestone complete, the harness MUST co
 - Create an opaque cleanup root, remove its source, restart, and prove the documented adoption or cleanup operation
   can resolve it. **Covered for parseable roots by `816a8a4`; permanently unparseable roots remain an explicit
   operator-resolution case.**
-- Pass prior receipt/evidence into teardown and prove driver result details survive restart and remain UID/generation
-  fenced.
+- Pass a relevance-fenced prior receipt into teardown and prove driver result details survive restart after successful
+  evidence publication while remaining UID/generation fenced. **Covered for the terminal-evidence contract by
+  `26982bf`; pre-publication crash retry remains an idempotence requirement.**
 
 Shared recovery coverage MUST prove that one destroy failure retains cleanup inputs across restart and that a stale
 delete request for an old UID cannot affect a recreated same-name resource.
 
-Commits `118429d`, `22d7814`, and `816a8a4` cover finalization lease completion, pre-effect failure cleanup,
+Commits `118429d`, `22d7814`, `816a8a4`, and `26982bf` cover finalization lease completion, pre-effect failure cleanup,
 same-name incarnation fencing, parseable GVK/driver replacement, resolved dependency preservation, pre-lease
-dependency revalidation, legacy application blocking, and parseable opaque-root recovery. Teardown evidence,
-direct-root, source-pin, permanently unparseable-root operator resolution, and remaining acceptance scenarios remain
-pending.
+dependency revalidation, legacy application blocking, parseable opaque-root recovery, and the terminal teardown
+evidence contract. Direct-root, source-pin, permanently unparseable-root operator resolution, and remaining
+acceptance scenarios remain pending.
 
 ## Implementation checklist
 
@@ -330,12 +336,14 @@ pending.
 - [x] Add Unit reconciliation/status diagnostics and generated schema coverage.
 - [x] Block legacy reconciliation without authoritative adoption and add UID-/generation-fenced recovery for parseable
   opaque cleanup roots, including source-absent and identity-transition cases.
+- [x] Pass relevant prior receipts to teardown and persist strict-JSON driver details in UID-/generation-fenced terminal
+  observed evidence, including legacy evidence compatibility.
 
 ### Required to complete the Unit milestone
 
 - [ ] Close the remaining items in [Unit lifecycle hardening](#unit-lifecycle-hardening); lease, incarnation,
-  parseable-transition, legacy-safety, and parseable-opaque-recovery items are complete in `118429d`, `22d7814`, and
-  `816a8a4`.
+  parseable-transition, legacy-safety, parseable-opaque-recovery, and terminal evidence items are complete in
+  `118429d`, `22d7814`, `816a8a4`, and `26982bf`.
 - [ ] Add controller-owned source-pin creation, retention, and UID-/revision-fenced release.
 - [ ] Add the Unit hardening acceptance scenarios and recovery cases.
 

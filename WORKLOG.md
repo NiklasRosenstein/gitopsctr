@@ -84,6 +84,21 @@ initial recovery patch; Luna High addressed all six and the regression suite pas
 teardown-evidence plumbing, direct-root deletion, controller-owned source pins, permanently unparseable-root operator
 resolution, forge-side merge enforcement, and the remaining acceptance cases.
 
+### 2.4 Unit teardown-evidence contract — complete for this increment
+
+Commit `26982bf` passes a relevance-fenced prior receipt into Unit teardown and persists strict-JSON
+`TeardownResult.details` in UID-/deletion-generation-fenced observed teardown evidence. Matching terminal evidence
+suppresses repeat teardown, legacy evidence documents remain readable with empty details, and malformed/non-finite
+driver details are rejected. The contract intentionally treats a crash before evidence publication as an idempotent
+driver retry; it does not add a separate in-progress evidence record.
+
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 446 tests,
+lint, typecheck, schema freshness, strict docs, actionlint, and formatting. Sol High's final review confirmed the
+prior-receipt relevance and terminal-evidence sequencing; its only additional finding was the non-finite JSON case,
+which Luna High fixed centrally with regression coverage. Remaining Unit backlog: direct-root deletion,
+controller-owned source pins, permanently unparseable-root operator resolution, forge-side merge enforcement, and the
+remaining acceptance cases.
+
 ### 3. StackTemplate and Stack resolution — pending
 
 ### 4. Direct Stack operations and source pins — pending
