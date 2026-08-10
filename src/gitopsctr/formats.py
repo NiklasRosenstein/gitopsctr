@@ -94,17 +94,28 @@ PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
                 "sourceRevisionPolicy": {
                     "type": "object",
                     "properties": {
-                        "refreshWhen": {
+                        "unavailableWhen": {
                             "type": "string",
                             "enum": ["missing", "outside-candidate-history"],
                             "default": "outside-candidate-history",
                             "description": (
-                                "Refresh an unchanged unit source when the previous revision is missing or "
-                                "outside the candidate revision's history."
+                                "Treat a retained source as unavailable when its commit is missing or outside "
+                                "the candidate revision's history."
                             ),
-                        }
+                        },
+                        "whenUnavailableDuringAdvance": {
+                            "type": "string",
+                            "enum": ["refresh", "error"],
+                            "default": "refresh",
+                            "description": "Action when an unavailable retained source is found during advancement.",
+                        },
+                        "whenUnavailableDuringPlan": {
+                            "type": "string",
+                            "enum": ["error", "refresh"],
+                            "default": "error",
+                            "description": "Action when an unavailable retained source is found during planning.",
+                        },
                     },
-                    "required": ["refreshWhen"],
                     "additionalProperties": False,
                 },
             },
@@ -143,14 +154,21 @@ class EnvironmentDefaults:
     refs: EnvironmentRefTemplates = EnvironmentRefTemplates()
 
 
-class SourceRevisionRefreshWhen(StrEnum):
+class SourceRevisionUnavailableWhen(StrEnum):
     MISSING = "missing"
     OUTSIDE_CANDIDATE_HISTORY = "outside-candidate-history"
 
 
+class SourceRevisionAction(StrEnum):
+    REFRESH = "refresh"
+    ERROR = "error"
+
+
 @dataclass(frozen=True)
 class SourceRevisionPolicy:
-    refresh_when: SourceRevisionRefreshWhen = SourceRevisionRefreshWhen.OUTSIDE_CANDIDATE_HISTORY
+    unavailable_when: SourceRevisionUnavailableWhen = SourceRevisionUnavailableWhen.OUTSIDE_CANDIDATE_HISTORY
+    when_unavailable_during_advance: SourceRevisionAction = SourceRevisionAction.REFRESH
+    when_unavailable_during_plan: SourceRevisionAction = SourceRevisionAction.ERROR
 
 
 @dataclass(frozen=True)
@@ -211,9 +229,17 @@ def validate_project_document(value: object, path: Path) -> Project:
             )
         ),
         source_revision_policy=SourceRevisionPolicy(
-            refresh_when=SourceRevisionRefreshWhen(
-                source_revision_policy_document.get("refreshWhen", SourceRevisionRefreshWhen.OUTSIDE_CANDIDATE_HISTORY)
-            )
+            unavailable_when=SourceRevisionUnavailableWhen(
+                source_revision_policy_document.get(
+                    "unavailableWhen", SourceRevisionUnavailableWhen.OUTSIDE_CANDIDATE_HISTORY
+                )
+            ),
+            when_unavailable_during_advance=SourceRevisionAction(
+                source_revision_policy_document.get("whenUnavailableDuringAdvance", SourceRevisionAction.REFRESH)
+            ),
+            when_unavailable_during_plan=SourceRevisionAction(
+                source_revision_policy_document.get("whenUnavailableDuringPlan", SourceRevisionAction.ERROR)
+            ),
         ),
     )
 

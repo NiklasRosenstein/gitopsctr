@@ -73,8 +73,9 @@ from gitopsctr.formats import (
     PROJECT_CONFIG_NAMES,
     DocumentFormat,
     DocumentFormatError,
+    SourceRevisionAction,
     SourceRevisionPolicy,
-    SourceRevisionRefreshWhen,
+    SourceRevisionUnavailableWhen,
     document_candidates,
     load_document,
     load_project_config,
@@ -243,6 +244,7 @@ STATUS_ROLES = {
     "APPROVE": "warning",
     "WARN": "warning",
     "FAILED": "error",
+    "ERROR": "error",
     "INVALID": "error",
     "READY": "focus",
     "RUN": "focus",
@@ -1154,6 +1156,16 @@ class ResolvedUnitSourceResult:
     refresh_reason: str | None = None
 
 
+class SourceRevisionUnavailableError(OperationError):
+    """A retained source revision is unavailable under the selected project policy."""
+
+    def __init__(self, unit_name: str, revision: str, operation: Literal["advance", "plan"]) -> None:
+        self.unit_name = unit_name
+        self.revision = revision
+        self.operation = operation
+        super().__init__(f"{unit_name} desired source {revision} is unavailable under project policy")
+
+
 def resolved_unit_source(
     specification: UnitResource[Any],
     source_root: Path,
@@ -1161,6 +1173,7 @@ def resolved_unit_source(
     current_desired: Path,
     legacy: dict[str, Any] | None,
     source_revision_policy: SourceRevisionPolicy | None = None,
+    source_revision_operation: Literal["advance", "plan"] = "advance",
 ) -> ResolvedUnitSourceResult:
     source_revision_policy = source_revision_policy or SourceRevisionPolicy()
     driver, source = require_unit_specification(specification)
@@ -1183,30 +1196,34 @@ def resolved_unit_source(
             if isinstance(previous_environment, str):
                 input_hash = prior_hash
         prior_available = commit_is_available(prior_revision)
-        if not prior_available:
-            inputs_changed = True
-            if prior_hash == input_hash:
-                refresh_reason = (
-                    f"retained source {describe_revision(prior_revision)} unavailable; "
-                    f"use candidate {describe_revision(source_revision)}"
-                )
-        elif not prior_hash:
+        if prior_available and not prior_hash:
             with tempfile.TemporaryDirectory() as prior_directory:
                 prior_root = Path(prior_directory) / "source"
                 materialize_revision(prior_revision, prior_root)
                 prior_hash = unit_input_hash(specification, prior_root)
-        if prior_available and prior_hash == input_hash:
-            if source_revision_policy.refresh_when is SourceRevisionRefreshWhen.MISSING or commit_is_ancestor(
-                prior_revision, source_revision
-            ):
+        if prior_hash == input_hash:
+            in_candidate_history = prior_available and (
+                source_revision_policy.unavailable_when is SourceRevisionUnavailableWhen.MISSING
+                or commit_is_ancestor(prior_revision, source_revision)
+            )
+            if in_candidate_history:
                 revision = prior_revision
             else:
                 inputs_changed = True
-                refresh_reason = (
-                    f"retained source {describe_revision(prior_revision)} is outside candidate history; "
-                    f"use {describe_revision(source_revision)}"
+                action = (
+                    source_revision_policy.when_unavailable_during_plan
+                    if source_revision_operation == "plan"
+                    else source_revision_policy.when_unavailable_during_advance
                 )
-        elif prior_available:
+                if action is SourceRevisionAction.ERROR:
+                    raise SourceRevisionUnavailableError(specification.name, prior_revision, source_revision_operation)
+                unavailable_reason = "is outside candidate history" if prior_available else "is unavailable"
+                dry_suffix = " in the dry candidate only" if source_revision_operation == "plan" else ""
+                refresh_reason = (
+                    f"retained source {describe_revision(prior_revision)} {unavailable_reason}; "
+                    f"use {describe_revision(source_revision)}{dry_suffix}"
+                )
+        else:
             inputs_changed = True
     return ResolvedUnitSourceResult(
         source=DesiredSource(
@@ -1902,6 +1919,7 @@ def build_desired_candidate(
     dry: bool = False,
     verbose: bool = True,
     source_revision_policy: SourceRevisionPolicy | None = None,
+    source_revision_operation: Literal["advance", "plan"] = "advance",
 ) -> BuildDesiredResult:
     if verbose:
         log_heading(f"Resolve desired state for {style_environment(environment_name)}")
@@ -1934,6 +1952,7 @@ def build_desired_candidate(
             current_desired,
             legacy,
             source_revision_policy,
+            source_revision_operation,
         )
         prepared[unit_name] = (specification, source_resolution.source)
         if source_resolution.refresh_reason is not None:
@@ -2298,6 +2317,7 @@ def advance_desired(
                 promotion=promotion,
                 dry=dry,
                 verbose=verbose,
+                source_revision_operation="advance",
             )
             if current_revision and directory_files(current_desired) == directory_files(candidate):
                 if verbose:
@@ -3440,6 +3460,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 observed_revision,
                 desired,
                 dry=True,
+                source_revision_operation="plan",
             )
             if args.unit in candidate_result.blocked:
                 log_status("WAIT", candidate_result.blocked[args.unit])
@@ -4692,6 +4713,25 @@ def main() -> int:
         if args.command != "schemas":
             REPOSITORY_ROOT = resolve_repository_root(args.repository)
         args.handler(args)
+    except SourceRevisionUnavailableError as exc:
+        log_status(
+            "ERROR",
+            f"{style_unit(exc.unit_name)}: desired source {describe_revision(exc.revision)} "
+            "is unavailable under project policy",
+        )
+        if exc.operation == "plan":
+            print(
+                "      Run advance-desired from a durable source revision before planning.",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                "      Run advance-desired from a durable source revision before retrying.",
+                file=sys.stderr,
+                flush=True,
+            )
+        return 1
     except (DriverError, OperationError, subprocess.CalledProcessError) as exc:
         if isinstance(exc, subprocess.CalledProcessError):
             detail = (exc.stderr or "").strip() or str(exc)

@@ -70,19 +70,34 @@
         "sourceRevisionPolicy": {
           "additionalProperties": false,
           "properties": {
-            "refreshWhen": {
+            "unavailableWhen": {
               "default": "outside-candidate-history",
-              "description": "Refresh an unchanged unit source when the previous revision is missing or outside the candidate revision's history.",
+              "description": "Treat a retained source as unavailable when its commit is missing or outside the candidate revision's history.",
               "enum": [
                 "missing",
                 "outside-candidate-history"
               ],
               "type": "string"
+            },
+            "whenUnavailableDuringAdvance": {
+              "default": "refresh",
+              "description": "Action when an unavailable retained source is found during advancement.",
+              "enum": [
+                "refresh",
+                "error"
+              ],
+              "type": "string"
+            },
+            "whenUnavailableDuringPlan": {
+              "default": "error",
+              "description": "Action when an unavailable retained source is found during planning.",
+              "enum": [
+                "error",
+                "refresh"
+              ],
+              "type": "string"
             }
           },
-          "required": [
-            "refreshWhen"
-          ],
           "type": "object"
         },
         "writeFormat": {

@@ -421,7 +421,8 @@ def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monke
         deploy_release.command_reconcile(args)
 
 
-def test_planned_reconcile_refreshes_unavailable_retained_source(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("plan_action", [None, "refresh"])
+def test_planned_reconcile_applies_plan_source_policy(tmp_path, monkeypatch, capsys, plan_action):
     source_revision = "b" * 40
     previous_revision = "a" * 40
     planned = []
@@ -454,6 +455,26 @@ def test_planned_reconcile_refreshes_unavailable_retained_source(tmp_path, monke
     def fake_materialize(revision: str, output: Path):
         output.mkdir(parents=True, exist_ok=True)
         if revision == source_revision:
+            project_spec = (
+                {}
+                if plan_action is None
+                else {
+                    "sourceRevisionPolicy": {
+                        "unavailableWhen": "outside-candidate-history",
+                        "whenUnavailableDuringAdvance": "refresh",
+                        "whenUnavailableDuringPlan": plan_action,
+                    }
+                }
+            )
+            _write_json(
+                output / "gitopsctr.yaml",
+                {
+                    "apiVersion": "gitopsctr.io/v1",
+                    "kind": "Project",
+                    "metadata": {"name": "example"},
+                    "spec": project_spec,
+                },
+            )
             _write_json(output / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
             _write_json(output / "deployment/environments/dev/units/aws-application.json", specification)
 
@@ -474,6 +495,7 @@ def test_planned_reconcile_refreshes_unavailable_retained_source(tmp_path, monke
         lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"),
     )
     monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
+    monkeypatch.setattr(deploy_release, "resolve_advance_source_revision", lambda *_args: source_revision)
     monkeypatch.setattr(deploy_release, "warn_if_source_revision_excludes_changes", lambda *_args: None)
     monkeypatch.setattr(deploy_release, "file_blob", lambda path: str(path))
     monkeypatch.setitem(
@@ -482,24 +504,33 @@ def test_planned_reconcile_refreshes_unavailable_retained_source(tmp_path, monke
         SimpleNamespace(plan=lambda context: planned.append(context)),
     )
 
-    deploy_release.command_reconcile(
-        Namespace(
-            unit="aws-application",
-            environment="dev",
-            desired_ref="deploy/dev",
-            desired_revision=None,
-            observed_ref="observed/dev",
-            plan=True,
-            report=None,
-            source_revision="HEAD",
-            advance=False,
-            require_source_ref=None,
-        )
+    command_args = Namespace(
+        unit="aws-application",
+        environment="dev",
+        desired_ref="deploy/dev",
+        desired_revision=None,
+        observed_ref="observed/dev",
+        plan=True,
+        report=None,
+        source_revision="HEAD",
+        advance=True,
+        require_source_ref=None,
     )
+
+    if plan_action is None:
+        with pytest.raises(deploy_release.SourceRevisionUnavailableError, match="unavailable under project policy"):
+            deploy_release.command_reconcile(command_args)
+        assert planned == []
+        return
+
+    deploy_release.command_reconcile(command_args)
 
     assert len(planned) == 1
     output = capsys.readouterr().err
-    assert "REFRESH  aws-application: retained source aaaaaaaaaaaa unavailable; use candidate bbbbbbbbbbbb" in output
+    assert (
+        "REFRESH  aws-application: retained source aaaaaaaaaaaa is unavailable; use bbbbbbbbbbbb "
+        "in the dry candidate only"
+    ) in output
     assert "PLAN     terraform planning succeeded" in output
 
 

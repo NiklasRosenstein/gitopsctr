@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -347,7 +348,7 @@ def test_removing_producer_environment_preserves_existing_input_hash(tmp_path, m
         current,
         None,
         deploy_release.SourceRevisionPolicy(
-            refresh_when=deploy_release.SourceRevisionRefreshWhen.MISSING,
+            unavailable_when=deploy_release.SourceRevisionUnavailableWhen.MISSING,
         ),
     )
 
@@ -402,7 +403,7 @@ def test_matching_input_hash_retains_available_previous_source_revision(tmp_path
         current,
         None,
         deploy_release.SourceRevisionPolicy(
-            refresh_when=deploy_release.SourceRevisionRefreshWhen.MISSING,
+            unavailable_when=deploy_release.SourceRevisionUnavailableWhen.MISSING,
         ),
     )
 
@@ -493,13 +494,13 @@ def test_source_less_unit_remains_without_a_resolved_source(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "refresh_when",
+    "unavailable_when",
     [
-        deploy_release.SourceRevisionRefreshWhen.MISSING,
-        deploy_release.SourceRevisionRefreshWhen.OUTSIDE_CANDIDATE_HISTORY,
+        deploy_release.SourceRevisionUnavailableWhen.MISSING,
+        deploy_release.SourceRevisionUnavailableWhen.OUTSIDE_CANDIDATE_HISTORY,
     ],
 )
-def test_unavailable_retained_source_refreshes_desired_state_and_logs(tmp_path, monkeypatch, capsys, refresh_when):
+def test_unavailable_retained_source_refreshes_desired_state_and_logs(tmp_path, monkeypatch, capsys, unavailable_when):
     previous_revision = "a" * 40
     candidate_revision = "b" * 40
     source, current, _ = _source_resolution_fixture(tmp_path, previous_revision, "sha256:same")
@@ -531,14 +532,14 @@ def test_unavailable_retained_source_refreshes_desired_state_and_logs(tmp_path, 
         None,
         candidate,
         dry=True,
-        source_revision_policy=deploy_release.SourceRevisionPolicy(refresh_when=refresh_when),
+        source_revision_policy=deploy_release.SourceRevisionPolicy(unavailable_when=unavailable_when),
     )
 
     refreshed = deploy_release.load_desired_unit(candidate / "units/aws-application.json", "aws-application")
     assert result.blocked == {}
     assert refreshed.spec.source.revision == candidate_revision
     output = capsys.readouterr().err
-    assert "REFRESH  aws-application: retained source aaaaaaaaaaaa unavailable; use candidate bbbbbbbbbbbb" in output
+    assert "REFRESH  aws-application: retained source aaaaaaaaaaaa is unavailable; use bbbbbbbbbbbb" in output
 
 
 def test_outside_candidate_history_refreshes_desired_state_and_logs(tmp_path, monkeypatch, capsys):
@@ -583,6 +584,63 @@ def test_outside_candidate_history_refreshes_desired_state_and_logs(tmp_path, mo
     assert (
         "REFRESH  aws-application: retained source aaaaaaaaaaaa is outside candidate history; use bbbbbbbbbbbb"
     ) in output
+
+
+def test_advance_policy_error_leaves_the_candidate_unpublished(tmp_path, monkeypatch):
+    previous_revision = "a" * 40
+    candidate_revision = "b" * 40
+    source, current, _ = _source_resolution_fixture(tmp_path, previous_revision, "sha256:same")
+    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
+    _write_json(
+        source / "deployment/environments/dev/units/aws-application.json",
+        {
+            "schema": 1,
+            "name": "aws-application",
+            "driver": "terraform",
+            "source": {"path": "."},
+        },
+    )
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    observed.mkdir()
+    monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
+    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
+    monkeypatch.setattr(deploy_release, "commit_is_ancestor", lambda *_args: False)
+
+    with pytest.raises(deploy_release.SourceRevisionUnavailableError, match="unavailable under project policy"):
+        deploy_release.build_desired_candidate(
+            "dev",
+            source,
+            candidate_revision,
+            current,
+            observed,
+            None,
+            candidate,
+            source_revision_policy=deploy_release.SourceRevisionPolicy(
+                when_unavailable_during_advance=deploy_release.SourceRevisionAction.ERROR,
+            ),
+            source_revision_operation="advance",
+        )
+
+    assert not deploy_release.unit_document_path(candidate, "aws-application").is_file()
+
+
+def test_main_reports_actionable_plan_policy_error(monkeypatch, capsys):
+    def handler(_args):
+        raise deploy_release.SourceRevisionUnavailableError("aws-application", "a" * 40, "plan")
+
+    monkeypatch.setattr(
+        deploy_release,
+        "build_parser",
+        lambda: SimpleNamespace(
+            parse_args=lambda: SimpleNamespace(command="schemas", handler=handler),
+        ),
+    )
+
+    assert deploy_release.main() == 1
+    output = capsys.readouterr().err
+    assert "ERROR    aws-application: desired source aaaaaaaaaaaa is unavailable under project policy" in output
+    assert "Run advance-desired from a durable source revision before planning." in output
 
 
 def test_source_input_globs_hash_only_matching_files(tmp_path):
