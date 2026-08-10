@@ -35,6 +35,15 @@ class GatedCandidate:
 
 
 @dataclass(frozen=True)
+class ControllerPin:
+    """A controller-owned Git ref retaining one exact source revision."""
+
+    name: str
+    ref: str
+    revision: str
+
+
+@dataclass(frozen=True)
 class GitStateStore:
     root: Path
     author_name: str = "gitopsctr"
@@ -81,6 +90,92 @@ class GitStateStore:
         ):
             raise OperationError(f"requested revision is not part of {ref} history")
         return GitRefSnapshot(ref, resolved)
+
+    def create_controller_pin(self, name: str, revision: str) -> ControllerPin:
+        """Create or retain a named pin without changing an existing revision.
+
+        ``revision`` may be any locally resolvable commit expression, but the
+        returned pin always contains its canonical object ID.  The remote pin
+        is created with an ordinary push, so a concurrent creator cannot
+        replace a pin with a different revision.
+        """
+
+        pin_ref = self._controller_pin_ref(name)
+        resolved_revision = self._resolve_commit(revision)
+        existing_revision = self._remote_ref_revision(pin_ref)
+        if existing_revision is not None:
+            if existing_revision != resolved_revision:
+                raise OperationError(
+                    f"controller pin {name!r} already points to {existing_revision}, "
+                    f"not requested revision {resolved_revision}"
+                )
+            return ControllerPin(name, pin_ref, resolved_revision)
+
+        pushed = self.git("push", "origin", f"{resolved_revision}:{pin_ref}", check=False)
+        if pushed.returncode != 0:
+            # Another actor may have won the create race.  Re-inspect the
+            # remote and accept only the exact requested revision.
+            existing_revision = self._remote_ref_revision(pin_ref)
+            if existing_revision == resolved_revision:
+                return ControllerPin(name, pin_ref, resolved_revision)
+            if existing_revision is not None:
+                raise OperationError(f"controller pin {name!r} was created at unexpected revision {existing_revision}")
+            raise OperationError(pushed.stderr.strip() or f"could not create controller pin {name!r}")
+
+        existing_revision = self._remote_ref_revision(pin_ref)
+        if existing_revision != resolved_revision:
+            raise OperationError(f"controller pin {name!r} was not retained at the requested revision")
+        return ControllerPin(name, pin_ref, resolved_revision)
+
+    def release_controller_pin(self, name: str, expected_revision: str) -> bool:
+        """Release a pin only when its current remote revision matches exactly.
+
+        Missing pins are already released and return ``False``.  A mismatched
+        pin is never modified.  The delete uses the normal Git push protocol
+        and is verified afterward; no force-push option is used.
+        """
+
+        pin_ref = self._controller_pin_ref(name)
+        existing_revision = self._remote_ref_revision(pin_ref)
+        if existing_revision is None:
+            return False
+        if existing_revision != expected_revision:
+            raise OperationError(
+                f"controller pin {name!r} is fenced at {existing_revision}, not expected revision {expected_revision}"
+            )
+
+        released = self.git("push", "origin", f":{pin_ref}", check=False)
+        remaining_revision = self._remote_ref_revision(pin_ref)
+        if remaining_revision is None:
+            return True
+        if remaining_revision != expected_revision:
+            raise OperationError(
+                f"controller pin {name!r} changed during release to unexpected revision {remaining_revision}"
+            )
+        raise OperationError(released.stderr.strip() or f"could not release controller pin {name!r}")
+
+    def _controller_pin_ref(self, name: str) -> str:
+        ref = f"refs/heads/gitopsctr/pins/{name}"
+        if self.git("check-ref-format", ref, check=False).returncode != 0:
+            raise OperationError(f"invalid controller pin name: {name!r}")
+        return ref
+
+    def _resolve_commit(self, revision: str) -> str:
+        resolved = self.git("rev-parse", "--verify", f"{revision}^{{commit}}", check=False)
+        if resolved.returncode != 0:
+            raise OperationError(f"revision {revision!r} is not a valid commit")
+        return resolved.stdout.strip()
+
+    def _remote_ref_revision(self, ref: str) -> str | None:
+        result = self.git("ls-remote", "--exit-code", "--refs", "origin", ref, check=False)
+        if result.returncode == 2:
+            return None
+        if result.returncode != 0:
+            raise OperationError(result.stderr.strip() or f"could not inspect {ref}")
+        lines = result.stdout.splitlines()
+        if len(lines) != 1 or len(lines[0].split()) != 2:
+            raise OperationError(f"remote ref inspection returned an invalid result for {ref}")
+        return lines[0].split()[0]
 
     def materialize(self, revision: str, output: Path) -> None:
         if output.exists() and any(output.iterdir()):
