@@ -154,6 +154,31 @@ class UnitExecutionContext[DesiredT: StrictModel]:
 
 
 @dataclass(frozen=True)
+class TeardownContext[DesiredT: StrictModel]:
+    """Fenced inputs for idempotently removing one retained desired Unit."""
+
+    environment: str
+    desired_root: Path
+    desired_revision: str
+    source_root: Path | None
+    source_revision: str | None
+    source_path: str | None
+    unit_name: str
+    unit: DesiredT
+    resource_uid: str
+    deletion_generation: int
+    report: Path | None = None
+    execution: DriverExecution = field(default_factory=default_driver_execution)
+
+
+@dataclass(frozen=True)
+class TeardownResult:
+    """Optional driver evidence from a successful, idempotent teardown."""
+
+    details: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class PlanningContext[DesiredT: StrictModel](UnitExecutionContext[DesiredT]):
     pass
 
@@ -203,6 +228,14 @@ class PlanningCapability[DesiredT: StrictModel](ABC):
     @abstractmethod
     def plan(self, context: PlanningContext[DesiredT]) -> None:
         """Validate and plan the unit without changing remote deployment state."""
+
+
+class TeardownCapability[DesiredT: StrictModel](ABC):
+    """Remove external state for a retained desired unit."""
+
+    @abstractmethod
+    def teardown(self, context: TeardownContext[DesiredT]) -> TeardownResult | None:
+        """Idempotently remove external state, honoring the UID and generation fence."""
 
 
 class ReconciliationCapability[DesiredT: StrictModel, ResultT: StrictModel](ABC):

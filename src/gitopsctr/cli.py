@@ -32,7 +32,9 @@ from gitopsctr.contracts import (
     CORE_CONTRACTS,
     ArtifactDescriptor,
     AuthoredSource,
+    DesiredLifecycle,
     DesiredSource,
+    LifecycleManagement,
     MaterializationDocument,
     ReceiptDesired,
     StrictModel,
@@ -54,6 +56,8 @@ from gitopsctr.driver import (
     ReconciliationCapability,
     ReconciliationContext,
     ReconciliationOutput,
+    TeardownCapability,
+    TeardownContext,
     UnitResolutionContext,
     VerificationContext,
     VerificationStatus,
@@ -142,6 +146,10 @@ GIT_AUTHOR_EMAIL = os.environ.get(
     "gitopsctr@users.noreply.github.com",
 )
 REPOSITORY_ROOT = Path.cwd().resolve()
+DESIRED_TRANSITION_BLOCKS_PATH = PurePosixPath(".gitopsctr/transition-blocks.json")
+DESIRED_CLEANUP_UNITS_PATH = PurePosixPath(".gitopsctr/cleanup/units")
+DESIRED_DELETION_INTENTS_PATH = PurePosixPath(".gitopsctr/deletion-intents/units")
+OBSERVED_TEARDOWN_EVIDENCE_PATH = PurePosixPath(".gitopsctr/teardowns/units")
 
 
 @dataclass(frozen=True)
@@ -1385,7 +1393,7 @@ def candidate_ref_template(source_root: Path, environment_name: str) -> str:
 
 
 def candidate_identifier(
-    operation: Literal["promotion", "rollback"],
+    operation: Literal["promotion", "rollback", "finalize"],
     environment_name: str,
     candidate: Path,
     target_ref: str,
@@ -1411,7 +1419,7 @@ def candidate_identifier(
 def resolve_candidate_ref(
     source_root: Path,
     environment_name: str,
-    operation: Literal["promotion", "rollback"],
+    operation: Literal["promotion", "rollback", "finalize"],
     candidate_id: str,
     override: str | None = None,
 ) -> str:
@@ -1440,8 +1448,6 @@ def load_environment_specifications(source_root: Path, environment_name: str) ->
         if len(candidates) > 1:
             raise OperationError(f"multiple document formats exist for unit {stem}")
         unit_paths.extend(candidates)
-    if not unit_paths:
-        raise OperationError(f"environment has no units: {environment_name}")
     specification_paths = {path.stem: path for path in unit_paths}
     specifications: dict[str, UnitResource[Any]] = {}
     for path in unit_paths:
@@ -1500,10 +1506,20 @@ def require_environment_unit(source_root: Path, environment_name: str, unit_name
 
 
 def reconciliation_statuses(unit_names: Sequence[str], desired: Path, observed: Path) -> list[tuple[str, str, str]]:
+    transition_blocks = load_desired_transition_blocks(desired)
+    deletion_intents = load_desired_deletion_intents(desired)
+    cleanup_names = {path.stem for path in desired_cleanup_root_paths(desired)}
+    unit_names = tuple(dict.fromkeys((*unit_names, *sorted(cleanup_names), *sorted(deletion_intents))))
     statuses = []
     for unit_name in unit_names:
         unit_path = unit_document_path(desired, unit_name)
         receipt_path = unit_document_path(observed, unit_name)
+        if unit_name in transition_blocks:
+            statuses.append((unit_name, "WAIT", transition_blocks[unit_name]))
+            continue
+        if unit_name in deletion_intents:
+            statuses.append((unit_name, "WAIT", deletion_intent_reason(deletion_intents[unit_name])))
+            continue
         if not unit_path.is_file():
             statuses.append((unit_name, "WAIT", "desired inputs are not materialized"))
             continue
@@ -1531,6 +1547,50 @@ def reconciliation_statuses(unit_names: Sequence[str], desired: Path, observed: 
                 )
             )
     return statuses
+
+
+def desired_cleanup_root_paths(root: Path) -> tuple[Path, ...]:
+    cleanup_root = root / DESIRED_CLEANUP_UNITS_PATH
+    if not cleanup_root.is_dir():
+        return ()
+    paths = sorted(
+        path for path in cleanup_root.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"}
+    )
+    by_name: dict[str, Path] = {}
+    for path in paths:
+        previous = by_name.get(path.stem)
+        if previous is not None:
+            raise OperationError(
+                f"multiple cleanup document formats exist for {path.stem!r}: {previous.name} and {path.name}"
+            )
+        by_name[path.stem] = path
+    return tuple(paths)
+
+
+def load_desired_transition_blocks(root: Path) -> dict[str, str]:
+    path = root / DESIRED_TRANSITION_BLOCKS_PATH
+    if not path.is_file():
+        return {}
+    document = load_json(path)
+    blocks = document.get("blocks")
+    if not isinstance(blocks, dict) or not all(
+        isinstance(name, str) and isinstance(reason, str) for name, reason in blocks.items()
+    ):
+        raise OperationError("invalid desired transition-block document")
+    return cast(dict[str, str], blocks)
+
+
+def write_desired_transition_blocks(root: Path, blocks: Mapping[str, str]) -> None:
+    path = root / DESIRED_TRANSITION_BLOCKS_PATH
+    if not blocks:
+        if path.is_file():
+            path.unlink()
+        return
+    write_document(
+        path,
+        {"schema": 1, "blocks": dict(sorted(blocks.items()))},
+        format=DocumentFormat.JSON,
+    )
 
 
 def changed_json_paths(previous: Any, current: Any, prefix: str = "") -> list[str]:
@@ -1939,6 +1999,7 @@ class BuildDesiredResult:
 
     blocked: Mapping[str, str]
     cleanup_inputs: Mapping[str, DesiredCleanupInput] = field(default_factory=dict)
+    blocked_transitions: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1951,13 +2012,535 @@ class DesiredCleanupInput:
     raw_document: JsonObject | None = None
 
 
-def desired_metadata_for_candidate(authored: UnitResource[Any], previous: UnitResource[Any] | None) -> ResourceMetadata:
+@dataclass(frozen=True)
+class OpaqueCleanupRoot:
+    """Unparseable desired input retained outside executable desired Units."""
+
+    path: Path
+    payload: object
+    metadata: ResourceMetadata
+    source: DesiredSource | None
+
+
+@dataclass(frozen=True)
+class RetainedCleanupIdentity:
+    path: str
+    uid: str
+
+
+@dataclass(frozen=True)
+class UnitDeletionIntent:
+    """Durable, UID-fenced intent to finalize one source-tracked Unit."""
+
+    unit_name: str
+    uid: str
+    deletion_generation: int
+    retained_source: DesiredSource | None
+    cleanup_identity: RetainedCleanupIdentity
+    retained_unit_blob: str
+    retained_api_version: str
+    retained_kind: str
+    retained_driver: str
+    retained_source_revision: str | None
+
+    @classmethod
+    def from_unit(cls, unit: UnitResource[Any], path: Path, root: Path) -> UnitDeletionIntent:
+        unit.metadata.validate_desired()
+        lifecycle = unit.metadata.lifecycle
+        if lifecycle is None or lifecycle.management is None or lifecycle.management.mode != "sourceTracked":
+            raise OperationError(f"{unit.name} cannot receive a source-tracked deletion intent")
+        source = getattr(unit.spec, "source", None)
+        if source is not None and not isinstance(source, DesiredSource):
+            raise OperationError(f"{unit.name} has an invalid retained source identity")
+        require_unit(unit, unit.name)
+        assert unit.metadata.uid is not None
+        return cls(
+            unit_name=unit.name,
+            uid=unit.metadata.uid,
+            deletion_generation=1,
+            retained_source=source,
+            cleanup_identity=RetainedCleanupIdentity(
+                path=path.relative_to(root).as_posix(),
+                uid=unit.metadata.uid,
+            ),
+            retained_unit_blob=file_blob(path),
+            retained_api_version=unit.gvk.api_version,
+            retained_kind=unit.gvk.kind,
+            retained_driver=unit.driver_name,
+            retained_source_revision=source.revision if source is not None else None,
+        )
+
+    def document(self) -> JsonObject:
+        return {
+            "schema": 2,
+            "kind": "UnitDeletionIntent",
+            "unitName": self.unit_name,
+            "uid": self.uid,
+            "deletionGeneration": self.deletion_generation,
+            "retainedSource": self.retained_source.to_dict() if self.retained_source is not None else None,
+            "cleanupIdentity": {
+                "path": self.cleanup_identity.path,
+                "uid": self.cleanup_identity.uid,
+            },
+            "retainedIdentity": {
+                "unitBlob": self.retained_unit_blob,
+                "apiVersion": self.retained_api_version,
+                "kind": self.retained_kind,
+                "driver": self.retained_driver,
+                "sourceRevision": self.retained_source_revision,
+            },
+        }
+
+    @classmethod
+    def from_document(cls, document: object, expected_name: str) -> UnitDeletionIntent:
+        if not isinstance(document, dict):
+            raise ValueError("deletion intent must be a mapping")
+        expected_keys = {
+            "schema",
+            "kind",
+            "unitName",
+            "uid",
+            "deletionGeneration",
+            "retainedSource",
+            "cleanupIdentity",
+            "retainedIdentity",
+        }
+        if (
+            set(document) != expected_keys
+            or type(document.get("schema")) is not int
+            or document.get("schema") != 2
+            or document.get("kind") != "UnitDeletionIntent"
+            or document.get("unitName") != expected_name
+        ):
+            raise ValueError("invalid deletion intent envelope")
+        uid = document.get("uid")
+        generation = document.get("deletionGeneration")
+        if (
+            not isinstance(uid, str)
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 1
+        ):
+            raise ValueError("invalid deletion intent fence")
+        ResourceMetadata(
+            name=expected_name,
+            uid=uid,
+            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
+        ).validate_desired()
+        raw_source = document.get("retainedSource")
+        if raw_source is not None and not isinstance(raw_source, dict):
+            raise ValueError("invalid retained source identity")
+        source = DesiredSource.from_dict(raw_source) if isinstance(raw_source, dict) else None
+        raw_cleanup = document.get("cleanupIdentity")
+        if not isinstance(raw_cleanup, dict) or set(raw_cleanup) != {"path", "uid"}:
+            raise ValueError("invalid cleanup identity")
+        cleanup_path = raw_cleanup.get("path")
+        cleanup_uid = raw_cleanup.get("uid")
+        if not isinstance(cleanup_path, str) or not isinstance(cleanup_uid, str) or cleanup_uid != uid:
+            raise ValueError("invalid cleanup identity")
+        relative = PurePosixPath(cleanup_path)
+        if (
+            relative.is_absolute()
+            or len(relative.parts) != 2
+            or relative.parts[0] != "units"
+            or relative.stem != expected_name
+            or relative.suffix not in {".json", ".yaml", ".yml"}
+        ):
+            raise ValueError("cleanup identity must retain a desired Unit path")
+        raw_identity = document.get("retainedIdentity")
+        if not isinstance(raw_identity, dict) or set(raw_identity) != {
+            "unitBlob",
+            "apiVersion",
+            "kind",
+            "driver",
+            "sourceRevision",
+        }:
+            raise ValueError("invalid retained unit identity")
+        retained_blob = raw_identity.get("unitBlob")
+        retained_api_version = raw_identity.get("apiVersion")
+        retained_kind = raw_identity.get("kind")
+        retained_driver = raw_identity.get("driver")
+        retained_source_revision = raw_identity.get("sourceRevision")
+        if (
+            not isinstance(retained_blob, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", retained_blob)
+            or not isinstance(retained_api_version, str)
+            or not isinstance(retained_kind, str)
+            or not isinstance(retained_driver, str)
+            or (retained_source_revision is not None and not isinstance(retained_source_revision, str))
+        ):
+            raise ValueError("invalid retained unit identity")
+        return cls(
+            unit_name=expected_name,
+            uid=uid,
+            deletion_generation=generation,
+            retained_source=source,
+            cleanup_identity=RetainedCleanupIdentity(path=cleanup_path, uid=cleanup_uid),
+            retained_unit_blob=retained_blob,
+            retained_api_version=retained_api_version,
+            retained_kind=retained_kind,
+            retained_driver=retained_driver,
+            retained_source_revision=retained_source_revision,
+        )
+
+
+@dataclass(frozen=True)
+class TeardownEvidence:
+    """Observed-state proof that one UID-fenced teardown completed."""
+
+    unit_name: str
+    uid: str
+    deletion_generation: int
+    desired_revision: str
+
+    def document(self) -> JsonObject:
+        return {
+            "schema": 1,
+            "kind": "UnitTeardownEvidence",
+            "unitName": self.unit_name,
+            "uid": self.uid,
+            "deletionGeneration": self.deletion_generation,
+            "desiredRevision": self.desired_revision,
+        }
+
+    @classmethod
+    def from_document(cls, document: object, expected_name: str) -> TeardownEvidence:
+        if not isinstance(document, dict) or set(document) != {
+            "schema",
+            "kind",
+            "unitName",
+            "uid",
+            "deletionGeneration",
+            "desiredRevision",
+        }:
+            raise ValueError("invalid teardown evidence envelope")
+        raw_uid = document.get("uid")
+        raw_generation = document.get("deletionGeneration")
+        raw_revision = document.get("desiredRevision")
+        if (
+            type(document.get("schema")) is not int
+            or document.get("schema") != 1
+            or document.get("kind") != "UnitTeardownEvidence"
+            or document.get("unitName") != expected_name
+            or not isinstance(raw_uid, str)
+            or not isinstance(raw_generation, int)
+            or isinstance(raw_generation, bool)
+            or raw_generation < 1
+            or not isinstance(raw_revision, str)
+        ):
+            raise ValueError("invalid teardown evidence envelope")
+        ResourceMetadata(
+            name=expected_name,
+            uid=raw_uid,
+            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
+        ).validate_desired()
+        if not re.fullmatch(r"[0-9a-f]{40}", raw_revision):
+            raise ValueError("invalid teardown evidence desired revision")
+        return cls(
+            unit_name=expected_name,
+            uid=raw_uid,
+            deletion_generation=raw_generation,
+            desired_revision=raw_revision,
+        )
+
+
+def desired_deletion_intent_paths(root: Path) -> tuple[Path, ...]:
+    directory = root / DESIRED_DELETION_INTENTS_PATH
+    if not directory.is_dir():
+        return ()
+    paths = sorted(path for path in directory.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"})
+    names: dict[str, Path] = {}
+    for path in paths:
+        if path.stem in names:
+            raise OperationError(f"multiple deletion intent formats exist for {path.stem!r}")
+        names[path.stem] = path
+    return tuple(paths)
+
+
+def load_desired_deletion_intents(root: Path) -> dict[str, UnitDeletionIntent]:
+    intents: dict[str, UnitDeletionIntent] = {}
+    for path in desired_deletion_intent_paths(root):
+        name = path.stem
+        try:
+            intent = UnitDeletionIntent.from_document(load_json(path), name)
+        except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
+            raise OperationError(f"invalid deletion intent for {name!r}") from exc
+        intents[name] = intent
+    return intents
+
+
+def write_deletion_intent(root: Path, intent: UnitDeletionIntent) -> Path:
+    directory = root / DESIRED_DELETION_INTENTS_PATH
+    for path in document_candidates(directory, intent.unit_name):
+        path.unlink()
+    return write_document(directory / f"{intent.unit_name}.json", intent.document(), format=DocumentFormat.JSON)
+
+
+def validate_retained_deletion_unit(
+    unit: UnitResource[Any], path: Path, intent: UnitDeletionIntent
+) -> tuple[str, DesiredSource | None]:
+    if file_blob(path) != intent.retained_unit_blob:
+        raise OperationError(f"retained desired Unit for {intent.unit_name!r} changed after deletion was requested")
+    if (
+        unit.metadata.uid != intent.uid
+        or unit.gvk.api_version != intent.retained_api_version
+        or unit.gvk.kind != intent.retained_kind
+        or unit.driver_name != intent.retained_driver
+    ):
+        raise OperationError(f"retained desired Unit for {intent.unit_name!r} no longer matches its deletion fence")
+    source_revision = getattr(unit.spec, "source", None)
+    if not isinstance(source_revision, DesiredSource):
+        source_revision = None
+    if (source_revision.revision if source_revision is not None else None) != intent.retained_source_revision:
+        raise OperationError(f"retained source revision for {intent.unit_name!r} changed after deletion was requested")
+    return require_unit(unit, intent.unit_name)
+
+
+def opaque_cleanup_root_for_intent(
+    unit_name: str,
+    intent: UnitDeletionIntent,
+    path: Path,
+    payload: object,
+) -> OpaqueCleanupRoot:
+    return OpaqueCleanupRoot(
+        path=path,
+        payload=payload,
+        metadata=ResourceMetadata(
+            name=unit_name,
+            uid=intent.uid,
+            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
+        ),
+        source=raw_document_source(payload),
+    )
+
+
+def deletion_intent_reason(intent: UnitDeletionIntent) -> str:
+    return (
+        f"deletion pending finalization (UID {intent.uid}, generation {intent.deletion_generation}); "
+        f"run finalize --unit {intent.unit_name} --uid {intent.uid} "
+        f"--deletion-generation {intent.deletion_generation}"
+    )
+
+
+def load_teardown_evidence(root: Path, unit_name: str) -> TeardownEvidence | None:
+    paths = document_candidates(root / OBSERVED_TEARDOWN_EVIDENCE_PATH, unit_name)
+    if len(paths) > 1:
+        raise OperationError(f"multiple teardown evidence formats exist for {unit_name!r}")
+    if not paths:
+        return None
+    try:
+        return TeardownEvidence.from_document(load_json(paths[0]), unit_name)
+    except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
+        raise OperationError(f"invalid teardown evidence for {unit_name!r}") from exc
+
+
+def publish_teardown_observation_cas(
+    observed_ref: str,
+    intent: UnitDeletionIntent,
+    desired_revision: str,
+) -> str:
+    evidence = TeardownEvidence(
+        unit_name=intent.unit_name,
+        uid=intent.uid,
+        deletion_generation=intent.deletion_generation,
+        desired_revision=desired_revision,
+    )
+    for attempt in range(5):
+        if attempt:
+            log_status("RETRY", f"teardown observation publish attempt {attempt + 1}/5")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            observed = Path(temporary_directory) / "observed"
+            observed_revision = observed_tree(observed_ref, observed)
+            existing = load_teardown_evidence(observed, intent.unit_name)
+            if existing is not None and (
+                existing.uid != evidence.uid or existing.deletion_generation != evidence.deletion_generation
+            ):
+                raise OperationError(f"observed teardown evidence for {intent.unit_name!r} has a different fence")
+            receipt_paths = document_candidates(observed / "units", intent.unit_name)
+            artifact_path = observed / "artifacts" / intent.unit_name
+            had_active_observation = bool(receipt_paths) or artifact_path.exists()
+            for receipt_path in receipt_paths:
+                receipt_path.unlink()
+            if artifact_path.is_dir() and not artifact_path.is_symlink():
+                shutil.rmtree(artifact_path)
+            elif artifact_path.is_symlink():
+                artifact_path.unlink()
+            evidence_path = observed / OBSERVED_TEARDOWN_EVIDENCE_PATH / f"{intent.unit_name}.json"
+            write_document(evidence_path, evidence.document(), format=DocumentFormat.JSON)
+            if existing is not None and not had_active_observation and observed_revision is not None:
+                return observed_revision
+            try:
+                return publish_tree(
+                    observed_ref,
+                    observed,
+                    observed_revision,
+                    f"Record teardown of {intent.unit_name} generation {intent.deletion_generation}",
+                )
+            except subprocess.CalledProcessError as exc:
+                if attempt == 4 or not retryable_push_failure(exc):
+                    raise
+    raise OperationError(f"could not update {observed_ref} after concurrent updates")
+
+
+def desired_uid_provenance(unit: UnitResource[Any], source: DesiredSource | None, source_revision: str | None) -> str:
+    return json.dumps(
+        {
+            "apiVersion": unit.gvk.api_version,
+            "kind": unit.gvk.kind,
+            "name": unit.name,
+            "source": source.to_dict() if source is not None else None,
+            "sourceRevision": source_revision,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def source_tracked_metadata_for_resource(
+    unit: UnitResource[Any], source: DesiredSource | None = None, source_revision: str | None = None
+) -> ResourceMetadata:
+    retained_source = source if source is not None else getattr(unit.spec, "source", None)
+    if retained_source is not None and not isinstance(retained_source, DesiredSource):
+        retained_source = None
+    return ResourceMetadata.source_tracked_from_provenance(
+        unit.name,
+        desired_uid_provenance(unit, retained_source, source_revision),
+    )
+
+
+def opaque_document_payload(path: Path) -> object:
+    try:
+        return load_json(path)
+    except Exception:
+        try:
+            return path.read_text()
+        except (OSError, UnicodeError) as exc:
+            return {"readError": str(exc)}
+
+
+def raw_document_source(payload: object) -> DesiredSource | None:
+    if not isinstance(payload, dict):
+        return None
+    specification = payload.get("spec", payload)
+    source = specification.get("source") if isinstance(specification, dict) else None
+    if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+        return None
+    inputs = source.get("inputs")
+    return DesiredSource(
+        path=source["path"],
+        revision=source.get("revision") if isinstance(source.get("revision"), str) else None,
+        driverVersion=source.get("driverVersion") if isinstance(source.get("driverVersion"), int) else None,
+        inputHash=source.get("inputHash") if isinstance(source.get("inputHash"), str) else None,
+        inputs=inputs if isinstance(inputs, list) and all(isinstance(value, str) for value in inputs) else None,
+    )
+
+
+def opaque_cleanup_metadata(name: str, payload: object, source_revision: str) -> ResourceMetadata:
+    has_metadata = isinstance(payload, dict) and "metadata" in payload
+    metadata_document = payload.get("metadata") if isinstance(payload, dict) else None
+    if has_metadata and not isinstance(metadata_document, dict):
+        raise OperationError(f"opaque cleanup metadata for {name!r} must be a mapping")
+    if isinstance(metadata_document, dict):
+        if metadata_document.get("name") != name:
+            raise OperationError(f"opaque cleanup metadata for {name!r} has a mismatched name")
+        if set(metadata_document) != {"name"}:
+            try:
+                metadata = ResourceMetadata.from_dict(metadata_document)
+                metadata.validate_desired()
+            except (KeyError, TypeError, ValueError) as exc:
+                raise OperationError(f"opaque cleanup metadata for {name!r} is invalid") from exc
+            lifecycle = metadata.lifecycle
+            if lifecycle is not None and (
+                lifecycle.owner is not None
+                or (lifecycle.management is not None and lifecycle.management.mode == "direct")
+            ):
+                raise OperationError(f"desired unit {name!r} collides with a directly managed or UID-owned resource")
+            if metadata.uid is None:
+                raise OperationError(f"opaque cleanup metadata for {name!r} has no canonical UID")
+            return ResourceMetadata(
+                name=name,
+                uid=metadata.uid,
+                lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
+            )
+    provenance = json.dumps(
+        {"name": name, "sourceRevision": source_revision, "payload": payload},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return ResourceMetadata.source_tracked_from_provenance(name, provenance)
+
+
+def load_desired_cleanup_roots(root: Path) -> dict[str, OpaqueCleanupRoot]:
+    roots: dict[str, OpaqueCleanupRoot] = {}
+    for path in desired_cleanup_root_paths(root):
+        name = path.stem
+        try:
+            document = load_json(path)
+        except DocumentFormatError as exc:
+            raise OperationError(f"invalid opaque cleanup envelope for {name!r}") from exc
+        if (
+            type(document.get("schema")) is not int
+            or document.get("schema") != 1
+            or document.get("kind") != "OpaqueCleanupRoot"
+            or "payload" not in document
+        ):
+            raise OperationError(f"invalid opaque cleanup envelope for {name!r}")
+        payload = document["payload"]
+        metadata_document = document.get("metadata")
+        if not isinstance(metadata_document, dict):
+            raise OperationError(f"invalid opaque cleanup envelope for {name!r}")
+        try:
+            metadata = ResourceMetadata.from_dict(metadata_document)
+            metadata.validate_desired()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise OperationError(f"invalid opaque cleanup metadata for {name!r}") from exc
+        if metadata.name != name:
+            raise OperationError(f"opaque cleanup metadata for {name!r} has a mismatched name")
+        lifecycle = metadata.lifecycle
+        if (
+            metadata.is_legacy_compatibility
+            or lifecycle is None
+            or lifecycle.management is None
+            or lifecycle.management.mode != "sourceTracked"
+        ):
+            raise OperationError(f"opaque cleanup metadata for {name!r} must be sourceTracked")
+        roots[name] = OpaqueCleanupRoot(
+            path=path,
+            payload=payload,
+            metadata=metadata,
+            source=raw_document_source(payload),
+        )
+    return roots
+
+
+def write_opaque_cleanup_root(root: Path, name: str, opaque: OpaqueCleanupRoot) -> Path:
+    suffix = opaque.path.suffix if opaque.path.suffix in {".json", ".yaml", ".yml"} else ".json"
+    path = root / DESIRED_CLEANUP_UNITS_PATH / f"{name}{suffix}"
+    write_document(
+        path,
+        {
+            "schema": 1,
+            "kind": "OpaqueCleanupRoot",
+            "metadata": opaque.metadata.document(profile="desired"),
+            "payload": opaque.payload,
+        },
+        format=DocumentFormat.YAML if suffix in {".yaml", ".yml"} else DocumentFormat.JSON,
+    )
+    return path
+
+
+def desired_metadata_for_candidate(
+    authored: UnitResource[Any],
+    previous: UnitResource[Any] | None,
+    source: DesiredSource | None = None,
+    source_revision: str | None = None,
+) -> ResourceMetadata:
     """Select a durable desired identity without reusing a colliding incarnation."""
 
     if previous is None:
-        return ResourceMetadata.new_source_tracked(authored.name)
+        return source_tracked_metadata_for_resource(authored, source, source_revision)
     if previous.is_legacy_compatibility:
-        return ResourceMetadata.new_source_tracked(authored.name)
+        return source_tracked_metadata_for_resource(previous)
     previous.metadata.validate_desired()
     lifecycle = previous.metadata.lifecycle
     if lifecycle is None:
@@ -2031,37 +2614,95 @@ def build_desired_candidate(
 
     prepared: dict[str, tuple[UnitResource[Any], DesiredSource | None]] = {}
     retained_transitions: dict[str, UnitResource[Any]] = {}
-    retained_raw_transitions: dict[str, tuple[Path, JsonObject]] = {}
-    for unit_name, specification in specifications.items():
-        previous_unit = unit_document_path(current_desired, unit_name)
-        previous_driver = persisted_unit_driver_name(previous_unit) if previous_unit.is_file() else None
-        if previous_unit.is_file() and previous_driver not in {None, specification.driver_name}:
-            raw_previous = load_json(previous_unit)
-            raw_metadata = raw_previous.get("metadata")
-            if isinstance(raw_metadata, dict) and set(raw_metadata) != {"name"}:
-                try:
-                    persisted_metadata = ResourceMetadata.from_dict(raw_metadata)
-                    persisted_metadata.validate_desired()
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise OperationError(
-                        f"desired unit {unit_name!r} has invalid persisted lifecycle metadata"
-                    ) from exc
-                lifecycle = persisted_metadata.lifecycle
-                if lifecycle is not None and (
-                    lifecycle.owner is not None
-                    or (lifecycle.management is not None and lifecycle.management.mode == "direct")
-                ):
-                    raise OperationError(
-                        f"desired unit {unit_name!r} collides with a directly managed or UID-owned resource"
-                    )
-            retained_raw_transitions[unit_name] = (previous_unit, raw_previous)
-            if verbose:
-                log_status(
-                    "RETAIN",
-                    f"{style_unit(unit_name)}: unavailable previous driver; retain legacy cleanup root",
+    opaque_transitions = load_desired_cleanup_roots(current_desired)
+    deletion_intents = load_desired_deletion_intents(current_desired)
+    blocked_transitions = load_desired_transition_blocks(current_desired)
+    blocked: dict[str, str] = {}
+    cleanup_inputs: dict[str, DesiredCleanupInput] = {}
+
+    def retain_deletion_intent(unit_name: str, intent: UnitDeletionIntent) -> None:
+        retained_path = current_desired / PurePosixPath(intent.cleanup_identity.path)
+        retained: UnitResource[Any] | None = None
+        opaque: OpaqueCleanupRoot | None = None
+        if retained_path.is_file():
+            try:
+                candidate_unit = load_desired_unit(retained_path, unit_name)
+                candidate_unit.metadata.validate_desired()
+                if candidate_unit.is_legacy_compatibility:
+                    raise OperationError("retained desired Unit is legacy")
+                validate_retained_deletion_unit(candidate_unit, retained_path, intent)
+                target_path = candidate / PurePosixPath(intent.cleanup_identity.path)
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(retained_path, target_path)
+                if getattr(candidate_unit.spec, "materialization", None) is not None:
+                    copy_unit_materialization(current_desired, candidate, unit_name, candidate_unit)
+                retained = candidate_unit
+            except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError):
+                opaque = opaque_cleanup_root_for_intent(
+                    unit_name,
+                    intent,
+                    retained_path,
+                    opaque_document_payload(retained_path),
                 )
+        if retained is None:
+            if opaque is None:
+                existing = opaque_transitions.get(unit_name)
+                if existing is not None:
+                    opaque = opaque_cleanup_root_for_intent(unit_name, intent, existing.path, existing.payload)
+                else:
+                    opaque = opaque_cleanup_root_for_intent(
+                        unit_name,
+                        intent,
+                        retained_path,
+                        {
+                            "kind": "UnavailableRetainedUnit",
+                            "unitName": unit_name,
+                            "uid": intent.uid,
+                            "retainedPath": intent.cleanup_identity.path,
+                        },
+                    )
+            write_opaque_cleanup_root(candidate, unit_name, opaque)
+        write_deletion_intent(candidate, intent)
+        reason = deletion_intent_reason(intent)
+        blocked_transitions[unit_name] = reason
+        blocked[unit_name] = reason
+        cleanup_inputs[unit_name] = DesiredCleanupInput(
+            unit_name=unit_name,
+            desired=retained,
+            source=getattr(retained.spec, "source", None) if retained is not None else intent.retained_source,
+        )
+        if verbose:
+            log_status("WAIT", f"{style_unit(unit_name)}: {reason}")
+
+    for unit_name, specification in specifications.items():
+        if unit_name in deletion_intents:
+            retain_deletion_intent(unit_name, deletion_intents[unit_name])
             continue
-        previous = load_desired_unit(previous_unit, unit_name) if previous_unit.is_file() else None
+        if unit_name in opaque_transitions:
+            blocked_transitions.setdefault(unit_name, "opaque cleanup root retained pending explicit adoption")
+            if verbose:
+                log_status("WAIT", f"{style_unit(unit_name)}: {blocked_transitions[unit_name]}")
+            continue
+        previous_unit = unit_document_path(current_desired, unit_name)
+        previous = None
+        if previous_unit.is_file():
+            try:
+                previous = load_desired_unit(previous_unit, unit_name)
+            except Exception:
+                opaque_payload = opaque_document_payload(previous_unit)
+                opaque_transitions[unit_name] = OpaqueCleanupRoot(
+                    path=previous_unit,
+                    payload=opaque_payload,
+                    metadata=opaque_cleanup_metadata(unit_name, opaque_payload, source_revision),
+                    source=raw_document_source(opaque_payload),
+                )
+                blocked_transitions[unit_name] = "previous desired unit is unavailable; opaque cleanup root retained"
+                if verbose:
+                    log_status(
+                        "RETAIN",
+                        f"{style_unit(unit_name)}: unavailable previous unit; retain opaque cleanup root",
+                    )
+                continue
         if previous is not None and not previous.is_legacy_compatibility:
             previous.metadata.validate_desired()
             lifecycle = previous.metadata.lifecycle
@@ -2077,11 +2718,12 @@ def build_desired_candidate(
             previous.gvk != specification.gvk or previous.driver_name != specification.driver_name
         ):
             retained = (
-                previous.with_metadata(ResourceMetadata.new_source_tracked(unit_name))
+                previous.with_metadata(source_tracked_metadata_for_resource(previous))
                 if previous.is_legacy_compatibility
                 else previous
             )
             retained_transitions[unit_name] = retained
+            blocked_transitions[unit_name] = "desired resource identity changed; previous cleanup root retained"
             if verbose:
                 log_status(
                     "RETAIN",
@@ -2115,7 +2757,6 @@ def build_desired_candidate(
 
     unresolved = set(prepared)
     unavailable: dict[str, str] = {}
-    blocked: dict[str, str] = {}
     while unresolved:
         progressed = False
         for unit_name in sorted(unresolved):
@@ -2154,7 +2795,9 @@ def build_desired_candidate(
             )
             previous_unit = unit_document_path(current_desired, unit_name)
             previous = load_desired_unit(previous_unit, unit_name) if previous_unit.is_file() else None
-            resolved = resolved.with_metadata(desired_metadata_for_candidate(authored, previous))
+            resolved = resolved.with_metadata(
+                desired_metadata_for_candidate(authored, previous, resolved_source, source_revision)
+            )
             candidate_unit = write_desired_candidate_unit(candidate_units / f"{unit_name}.json", resolved, source_root)
             previous_inputs = getattr(previous.spec, "resolvedInputs", None) if previous is not None else None
             previous_receipts = previous_inputs.receipts if previous_inputs is not None else None
@@ -2199,7 +2842,9 @@ def build_desired_candidate(
         if previous_driver == next_driver:
             previous_resource = load_desired_unit(previous, unit_name)
             retained = previous_resource.with_metadata(
-                desired_metadata_for_candidate(prepared[unit_name][0], previous_resource)
+                desired_metadata_for_candidate(
+                    prepared[unit_name][0], previous_resource, prepared[unit_name][1], source_revision
+                )
             )
             write_desired_candidate_unit(candidate_units / previous.name, retained, source_root)
             copy_unit_materialization(current_desired, candidate, unit_name, previous_resource)
@@ -2212,37 +2857,6 @@ def build_desired_candidate(
             log_status("WAIT", f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}")
         blocked[unit_name] = unavailable[unit_name]
 
-    cleanup_inputs: dict[str, DesiredCleanupInput] = {}
-    for unit_name, (previous_path, raw_previous) in retained_raw_transitions.items():
-        selected = DocumentFormat.YAML if previous_path.suffix in {".yaml", ".yml"} else DocumentFormat.JSON
-        write_document(candidate_units / previous_path.name, raw_previous, format=selected)
-        raw_specification = raw_previous.get("spec", raw_previous)
-        raw_source = raw_specification.get("source") if isinstance(raw_specification, dict) else None
-        cleanup_source = None
-        if isinstance(raw_source, dict) and isinstance(raw_source.get("path"), str):
-            cleanup_revision = raw_source.get("revision")
-            cleanup_driver_version = raw_source.get("driverVersion")
-            cleanup_input_hash = raw_source.get("inputHash")
-            cleanup_raw_inputs = raw_source.get("inputs")
-            cleanup_inputs_value = (
-                cast(list[str], cleanup_raw_inputs)
-                if isinstance(cleanup_raw_inputs, list) and all(isinstance(value, str) for value in cleanup_raw_inputs)
-                else None
-            )
-            cleanup_source = DesiredSource(
-                path=cast(str, raw_source["path"]),
-                revision=cleanup_revision if isinstance(cleanup_revision, str) else None,
-                driverVersion=cleanup_driver_version if isinstance(cleanup_driver_version, int) else None,
-                inputHash=cleanup_input_hash if isinstance(cleanup_input_hash, str) else None,
-                inputs=cleanup_inputs_value,
-            )
-        cleanup_inputs[unit_name] = DesiredCleanupInput(
-            unit_name=unit_name,
-            desired=None,
-            source=cleanup_source,
-            raw_document=raw_previous,
-        )
-        blocked[unit_name] = "previous desired driver is unavailable; legacy cleanup root retained"
     for unit_name, retained in retained_transitions.items():
         previous_path = unit_document_path(current_desired, unit_name)
         write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
@@ -2257,23 +2871,58 @@ def build_desired_candidate(
     for unit_name, previous_path in _current_desired_unit_paths(current_desired).items():
         if unit_name in specifications:
             continue
-        previous = load_desired_unit(previous_path, unit_name)
+        if unit_name in deletion_intents:
+            retain_deletion_intent(unit_name, deletion_intents[unit_name])
+            continue
+        try:
+            previous = load_desired_unit(previous_path, unit_name)
+        except Exception:
+            opaque_payload = opaque_document_payload(previous_path)
+            opaque_transitions[unit_name] = OpaqueCleanupRoot(
+                path=previous_path,
+                payload=opaque_payload,
+                metadata=opaque_cleanup_metadata(unit_name, opaque_payload, source_revision),
+                source=raw_document_source(opaque_payload),
+            )
+            blocked_transitions[unit_name] = "source absent; opaque cleanup root retained"
+            continue
         retained = previous
         if previous.is_legacy_compatibility:
-            retained = previous.with_metadata(ResourceMetadata.new_source_tracked(unit_name))
+            retained = previous.with_metadata(source_tracked_metadata_for_resource(previous))
         write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
         if getattr(retained.spec, "materialization", None) is not None:
             copy_unit_materialization(current_desired, candidate, unit_name, previous)
         lifecycle = retained.metadata.lifecycle
         if lifecycle is not None and lifecycle.management is not None and lifecycle.management.mode == "sourceTracked":
+            retained_candidate_path = unit_document_path(candidate, unit_name)
+            intent = UnitDeletionIntent.from_unit(retained, retained_candidate_path, candidate)
+            deletion_intents[unit_name] = intent
+            write_deletion_intent(candidate, intent)
+            deletion_reason = deletion_intent_reason(intent)
+            blocked_transitions[unit_name] = deletion_reason
+            blocked[unit_name] = deletion_reason
             cleanup_inputs[unit_name] = DesiredCleanupInput(
                 unit_name=unit_name,
                 desired=retained,
                 source=getattr(retained.spec, "source", None),
             )
             if verbose:
-                log_status("RETAIN", f"{style_unit(unit_name)}: source absent; cleanup inputs retained")
-    return BuildDesiredResult(blocked=blocked, cleanup_inputs=cleanup_inputs)
+                log_status("WAIT", f"{style_unit(unit_name)}: {deletion_reason}")
+    for unit_name, opaque in opaque_transitions.items():
+        write_opaque_cleanup_root(candidate, unit_name, opaque)
+        cleanup_inputs[unit_name] = DesiredCleanupInput(
+            unit_name=unit_name,
+            desired=None,
+            source=opaque.source,
+            raw_document=opaque.payload if isinstance(opaque.payload, dict) else None,
+        )
+        blocked[unit_name] = blocked_transitions[unit_name]
+    write_desired_transition_blocks(candidate, blocked_transitions)
+    return BuildDesiredResult(
+        blocked=blocked,
+        cleanup_inputs=cleanup_inputs,
+        blocked_transitions=blocked_transitions,
+    )
 
 
 def retryable_push_failure(exc: subprocess.CalledProcessError) -> bool:
@@ -2515,7 +3164,7 @@ def advance_desired(
                     f"{promotion.source_environment} is not an allowed promotion source for {environment}"
                 )
             observed_revision = observed_tree(observed_ref, observed)
-            build_desired_candidate(
+            candidate_result = build_desired_candidate(
                 environment,
                 source_root,
                 effective_source_revision,
@@ -2528,6 +3177,10 @@ def advance_desired(
                 verbose=verbose,
                 source_revision_operation="advance",
             )
+            if candidate_result is not None:
+                for unit_name, reason in sorted(candidate_result.blocked_transitions.items()):
+                    if verbose:
+                        log_status("WAIT", f"{style_unit(unit_name)}: {reason}")
             load_desired_resource_graph(candidate)
             if current_revision and directory_files(current_desired) == directory_files(candidate):
                 if verbose:
@@ -2897,6 +3550,148 @@ def validate_materialized_desired(
     return specifications, desired_units
 
 
+def canonicalize_rollback_unit(candidate_path: Path, current_path: Path) -> None:
+    """Keep historical payload while carrying forward the current incarnation identity."""
+
+    historical = load_desired_unit(candidate_path, candidate_path.stem)
+    current = load_desired_unit(current_path, current_path.stem) if current_path.is_file() else None
+    if current is not None:
+        metadata = (
+            source_tracked_metadata_for_resource(current) if current.is_legacy_compatibility else current.metadata
+        )
+    elif historical.is_legacy_compatibility:
+        metadata = source_tracked_metadata_for_resource(historical)
+    else:
+        historical.metadata.validate_desired()
+        metadata = historical.metadata
+    selected = DocumentFormat.YAML if candidate_path.suffix in {".yaml", ".yml"} else DocumentFormat.JSON
+    write_document(
+        candidate_path,
+        serialize_unit_document(historical.with_metadata(metadata), profile="desired"),
+        format=selected,
+    )
+
+
+def copy_current_blocked_unit(current: Path, candidate: Path, unit_name: str) -> None:
+    """Carry a parseable blocked current unit and its materialization into rollback."""
+
+    current_path = unit_document_path(current, unit_name)
+    current_unit = load_desired_unit(current_path, unit_name)
+    if current_unit.is_legacy_compatibility:
+        current_unit = current_unit.with_metadata(source_tracked_metadata_for_resource(current_unit))
+    else:
+        current_unit.metadata.validate_desired()
+    for unit_path in document_candidates(candidate / "units", unit_name):
+        unit_path.unlink()
+    selected = DocumentFormat.YAML if current_path.suffix in {".yaml", ".yml"} else DocumentFormat.JSON
+    write_document(
+        candidate / "units" / f"{unit_name}{current_path.suffix}",
+        serialize_unit_document(current_unit, profile="desired"),
+        format=selected,
+    )
+    copy_unit_materialization(current, candidate, unit_name, current_unit)
+
+
+def merge_current_cleanup_state(current: Path, candidate: Path) -> None:
+    """Carry only active current cleanup lifecycles through a historical rollback."""
+
+    current_roots = load_desired_cleanup_roots(current)
+    current_intents = load_desired_deletion_intents(current)
+    current_blocks = load_desired_transition_blocks(current)
+    cleanup_directory = candidate / DESIRED_CLEANUP_UNITS_PATH
+    if cleanup_directory.is_dir():
+        for cleanup_path in cleanup_directory.iterdir():
+            if cleanup_path.is_file() and cleanup_path.suffix in {".json", ".yaml", ".yml"}:
+                cleanup_path.unlink()
+    deletion_directory = candidate / DESIRED_DELETION_INTENTS_PATH
+    if deletion_directory.is_dir():
+        for intent_path in deletion_directory.iterdir():
+            if intent_path.is_file() and intent_path.suffix in {".json", ".yaml", ".yml"}:
+                intent_path.unlink()
+    merged_blocks = dict(current_blocks)
+    for name, root in current_roots.items():
+        for unit_path in document_candidates(candidate / "units", name):
+            unit_path.unlink()
+        write_opaque_cleanup_root(candidate, name, root)
+        merged_blocks.setdefault(name, "opaque cleanup root retained pending explicit adoption")
+    for name, intent in current_intents.items():
+        for unit_path in document_candidates(candidate / "units", name):
+            unit_path.unlink()
+        retained_path = current / PurePosixPath(intent.cleanup_identity.path)
+        retained_unit: UnitResource[Any] | None = None
+        if retained_path.is_file():
+            try:
+                candidate_unit = load_desired_unit(retained_path, name)
+                candidate_unit.metadata.validate_desired()
+                validate_retained_deletion_unit(candidate_unit, retained_path, intent)
+                retained_unit = candidate_unit
+            except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError):
+                retained_unit = None
+        if retained_unit is not None:
+            target_path = candidate / PurePosixPath(intent.cleanup_identity.path)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(retained_path, target_path)
+            if getattr(retained_unit.spec, "materialization", None) is not None:
+                copy_unit_materialization(current, candidate, name, retained_unit)
+        else:
+            payload = (
+                opaque_document_payload(retained_path)
+                if retained_path.is_file()
+                else {
+                    "kind": "UnavailableRetainedUnit",
+                    "unitName": name,
+                    "uid": intent.uid,
+                    "retainedPath": intent.cleanup_identity.path,
+                }
+            )
+            write_opaque_cleanup_root(
+                candidate,
+                name,
+                opaque_cleanup_root_for_intent(name, intent, retained_path, payload),
+            )
+        write_deletion_intent(candidate, intent)
+        merged_blocks[name] = deletion_intent_reason(intent)
+    for name in current_blocks:
+        if name in current_roots or name in current_intents:
+            continue
+        current_path = unit_document_path(current, name)
+        if current_path.is_file():
+            copy_current_blocked_unit(current, candidate, name)
+        else:
+            for unit_path in document_candidates(candidate / "units", name):
+                unit_path.unlink()
+    write_desired_transition_blocks(candidate, merged_blocks)
+
+
+def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[str, ...]:
+    """Find active owned or observation-dependent descendants of a teardown target."""
+
+    resources = load_desired_resource_graph(root)
+    target_key = (target.gvk.api_version, target.gvk.kind, target.name)
+    pending = [target_key]
+    dependents: set[str] = set()
+    while pending:
+        parent_key = pending.pop()
+        for key, child in resources.items():
+            if key == parent_key or child.name in dependents:
+                continue
+            lifecycle = child.metadata.lifecycle
+            owner = lifecycle.owner if lifecycle is not None else None
+            owner_matches = False
+            if owner is not None:
+                owner_key = (owner.apiVersion, owner.kind, owner.name)
+                parent = resources.get(owner_key)
+                owner_matches = owner_key == parent_key and parent is not None and parent.metadata.uid == owner.uid
+            dependency_matches = bool(
+                observation_reference_units(child.driver.desired_unit_contract.dump(child.spec))
+                & {resources[parent_key].name}
+            )
+            if owner_matches or dependency_matches:
+                dependents.add(child.name)
+                pending.append(key)
+    return tuple(sorted(dependents))
+
+
 def command_rollback(args: argparse.Namespace) -> None:
     reason = args.reason.strip()
     if not reason:
@@ -3043,7 +3838,13 @@ def command_rollback(args: argparse.Namespace) -> None:
                     candidate_path,
                 )
                 copy_unit_materialization(target, candidate, unit_name, historical_unit)
+        merge_current_cleanup_state(current, candidate)
+        current_cleanup_names = set(load_desired_cleanup_roots(current))
+        for candidate_path in _current_desired_unit_paths(candidate).values():
+            canonicalize_rollback_unit(candidate_path, unit_document_path(current, candidate_path.stem))
         for unit_name in materialized_units:
+            if unit_name in current_cleanup_names:
+                continue
             validate_unit_materialization(
                 candidate,
                 unit_name,
@@ -3104,6 +3905,179 @@ def command_rollback(args: argparse.Namespace) -> None:
         write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
 
 
+def command_finalize(args: argparse.Namespace) -> bool:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
+        raise OperationError(f"invalid unit name: {args.unit!r}")
+    if not isinstance(getattr(args, "uid", None), str) or not args.uid:
+        raise OperationError("finalize requires --uid")
+    if (
+        not isinstance(getattr(args, "deletion_generation", None), int)
+        or isinstance(args.deletion_generation, bool)
+        or args.deletion_generation < 1
+    ):
+        raise OperationError("finalize requires --deletion-generation >= 1")
+    desired_ref, observed_ref = deployment_refs(
+        REPOSITORY_ROOT,
+        args.environment,
+        args.desired_ref,
+        args.observed_ref,
+    )
+    log_heading(f"Finalize {style_unit(args.unit)}")
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary = Path(temporary_directory)
+        current = temporary / "current"
+        observed = temporary / "observed"
+        current_revision = observed_tree(desired_ref, current)
+        if current_revision is None:
+            log_status("KEEP", f"{style_unit(args.unit)}: no desired state")
+            return False
+        intents = load_desired_deletion_intents(current)
+        intent = intents.get(args.unit)
+        if intent is None:
+            log_status("KEEP", f"{style_unit(args.unit)}: no deletion intent")
+            return False
+        if args.uid != intent.uid:
+            raise OperationError(f"stale deletion intent UID fence for {args.unit!r}")
+        if args.deletion_generation != intent.deletion_generation:
+            raise OperationError(f"stale deletion generation fence for {args.unit!r}")
+        retained_path = current / PurePosixPath(intent.cleanup_identity.path)
+        if not retained_path.is_file():
+            log_status("WAIT", f"{style_unit(args.unit)}: retained desired Unit is unavailable; deletion intent kept")
+            return False
+        try:
+            unit = load_desired_unit(retained_path, args.unit)
+            unit.metadata.validate_desired()
+            lifecycle = unit.metadata.lifecycle
+            if unit.is_legacy_compatibility or unit.metadata.uid != intent.uid:
+                raise OperationError("retained desired Unit is not the fenced canonical incarnation")
+            if lifecycle is None or lifecycle.management is None or lifecycle.management.mode != "sourceTracked":
+                raise OperationError("retained desired Unit is not source-tracked")
+            if unit_contains_reference(unit):
+                raise OperationError("retained desired Unit contains unresolved inputs")
+            require_unit(unit, args.unit)
+            validate_retained_deletion_unit(unit, retained_path, intent)
+            validate_unit_materialization(current, args.unit, unit)
+            load_desired_resource_graph(current)
+            dependents = active_teardown_dependents(current, unit)
+            if dependents:
+                raise OperationError(f"active owned/dependent Units must be finalized first: {', '.join(dependents)}")
+        except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError) as exc:
+            log_status("WAIT", f"{style_unit(args.unit)}: {exc}; deletion intent kept")
+            return False
+        observed_tree(observed_ref, observed)
+        existing_evidence = load_teardown_evidence(observed, args.unit)
+        if existing_evidence is not None and (
+            existing_evidence.uid != intent.uid or existing_evidence.deletion_generation != intent.deletion_generation
+        ):
+            raise OperationError(f"stale observed teardown evidence for {args.unit!r}")
+        if existing_evidence is not None and args.dry:
+            log_status("DRY", f"{style_unit(args.unit)}: teardown evidence already exists")
+            return False
+        if existing_evidence is None:
+            driver = unit.driver
+            if not isinstance(driver, TeardownCapability):
+                log_status(
+                    "WAIT",
+                    f"{style_unit(args.unit)}: driver {unit.driver_name} does not support teardown; "
+                    "install teardown support or resolve the intent explicitly",
+                )
+                return False
+            source = getattr(unit.spec, "source", None)
+            if source is not None and not isinstance(source, DesiredSource):
+                log_status(
+                    "WAIT", f"{style_unit(args.unit)}: retained source identity is invalid; deletion intent kept"
+                )
+                return False
+            source_root = None
+            if source is not None and source.revision is not None:
+                source_root = temporary / "source"
+                try:
+                    materialize_revision(source.revision, source_root)
+                except (DocumentFormatError, OperationError, subprocess.CalledProcessError) as exc:
+                    log_status("WAIT", f"{style_unit(args.unit)}: retained source is unavailable: {exc}")
+                    return False
+            if args.dry:
+                log_status(
+                    "DRY", f"{style_unit(args.unit)}: teardown would run at generation {intent.deletion_generation}"
+                )
+                return False
+            try:
+                driver.teardown(
+                    TeardownContext(
+                        environment=args.environment,
+                        desired_root=current,
+                        desired_revision=current_revision,
+                        source_root=source_root,
+                        source_revision=source.revision if source is not None else None,
+                        source_path=source.path if source is not None else None,
+                        unit_name=args.unit,
+                        unit=unit.spec,
+                        resource_uid=intent.uid,
+                        deletion_generation=intent.deletion_generation,
+                        report=Path(args.report).resolve() if args.report else None,
+                        execution=DriverExecution.console(),
+                    )
+                )
+            except (DriverError, OperationError, subprocess.CalledProcessError) as exc:
+                detail = (exc.stderr or "").strip() if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+                log_status("WAIT", f"{style_unit(args.unit)}: teardown failed: {detail or exc}; deletion intent kept")
+                return False
+        try:
+            publish_teardown_observation_cas(observed_ref, intent, current_revision)
+        except (OperationError, subprocess.CalledProcessError) as exc:
+            log_status("WAIT", f"{style_unit(args.unit)}: teardown evidence was not published: {exc}")
+            return False
+        candidate = temporary / "candidate"
+        shutil.copytree(current, candidate)
+        for path in document_candidates(candidate / "units", args.unit):
+            path.unlink()
+        for path in document_candidates(candidate / DESIRED_DELETION_INTENTS_PATH, args.unit):
+            path.unlink()
+        materialization = getattr(unit.spec, "materialization", None)
+        if materialization is not None:
+            materialized_path = candidate / materialization.path
+            if materialized_path.is_dir():
+                shutil.rmtree(materialized_path)
+        transition_blocks = load_desired_transition_blocks(candidate)
+        transition_blocks.pop(args.unit, None)
+        write_desired_transition_blocks(candidate, transition_blocks)
+        load_desired_resource_graph(candidate)
+        candidate_id = candidate_identifier(
+            "finalize",
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            {
+                "unit": args.unit,
+                "uid": intent.uid,
+                "deletionGeneration": intent.deletion_generation,
+            },
+        )
+        candidate_ref = resolve_candidate_ref(
+            REPOSITORY_ROOT,
+            args.environment,
+            "finalize",
+            candidate_id,
+            args.candidate_ref,
+        )
+        revision, outcome = publish_desired_change(
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            candidate_ref,
+            f"Finalize deletion of {args.unit} generation {intent.deletion_generation}",
+            f"Finalize deletion of {args.unit} generation {intent.deletion_generation}",
+            f"Finalize deletion of `{args.unit}` after successful UID-fenced teardown.",
+            False,
+        )
+        log_status("UPDATE", f"{style_branch(desired_ref)} advanced to {describe_revision(revision)}")
+        print(revision)
+        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
+        return True
+
+
 def command_resolve_desired(args: argparse.Namespace) -> None:
     revision = resolve_ref(args.desired_ref, args.desired_revision)
     print(revision)
@@ -3147,8 +4121,9 @@ def command_status(args: argparse.Namespace) -> None:
         specifications = load_environment_specifications(REPOSITORY_ROOT, args.environment)
         statuses = reconciliation_statuses(sorted(specifications), desired, observed)
         if args.unit is not None:
-            if args.unit not in specifications:
-                available = ", ".join(sorted(specifications)) or "none"
+            status_names = {unit_name for unit_name, _status, _reason in statuses}
+            if args.unit not in status_names:
+                available = ", ".join(sorted(status_names)) or "none"
                 raise OperationError(
                     f"unknown unit {args.unit!r} for environment {args.environment!r}; available units: {available}"
                 )
@@ -3694,6 +4669,16 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             if observed_revision
             else f"{style_branch(observed_ref)} has no receipts yet",
         )
+        if transition_reason := load_desired_transition_blocks(desired).get(args.unit):
+            log_status("WAIT", transition_reason)
+            log_status("DONE", f"{style_unit(args.unit)}: no changes")
+            write_reconcile_outputs(False)
+            return False
+        if deletion_intent := load_desired_deletion_intents(desired).get(args.unit):
+            log_status("WAIT", deletion_intent_reason(deletion_intent))
+            log_status("DONE", f"{style_unit(args.unit)}: no changes")
+            write_reconcile_outputs(False)
+            return False
         unit_path = unit_document_path(desired, args.unit)
         if not unit_path.is_file():
             log_status("WAIT", "desired inputs are not materialized")
@@ -4747,6 +5732,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rollback.add_argument("--dry", action="store_true")
     rollback.set_defaults(handler=command_rollback)
+
+    finalize = commands.add_parser(
+        "finalize",
+        help="finalize one durable source-tracked deletion intent",
+    )
+    finalize.add_argument("--environment", required=True)
+    finalize.add_argument("--unit", required=True)
+    finalize.add_argument("--uid", required=True, help="expected deletion-intent UID fence")
+    finalize.add_argument(
+        "--deletion-generation",
+        required=True,
+        type=int,
+        help="expected deletion generation fence",
+    )
+    finalize.add_argument("--desired-ref", help="override the environment's desired ref")
+    finalize.add_argument("--observed-ref", help="override the environment's observed ref")
+    finalize.add_argument(
+        "--candidate-ref",
+        help="exact candidate ref override when the environment uses a pull-request change gate",
+    )
+    finalize.add_argument("--report", help="directory where the driver may write teardown reports")
+    finalize.add_argument("--dry", action="store_true")
+    finalize.set_defaults(handler=command_finalize)
 
     resolve = commands.add_parser(
         "resolve-desired",

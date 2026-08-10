@@ -243,10 +243,216 @@ def test_blocked_driver_transition_omits_previous_unit_and_reports_wait(tmp_path
 
     deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate)
 
-    assert deploy_release.load_json(candidate / "units/frontend.json") == deploy_release.load_json(
-        current / "units/frontend.json"
+    assert not (candidate / "units/frontend.json").exists()
+    cleanup = deploy_release.load_json(candidate / ".gitopsctr/cleanup/units/frontend.json")
+    assert cleanup["metadata"]["lifecycle"] == {"management": {"mode": "sourceTracked"}}
+    assert cleanup["payload"] == deploy_release.load_json(current / "units/frontend.json")
+    assert deploy_release.load_desired_transition_blocks(candidate)["frontend"] == (
+        "previous desired unit is unavailable; opaque cleanup root retained"
     )
-    assert "retain legacy cleanup root" in capsys.readouterr().err
+    assert deploy_release.load_desired_transition_blocks(candidate) == {
+        "frontend": "previous desired unit is unavailable; opaque cleanup root retained"
+    }
+    assert deploy_release.reconciliation_statuses(["frontend"], candidate, observed) == [
+        ("frontend", "WAIT", "previous desired unit is unavailable; opaque cleanup root retained")
+    ]
+    assert "retain opaque cleanup root" in capsys.readouterr().err
+
+
+def test_unparseable_previous_unit_uses_opaque_cleanup_root(tmp_path):
+    source = tmp_path / "source"
+    current = tmp_path / "current"
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
+    _write_json(
+        source / "deployment/environments/dev/units/frontend.json",
+        {"schema": 1, "name": "frontend", "driver": "terraform", "source": {"path": "."}},
+    )
+    raw = {
+        "name": "frontend",
+        "driver": "terraform",
+        "metadata": {
+            "name": "frontend",
+            "uid": "old-frontend-uid",
+            "lifecycle": {"management": {"mode": "sourceTracked"}},
+        },
+        "source": {"path": ".", "revision": "a" * 40},
+        "terraform": {"variables": []},
+    }
+    _write_json(current / "units/frontend.json", raw)
+    observed.mkdir()
+
+    result = deploy_release.build_desired_candidate(
+        "dev", source, "b" * 40, current, observed, None, candidate, verbose=False
+    )
+
+    assert "frontend" in result.blocked
+    assert not (candidate / "units/frontend.json").exists()
+    cleanup = deploy_release.load_json(candidate / ".gitopsctr/cleanup/units/frontend.json")
+    assert cleanup["payload"] == raw
+    assert cleanup["metadata"]["uid"] == "old-frontend-uid"
+    assert cleanup["metadata"]["lifecycle"] == {"management": {"mode": "sourceTracked"}}
+
+    repeated = tmp_path / "repeated"
+    deploy_release.build_desired_candidate("dev", source, "b" * 40, candidate, observed, None, repeated, verbose=False)
+    assert not (repeated / "units/frontend.json").exists()
+    assert deploy_release.load_json(repeated / ".gitopsctr/cleanup/units/frontend.json") == cleanup
+    assert deploy_release.load_desired_transition_blocks(repeated) == deploy_release.load_desired_transition_blocks(
+        candidate
+    )
+
+
+def test_source_absent_unparseable_unit_is_retained_only_as_cleanup_payload(tmp_path):
+    source = tmp_path / "source"
+    current = tmp_path / "current"
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
+    _write_json(
+        source / "deployment/environments/dev/units/active.json",
+        {"schema": 1, "name": "active", "driver": "terraform", "source": {"path": "."}},
+    )
+    raw = {"name": "orphan", "driver": "missing-driver", "source": {"path": "."}}
+    _write_json(current / "units/orphan.json", raw)
+    observed.mkdir()
+
+    result = deploy_release.build_desired_candidate(
+        "dev", source, "b" * 40, current, observed, None, candidate, verbose=False
+    )
+
+    assert "orphan" in result.blocked
+    assert not (candidate / "units/orphan.json").exists()
+    cleanup = deploy_release.load_json(candidate / ".gitopsctr/cleanup/units/orphan.json")
+    assert cleanup["payload"] == raw
+    assert deploy_release.load_desired_transition_blocks(candidate)["orphan"] == (
+        "source absent; opaque cleanup root retained"
+    )
+    assert deploy_release.reconciliation_statuses(["active"], candidate, observed)[-1] == (
+        "orphan",
+        "WAIT",
+        "source absent; opaque cleanup root retained",
+    )
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".yml"])
+def test_cleanup_root_loader_reads_yaml_and_write_preserves_suffix(tmp_path, suffix):
+    root = tmp_path / "desired"
+    metadata = ResourceMetadata.source_tracked_from_provenance("frontend", "yaml-cleanup:v1")
+    opaque = deploy_release.OpaqueCleanupRoot(
+        path=Path(f"frontend{suffix}"),
+        payload={"name": "frontend", "driver": "missing-driver"},
+        metadata=metadata,
+        source=None,
+    )
+
+    path = deploy_release.write_opaque_cleanup_root(root, "frontend", opaque)
+
+    assert path == root / f".gitopsctr/cleanup/units/frontend{suffix}"
+    loaded = deploy_release.load_desired_cleanup_roots(root)
+    assert loaded["frontend"].path == path
+    assert loaded["frontend"].payload == opaque.payload
+    assert loaded["frontend"].metadata.uid == metadata.uid
+
+
+def test_cleanup_root_loader_rejects_duplicate_document_formats(tmp_path):
+    root = tmp_path / "desired"
+    metadata = ResourceMetadata.source_tracked_from_provenance("frontend", "duplicate-cleanup:v1")
+    envelope = {
+        "schema": 1,
+        "kind": "OpaqueCleanupRoot",
+        "metadata": metadata.document(profile="desired"),
+        "payload": {"name": "frontend", "driver": "missing-driver"},
+    }
+    deploy_release.write_document(
+        root / ".gitopsctr/cleanup/units/frontend.json", envelope, format=deploy_release.DocumentFormat.JSON
+    )
+    deploy_release.write_document(
+        root / ".gitopsctr/cleanup/units/frontend.yaml", envelope, format=deploy_release.DocumentFormat.YAML
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="multiple cleanup document formats"):
+        deploy_release.load_desired_cleanup_roots(root)
+
+
+@pytest.mark.parametrize("change", ["schema", "kind", "metadata", "payload"])
+def test_cleanup_root_loader_rejects_noncanonical_envelopes(tmp_path, change):
+    root = tmp_path / "desired"
+    metadata = ResourceMetadata.source_tracked_from_provenance("frontend", "cleanup-envelope:v1")
+    envelope = {
+        "schema": 1,
+        "kind": "OpaqueCleanupRoot",
+        "metadata": metadata.document(profile="desired"),
+        "payload": {"name": "frontend", "driver": "missing-driver"},
+    }
+    if change == "schema":
+        envelope["schema"] = 2
+    elif change == "kind":
+        envelope["kind"] = "Other"
+    elif change == "metadata":
+        envelope["metadata"] = {**envelope["metadata"], "name": "other"}
+    else:
+        del envelope["payload"]
+    _write_json(root / ".gitopsctr/cleanup/units/frontend.json", envelope)
+
+    with pytest.raises(deploy_release.OperationError, match="opaque cleanup"):
+        deploy_release.load_desired_cleanup_roots(root)
+
+
+def test_cleanup_root_loader_rejects_legacy_metadata_envelope(tmp_path):
+    root = tmp_path / "desired"
+    _write_json(
+        root / ".gitopsctr/cleanup/units/frontend.json",
+        {
+            "schema": 1,
+            "kind": "OpaqueCleanupRoot",
+            "metadata": {"name": "frontend"},
+            "payload": {"name": "frontend", "driver": "missing-driver"},
+        },
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="must be sourceTracked"):
+        deploy_release.load_desired_cleanup_roots(root)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"name": "other"},
+        {
+            "name": "other",
+            "uid": "uid-1",
+            "lifecycle": {"management": {"mode": "sourceTracked"}},
+        },
+    ],
+)
+def test_opaque_cleanup_metadata_rejects_explicit_name_mismatch(metadata):
+    with pytest.raises(deploy_release.OperationError, match="mismatched name"):
+        deploy_release.opaque_cleanup_metadata(
+            "frontend",
+            {"metadata": metadata, "payload": {"name": "frontend"}},
+            "b" * 40,
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"name": "frontend", "uid": "uid-1", "lifecycle": {"management": {"mode": "invalid"}}},
+        {
+            "name": "frontend",
+            "uid": "uid-1",
+            "lifecycle": {"owner": {"apiVersion": "unit.gitopsctr.io/v1", "kind": "Terraform", "name": "owner"}},
+        },
+    ],
+)
+def test_opaque_cleanup_metadata_fails_closed_for_malformed_authority(metadata):
+    with pytest.raises(deploy_release.OperationError, match="opaque cleanup metadata"):
+        deploy_release.opaque_cleanup_metadata(
+            "frontend",
+            {"metadata": metadata, "payload": {"name": "frontend"}},
+            "b" * 40,
+        )
 
 
 def test_blocked_unit_with_same_driver_retains_previous_desired_state(tmp_path, monkeypatch):

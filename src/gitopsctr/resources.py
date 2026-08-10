@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -66,6 +67,17 @@ class ResourceMetadata(StrictModel):
         return cls(
             name=name,
             uid=uuid4().hex,
+            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
+        )
+
+    @classmethod
+    def source_tracked_from_provenance(cls, name: str, provenance: str) -> ResourceMetadata:
+        """Create a source-tracked identity stable for one desired proposal."""
+
+        digest = hashlib.sha256(f"gitopsctr/desired-uid/v1\0{provenance}".encode()).hexdigest()[:32]
+        return cls(
+            name=name,
+            uid=f"d1-{digest}",
             lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
         )
 
@@ -322,6 +334,8 @@ class ResourceCatalog:
                     metadata_model = ResourceMetadata(name=name)
                 else:
                     metadata_model = ResourceMetadata.from_dict(metadata)
+                    if metadata_model.is_legacy_compatibility:
+                        raise ValueError("desired metadata with lifecycle fields cannot use null values")
                     metadata_model.validate_desired()
             except (TypeError, ValueError, KeyError) as exc:
                 raise OperationError(f"desired unit {name} has invalid lifecycle metadata: {exc}") from exc

@@ -234,6 +234,10 @@ def _install_rollback_simulation(
     current_promoted: bool = False,
     target_promoted: bool = False,
     materialized_payloads: bool = False,
+    canonical_payloads: bool = False,
+    current_cleanup: bool = False,
+    current_blocked: bool = False,
+    target_cleanup: bool = False,
 ):
     revisions = {
         "target": "a" * 40,
@@ -286,6 +290,15 @@ def _install_rollback_simulation(
                         "inventory": [],
                     },
                 }
+            if canonical_payloads:
+                historical = deploy_release.parse_desired_unit_document(unit, name)
+                unit = deploy_release.serialize_unit_document(
+                    historical.with_metadata(
+                        deploy_release.ResourceMetadata.source_tracked_from_provenance(
+                            name, f"rollback-test:{value}:{name}"
+                        )
+                    )
+                )
             _write_json(output / f"units/{name}.json", unit)
         if promoted:
             _write_json(output / "promotion.json", _promotion_document(revision))
@@ -298,6 +311,22 @@ def _install_rollback_simulation(
                 "rollback",
                 target_promoted,
             )
+            if target_cleanup:
+                _write_json(
+                    output / ".gitopsctr/cleanup/units/unrelated.json",
+                    {
+                        "schema": 1,
+                        "kind": "OpaqueCleanupRoot",
+                        "metadata": deploy_release.ResourceMetadata.source_tracked_from_provenance(
+                            "unrelated", "rollback-target-cleanup"
+                        ).document(profile="desired"),
+                        "payload": {"name": "unrelated", "driver": "terraform"},
+                    },
+                )
+                _write_json(
+                    output / ".gitopsctr/transition-blocks.json",
+                    {"schema": 1, "blocks": {"unrelated": "historical stale block"}},
+                )
         elif revision == revisions["target_specification"]:
             write_source(output, target_promoted)
         elif revision == revisions["current_specification"]:
@@ -313,6 +342,40 @@ def _install_rollback_simulation(
             "current",
             current_promoted,
         )
+        if current_blocked:
+            base_path = output / "units/base.json"
+            base = deploy_release.parse_desired_unit_document(deploy_release.load_json(base_path), "base")
+            _write_json(
+                base_path,
+                deploy_release.serialize_unit_document(
+                    base.with_metadata(
+                        deploy_release.ResourceMetadata.source_tracked_from_provenance(
+                            "base", "rollback-current-blocked"
+                        )
+                    )
+                ),
+            )
+            _write_json(
+                output / ".gitopsctr/transition-blocks.json",
+                {"schema": 1, "blocks": {"base": "current parseable transition is blocked"}},
+            )
+        if current_cleanup:
+            cleanup_payload = _desired_unit("base", revisions["current_specification"], "current-cleanup")
+            _write_json(
+                output / ".gitopsctr/cleanup/units/base.json",
+                {
+                    "schema": 1,
+                    "kind": "OpaqueCleanupRoot",
+                    "metadata": deploy_release.ResourceMetadata.source_tracked_from_provenance(
+                        "base", "rollback-current-cleanup"
+                    ).document(profile="desired"),
+                    "payload": cleanup_payload,
+                },
+            )
+            _write_json(
+                output / ".gitopsctr/transition-blocks.json",
+                {"schema": 1, "blocks": {"base": "current opaque cleanup root retained"}},
+            )
         return revisions["current"]
 
     def publish(ref, directory, parent, message):
@@ -401,7 +464,11 @@ def test_rollback_publishes_complete_forward_desired_state(
     }
     for unit, value in expected.items():
         document = json.loads(publication["files"][f"units/{unit}.json"])
-        assert document["terraform"]["variables"]["value"] == value
+        assert document["apiVersion"] == "unit.gitopsctr.io/v1"
+        assert document["metadata"]["uid"]
+        assert document["metadata"]["lifecycle"] == {"management": {"mode": "sourceTracked"}}
+        assert "driver" not in document
+        assert document["spec"]["terraform"]["variables"]["value"] == value
     message = publication["message"]
     assert f"Target-Desired-Revision: {revisions['target']}" in message
     assert f"Target-Observed-Revision: {revisions['observed']}" in message
@@ -439,7 +506,7 @@ def test_rollback_copies_exact_historical_payloads_and_removes_stale_files(
         assert files[f"materialized/{name}/rendered.yaml"] == f"unit: {name}\nvalue: {expected_value}\n".encode()
         assert (f"materialized/{name}/stale.yaml" in files) is (name not in historical_units)
         unit = json.loads(files[f"units/{name}.json"])
-        assert unit["materialization"]["path"] == f"materialized/{name}"
+        assert unit["spec"]["materialization"]["path"] == f"materialized/{name}"
         payload_root = tmp_path / name
         for path, content in files.items():
             prefix = f"materialized/{name}/"
@@ -447,7 +514,99 @@ def test_rollback_copies_exact_historical_payloads_and_removes_stale_files(
                 output = payload_root / path.removeprefix(prefix)
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_bytes(content)
-        assert unit["materialization"]["digest"] == deploy_release.materialization_tree_digest(payload_root)
+        assert unit["spec"]["materialization"]["digest"] == deploy_release.materialization_tree_digest(payload_root)
+
+
+def test_rollback_preserves_current_canonical_identity_over_historical_identity(monkeypatch, capsys):
+    revisions, publications = _install_rollback_simulation(monkeypatch, canonical_payloads=True)
+    args = deploy_release.build_parser().parse_args(
+        [
+            "rollback",
+            "--environment",
+            "dev",
+            "--to-desired-revision",
+            revisions["target"],
+            "--reason",
+            "Known-bad release",
+        ]
+    )
+
+    args.handler(args)
+
+    capsys.readouterr()
+    for name in ("base", "consumer", "unrelated"):
+        document = json.loads(publications[0]["files"][f"units/{name}.json"])
+        current_uid = deploy_release.ResourceMetadata.source_tracked_from_provenance(
+            name, f"rollback-test:current:{name}"
+        ).uid
+        historical_uid = deploy_release.ResourceMetadata.source_tracked_from_provenance(
+            name, f"rollback-test:rollback:{name}"
+        ).uid
+        assert document["metadata"]["uid"] == current_uid
+        assert document["metadata"]["uid"] != historical_uid
+
+
+def test_full_rollback_preserves_current_opaque_cleanup_root(monkeypatch, capsys):
+    revisions, publications = _install_rollback_simulation(monkeypatch, current_cleanup=True)
+    args = deploy_release.build_parser().parse_args(
+        [
+            "rollback",
+            "--environment",
+            "dev",
+            "--to-desired-revision",
+            revisions["target"],
+            "--reason",
+            "Known-bad release",
+        ]
+    )
+
+    args.handler(args)
+
+    capsys.readouterr()
+    files = publications[0]["files"]
+    assert "units/base.json" not in files
+    cleanup = json.loads(files[".gitopsctr/cleanup/units/base.json"])
+    assert cleanup["payload"]["source"]["revision"] == revisions["current_specification"]
+    assert json.loads(files[".gitopsctr/transition-blocks.json"])["blocks"]["base"] == (
+        "current opaque cleanup root retained"
+    )
+
+
+def test_full_rollback_preserves_current_parseable_blocked_unit_and_materialization(monkeypatch, capsys):
+    revisions, publications = _install_rollback_simulation(
+        monkeypatch,
+        materialized_payloads=True,
+        current_blocked=True,
+        target_cleanup=True,
+    )
+    args = deploy_release.build_parser().parse_args(
+        [
+            "rollback",
+            "--environment",
+            "dev",
+            "--to-desired-revision",
+            revisions["target"],
+            "--reason",
+            "Known-bad release",
+        ]
+    )
+
+    args.handler(args)
+
+    capsys.readouterr()
+    files = publications[0]["files"]
+    base = json.loads(files["units/base.json"])
+    assert (
+        base["metadata"]["uid"]
+        == deploy_release.ResourceMetadata.source_tracked_from_provenance("base", "rollback-current-blocked").uid
+    )
+    assert base["spec"]["materialization"]["path"] == "materialized/base"
+    assert files["materialized/base/rendered.yaml"] == b"unit: base\nvalue: current\n"
+    assert ".gitopsctr/cleanup/units/unrelated.json" not in files
+    assert json.loads(files[".gitopsctr/transition-blocks.json"]) == {
+        "blocks": {"base": "current parseable transition is blocked"},
+        "schema": 1,
+    }
 
 
 @pytest.mark.parametrize(

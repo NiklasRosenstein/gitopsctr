@@ -240,6 +240,18 @@ def test_generated_schemas_and_examples_validate_from_the_local_catalog():
         Draft202012Validator(by_id[environment["$schema"]], registry=registry).validate(environment)
 
 
+@pytest.mark.parametrize("field", ["uid", "lifecycle"])
+def test_generated_desired_schema_rejects_explicit_null_metadata(field):
+    authored = authored_examples()[0]
+    desired = desired_example(authored)
+    document = cli.serialize_unit_document(desired, profile="desired")
+    document["metadata"][field] = None
+    schema = next(schema for schema in schemas.schema_documents().values() if schema.get("$id") == document["$schema"])
+
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
+
+
 def test_schema_catalog_is_deterministic_checkable_and_prunes_obsolete_schemas(tmp_path):
     assert schemas.export_schemas(tmp_path)
     first = {path: path.read_bytes() for path in sorted(tmp_path.rglob("*")) if path.is_file()}

@@ -358,6 +358,53 @@ def test_known_unmaterialized_unit_remains_a_successful_wait(monkeypatch):
     assert outputs == [(False, "")]
 
 
+def test_reconcile_reports_persisted_transition_reason_before_unit_materialization(monkeypatch, capsys):
+    outputs = []
+
+    def fake_observed_tree(_ref: str, output: Path):
+        output.mkdir(parents=True, exist_ok=True)
+        return "b" * 40
+
+    def fake_materialize(_revision: str, output: Path):
+        output.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            output / ".gitopsctr/transition-blocks.json",
+            {"schema": 1, "blocks": {"frontend": "persisted opaque cleanup reason"}},
+        )
+
+    monkeypatch.setattr(deploy_release, "observed_tree", fake_observed_tree)
+    monkeypatch.setattr(
+        deploy_release,
+        "git",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(args, 0, "a" * 40 + "\n", ""),
+    )
+    monkeypatch.setattr(deploy_release, "resolve_ref", lambda *_args: "c" * 40)
+    monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
+    monkeypatch.setattr(
+        deploy_release,
+        "write_reconcile_outputs",
+        lambda reconciled, desired="": outputs.append((reconciled, desired)),
+    )
+
+    deploy_release.command_reconcile(
+        Namespace(
+            unit="frontend",
+            environment="dev",
+            desired_ref="deploy/dev",
+            desired_revision=None,
+            observed_ref="observed/dev",
+            plan=False,
+            report=None,
+            source_revision=None,
+            advance=False,
+            require_source_ref=None,
+        )
+    )
+
+    assert outputs == [(False, "")]
+    assert "WAIT     persisted opaque cleanup reason" in capsys.readouterr().err
+
+
 def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monkeypatch):
     report = tmp_path / "report"
     calls = []
