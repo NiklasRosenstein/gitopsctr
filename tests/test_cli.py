@@ -264,6 +264,84 @@ def test_blocked_driver_transition_omits_previous_unit_and_reports_wait(tmp_path
     assert "retain opaque cleanup root" in capsys.readouterr().err
 
 
+def test_parseable_driver_transition_creates_fenced_deletion_intent(tmp_path):
+    source = tmp_path / "source"
+    current = tmp_path / "current"
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    repeated = tmp_path / "repeated"
+    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
+    _write_json(
+        source / "deployment/environments/dev/units/application.json",
+        {
+            "schema": 1,
+            "name": "application",
+            "driver": "vite-oci-bundle",
+            "source": {"path": "frontend"},
+            "build": {"nodeVersion": "24"},
+            "publish": {"repository": "registry.example/application"},
+        },
+    )
+    current_unit = _terraform_desired_resource("application")
+    _write_json(current / "units/application.json", deploy_release.serialize_unit_document(current_unit))
+    observed.mkdir()
+
+    result = deploy_release.build_desired_candidate(
+        "dev", source, "b" * 40, current, observed, None, candidate, verbose=False
+    )
+
+    intent = deploy_release.load_desired_deletion_intents(candidate)["application"]
+    assert intent.uid == current_unit.metadata.uid
+    assert (
+        deploy_release.load_desired_unit(candidate / "units/application.json", "application").metadata.uid == intent.uid
+    )
+    assert result.blocked["application"] == deploy_release.deletion_intent_reason(intent)
+    assert deploy_release.load_desired_transition_blocks(candidate)["application"] == (
+        deploy_release.deletion_intent_reason(intent)
+    )
+
+    deploy_release.build_desired_candidate("dev", source, "c" * 40, candidate, observed, None, repeated, verbose=False)
+    assert deploy_release.load_desired_deletion_intents(repeated)["application"].uid == intent.uid
+
+
+def test_finalized_same_name_recreation_gets_new_uid_from_tombstone(tmp_path):
+    source = tmp_path / "source"
+    current = tmp_path / "current"
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    repeated = tmp_path / "repeated"
+    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
+    _write_json(
+        source / "deployment/environments/dev/units/application.json",
+        {
+            "schema": 1,
+            "name": "application",
+            "driver": "terraform",
+            "source": {"path": "infra/deploy"},
+            "terraform": {"backend": {}, "variables": {}, "observeOutputs": []},
+        },
+    )
+    (source / "infra/deploy").mkdir(parents=True)
+    (source / "infra/deploy/main.tf").write_text("terraform {}\n")
+    current.mkdir()
+    observed.mkdir()
+    old_uid = "d1-finalized-application"
+    deploy_release.write_unit_incarnation_tombstone(
+        current,
+        deploy_release.UnitIncarnationTombstone(unit_name="application", uid=old_uid),
+    )
+
+    deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate, verbose=False)
+    recreated = deploy_release.load_desired_unit(candidate / "units/application.json", "application")
+    assert recreated.metadata.uid != old_uid
+    assert deploy_release.load_desired_unit_incarnation_tombstones(candidate)["application"].uid == old_uid
+
+    deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, repeated, verbose=False)
+    assert deploy_release.load_desired_unit(repeated / "units/application.json", "application").metadata.uid == (
+        recreated.metadata.uid
+    )
+
+
 def test_unparseable_previous_unit_uses_opaque_cleanup_root(tmp_path):
     source = tmp_path / "source"
     current = tmp_path / "current"

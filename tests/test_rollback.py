@@ -546,6 +546,33 @@ def test_rollback_preserves_current_canonical_identity_over_historical_identity(
         assert document["metadata"]["uid"] != historical_uid
 
 
+def test_rollback_restores_historical_payload_with_new_uid_after_finalization(tmp_path):
+    current = tmp_path / "current"
+    candidate = tmp_path / "candidate"
+    historical_path = candidate / "units/application.json"
+    current.mkdir()
+    _write_json(historical_path, _desired_unit("application", "b" * 40, "historical"))
+    finalized = deploy_release.UnitIncarnationTombstone(
+        unit_name="application",
+        uid="d1-finalized-application",
+    )
+    deploy_release.write_unit_incarnation_tombstone(current, finalized)
+
+    deploy_release.merge_current_cleanup_state(current, candidate)
+    deploy_release.canonicalize_rollback_unit(
+        historical_path,
+        current / "units/application.json",
+        deploy_release.load_desired_unit_incarnation_tombstones(candidate)["application"],
+    )
+
+    restored = deploy_release.load_desired_unit(historical_path, "application")
+    assert restored.metadata.uid != finalized.uid
+    assert restored.metadata.lifecycle is not None
+    assert restored.metadata.lifecycle.management is not None
+    assert restored.metadata.lifecycle.management.mode == "sourceTracked"
+    assert deploy_release.load_desired_unit_incarnation_tombstones(candidate)["application"] == finalized
+
+
 def test_full_rollback_preserves_current_opaque_cleanup_root(monkeypatch, capsys):
     revisions, publications = _install_rollback_simulation(monkeypatch, current_cleanup=True)
     args = deploy_release.build_parser().parse_args(

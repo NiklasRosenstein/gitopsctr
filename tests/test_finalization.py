@@ -1,5 +1,6 @@
 """Durable source-tracked deletion intents and fenced finalization."""
 
+import json
 import shutil
 from argparse import Namespace
 from dataclasses import replace
@@ -168,7 +169,7 @@ def test_source_absence_publishes_durable_deletion_intent_and_retries(tmp_path):
     intent = deploy_release.load_desired_deletion_intents(candidate)["application"]
     assert result.blocked["application"] == deploy_release.deletion_intent_reason(intent)
     assert intent.uid == "d1-application"
-    assert intent.deletion_generation == 1
+    assert intent.deletion_generation == 2
     assert intent.retained_source == DesiredSource(
         path="infra/deploy",
         revision="a" * 40,
@@ -189,7 +190,44 @@ def test_source_absence_publishes_durable_deletion_intent_and_retries(tmp_path):
     assert (repeated / ".gitopsctr/deletion-intents/units/application.json").read_bytes() == (
         candidate / ".gitopsctr/deletion-intents/units/application.json"
     ).read_bytes()
-    assert deploy_release.load_desired_deletion_intents(repeated)["application"].deletion_generation == 1
+    assert deploy_release.load_desired_deletion_intents(repeated)["application"].deletion_generation == 2
+
+
+def test_repeated_advance_migrates_an_existing_generation_one_intent_once(tmp_path):
+    source = tmp_path / "source"
+    current = tmp_path / "current"
+    candidate = tmp_path / "candidate"
+    repeated = tmp_path / "repeated"
+    _source_root(source)
+    unit_path = current / "units/application.json"
+    _write_json(unit_path, _terraform_unit("application", "d1-application"))
+    unit = deploy_release.load_desired_unit(unit_path, "application")
+    intent = deploy_release.UnitDeletionIntent.from_unit(unit, unit_path, current)
+    deploy_release.write_deletion_intent(current, intent)
+
+    deploy_release.build_desired_candidate(
+        "dev", source, "b" * 40, current, tmp_path / "observed", None, candidate, verbose=False
+    )
+
+    migrated = deploy_release.load_desired_deletion_intents(candidate)["application"]
+    assert migrated.deletion_generation == 2
+    assert deploy_release.load_desired_unit_incarnation_tombstones(candidate)["application"] == (
+        deploy_release.UnitIncarnationTombstone(
+            unit_name="application",
+            uid=intent.uid,
+            state="active",
+            next_deletion_generation=2,
+        )
+    )
+
+    deploy_release.build_desired_candidate(
+        "dev", source, "c" * 40, candidate, tmp_path / "observed", None, repeated, verbose=False
+    )
+    assert deploy_release.load_desired_deletion_intents(repeated)["application"] == migrated
+    assert (
+        deploy_release.load_desired_unit_incarnation_tombstones(repeated)["application"]
+        == (deploy_release.load_desired_unit_incarnation_tombstones(candidate)["application"])
+    )
 
 
 def test_finalize_tears_down_then_publishes_absent_state_and_is_idempotent(tmp_path, monkeypatch, capsys):
@@ -256,12 +294,109 @@ def test_finalize_tears_down_then_publishes_absent_state_and_is_idempotent(tmp_p
     files = publications[-1]["files"]
     assert "units/application.json" not in files
     assert ".gitopsctr/deletion-intents/units/application.json" not in files
+    assert ".gitopsctr/effect-leases/units/application.json" not in files
+    assert json.loads(files[".gitopsctr/incarnations/units/application.json"].decode()) == {
+        "schema": 1,
+        "kind": "UnitIncarnationTombstone",
+        "unitName": "application",
+        "uid": intent.uid,
+    }
     assert ".gitopsctr/transition-blocks.json" not in files
     assert capsys.readouterr().out == "d" * 40 + "\n"
 
     desired_files = files
     assert deploy_release.command_finalize(_finalize_args(uid=intent.uid, deletion_generation=1)) is False
     assert len(teardown_calls) == 1
+
+
+def test_finalize_source_materialization_failure_does_not_acquire_effect_lease(tmp_path, monkeypatch, capsys):
+    current = tmp_path / "current"
+    unit_path = current / "units/application.json"
+    _write_json(unit_path, _terraform_unit("application", "d1-application"))
+    unit = deploy_release.load_desired_unit(unit_path, "application")
+    intent = deploy_release.UnitDeletionIntent.from_unit(unit, unit_path, current)
+    deploy_release.write_deletion_intent(current, intent)
+
+    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(deploy_release, "observed_tree", _copy_observed_files(deploy_release.directory_files(current)))
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(
+        deploy_release,
+        "materialize_revision",
+        lambda _revision, _output: (_ for _ in ()).throw(OperationError("source checkout failed")),
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "acquire_effect_lease",
+        lambda *_args, **_kwargs: pytest.fail("pre-effect source failure acquired a lease"),
+    )
+
+    assert deploy_release.command_finalize(_finalize_args()) is False
+    assert "retained source is unavailable" in capsys.readouterr().err
+
+
+def test_finalize_releases_lease_when_local_lease_materialization_fails(tmp_path, monkeypatch):
+    current = tmp_path / "current"
+    unit_path = current / "units/application.json"
+    _write_json(unit_path, _terraform_unit("application", "d1-application"))
+    unit = deploy_release.load_desired_unit(unit_path, "application")
+    intent = deploy_release.UnitDeletionIntent.from_unit(unit, unit_path, current)
+    deploy_release.write_deletion_intent(current, intent)
+    released: list[deploy_release.EffectLeaseAcquisition] = []
+
+    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(deploy_release, "observed_tree", _copy_observed_files(deploy_release.directory_files(current)))
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(
+        deploy_release,
+        "materialize_revision",
+        lambda _revision, output: output.mkdir(parents=True, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "write_effect_lease",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OperationError("local lease write failed")),
+    )
+    monkeypatch.setattr(
+        deploy_release, "release_pre_effect_lease", lambda _ref, acquisition: released.append(acquisition)
+    )
+
+    with pytest.raises(OperationError, match="local lease write failed"):
+        deploy_release.command_finalize(_finalize_args())
+    assert len(released) == 1
+    assert released[0].lease.uid == intent.uid
+
+
+def test_finalize_releases_lease_when_heartbeat_startup_fails(tmp_path, monkeypatch):
+    current = tmp_path / "current"
+    unit_path = current / "units/application.json"
+    _write_json(unit_path, _terraform_unit("application", "d1-application"))
+    unit = deploy_release.load_desired_unit(unit_path, "application")
+    intent = deploy_release.UnitDeletionIntent.from_unit(unit, unit_path, current)
+    deploy_release.write_deletion_intent(current, intent)
+    released: list[deploy_release.EffectLeaseAcquisition] = []
+
+    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(deploy_release, "observed_tree", _copy_observed_files(deploy_release.directory_files(current)))
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(
+        deploy_release,
+        "materialize_revision",
+        lambda _revision, output: output.mkdir(parents=True, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "start_effect_lease_heartbeat",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OperationError("heartbeat unavailable")),
+    )
+    monkeypatch.setattr(
+        deploy_release, "release_pre_effect_lease", lambda _ref, acquisition: released.append(acquisition)
+    )
+
+    with pytest.raises(OperationError, match="heartbeat unavailable"):
+        deploy_release.command_finalize(_finalize_args())
+    assert len(released) == 1
+    assert released[0].lease.uid == intent.uid
 
 
 def test_finalize_blocks_unsupported_driver_and_retains_intent(tmp_path, monkeypatch, capsys):
