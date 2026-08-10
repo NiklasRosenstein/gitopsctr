@@ -4,7 +4,7 @@
 > finalization slice, Stack/StackTemplate contracts, Stack projection, direct Stack instantiation, Stack deletion
 > lifecycle, Stack-owned convergence ordering, GitHub/GitLab.com eligibility, and controller-owned pin claim recovery are implemented,
 > including terminal teardown evidence, explicit direct-Unit deletion, and direct Stack source-pin creation/release.
-> Forge merge enforcement, Argo manifest publication, and end-to-end external acceptance
+> Forge merge enforcement, Argo manifest publication, and deployment-owned setup
 > remain pending. Field names, document layouts,
 > and command names are illustrative unless
 > explicitly marked **Settled**.
@@ -34,9 +34,9 @@ implementation.
 | Forge eligibility/expiry/orphan recovery | **GitHub and GitLab eligibility implemented; merge enforcement remains external** | `36a529b` implements fail-closed GitHub eligibility, expiry, pin comparison, and UID-fenced cleanup requests for present roots. The read-only `glab` adapter and CAS-fenced orphan recovery are now implemented. Authoritative merge-time enforcement remains deployment configuration. |
 | Stack dependency ordering | **Convergence and multi-instance isolation implemented** | `3b25f04` includes Stack-generated and desired-only Stack Units in convergence/status and preserves explicit cross-kind Stack edges during teardown; the current increment scopes generated names as `<stack>--<template-unit>`. External-driver acceptance remains. |
 | Argo integration and external publication | **Boundary and Argo absence observation implemented; external publication remains deployment-owned** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. Argo-backed Kubernetes Units now wait for Application absence during teardown, and the Kubernetes/Argo acceptance job proves external delivery and observation. This repository still does not publish preview manifests or own ApplicationSet resources. |
-| End-to-end acceptance, security, operations, and legacy retirement | **Core acceptance and operational guidance implemented; driver-backed Stack acceptance and retirement pending** | Operational/security guidance, Docker/Terraform, Kubernetes, Argo, restart, focused recovery, and a real temporary-repository Stack harness are implemented. Driver-backed Stack cleanup, forge policy configuration, and legacy migration completion remain open. |
+| End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, and a real temporary-repository Stack harness are implemented. Forge policy configuration, remaining Unit hardening cases, and legacy migration completion remain open. |
 
-The repository verification suite currently passes (`541` tests), including the landed concurrency, recovery,
+The repository verification suite currently passes (`544` tests), including the landed concurrency, recovery,
 incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
 not sufficient, for the remaining preview-environment milestones because forge policy configuration,
 Stack-specific external acceptance, and legacy migration are still open.
@@ -413,9 +413,11 @@ scenarios remain pending.
 - [x] Add focused Stack lifecycle, restart/recovery, and dependency-ordering acceptance coverage in
   `tests/test_preview_acceptance.py`; real Docker/Terraform, Kubernetes, and Argo acceptance jobs are present.
 - [x] Add a real temporary-repository Stack harness with a deterministic external inventory, restart recovery, UID
-  retention, reverse teardown, and same-name recreation assertions; real driver-backed cleanup remains separate.
+  retention, reverse teardown, and same-name recreation assertions; Docker/Terraform driver-backed cleanup is covered
+  by the demo acceptance flow.
 - [x] Add instance-scoped generated Unit naming and acceptance coverage for two concurrent Stacks from one template.
-- [ ] Extend Docker/Terraform acceptance to observe Stack-driven cleanup.
+- [x] Extend Docker/Terraform acceptance to add a source Stack, observe its generated Terraform Unit, remove the
+  Stack, and finalize the Unit and Stack against the real Docker inventory.
 - [x] Add Argo CD boundary examples, operations, security documentation, and external-delivery acceptance; native
   preview manifest publication and provider-specific setup remain deployment-owned.
 - [x] Add GitHub and GitLab.com eligibility, expiry handling, present-root recovery, and CAS-fenced candidate-aware
@@ -447,3 +449,4 @@ scenarios remain pending.
 | 2026-08-10 | Unit lifecycle implementation is a foundation milestone, not completion of the end-to-end Stack/preview feature. Lease, incarnation, dependency, compatibility, opaque-root, evidence, and source-pin hardening remain tracked work. |
 | 2026-08-11 | Use one CAS-fenced controller claim per Stack pin; recovery must verify the target and candidate revisions before reaping. Unclaimed legacy pins remain retained. |
 | 2026-08-11 | Run repository CI for GitHub `merge_group` requests; required checks and merge-queue policy remain forge configuration. |
+| 2026-08-11 | Validate Stack cleanup with the real Docker/Terraform drivers: add a source Stack, converge its generated Unit, remove it, and finalize the Unit before the Stack root. |

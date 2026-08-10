@@ -126,7 +126,7 @@ race and advised this narrow verifier. Repository branch-protection or required-
 still needed for an authoritative merge-time guarantee; source pins, permanently unparseable-root operator
 resolution, and the remaining acceptance cases are also pending.
 
-### 3. StackTemplate and Stack resolution — core lifecycle complete; acceptance pending
+### 3. StackTemplate and Stack resolution — core lifecycle and acceptance complete
 
 Commits `eb0bcb9`, `b441941`, and `84d7ddb` add typed authored/desired StackTemplate and Stack contracts, public schema publication, strict
 parameter declarations for string/integer/number/boolean/object/array values, recursive `fromParameter` expansion,
@@ -136,11 +136,11 @@ provenance with replay/collision fencing. Commit `d071c1e` adds source-absence S
 owned-Unit closure fencing, and Stack finalization after child teardown. Commit `3b25f04` integrates StackTemplate
 dependencies into generic convergence/status and reverse teardown ordering; the follow-up correctness pass also
 preserves cross-kind edges. Generated Unit names are now Stack-scoped, allowing concurrent instances from one
-template; the external restart/acceptance harness remains pending.
+template; temporary-repository and driver-backed acceptance coverage is now present.
 
-Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 541 tests,
-lint, typecheck, schema freshness, strict docs, actionlint, formatting, and diff checks. Remaining Milestone 3 work is
-restart/failure-injection and direct/source-tracked Stack owner-graph acceptance.
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 544 tests,
+lint, typecheck, schema freshness, strict docs, actionlint, formatting, and diff checks. No required Stack resolution
+work remains in this milestone.
 
 ### 4. Controller-owned source-pin lifecycle — lifecycle and claim recovery complete
 
@@ -156,19 +156,19 @@ cleanup. Unclaimed legacy pins remain retained. Native GitLab.com lookup is prov
 Self-hosted GitLab setup, scheduler wiring, and authoritative merge-time forge enforcement remain external follow-up
 work.
 
-### 5. Direct Stack lifecycle — core complete; acceptance pending
+### 5. Direct Stack lifecycle — core and acceptance complete
 
 Commit `84d7ddb` adds `instantiate-stack`, exact template revision/path/digest provenance, request replay fencing,
-direct management metadata, and Stack-owned generated Units. The focused CLI/contract/graph tests and full 541-test
+direct management metadata, and Stack-owned generated Units. The focused CLI/contract/graph tests and full 544-test
 repository check pass. Commit `d071c1e` adds `request-delete-direct-stack`, source-absence handling for source-tracked
 Stacks, child deletion obligations, UID/generation fencing, and `finalize-stack`; the focused Stack suite and full
-541-test repository check pass. Restart acceptance and external-driver cleanup coverage remain open; dependency
+544-test repository check pass. Restart acceptance and external-driver cleanup coverage are now present; dependency
 ordering is now implemented and covered by focused graph tests. Commit `1a4bf66` adds focused acceptance coverage
 for source-tracked cleanup across a desired-state restart, direct finalization retry after publication failure, and
 public dependency ordering. Commit `a18c23f` adds a desired-head incarnation fence and exact owner checks. Commit
 `f12329a` adds durable `.gitopsctr/incarnations/stacks` tombstones, carries them through desired candidates and
-rollback, and fences source/direct recreation from finalized UIDs. A richer request ledger and real external-inventory/
-driver acceptance remain open.
+rollback, and fences source/direct recreation from finalized UIDs. A richer request ledger remains optional follow-up
+work.
 
 ### 6. Forge recovery and operational boundary — core recovery complete; external integrations pending
 
@@ -182,16 +182,18 @@ read-only GitLab.com eligibility adapter uses `glab`; the repository still does 
 ApplicationSet resources, and forge-side required checks/merge queues remain deployment configuration. CI now runs for
 GitHub `merge_group` requests and verifies the exact candidate/base commit shape.
 
-Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 541 tests,
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 544 tests,
 lint, typecheck, schema freshness, strict docs, actionlint, formatting, and diff checks.
 
-### 7. Acceptance harness and security/operations documentation — documentation complete; acceptance pending
+### 7. Acceptance harness and security/operations documentation — acceptance and documentation complete
 
 The operational/security guide is published at `docs/preview-environments.md` and linked from the MkDocs navigation.
-Docker/Terraform, Kubernetes, and Argo acceptance jobs are present. Argo-backed Kubernetes teardown now waits for
-Application absence. The temporary-repository Stack harness now proves
-restart recovery, UID retention, reverse teardown, and same-name recreation against a deterministic inventory. The
-remaining work is driver-backed Stack cleanup, required forge policy configuration, and legacy migration completion.
+Docker/Terraform, Kubernetes, and Argo acceptance jobs are present. The Docker acceptance now adds a source Stack,
+observes its generated Terraform Unit, removes the Stack, and finalizes the real container through the normal
+UID-fenced Unit and Stack lifecycle. Argo-backed Kubernetes teardown waits for Application absence. The temporary-
+repository Stack harness proves restart recovery, UID retention, reverse teardown, and same-name recreation against a
+deterministic inventory. Remaining work is required forge policy configuration, remaining Unit hardening cases, and
+legacy migration completion.
 
 ### 8. Remove legacy compatibility after migration condition — pending
 

@@ -47,7 +47,8 @@ mise run demo-clean
 ```
 
 CI runs the same end-to-end acceptance flow available locally. It deploys from an empty state, requires a second
-convergence to run no drivers and move no refs, and always cleans up:
+convergence to run no drivers and move no refs, then adds a source Stack, verifies its generated Terraform Unit,
+removes the Stack, and finalizes the generated Unit and Stack. It always cleans up:
 
 ```console
 mise run demo-acceptance
