@@ -24,7 +24,7 @@ implementation.
 | Area | Status | Reconciliation |
 | --- | --- | --- |
 | Desired Unit identity, lifecycle authority, ownership, legacy retention, rollback, and schema profiles | **Implemented for Unit** | Keep the generic semantic model; extend it to Stack and StackTemplate later. |
-| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit** | Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac` close lease, incarnation, transition, dependency, legacy-safety, opaque-recovery, evidence-contract, and direct-root lifecycle defects; source pins, forge enforcement, and acceptance work remains. |
+| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit** | Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac` close lease, incarnation, transition, dependency, legacy-safety, opaque-recovery, evidence-contract, and direct-root lifecycle defects; explicit operator resolution now covers permanently unparseable roots. Forge enforcement remains external. |
 | Change-gated candidate freshness | **Local and CI verifier implemented** | `88ae0b9` rejects stale, rebased, multi-commit, merge, root, and missing-head candidates before review creation. CI now verifies the exact GitHub pull-request and merge-queue event head and target; required check and branch-protection policy remain forge configuration. |
 | StackTemplate/Stack contracts and deterministic parameter expansion | **Implemented** | Commits `eb0bcb9` and `84d7ddb`; direct desired Stack provenance is typed and schema-published. |
 | Generated Stack resource graphs with UID-fenced ownership | **Implemented projection and closure** | `b441941` and `d071c1e` project source-authored/direct Stack-owned Units and retain a UID-fenced closure through deletion. |
@@ -34,9 +34,9 @@ implementation.
 | Forge eligibility/expiry/orphan recovery | **GitHub and GitLab eligibility implemented; merge enforcement remains external** | `36a529b` implements fail-closed GitHub eligibility, expiry, pin comparison, and UID-fenced cleanup requests for present roots. The read-only `glab` adapter and CAS-fenced orphan recovery are now implemented. Authoritative merge-time enforcement remains deployment configuration. |
 | Stack dependency ordering | **Convergence and multi-instance isolation implemented** | `3b25f04` includes Stack-generated and desired-only Stack Units in convergence/status and preserves explicit cross-kind Stack edges during teardown; the current increment scopes generated names as `<stack>--<template-unit>`. External-driver acceptance remains. |
 | Argo integration and external publication | **Boundary and Argo absence observation implemented; external publication remains deployment-owned** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. Argo-backed Kubernetes Units now wait for Application absence during teardown, and the Kubernetes/Argo acceptance job proves external delivery and observation. This repository still does not publish preview manifests or own ApplicationSet resources. |
-| End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, and a real temporary-repository Stack harness are implemented. Forge policy configuration, remaining Unit hardening cases, and legacy migration completion remain open. |
+| End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. Forge policy configuration and legacy migration completion remain open. |
 
-The repository verification suite currently passes (`544` tests), including the landed concurrency, recovery,
+The repository verification suite currently passes (`548` tests), including the landed concurrency, recovery,
 incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
 not sufficient, for the remaining preview-environment milestones because forge policy configuration,
 Stack-specific external acceptance, and legacy migration are still open.
@@ -347,8 +347,7 @@ Before declaring the Unit implementation milestone complete, the harness MUST co
 - Apply a legacy desired Unit without `--advance` and prove it blocks safely with migration guidance. **Covered by
   `816a8a4`.**
 - Create an opaque cleanup root, remove its source, restart, and prove the documented adoption or cleanup operation
-  can resolve it. **Covered for parseable roots by `816a8a4`; permanently unparseable roots remain an explicit
-  operator-resolution case.**
+  can resolve it. **Covered by `816a8a4` and the UID-fenced `resolve-opaque-unit` operator path.**
 - Pass a relevance-fenced prior receipt into teardown and prove driver result details survive restart after successful
   evidence publication while remaining UID/generation fenced. **Covered for the terminal-evidence contract by
   `26982bf`; pre-publication crash retry remains an idempotence requirement.**
@@ -362,9 +361,8 @@ delete request for an old UID cannot affect a recreated same-name resource.
 Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, `f9cc2ac`, and `88ae0b9` cover finalization lease completion, pre-effect
 failure cleanup, same-name incarnation fencing, parseable GVK/driver replacement, resolved dependency preservation,
 pre-lease dependency revalidation, legacy application blocking, parseable opaque-root recovery, the terminal teardown
-evidence contract, explicit direct-Unit deletion, and local candidate freshness fencing. Source-pin, forge-side
-required-check/merge-queue enforcement, permanently unparseable-root operator resolution, and remaining acceptance
-scenarios remain pending.
+evidence contract, explicit direct-Unit deletion, local candidate freshness fencing, and operator-confirmed resolution
+of permanently unparseable roots. Forge-side required-check/merge-queue enforcement remains pending.
 
 ## Implementation checklist
 
@@ -396,8 +394,9 @@ scenarios remain pending.
 - [x] Complete candidate-aware orphan-pin ownership/recovery with CAS-fenced controller claim refs; finalized-tombstone
   release and proven pre-publication failure cleanup remain compatible. Unclaimed legacy pins are retained for operator
   resolution.
-- [ ] Add the remaining Unit hardening acceptance scenarios and recovery cases; the local candidate freshness check is
-  now also enforced by the GitHub CI job.
+- [x] Add the remaining Unit hardening acceptance scenarios and recovery cases, including restart after destroy
+  failure, stale same-name deletion fencing, and operator resolution of an unparseable root; the local candidate
+  freshness check is now also enforced by the GitHub CI job.
 
 ### Pending preview-environment feature work
 
@@ -450,3 +449,4 @@ scenarios remain pending.
 | 2026-08-11 | Use one CAS-fenced controller claim per Stack pin; recovery must verify the target and candidate revisions before reaping. Unclaimed legacy pins remain retained. |
 | 2026-08-11 | Run repository CI for GitHub `merge_group` requests; required checks and merge-queue policy remain forge configuration. |
 | 2026-08-11 | Validate Stack cleanup with the real Docker/Terraform drivers: add a source Stack, converge its generated Unit, remove it, and finalize the Unit before the Stack root. |
+| 2026-08-11 | Resolve a permanently unparseable cleanup root only with an exact UID, explicit external-cleanup confirmation, and a durable Unit incarnation tombstone; parseable roots must use driver-backed recovery. |

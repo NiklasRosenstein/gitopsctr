@@ -1556,6 +1556,7 @@ def candidate_identifier(
         "request-delete-direct-unit",
         "request-delete-direct-stack",
         "instantiate-stack",
+        "resolve-opaque-unit",
     ],
     environment_name: str,
     candidate: Path,
@@ -1590,6 +1591,7 @@ def resolve_candidate_ref(
         "request-delete-direct-unit",
         "request-delete-direct-stack",
         "instantiate-stack",
+        "resolve-opaque-unit",
     ],
     candidate_id: str,
     override: str | None = None,
@@ -4516,6 +4518,109 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
             return True
 
 
+def command_resolve_opaque_unit(args: argparse.Namespace) -> bool:
+    """Resolve an unparseable cleanup root after external cleanup is confirmed."""
+
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
+        raise OperationError(f"invalid unit name: {args.unit!r}")
+    if not isinstance(args.uid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args.uid):
+        raise OperationError("resolve-opaque-unit requires a valid --uid")
+    if not args.confirm_external_cleanup:
+        raise OperationError("resolve-opaque-unit requires --confirm-external-cleanup")
+    if not isinstance(args.reason, str) or not args.reason.strip() or len(args.reason) > 500:
+        raise OperationError("resolve-opaque-unit requires a bounded non-empty --reason")
+
+    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, None)
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary = Path(temporary_directory)
+        current = temporary / "current"
+        candidate = temporary / "candidate"
+        current_revision = observed_tree(desired_ref, current)
+        if current_revision is None:
+            raise OperationError(f"desired ref {desired_ref!r} has no state")
+
+        opaque = load_desired_cleanup_roots(current).get(args.unit)
+        if opaque is None:
+            raise OperationError(f"no opaque cleanup root exists for {args.unit!r}")
+        if opaque.metadata.uid != args.uid:
+            raise OperationError(f"stale opaque cleanup UID fence for {args.unit!r}")
+        if document_candidates(current / "units", args.unit):
+            raise OperationError(f"opaque cleanup root for {args.unit!r} conflicts with a desired Unit")
+        if args.unit in load_desired_deletion_intents(current):
+            raise OperationError(
+                f"opaque cleanup root for {args.unit!r} has a deletion intent; restore the Unit before resolving it"
+            )
+        lease = load_desired_effect_leases(current).get(args.unit)
+        if lease is not None and effect_lease_active(lease):
+            raise OperationError(f"active effect lease blocks opaque resolution for {args.unit!r}")
+        if isinstance(opaque.payload, dict):
+            try:
+                parse_desired_unit_document(cast(dict[str, Any], opaque.payload), args.unit)
+            except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError):
+                pass
+            else:
+                raise OperationError(f"opaque cleanup root for {args.unit!r} is parseable; use recover-opaque-unit")
+
+        shutil.copytree(current, candidate)
+        for path in document_candidates(candidate / DESIRED_CLEANUP_UNITS_PATH, args.unit):
+            path.unlink()
+        write_unit_incarnation_tombstone(
+            candidate,
+            UnitIncarnationTombstone(unit_name=args.unit, uid=args.uid),
+        )
+        blocks = load_desired_transition_blocks(candidate)
+        blocks.pop(args.unit, None)
+        write_desired_transition_blocks(candidate, blocks)
+        load_desired_resource_graph(candidate)
+        if args.dry:
+            log_status("DRY", f"{style_unit(args.unit)}: opaque cleanup resolution would be published")
+            return False
+
+        candidate_id = candidate_identifier(
+            "resolve-opaque-unit",
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            {"unit": args.unit, "uid": args.uid, "reason": args.reason},
+        )
+        candidate_ref = resolve_candidate_ref(
+            REPOSITORY_ROOT,
+            args.environment,
+            "resolve-opaque-unit",
+            candidate_id,
+            args.candidate_ref,
+        )
+        if candidate_ref in {desired_ref, observed_ref}:
+            raise OperationError("opaque resolution candidate ref conflicts with deployment state")
+        revision, outcome = publish_desired_change(
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            candidate_ref,
+            f"Resolve opaque cleanup for {args.unit}: {args.reason.strip()}",
+            f"Resolve opaque cleanup for {args.unit}",
+            (
+                f"Record operator-confirmed external cleanup for opaque Unit `{args.unit}` "
+                f"(UID `{args.uid}`). Reason: {args.reason.strip()}"
+            ),
+            False,
+            current,
+        )
+        if outcome is not None:
+            log_status(
+                "REVIEW",
+                f"{style_branch(candidate_ref)} submitted at {describe_revision(revision)}; "
+                f"{style_branch(desired_ref)} remains at {describe_revision(current_revision)}",
+            )
+        else:
+            log_status("UPDATE", f"{style_branch(desired_ref)} advanced to {describe_revision(revision)}")
+        print(revision)
+        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
+        return True
+
+
 def desired_metadata_for_candidate(
     authored: UnitResource[Any],
     previous: UnitResource[Any] | None,
@@ -6429,6 +6534,7 @@ _CANDIDATE_OPERATIONS = (
     "request-delete-direct-unit",
     "request-delete-direct-stack",
     "instantiate-stack",
+    "resolve-opaque-unit",
 )
 
 
@@ -9452,6 +9558,7 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
             "Recovery",
             (
                 "recover-opaque-unit",
+                "resolve-opaque-unit",
                 "recover-orphaned-stacks",
                 "request-delete-direct-unit",
                 "request-delete-direct-stack",
@@ -9697,6 +9804,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recover_opaque.add_argument("--dry", action="store_true")
     recover_opaque.set_defaults(handler=command_recover_opaque_unit)
+
+    resolve_opaque = commands.add_parser(
+        "resolve-opaque-unit",
+        help="resolve an unparseable opaque cleanup root after external cleanup",
+    )
+    resolve_opaque.add_argument("--environment", required=True)
+    resolve_opaque.add_argument("--unit", required=True)
+    resolve_opaque.add_argument("--uid", required=True, help="exact opaque cleanup UID fence")
+    resolve_opaque.add_argument(
+        "--reason",
+        required=True,
+        help="bounded operator reason for the confirmed external cleanup",
+    )
+    resolve_opaque.add_argument(
+        "--confirm-external-cleanup",
+        action="store_true",
+        help="confirm that the external resource was cleaned up outside gitopsctr",
+    )
+    resolve_opaque.add_argument("--desired-ref", help="override the environment's desired ref")
+    resolve_opaque.add_argument(
+        "--candidate-ref",
+        help="exact candidate ref override when the environment uses a pull-request change gate",
+    )
+    resolve_opaque.add_argument("--dry", action="store_true")
+    resolve_opaque.set_defaults(handler=command_resolve_opaque_unit)
 
     recover_stacks = commands.add_parser(
         "recover-orphaned-stacks",

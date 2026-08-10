@@ -140,3 +140,8 @@ to the controller.
 - Keep controller pin refs and desired deletion intents observable until the
   Stack closure is finalized; do not manually delete either as a cleanup
   shortcut.
+- For an unparseable cleanup root, restore the matching driver and use
+  `recover-opaque-unit` when possible. If the external resource was cleaned up
+  outside gitopsctr, use `resolve-opaque-unit --uid ... --reason ...
+  --confirm-external-cleanup`. The command is UID-fenced and rejects parseable
+  roots, active leases, and roots with deletion intents.
