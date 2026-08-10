@@ -421,6 +421,88 @@ def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monke
         deploy_release.command_reconcile(args)
 
 
+def test_planned_reconcile_refreshes_unavailable_retained_source(tmp_path, monkeypatch, capsys):
+    source_revision = "b" * 40
+    previous_revision = "a" * 40
+    planned = []
+
+    specification = {
+        "schema": 1,
+        "name": "aws-application",
+        "driver": "terraform",
+        "source": {"path": "."},
+    }
+    previous = {
+        "schema": 1,
+        "name": "aws-application",
+        "driver": "terraform",
+        "source": {
+            "path": ".",
+            "revision": previous_revision,
+            "inputHash": "sha256:same",
+            "driverVersion": 2,
+        },
+    }
+
+    def fake_git(*args, **_kwargs):
+        if args[0] == "rev-parse":
+            return subprocess.CompletedProcess(args, 0, source_revision + "\n", "")
+        if args[0] == "cat-file":
+            return subprocess.CompletedProcess(args, 1, "", "missing")
+        raise AssertionError(args)
+
+    def fake_materialize(revision: str, output: Path):
+        output.mkdir(parents=True, exist_ok=True)
+        if revision == source_revision:
+            _write_json(output / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
+            _write_json(output / "deployment/environments/dev/units/aws-application.json", specification)
+
+    def fake_observed_tree(ref: str, output: Path):
+        output.mkdir(parents=True, exist_ok=True)
+        if ref == "deploy/dev":
+            _write_json(output / "units/aws-application.json", previous)
+            return "c" * 40
+        return None
+
+    monkeypatch.setattr(deploy_release, "load_environment", lambda *_args: {"promotion": None})
+    monkeypatch.setattr(deploy_release, "git", fake_git)
+    monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
+    monkeypatch.setattr(deploy_release, "observed_tree", fake_observed_tree)
+    monkeypatch.setattr(
+        deploy_release,
+        "deployment_refs",
+        lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"),
+    )
+    monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
+    monkeypatch.setattr(deploy_release, "warn_if_source_revision_excludes_changes", lambda *_args: None)
+    monkeypatch.setattr(deploy_release, "file_blob", lambda path: str(path))
+    monkeypatch.setitem(
+        deploy_release.PLANNING_DRIVERS,
+        "terraform",
+        SimpleNamespace(plan=lambda context: planned.append(context)),
+    )
+
+    deploy_release.command_reconcile(
+        Namespace(
+            unit="aws-application",
+            environment="dev",
+            desired_ref="deploy/dev",
+            desired_revision=None,
+            observed_ref="observed/dev",
+            plan=True,
+            report=None,
+            source_revision="HEAD",
+            advance=False,
+            require_source_ref=None,
+        )
+    )
+
+    assert len(planned) == 1
+    output = capsys.readouterr().err
+    assert "REFRESH  aws-application: retained source aaaaaaaaaaaa unavailable; use candidate bbbbbbbbbbbb" in output
+    assert "PLAN     terraform planning succeeded" in output
+
+
 def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_path, monkeypatch):
     advances = []
     outputs = []

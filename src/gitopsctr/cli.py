@@ -790,6 +790,11 @@ def unit_input_hash(specification: UnitResource[Any], source_root: Path) -> str 
     )
 
 
+def commit_is_available(revision: str) -> bool:
+    """Return whether Git can resolve ``revision`` as a commit for materialization."""
+    return git("cat-file", "-e", f"{revision}^{{commit}}", check=False).returncode == 0
+
+
 def prior_unit_source(
     unit_name: str,
     current_desired: Path,
@@ -1157,12 +1162,15 @@ def resolved_unit_source(
             previous_environment = persisted_unit_source_identity(previous_unit_path).environment
             if isinstance(previous_environment, str):
                 input_hash = prior_hash
-        if not prior_hash:
+        prior_available = commit_is_available(prior_revision)
+        if not prior_available:
+            inputs_changed = True
+        elif not prior_hash:
             with tempfile.TemporaryDirectory() as prior_directory:
                 prior_root = Path(prior_directory) / "source"
                 materialize_revision(prior_revision, prior_root)
                 prior_hash = unit_input_hash(specification, prior_root)
-        if prior_hash == input_hash:
+        if prior_available and prior_hash == input_hash:
             revision = prior_revision
         else:
             inputs_changed = True
@@ -1882,7 +1890,21 @@ def build_desired_candidate(
         )
         prepared[unit_name] = (specification, resolved_source)
         previous_unit = unit_document_path(current_desired, unit_name)
-        if not previous_unit.is_file():
+        previous_source = prior_unit_source(unit_name, current_desired, legacy)
+        refreshed = (
+            previous_unit.is_file()
+            and source_changed
+            and previous_source is not None
+            and resolved_source is not None
+            and previous_source[0] != resolved_source.revision
+            and previous_source[1] == resolved_source.inputHash
+        )
+        if refreshed:
+            source_resolution = (
+                f"retained source {describe_revision(previous_source[0])} unavailable; "
+                f"use candidate {describe_revision(source_revision)}"
+            )
+        elif not previous_unit.is_file():
             source_resolution = "new unit; use candidate revision"
         elif source_changed:
             source_resolution = "inputs changed; use candidate revision"
@@ -1891,7 +1913,7 @@ def build_desired_candidate(
         else:
             source_resolution = f"inputs unchanged; retain {describe_revision(resolved_source.revision)}"
         if verbose:
-            log_status("CHECK", f"{style_unit(unit_name)}: {source_resolution}")
+            log_status("REFRESH" if refreshed else "CHECK", f"{style_unit(unit_name)}: {source_resolution}")
 
     unresolved = set(prepared)
     unavailable: dict[str, str] = {}

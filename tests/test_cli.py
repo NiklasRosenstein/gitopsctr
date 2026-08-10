@@ -310,7 +310,7 @@ def test_blocked_unit_with_same_driver_retains_previous_desired_state(tmp_path, 
     assert "frontend" in result.blocked
 
 
-def test_removing_producer_environment_preserves_existing_input_hash(tmp_path):
+def test_removing_producer_environment_preserves_existing_input_hash(tmp_path, monkeypatch):
     source = tmp_path / "source"
     current = tmp_path / "current"
     source.mkdir()
@@ -338,12 +338,124 @@ def test_removing_producer_environment_preserves_existing_input_hash(tmp_path):
             },
         },
     )
+    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
 
     resolved, changed = deploy_release.resolved_unit_source(specification_resource, source, "b" * 40, current, None)
 
     assert resolved.inputHash == legacy_hash
     assert resolved.revision == "a" * 40
     assert changed is False
+
+
+def _source_resolution_fixture(tmp_path: Path, previous_revision: str, input_hash: str):
+    source = tmp_path / "source"
+    current = tmp_path / "current"
+    source.mkdir()
+    (source / "main.tf").write_text("terraform {}\n")
+    specification = deploy_release.parse_authored_unit_document(
+        {
+            "schema": 1,
+            "name": "aws-application",
+            "driver": "terraform",
+            "source": {"path": "."},
+        },
+        "aws-application",
+    )
+    _write_json(
+        current / "units/aws-application.json",
+        {
+            "schema": 1,
+            "name": "aws-application",
+            "driver": "terraform",
+            "source": {
+                "path": ".",
+                "revision": previous_revision,
+                "inputHash": input_hash,
+                "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"],
+            },
+        },
+    )
+    return source, current, specification
+
+
+def test_matching_input_hash_retains_available_previous_source_revision(tmp_path, monkeypatch):
+    previous_revision = "a" * 40
+    candidate_revision = "b" * 40
+    source, current, specification = _source_resolution_fixture(tmp_path, previous_revision, "sha256:same")
+    monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
+    monkeypatch.setattr(deploy_release, "commit_is_available", lambda revision: revision == previous_revision)
+
+    resolved, changed = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
+
+    assert resolved.revision == previous_revision
+    assert changed is False
+
+
+def test_matching_input_hash_refreshes_unavailable_previous_source_revision(tmp_path, monkeypatch):
+    previous_revision = "a" * 40
+    candidate_revision = "b" * 40
+    source, current, specification = _source_resolution_fixture(tmp_path, previous_revision, "sha256:same")
+    monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
+    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: False)
+
+    resolved, changed = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
+
+    assert resolved.revision == candidate_revision
+    assert changed is True
+
+
+def test_changed_input_hash_uses_candidate_source_revision(tmp_path, monkeypatch):
+    previous_revision = "a" * 40
+    candidate_revision = "b" * 40
+    source, current, specification = _source_resolution_fixture(tmp_path, previous_revision, "sha256:old")
+    monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:new")
+    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
+
+    resolved, changed = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
+
+    assert resolved.revision == candidate_revision
+    assert changed is True
+
+
+def test_unavailable_retained_source_refreshes_desired_state_and_logs(tmp_path, monkeypatch, capsys):
+    previous_revision = "a" * 40
+    candidate_revision = "b" * 40
+    source, current, _ = _source_resolution_fixture(tmp_path, previous_revision, "sha256:same")
+    _write_json(
+        source / "deployment/environments/dev/environment.json",
+        {"schema": 1, "name": "dev"},
+    )
+    _write_json(
+        source / "deployment/environments/dev/units/aws-application.json",
+        {
+            "schema": 1,
+            "name": "aws-application",
+            "driver": "terraform",
+            "source": {"path": "."},
+        },
+    )
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    observed.mkdir()
+    monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
+    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: False)
+
+    result = deploy_release.build_desired_candidate(
+        "dev",
+        source,
+        candidate_revision,
+        current,
+        observed,
+        None,
+        candidate,
+        dry=True,
+    )
+
+    refreshed = deploy_release.load_desired_unit(candidate / "units/aws-application.json", "aws-application")
+    assert result.blocked == {}
+    assert refreshed.spec.source.revision == candidate_revision
+    output = capsys.readouterr().err
+    assert "REFRESH  aws-application: retained source aaaaaaaaaaaa unavailable; use candidate bbbbbbbbbbbb" in output
 
 
 def test_source_input_globs_hash_only_matching_files(tmp_path):
