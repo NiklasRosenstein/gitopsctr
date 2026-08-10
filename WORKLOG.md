@@ -202,6 +202,11 @@ operators a UID-fenced path for permanently unparseable cleanup roots. It requir
 confirmation, rejects parseable roots, active leases, and deletion intents, and writes a finalized Unit incarnation
 tombstone before publishing the resolution.
 
+Commit `8bb059e` closes the remaining pre-publication recovery gap. If teardown evidence is published but finalization
+publication fails, a fresh controller run reuses the matching durable effect lease and evidence, removes the deletion
+intent, and does not invoke the external driver a second time. Focused acceptance coverage now has five tests; the
+full repository verification is pending for this increment.
+
 ### 8. Remove legacy compatibility after migration condition — pending
 
 Legacy desired-resource compatibility remains intentionally enabled. It can be removed only after every supported

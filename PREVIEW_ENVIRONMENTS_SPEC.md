@@ -24,7 +24,7 @@ implementation.
 | Area | Status | Reconciliation |
 | --- | --- | --- |
 | Desired Unit identity, lifecycle authority, ownership, legacy retention, rollback, and schema profiles | **Implemented for Unit** | Keep the generic semantic model; extend it to Stack and StackTemplate later. |
-| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit** | Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac` close lease, incarnation, transition, dependency, legacy-safety, opaque-recovery, evidence-contract, and direct-root lifecycle defects; explicit operator resolution now covers permanently unparseable roots. Forge enforcement remains external. |
+| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit** | Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, `f9cc2ac`, and `8bb059e` close lease, incarnation, transition, dependency, legacy-safety, opaque-recovery, evidence-contract, direct-root, and post-evidence recovery defects; explicit operator resolution now covers permanently unparseable roots. Forge enforcement remains external. |
 | Change-gated candidate freshness | **Local and CI verifier implemented** | `88ae0b9` rejects stale, rebased, multi-commit, merge, root, and missing-head candidates before review creation. CI now verifies the exact GitHub pull-request and merge-queue event head and target; required check and branch-protection policy remain forge configuration. |
 | StackTemplate/Stack contracts and deterministic parameter expansion | **Implemented** | Commits `eb0bcb9` and `84d7ddb`; direct desired Stack provenance is typed and schema-published. |
 | Generated Stack resource graphs with UID-fenced ownership | **Implemented projection and closure** | `b441941` and `d071c1e` project source-authored/direct Stack-owned Units and retain a UID-fenced closure through deletion. |
@@ -36,7 +36,7 @@ implementation.
 | Argo integration and external publication | **Boundary and Argo absence observation implemented; external publication remains deployment-owned** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. Argo-backed Kubernetes Units now wait for Application absence during teardown, and the Kubernetes/Argo acceptance job proves external delivery and observation. This repository still does not publish preview manifests or own ApplicationSet resources. |
 | End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. Forge policy configuration and legacy migration completion remain open. |
 
-The repository verification suite currently passes (`548` tests), including the landed concurrency, recovery,
+The repository verification suite currently passes (`549` tests), including the landed concurrency, recovery,
 incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
 not sufficient, for the remaining preview-environment milestones because forge policy configuration,
 Stack-specific external acceptance, and legacy migration are still open.
@@ -148,7 +148,9 @@ not require deletion of the backend state object.
 
 Successful `TeardownResult.details` are persisted in UID-/generation-fenced observed teardown evidence, with legacy
 evidence documents interpreted as empty details. A crash before that evidence publication may retry the idempotent
-driver operation; the current contract does not invent a separate in-progress evidence record. Receipt identity must
+driver operation. If evidence is already published but finalization publication fails, a fresh run reuses the matching
+UID-/snapshot-fenced lease and evidence without invoking the driver again. The current contract does not invent a
+separate in-progress evidence record. Receipt identity must
 eventually distinguish resource incarnation and semantic desired generation. Whether this replaces the current
 whole-document blob identity immediately or through a compatibility period is **Open**.
 
@@ -187,10 +189,10 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
   recovery path for parseable opaque roots, including source-absent roots and identity transitions. It preserves
   deletion intent and immutable cleanup fences, migrates generation-one intents, validates retained materialization,
   rejects stale source state, and never invokes reconciliation, teardown, or observed-evidence writes.
-- **Done in `26982bf` — teardown evidence contract:** `TeardownContext` receives only a relevance-fenced prior receipt;
+- **Done in `26982bf` and `8bb059e` — teardown evidence contract:** `TeardownContext` receives only a relevance-fenced prior receipt;
   terminal evidence is controller-owned and suppresses repeat teardown. `TeardownResult.details` are validated as
   strict JSON and persisted in UID-/generation-fenced observed evidence, with legacy evidence defaulting to empty
-  details. A pre-publication crash remains a normal idempotent driver retry rather than an in-progress evidence state.
+  details. A crash after evidence publication resumes finalization from the existing lease and does not repeat teardown.
 - **Done in `f9cc2ac` — direct-Unit lifecycle:** `request-delete-direct-unit` creates an exact UID-/generation-fenced
   deletion intent only for a canonical directly managed root, retains the root even when authored source is absent,
   and reuses the existing finalization path. Source-tracked, owned, legacy, and stale-UID requests are rejected;
@@ -349,8 +351,8 @@ Before declaring the Unit implementation milestone complete, the harness MUST co
 - Create an opaque cleanup root, remove its source, restart, and prove the documented adoption or cleanup operation
   can resolve it. **Covered by `816a8a4` and the UID-fenced `resolve-opaque-unit` operator path.**
 - Pass a relevance-fenced prior receipt into teardown and prove driver result details survive restart after successful
-  evidence publication while remaining UID/generation fenced. **Covered for the terminal-evidence contract by
-  `26982bf`; pre-publication crash retry remains an idempotence requirement.**
+  evidence publication while remaining UID/generation fenced. **Covered by `26982bf` and `8bb059e`, including a
+  crash after evidence publication and before finalization publication.**
 - Request deletion of a direct Unit with an exact UID, remove authored source if any, restart, and prove the direct Unit
   remains retained until finalization. **Covered by `f9cc2ac`; local candidate freshness is covered by `88ae0b9`, while
   forge-side required-check/merge-queue enforcement remains pending.**
@@ -358,7 +360,7 @@ Before declaring the Unit implementation milestone complete, the harness MUST co
 Shared recovery coverage MUST prove that one destroy failure retains cleanup inputs across restart and that a stale
 delete request for an old UID cannot affect a recreated same-name resource.
 
-Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, `f9cc2ac`, and `88ae0b9` cover finalization lease completion, pre-effect
+Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, `f9cc2ac`, `8bb059e`, and `88ae0b9` cover finalization lease completion, pre-effect
 failure cleanup, same-name incarnation fencing, parseable GVK/driver replacement, resolved dependency preservation,
 pre-lease dependency revalidation, legacy application blocking, parseable opaque-root recovery, the terminal teardown
 evidence contract, explicit direct-Unit deletion, local candidate freshness fencing, and operator-confirmed resolution
