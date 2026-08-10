@@ -527,6 +527,23 @@ def application_status(provider: Provider) -> dict[str, object]:
     return cast(dict[str, object], json.loads(output))
 
 
+def refresh_argo_application(provider: Provider) -> None:
+    run(
+        "kubectl",
+        "--context",
+        kube_context(provider, "argocd"),
+        "--namespace",
+        ARGO_NAMESPACE,
+        "patch",
+        "application.argoproj.io",
+        ARGO_APPLICATION,
+        "--type",
+        "merge",
+        "--patch",
+        json.dumps({"metadata": {"annotations": {"argocd.argoproj.io/refresh": "normal"}}}),
+    )
+
+
 def verify_argo_revision(provider: Provider, expected_revision: str) -> None:
     status = cast(dict[str, object], application_status(provider).get("status", {}))
     sync = cast(dict[str, object], status.get("sync", {}))
@@ -647,14 +664,21 @@ def acceptance(provider: Provider, delivery: Delivery = "direct") -> None:
                 controller(provider, "reconcile", "--environment", "dev", "--unit", "demo-image", delivery=delivery)
                 controller(
                     provider,
+                    "advance-desired",
+                    "--environment",
+                    "dev",
+                    "--source-revision",
+                    "HEAD",
+                    delivery=delivery,
+                )
+                refresh_argo_application(provider)
+                controller(
+                    provider,
                     "reconcile",
                     "--environment",
                     "dev",
                     "--unit",
                     "web",
-                    "--advance",
-                    "--source-revision",
-                    "HEAD",
                     delivery=delivery,
                 )
                 first_heads = deployment_heads(provider, delivery, remote)

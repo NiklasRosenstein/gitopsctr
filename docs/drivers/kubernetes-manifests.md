@@ -148,9 +148,9 @@ renders and applies the workload, verifies the running application through the C
 no Git refs, and always removes the cluster.
 
 `mise run argocd-acceptance -- PROVIDER` exercises external delivery. It installs an isolated Argo CD Core instance,
-creates an automated Application before the first materialized payload exists, and uses one `web --advance`
-reconciliation to commit Helm-rendered YAML and observe Argo CD syncing that exact desired revision. Argo CD, not
-gitopsctr, applies the workload.
+creates an automated Application before the first materialized payload exists, advances the rendered Helm payload,
+explicitly refreshes the Application, and observes Argo CD syncing that exact desired revision. Argo CD, not gitopsctr,
+applies the workload.
 
 ## Schemas
 

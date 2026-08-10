@@ -29,9 +29,9 @@ mise run kubernetes-acceptance -- minikube
 ## Argo CD acceptance
 
 The Argo CD variant keeps the same image build and Helm materialization, but it creates an automated Argo CD
-Application before `materialized/web` exists. Its first `web --advance` reconciliation commits the rendered YAML to
-`gitopsctr/desired/dev` and waits for Argo CD to sync that exact commit. Argo CD applies the workload; gitopsctr only
-observes its Application resource through Kubernetes.
+Application before `materialized/web` exists. Its first desired-state advance commits the rendered YAML to
+`gitopsctr/desired/dev`; the test then explicitly refreshes the Application before waiting for Argo CD to sync that
+exact commit. Argo CD applies the workload; gitopsctr only observes its Application resource through Kubernetes.
 
 ```console
 mise run argocd-acceptance -- kind

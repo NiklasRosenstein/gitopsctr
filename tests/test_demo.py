@@ -198,3 +198,35 @@ def test_argocd_demo_uses_the_external_observer_and_materialized_payload(tmp_pat
         "path": "materialized/web",
     }
     assert application["spec"]["syncPolicy"] == {"automated": {}}
+
+
+def test_refresh_argo_application_requests_application_refresh(monkeypatch):
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def fake_run(*args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(kubernetes_demo, "run", fake_run)
+
+    kubernetes_demo.refresh_argo_application("kind")
+
+    assert calls == [
+        (
+            (
+                "kubectl",
+                "--context",
+                kubernetes_demo.kube_context("kind", "argocd"),
+                "--namespace",
+                kubernetes_demo.ARGO_NAMESPACE,
+                "patch",
+                "application.argoproj.io",
+                kubernetes_demo.ARGO_APPLICATION,
+                "--type",
+                "merge",
+                "--patch",
+                '{"metadata": {"annotations": {"argocd.argoproj.io/refresh": "normal"}}}',
+            ),
+            {},
+        )
+    ]
