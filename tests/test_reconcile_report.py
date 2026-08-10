@@ -440,6 +440,61 @@ def test_reconcile_reports_persisted_transition_reason_before_unit_materializati
     assert "WAIT     persisted opaque cleanup reason" in capsys.readouterr().err
 
 
+def test_reconcile_legacy_unit_without_advance_blocks_before_effect(monkeypatch, capsys):
+    desired_files = {
+        "units/frontend.json": json.dumps(
+            {
+                "schema": 1,
+                "name": "frontend",
+                "driver": "frontend-s3-cloudfront",
+                "source": {"path": "frontend"},
+            }
+        ).encode()
+    }
+    outputs = []
+
+    def fake_materialize(_revision: str, output: Path):
+        output.mkdir(parents=True, exist_ok=True)
+        for relative, content in desired_files.items():
+            target = output / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+
+    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(deploy_release, "resolve_ref", lambda *_args: "c" * 40)
+    monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
+    monkeypatch.setattr(deploy_release, "observed_tree", lambda _ref, output: output.mkdir(parents=True) or None)
+    monkeypatch.setattr(
+        deploy_release,
+        "write_reconcile_outputs",
+        lambda reconciled, desired="": outputs.append((reconciled, desired)),
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "acquire_effect_lease",
+        lambda *_args, **_kwargs: pytest.fail("legacy reconciliation acquired an effect lease"),
+    )
+
+    deploy_release.command_reconcile(
+        Namespace(
+            unit="frontend",
+            environment="dev",
+            desired_ref="deploy/dev",
+            desired_revision=None,
+            observed_ref="observed/dev",
+            plan=False,
+            report=None,
+            source_revision=None,
+            advance=False,
+            require_source_ref=None,
+            reapply=False,
+        )
+    )
+
+    assert outputs == [(False, "")]
+    assert "run advance-desired" in capsys.readouterr().err
+
+
 def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monkeypatch):
     report = tmp_path / "report"
     calls = []
@@ -464,10 +519,12 @@ def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monke
             _write_json(
                 output / "units/aws-application.json",
                 {
-                    "schema": 1,
-                    "name": "aws-application",
-                    "driver": "terraform",
-                    "source": {"path": "infra/deploy", "revision": "a" * 40},
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "metadata": ResourceMetadata.source_tracked_from_provenance(
+                        "aws-application", "reconcile-plan-test"
+                    ).document(profile="desired"),
+                    "spec": {"source": {"path": "infra/deploy", "revision": "a" * 40}},
                 },
             )
 

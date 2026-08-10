@@ -3465,6 +3465,261 @@ def write_opaque_cleanup_root(root: Path, name: str, opaque: OpaqueCleanupRoot) 
     return path
 
 
+def source_tracked_metadata_for_uid(
+    name: str, uid: str, owner: DesiredOwnerReference | None = None
+) -> ResourceMetadata:
+    """Build canonical recovery metadata without accepting authority from opaque payload bytes."""
+
+    lifecycle = (
+        DesiredLifecycle(owner=owner)
+        if owner is not None
+        else DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked"))
+    )
+    metadata = ResourceMetadata(name=name, uid=uid, lifecycle=lifecycle)
+    metadata.validate_desired()
+    return metadata
+
+
+def parse_opaque_recovery_unit(
+    opaque: OpaqueCleanupRoot,
+    unit_name: str,
+    uid: str,
+    intent: UnitDeletionIntent | None = None,
+) -> UnitResource[Any]:
+    """Parse only the persisted opaque payload, applying an external UID fence."""
+
+    if opaque.metadata.uid != uid:
+        raise OperationError(f"opaque cleanup UID fence for {unit_name!r} does not match --uid")
+    if not isinstance(opaque.payload, dict):
+        raise OperationError(f"opaque cleanup payload for {unit_name!r} is not a parseable Unit document")
+    try:
+        parsed = parse_desired_unit_document(cast(dict[str, Any], opaque.payload), unit_name)
+    except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError) as exc:
+        raise OperationError(f"opaque cleanup payload for {unit_name!r} is not parseable: {exc}") from exc
+    if not parsed.is_legacy_compatibility and parsed.metadata.uid != uid:
+        raise OperationError(f"opaque cleanup payload for {unit_name!r} has a conflicting lifecycle identity")
+    lifecycle = parsed.metadata.lifecycle
+    if lifecycle is None and not parsed.is_legacy_compatibility:
+        raise OperationError(f"opaque cleanup payload for {unit_name!r} has no lifecycle authority")
+    if lifecycle is not None:
+        if lifecycle.management is not None and lifecycle.management.mode == "direct":
+            raise OperationError(f"opaque cleanup payload for {unit_name!r} has direct lifecycle authority")
+        if intent is None and lifecycle.owner is not None:
+            raise OperationError(f"opaque cleanup payload for {unit_name!r} has an unvalidated owner identity")
+    if intent is not None:
+        if (
+            parsed.gvk.api_version != intent.retained_api_version
+            or parsed.gvk.kind != intent.retained_kind
+            or parsed.driver_name != intent.retained_driver
+            or (lifecycle.owner if lifecycle is not None else None) != intent.retained_owner
+        ):
+            raise OperationError(f"opaque cleanup payload for {unit_name!r} conflicts with its deletion intent")
+        source = getattr(parsed.spec, "source", None)
+        source_revision = source.revision if isinstance(source, DesiredSource) else None
+        if source_revision != intent.retained_source_revision:
+            raise OperationError(f"opaque cleanup payload for {unit_name!r} conflicts with its retained source fence")
+        if intent.retained_source is not None:
+            if not isinstance(source, DesiredSource) or source.path != intent.retained_source.path:
+                raise OperationError(f"opaque cleanup payload for {unit_name!r} conflicts with its source path fence")
+        if tuple(sorted(desired_observation_reference_units(parsed))) != intent.retained_dependencies:
+            raise OperationError(f"opaque cleanup payload for {unit_name!r} conflicts with its dependency fence")
+    return parsed
+
+
+def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
+        raise OperationError(f"invalid unit name: {args.unit!r}")
+    if not isinstance(args.uid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args.uid):
+        raise OperationError("recover-opaque-unit requires a valid --uid")
+    if not isinstance(args.source_revision, str) or not re.fullmatch(r"[0-9a-f]{40}", args.source_revision):
+        raise OperationError("recover-opaque-unit requires an authoritative full --source-revision commit")
+    if not commit_is_available(args.source_revision):
+        raise OperationError(f"authoritative source revision is unavailable: {args.source_revision}")
+
+    desired_ref, observed_ref = deployment_refs(
+        REPOSITORY_ROOT,
+        args.environment,
+        args.desired_ref,
+        None,
+    )
+    with unit_effect_lock(args.environment, args.unit):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            source_root = temporary / "source"
+            current = temporary / "current"
+            candidate = temporary / "candidate"
+            materialize_revision(args.source_revision, source_root)
+            current_revision = observed_tree(desired_ref, current)
+            if current_revision is None:
+                raise OperationError(f"desired ref {desired_ref!r} has no state to recover")
+
+            opaque = load_desired_cleanup_roots(current).get(args.unit)
+            if opaque is None:
+                raise OperationError(f"no opaque cleanup root exists for {args.unit!r}")
+            intents = load_desired_deletion_intents(current)
+            intent = intents.get(args.unit)
+            if intent is not None and intent.uid != args.uid:
+                raise OperationError(f"stale deletion intent UID fence for {args.unit!r}")
+            if intent is None and opaque.metadata.uid != args.uid:
+                raise OperationError(f"stale opaque cleanup UID fence for {args.unit!r}")
+            incarnation_tombstones = load_desired_unit_incarnation_tombstones(current)
+            incarnation = incarnation_tombstones.get(args.unit)
+            if incarnation is not None and incarnation.uid != args.uid:
+                raise OperationError(f"opaque cleanup {args.unit!r} conflicts with its incarnation fence")
+            if incarnation is not None and incarnation.state == "finalized":
+                raise OperationError(f"opaque cleanup {args.unit!r} has already been finalized")
+            if intent is not None and intent.deletion_generation == 1:
+                # Generation-one intents predate incarnation fences.  Migrate the
+                # intent before recovery so legacy teardown evidence cannot prove
+                # completion for the recovered lifecycle.
+                incarnation = incarnation or UnitIncarnationTombstone(
+                    unit_name=args.unit,
+                    uid=args.uid,
+                    state="active",
+                    next_deletion_generation=2,
+                )
+                incarnation = replace(
+                    incarnation,
+                    state="active",
+                    next_deletion_generation=max(2, incarnation.next_deletion_generation),
+                )
+                incarnation_tombstones[args.unit] = incarnation
+                intent = replace(intent, deletion_generation=2)
+            if any(
+                effect_lease_active(lease)
+                for lease in load_desired_effect_leases(current).values()
+                if lease.unit_name == args.unit
+            ):
+                raise OperationError(f"active effect lease blocks opaque recovery for {args.unit!r}")
+            if document_candidates(current / "units", args.unit):
+                raise OperationError(f"canonical desired Unit {args.unit!r} already exists")
+
+            parsed = parse_opaque_recovery_unit(opaque, args.unit, args.uid, intent)
+            specifications = load_environment_specifications(source_root, args.environment)
+            source_specification = specifications.get(args.unit)
+            source_present = source_specification is not None
+            if source_present:
+                if parsed.gvk != source_specification.gvk or parsed.driver_name != source_specification.driver_name:
+                    transition = True
+                else:
+                    transition = False
+                payload_source = getattr(parsed.spec, "source", None)
+                authored_source = getattr(source_specification.spec, "source", None)
+                if not transition and (
+                    (payload_source is None) != (authored_source is None)
+                    or (
+                        payload_source is not None
+                        and authored_source is not None
+                        and payload_source.path != authored_source.path
+                    )
+                ):
+                    raise OperationError(f"opaque cleanup payload for {args.unit!r} conflicts with source identity")
+                if not transition and not parsed.is_legacy_compatibility:
+                    payload_revision = payload_source.revision if isinstance(payload_source, DesiredSource) else None
+                    if payload_revision != args.source_revision:
+                        raise OperationError(
+                            f"authoritative source for {args.unit!r} changed after opaque cleanup was retained; "
+                            "run advance-desired before recovery"
+                        )
+            else:
+                transition = False
+
+            if incarnation is None:
+                incarnation = UnitIncarnationTombstone(
+                    unit_name=args.unit,
+                    uid=args.uid,
+                    state="active",
+                    next_deletion_generation=2,
+                )
+
+            if intent is not None:
+                metadata = source_tracked_metadata_for_uid(args.unit, args.uid, intent.retained_owner)
+            else:
+                metadata = source_tracked_metadata_for_uid(args.unit, args.uid)
+            restored = parsed.with_metadata(metadata)
+            require_unit(restored, args.unit)
+            validate_unit_materialization(current, args.unit, parsed)
+
+            shutil.copytree(current, candidate)
+            for path in document_candidates(candidate / DESIRED_CLEANUP_UNITS_PATH, args.unit):
+                path.unlink()
+            for path in document_candidates(candidate / "units", args.unit):
+                path.unlink()
+            write_desired_candidate_unit(
+                candidate / "units" / f"{args.unit}{opaque.path.suffix}",
+                restored,
+                source_root,
+            )
+            copy_unit_materialization(current, candidate, args.unit, restored)
+            write_unit_incarnation_tombstone(candidate, incarnation)
+
+            transition_blocks = load_desired_transition_blocks(candidate)
+            transition_blocks.pop(args.unit, None)
+            if intent is not None:
+                restored_path = unit_document_path(candidate, args.unit)
+                if file_blob(restored_path) != intent.retained_unit_blob:
+                    raise OperationError(
+                        f"recovered desired Unit for {args.unit!r} does not match its immutable retained_unit_blob"
+                    )
+                write_deletion_intent(candidate, intent)
+                transition_blocks[args.unit] = deletion_intent_reason(intent)
+            elif not source_present or transition:
+                restored_path = unit_document_path(candidate, args.unit)
+                new_intent = UnitDeletionIntent.from_unit(
+                    restored,
+                    restored_path,
+                    candidate,
+                    incarnation.next_deletion_generation,
+                )
+                write_deletion_intent(candidate, new_intent)
+                transition_blocks[args.unit] = deletion_intent_reason(new_intent)
+            write_desired_transition_blocks(candidate, transition_blocks)
+            load_desired_resource_graph(candidate)
+            if args.dry:
+                log_status("DRY", f"{style_unit(args.unit)}: opaque cleanup recovery would be published")
+                return False
+            candidate_id = candidate_identifier(
+                "finalize",
+                args.environment,
+                candidate,
+                desired_ref,
+                current_revision,
+                {"unit": args.unit, "uid": args.uid, "operation": "recover-opaque-unit"},
+            )
+            candidate_ref = resolve_candidate_ref(
+                REPOSITORY_ROOT,
+                args.environment,
+                "finalize",
+                candidate_id,
+                args.candidate_ref,
+            )
+            if candidate_ref in {desired_ref, observed_ref}:
+                raise OperationError("opaque recovery candidate ref conflicts with deployment state")
+            revision, outcome = publish_desired_change(
+                args.environment,
+                candidate,
+                desired_ref,
+                current_revision,
+                candidate_ref,
+                f"Recover opaque cleanup for {args.unit}",
+                f"Recover opaque cleanup for {args.unit}",
+                f"Restore the UID-fenced opaque cleanup root for `{args.unit}`.",
+                False,
+                current,
+            )
+            if outcome is not None:
+                log_status(
+                    "REVIEW",
+                    f"{style_branch(candidate_ref)} submitted at {describe_revision(revision)}; "
+                    f"{style_branch(desired_ref)} remains at {describe_revision(current_revision)}",
+                )
+            else:
+                log_status("UPDATE", f"{style_branch(desired_ref)} advanced to {describe_revision(revision)}")
+            print(revision)
+            write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
+            return True
+
+
 def desired_metadata_for_candidate(
     authored: UnitResource[Any],
     previous: UnitResource[Any] | None,
@@ -6175,6 +6430,16 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             log_status("DONE", f"{style_unit(args.unit)}: no changes")
             write_reconcile_outputs(False)
             return False
+        unit = load_desired_unit(unit_path, args.unit)
+        if unit.is_legacy_compatibility:
+            log_status(
+                "WAIT",
+                "legacy desired Unit has no lifecycle identity; run advance-desired against an authoritative "
+                "source revision to adopt it before reconciliation",
+            )
+            log_status("DONE", f"{style_unit(args.unit)}: no changes")
+            write_reconcile_outputs(False)
+            return False
         ensure_desired_units_materialized(desired)
         load_desired_resource_graph(desired)
         if raw_unit_contains_reference(load_json(unit_path)):
@@ -6182,7 +6447,6 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             log_status("DONE", f"{style_unit(args.unit)}: no changes")
             write_reconcile_outputs(False)
             return False
-        unit = load_desired_unit(unit_path, args.unit)
         driver_name, source = require_unit(unit, args.unit)
         validate_unit_materialization(desired, args.unit, unit)
         log_status("DRIVER", driver_name)
@@ -7152,6 +7416,7 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
             "Deployment",
             ("advance-desired", "promote", "rollback", "recover-effect-lease", "resolve-desired"),
         ),
+        ("Recovery", ("recover-opaque-unit", "finalize")),
         ("Inspection", ("status", "list", "show", "verify", "dependencies")),
         ("Reconciliation", ("reconcile", "converge")),
         ("Git data", ("read-tree", "publish-tree")),
@@ -7351,6 +7616,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recover_effect_lease.add_argument("--desired-ref", help="override the environment's desired ref")
     recover_effect_lease.set_defaults(handler=command_recover_effect_lease)
+
+    recover_opaque = commands.add_parser(
+        "recover-opaque-unit",
+        help="recover a UID-fenced opaque cleanup root using installed driver code",
+    )
+    recover_opaque.add_argument("--environment", required=True)
+    recover_opaque.add_argument("--unit", required=True)
+    recover_opaque.add_argument("--uid", required=True, help="exact opaque cleanup UID fence")
+    recover_opaque.add_argument(
+        "--source-revision",
+        required=True,
+        help="authoritative full source commit used only to validate recovery eligibility",
+    )
+    recover_opaque.add_argument("--desired-ref", help="override the environment's desired ref")
+    recover_opaque.add_argument(
+        "--candidate-ref",
+        help="exact candidate ref override when the environment uses a pull-request change gate",
+    )
+    recover_opaque.add_argument("--dry", action="store_true")
+    recover_opaque.set_defaults(handler=command_recover_opaque_unit)
 
     finalize = commands.add_parser(
         "finalize",

@@ -143,6 +143,268 @@ def _finalize_args(unit: str = "application", **overrides: object) -> Namespace:
     return Namespace(**values)
 
 
+def _recover_opaque_args(unit: str = "application", **overrides: object) -> Namespace:
+    values = {
+        "unit": unit,
+        "environment": "dev",
+        "desired_ref": "deploy/dev",
+        "candidate_ref": None,
+        "uid": "d1-application",
+        "source_revision": "b" * 40,
+        "dry": False,
+    }
+    values.update(overrides)
+    return Namespace(**values)
+
+
+def _prepare_opaque_recovery(
+    tmp_path: Path,
+    monkeypatch,
+    payload: dict[str, object],
+    *,
+    source_unit: dict[str, object] | None = None,
+    intent: deploy_release.UnitDeletionIntent | None = None,
+):
+    current = tmp_path / "current"
+    source = tmp_path / "source"
+    current.mkdir()
+    _source_root(source)
+    deploy_release.write_opaque_cleanup_root(
+        current,
+        "application",
+        deploy_release.OpaqueCleanupRoot(
+            path=current / ".gitopsctr/cleanup/units/application.json",
+            payload=payload,
+            metadata=deploy_release.ResourceMetadata(
+                name="application",
+                uid="d1-application",
+                lifecycle=deploy_release.DesiredLifecycle(
+                    management=deploy_release.LifecycleManagement(mode="sourceTracked")
+                ),
+            ),
+            source=deploy_release.raw_document_source(payload),
+        ),
+    )
+    if intent is not None:
+        deploy_release.write_deletion_intent(current, intent)
+    if source_unit is not None:
+        _write_json(source / "deployment/environments/dev/units/application.json", source_unit)
+
+    published: list[Path] = []
+
+    def observed_tree(_ref: str, output: Path):
+        shutil.copytree(current, output)
+        return "c" * 40
+
+    def materialize_revision(_revision: str, output: Path):
+        shutil.copytree(source, output)
+
+    def publish_desired_change(_environment, candidate, *_args, **_kwargs):
+        snapshot = tmp_path / f"published-{len(published)}"
+        shutil.copytree(candidate, snapshot)
+        published.append(snapshot)
+        return "d" * 40, None
+
+    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
+    monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
+    monkeypatch.setattr(deploy_release, "materialize_revision", materialize_revision)
+    monkeypatch.setattr(deploy_release, "publish_desired_change", publish_desired_change)
+    monkeypatch.setattr(deploy_release, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+    return current, source, published
+
+
+def test_recover_opaque_source_absent_restores_unit_and_creates_intent(tmp_path, monkeypatch):
+    payload = _terraform_unit("application", "d1-application")
+    _current, _source, published = _prepare_opaque_recovery(tmp_path, monkeypatch, payload)
+
+    assert deploy_release.command_recover_opaque_unit(_recover_opaque_args(source_revision="a" * 40)) is True
+
+    candidate = published[0]
+    restored = deploy_release.load_desired_unit(candidate / "units/application.json", "application")
+    intent = deploy_release.load_desired_deletion_intents(candidate)["application"]
+    assert restored.metadata.uid == "d1-application"
+    assert intent.uid == "d1-application"
+    assert intent.deletion_generation == 2
+    assert not deploy_release.load_desired_cleanup_roots(candidate)
+
+
+def test_recover_opaque_source_present_restores_active_source_tracked_unit(tmp_path, monkeypatch):
+    payload = _terraform_unit("application", "d1-application")
+    source_unit = json.loads(json.dumps(payload))
+    source_unit["metadata"] = {"name": "application"}
+    source_unit["spec"]["source"] = {"path": "infra/deploy"}
+    _current, _source, published = _prepare_opaque_recovery(
+        tmp_path,
+        monkeypatch,
+        payload,
+        source_unit=source_unit,
+    )
+
+    assert deploy_release.command_recover_opaque_unit(_recover_opaque_args(source_revision="a" * 40)) is True
+
+    candidate = published[0]
+    restored = deploy_release.load_desired_unit(candidate / "units/application.json", "application")
+    assert restored.metadata.uid == "d1-application"
+    assert restored.metadata.lifecycle is not None
+    assert restored.metadata.lifecycle.management is not None
+    assert restored.metadata.lifecycle.management.mode == "sourceTracked"
+    assert deploy_release.load_desired_deletion_intents(candidate) == {}
+    assert deploy_release.load_desired_unit_incarnation_tombstones(candidate)["application"].state == "active"
+
+
+def test_recover_opaque_source_transition_restores_old_unit_with_intent(tmp_path, monkeypatch):
+    payload = _terraform_unit("application", "d1-application")
+    vite = deploy_release.parse_desired_unit_document(_vite_unit("application", "new-vite"), "application")
+    source_unit = deploy_release.serialize_unit_document(vite, profile="desired")
+    source_unit["metadata"] = {"name": "application"}
+    source_unit["spec"]["source"] = {"path": "frontend"}
+    source_unit["spec"].pop("inputs", None)
+    source_unit["spec"].pop("resolvedInputs", None)
+    _current, _source, published = _prepare_opaque_recovery(
+        tmp_path,
+        monkeypatch,
+        payload,
+        source_unit=source_unit,
+    )
+
+    assert deploy_release.command_recover_opaque_unit(_recover_opaque_args()) is True
+
+    candidate = published[0]
+    restored = deploy_release.load_desired_unit(candidate / "units/application.json", "application")
+    intent = deploy_release.load_desired_deletion_intents(candidate)["application"]
+    assert restored.driver_name == "terraform"
+    assert intent.uid == "d1-application"
+    assert intent.deletion_generation == 2
+
+
+def test_recover_opaque_existing_intent_preserves_uid_and_generation(tmp_path, monkeypatch):
+    payload = _terraform_unit("application", "d1-application")
+    retained = tmp_path / "retained/units/application.yaml"
+    _write_json(retained, payload)
+    original = deploy_release.load_desired_unit(retained, "application")
+    deploy_release.write_desired_candidate_unit(retained, original, tmp_path / "retained")
+    original = deploy_release.load_desired_unit(retained, "application")
+    canonical_payload = deploy_release.serialize_unit_document(original, profile="desired")
+    intent = deploy_release.UnitDeletionIntent.from_unit(original, retained, tmp_path / "retained", 7)
+    current, _source, published = _prepare_opaque_recovery(tmp_path, monkeypatch, canonical_payload, intent=intent)
+
+    assert deploy_release.command_recover_opaque_unit(_recover_opaque_args()) is True
+
+    candidate = published[0]
+    recovered_intent = deploy_release.load_desired_deletion_intents(candidate)["application"]
+    assert recovered_intent.uid == intent.uid
+    assert recovered_intent.deletion_generation == 7
+    assert (
+        deploy_release.load_desired_unit(
+            deploy_release.unit_document_path(candidate, "application"), "application"
+        ).metadata.uid
+        == intent.uid
+    )
+    assert not deploy_release.load_desired_cleanup_roots(candidate)
+    assert deploy_release.load_desired_cleanup_roots(current)
+
+
+def test_recover_opaque_migrates_generation_one_intent_before_recovery(tmp_path, monkeypatch):
+    payload = _terraform_unit("application", "d1-application")
+    retained = tmp_path / "retained/units/application.yaml"
+    _write_json(retained, payload)
+    original = deploy_release.load_desired_unit(retained, "application")
+    deploy_release.write_desired_candidate_unit(retained, original, tmp_path / "retained")
+    original = deploy_release.load_desired_unit(retained, "application")
+    canonical_payload = deploy_release.serialize_unit_document(original, profile="desired")
+    intent = deploy_release.UnitDeletionIntent.from_unit(original, retained, tmp_path / "retained", 1)
+    _current, _source, published = _prepare_opaque_recovery(tmp_path, monkeypatch, canonical_payload, intent=intent)
+
+    assert deploy_release.command_recover_opaque_unit(_recover_opaque_args()) is True
+
+    candidate = published[0]
+    recovered = deploy_release.load_desired_deletion_intents(candidate)["application"]
+    assert recovered.deletion_generation == 2
+    assert deploy_release.load_desired_unit_incarnation_tombstones(candidate)["application"] == (
+        deploy_release.UnitIncarnationTombstone(
+            unit_name="application",
+            uid="d1-application",
+            state="active",
+            next_deletion_generation=2,
+        )
+    )
+
+
+def test_recover_opaque_rejects_changed_payload_against_immutable_intent_blob(tmp_path, monkeypatch):
+    original_payload = _terraform_unit("application", "d1-application")
+    retained = tmp_path / "retained/units/application.yaml"
+    _write_json(retained, original_payload)
+    original = deploy_release.load_desired_unit(retained, "application")
+    deploy_release.write_desired_candidate_unit(retained, original, tmp_path / "retained")
+    original = deploy_release.load_desired_unit(retained, "application")
+    canonical_payload = deploy_release.serialize_unit_document(original, profile="desired")
+    intent = deploy_release.UnitDeletionIntent.from_unit(original, retained, tmp_path / "retained", 7)
+    changed_payload = json.loads(json.dumps(canonical_payload))
+    changed_payload["spec"]["terraform"]["variables"] = {"changed": "after-teardown"}  # type: ignore[index]
+    _current, _source, published = _prepare_opaque_recovery(tmp_path, monkeypatch, changed_payload, intent=intent)
+
+    with pytest.raises(OperationError, match="immutable retained_unit_blob"):
+        deploy_release.command_recover_opaque_unit(_recover_opaque_args())
+    assert not published
+
+
+def test_recover_opaque_blocks_stale_same_identity_source_payload(tmp_path, monkeypatch):
+    payload = _terraform_unit("application", "d1-application", source_revision="a" * 40)
+    source_unit = json.loads(json.dumps(payload))
+    source_unit["metadata"] = {"name": "application"}
+    source_unit["spec"]["source"] = {"path": "infra/deploy"}
+    current, _source, published = _prepare_opaque_recovery(tmp_path, monkeypatch, payload, source_unit=source_unit)
+
+    with pytest.raises(OperationError, match="authoritative source.*changed"):
+        deploy_release.command_recover_opaque_unit(_recover_opaque_args(source_revision="b" * 40))
+    assert not published
+    assert deploy_release.load_desired_cleanup_roots(current)["application"].metadata.uid == "d1-application"
+
+
+def test_recover_opaque_adopts_parseable_legacy_payload_with_outer_uid(tmp_path, monkeypatch):
+    payload = _terraform_unit("application", "d1-application")
+    payload["metadata"] = {"name": "application"}
+    source_unit = json.loads(json.dumps(payload))
+    source_unit["spec"]["source"] = {"path": "infra/deploy"}
+    _current, _source, published = _prepare_opaque_recovery(tmp_path, monkeypatch, payload, source_unit=source_unit)
+
+    assert deploy_release.command_recover_opaque_unit(_recover_opaque_args()) is True
+
+    restored = deploy_release.load_desired_unit(published[0] / "units/application.json", "application")
+    assert not restored.is_legacy_compatibility
+    assert restored.metadata.uid == "d1-application"
+
+
+def test_recover_opaque_fences_dry_run_uid_and_active_lease(tmp_path, monkeypatch):
+    payload = _terraform_unit("application", "d1-application")
+    current, _source, published = _prepare_opaque_recovery(tmp_path, monkeypatch, payload)
+
+    assert deploy_release.command_recover_opaque_unit(_recover_opaque_args(dry=True)) is False
+    assert not published
+    assert deploy_release.load_desired_cleanup_roots(current)["application"].metadata.uid == "d1-application"
+
+    with pytest.raises(OperationError, match="opaque cleanup UID fence"):
+        deploy_release.command_recover_opaque_unit(_recover_opaque_args(uid="d1-other"))
+
+    with pytest.raises(OperationError, match="authoritative full"):
+        deploy_release.command_recover_opaque_unit(_recover_opaque_args(source_revision="main"))
+
+    deploy_release.write_effect_lease(
+        current,
+        deploy_release.EffectLease(
+            unit_name="application",
+            uid="d1-application",
+            token="lease-test",
+            owner="test",
+            desired_revision="c" * 40,
+            expires_at=None,
+        ),
+    )
+    with pytest.raises(OperationError, match="active effect lease"):
+        deploy_release.command_recover_opaque_unit(_recover_opaque_args())
+
+
 def _copy_observed_files(files: dict[str, bytes]):
     def observed_tree(_ref: str, output: Path):
         output.mkdir(parents=True, exist_ok=True)
