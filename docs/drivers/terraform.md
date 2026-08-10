@@ -34,10 +34,12 @@ spec:
 `source.path` identifies the Terraform working directory relative to the root
 of the selected source revision. `source.inputs` is the input fingerprint,
 resolved relative to that working directory; glob patterns are supported. `backend` is passed to
-`terraform init`, `variables` become `TF_VAR_*` values, and `observeOutputs`
-selects outputs that downstream units may consume. HTTP checks are optional and
-run after apply. Backend and variable values must be JSON-compatible scalar or
-object values accepted by the driver.
+`terraform init`. Resolved `variables` are passed through a temporary JSON
+`-var-file`, so unit variables take precedence over `terraform.tfvars` and are
+removed after Terraform finishes. `observeOutputs` selects outputs that
+downstream units may consume. HTTP checks are optional and run after apply.
+Backend and variable values must be JSON-compatible scalar or object values
+accepted by the driver.
 
 `reconcile --plan` runs the speculative plan and writes report evidence only;
 it does not apply or publish a receipt. `verify` runs a refresh-enabled,
