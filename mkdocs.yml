@@ -34,6 +34,7 @@ nav:
   - Operations:
       - Workflow guide: operations.md
       - GitHub Action: github-action.md
+      - Preview environments: preview-environments.md
   - Extending gitopsctr:
       - Driver execution: driver-execution.md
   - Reference:
