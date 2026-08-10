@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypedDict
@@ -116,6 +119,7 @@ class TerraformRuntime:
 
     working_directory: Path
     environment: dict[str, str]
+    variables: dict[str, JsonValue]
     init_args: list[str]
     observed_output_names: list[str]
     checks: list[TerraformHttpCheck]
@@ -171,16 +175,33 @@ def terraform_runtime(
         raise DriverError("terraform observeOutputs must be a list of names")
 
     terraform_root = context.source_root / context.source_path
-    terraform_environment = os.environ | {
-        f"TF_VAR_{name}": value if isinstance(value, str) else json.dumps(value) for name, value in variables.items()
-    }
     return TerraformRuntime(
         working_directory=terraform_root,
-        environment=terraform_environment,
+        environment=os.environ.copy(),
+        variables=dict(variables),
         init_args=backend_args,
         observed_output_names=output_names,
         checks=checks,
     )
+
+
+@contextmanager
+def terraform_variable_file(runtime: TerraformRuntime) -> Iterator[Path | None]:
+    """Yield a temporary JSON variable file so unit variables outrank tfvars files."""
+
+    if not runtime.variables:
+        yield None
+        return
+    with tempfile.TemporaryDirectory(prefix="gitopsctr-terraform-") as temporary_directory:
+        variable_file = Path(temporary_directory) / "unit.tfvars.json"
+        variable_file.write_text(json.dumps(runtime.variables), encoding="utf-8")
+        yield variable_file
+
+
+def terraform_variable_file_args(variable_file: Path | None) -> tuple[str, ...]:
+    if variable_file is None:
+        return ()
+    return (f"-var-file={variable_file}",)
 
 
 class TerraformDriver(
@@ -303,17 +324,19 @@ class TerraformDriver(
                 report_text.write_text(result.stdout + result.stderr)
             return result
 
-        terraform("init", *runtime.init_args)
-        terraform(
-            "plan",
-            f"-out={plan}",
-            "-refresh=false",
-            "-lock=false",
-            "-input=false",
-            "-no-color",
-        )
-        if report_text is not None:
-            terraform("show", "-no-color", str(plan), reported=True)
+        with terraform_variable_file(runtime) as variable_file:
+            terraform("init", *runtime.init_args)
+            terraform(
+                "plan",
+                *terraform_variable_file_args(variable_file),
+                f"-out={plan}",
+                "-refresh=false",
+                "-lock=false",
+                "-input=false",
+                "-no-color",
+            )
+            if report_text is not None:
+                terraform("show", "-no-color", str(plan), reported=True)
 
     def reconcile(
         self,
@@ -355,11 +378,17 @@ class TerraformDriver(
                 report_text.write_text(result.stdout + result.stderr)
             return result
 
-        terraform("init", *runtime.init_args)
-        terraform("plan", f"-out={plan}", emit=report_text is None)
-        if report_text is not None:
-            terraform("show", "-no-color", str(plan), reported=True)
-        terraform("apply", "-auto-approve", str(plan))
+        with terraform_variable_file(runtime) as variable_file:
+            terraform("init", *runtime.init_args)
+            terraform(
+                "plan",
+                *terraform_variable_file_args(variable_file),
+                f"-out={plan}",
+                emit=report_text is None,
+            )
+            if report_text is not None:
+                terraform("show", "-no-color", str(plan), reported=True)
+            terraform("apply", "-auto-approve", str(plan))
         try:
             raw_outputs = json.loads(
                 context.execution.run(
@@ -414,25 +443,27 @@ class TerraformDriver(
             ".verify.tfplan",
         )
 
-        context.execution.run(
-            "terraform",
-            "init",
-            *runtime.init_args,
-            cwd=runtime.working_directory,
-            env=runtime.environment,
-        )
-        result = context.execution.run(
-            "terraform",
-            "plan",
-            "-detailed-exitcode",
-            "-input=false",
-            "-no-color",
-            f"-out={plan}",
-            cwd=runtime.working_directory,
-            env=runtime.environment,
-            output=CommandOutput.TEE,
-            check=False,
-        )
+        with terraform_variable_file(runtime) as variable_file:
+            context.execution.run(
+                "terraform",
+                "init",
+                *runtime.init_args,
+                cwd=runtime.working_directory,
+                env=runtime.environment,
+            )
+            result = context.execution.run(
+                "terraform",
+                "plan",
+                *terraform_variable_file_args(variable_file),
+                "-detailed-exitcode",
+                "-input=false",
+                "-no-color",
+                f"-out={plan}",
+                cwd=runtime.working_directory,
+                env=runtime.environment,
+                output=CommandOutput.TEE,
+                check=False,
+            )
         output = "".join(part for part in (result.stdout, result.stderr) if part)
         if report_text is not None:
             report_text.write_text(output)

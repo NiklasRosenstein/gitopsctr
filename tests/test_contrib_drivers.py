@@ -1,5 +1,6 @@
 """Deployment drivers own their optional report artifacts."""
 
+import json
 import subprocess
 import sys
 import tarfile
@@ -680,10 +681,15 @@ def test_terraform_rejects_structured_backend_values(tmp_path):
 def test_terraform_plan_saves_binary_plan_and_rendered_report(tmp_path, monkeypatch):
     report = tmp_path / "report"
     commands: list[tuple[str, ...]] = []
+    variable_file: Path | None = None
 
-    def fake_run(*args, **_kwargs):
+    def fake_run(*args, **kwargs):
+        nonlocal variable_file
         commands.append(args)
         if args[1] == "plan":
+            variable_file = Path(next(value for value in args if value.startswith("-var-file=")).split("=", 1)[1])
+            assert json.loads(variable_file.read_text()) == {"environment": "dev"}
+            assert "TF_VAR_environment" not in kwargs["env"]
             plan = Path(next(value for value in args if value.startswith("-out=")).split("=", 1)[1])
             plan.write_bytes(b"saved plan")
             return subprocess.CompletedProcess(args, 0, "planning\n", "")
@@ -698,10 +704,13 @@ def test_terraform_plan_saves_binary_plan_and_rendered_report(tmp_path, monkeypa
     assert (report / "plan.tfplan").read_bytes() == b"saved plan"
     assert (report / "plan.txt").read_text() == ("Plan: 1 to add, 0 to change, 0 to destroy.\n")
     plan_command = next(command for command in commands if command[1] == "plan")
+    assert variable_file is not None
+    assert f"-var-file={variable_file}" in plan_command
     assert "-refresh=false" in plan_command
     assert "-lock=false" in plan_command
     assert "-input=false" in plan_command
     assert "-no-color" in plan_command
+    assert not variable_file.exists()
 
 
 def test_terraform_report_contains_plan_failure_diagnostics(tmp_path, monkeypatch):
@@ -737,10 +746,15 @@ def test_terraform_verification_uses_refresh_enabled_read_only_saved_plan(
 ):
     report = tmp_path / "report"
     commands: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    variable_file: Path | None = None
 
     def fake_run(*args, **kwargs):
+        nonlocal variable_file
         commands.append((args, kwargs))
         if args[1] == "plan":
+            variable_file = Path(next(value for value in args if value.startswith("-var-file=")).split("=", 1)[1])
+            assert json.loads(variable_file.read_text()) == {"environment": "dev"}
+            assert "TF_VAR_environment" not in kwargs["env"]
             plan = Path(next(value for value in args if value.startswith("-out=")).split("=", 1)[1])
             plan.write_bytes(b"verification plan")
             return subprocess.CompletedProcess(args, exit_code, "verification output\n", "")
@@ -763,9 +777,11 @@ def test_terraform_verification_uses_refresh_enabled_read_only_saved_plan(
     )
 
     assert result == VerificationResult(expected_status)
+    assert variable_file is not None
     assert (report / "verify.tfplan").read_bytes() == b"verification plan"
     assert (report / "verify.txt").read_text() == "verification output\n"
     plan_command, plan_kwargs = next(item for item in commands if item[0][1] == "plan")
+    assert f"-var-file={variable_file}" in plan_command
     assert "-detailed-exitcode" in plan_command
     assert "-input=false" in plan_command
     assert "-no-color" in plan_command
@@ -774,6 +790,7 @@ def test_terraform_verification_uses_refresh_enabled_read_only_saved_plan(
     assert plan_kwargs["output"] is CommandOutput.TEE
     assert plan_kwargs["check"] is False
     assert not any(command[1] == "apply" for command, _ in commands)
+    assert not variable_file.exists()
 
 
 def test_terraform_verification_turns_other_exit_codes_into_driver_errors(tmp_path, monkeypatch):
