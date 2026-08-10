@@ -82,13 +82,13 @@ def test_desired_resolution_logs_unit_and_observation_decision(tmp_path, monkeyp
     monkeypatch.setattr(
         deploy_release,
         "resolved_unit_source",
-        lambda *_args: (
-            DesiredSource(
+        lambda *_args: deploy_release.ResolvedUnitSourceResult(
+            source=DesiredSource(
                 path="scripts/deployment_drivers.py",
                 revision="a" * 40,
                 inputHash="sha256:value",
             ),
-            False,
+            inputs_changed=False,
         ),
     )
     monkeypatch.setattr(
@@ -142,9 +142,9 @@ def test_desired_candidate_drops_legacy_artifact_catalogue(tmp_path, monkeypatch
     monkeypatch.setattr(
         deploy_release,
         "resolved_unit_source",
-        lambda *_args: (
-            DesiredSource(path=".", revision="a" * 40, inputHash="sha256:value"),
-            False,
+        lambda *_args: deploy_release.ResolvedUnitSourceResult(
+            source=DesiredSource(path=".", revision="a" * 40, inputHash="sha256:value"),
+            inputs_changed=False,
         ),
     )
 
@@ -228,13 +228,13 @@ def test_blocked_driver_transition_omits_previous_unit_and_reports_wait(tmp_path
     monkeypatch.setattr(
         deploy_release,
         "resolved_unit_source",
-        lambda *_args: (
-            DesiredSource(
+        lambda *_args: deploy_release.ResolvedUnitSourceResult(
+            source=DesiredSource(
                 path="scripts/deployment_drivers.py",
                 revision="b" * 40,
                 inputHash="sha256:value",
             ),
-            True,
+            inputs_changed=True,
         ),
     )
 
@@ -294,13 +294,13 @@ def test_blocked_unit_with_same_driver_retains_previous_desired_state(tmp_path, 
     monkeypatch.setattr(
         deploy_release,
         "resolved_unit_source",
-        lambda *_args: (
-            DesiredSource(
+        lambda *_args: deploy_release.ResolvedUnitSourceResult(
+            source=DesiredSource(
                 path="scripts/deployment_drivers.py",
                 revision="b" * 40,
                 inputHash="sha256:value",
             ),
-            True,
+            inputs_changed=True,
         ),
     )
 
@@ -340,11 +340,21 @@ def test_removing_producer_environment_preserves_existing_input_hash(tmp_path, m
     )
     monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
 
-    resolved, changed = deploy_release.resolved_unit_source(specification_resource, source, "b" * 40, current, None)
+    result = deploy_release.resolved_unit_source(
+        specification_resource,
+        source,
+        "b" * 40,
+        current,
+        None,
+        deploy_release.SourceRevisionPolicy(
+            refresh_when=deploy_release.SourceRevisionRefreshWhen.MISSING,
+        ),
+    )
 
-    assert resolved.inputHash == legacy_hash
-    assert resolved.revision == "a" * 40
-    assert changed is False
+    assert result.source is not None
+    assert result.source.inputHash == legacy_hash
+    assert result.source.revision == "a" * 40
+    assert result.inputs_changed is False
 
 
 def _source_resolution_fixture(tmp_path: Path, previous_revision: str, input_hash: str):
@@ -385,10 +395,57 @@ def test_matching_input_hash_retains_available_previous_source_revision(tmp_path
     monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
     monkeypatch.setattr(deploy_release, "commit_is_available", lambda revision: revision == previous_revision)
 
-    resolved, changed = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
+    result = deploy_release.resolved_unit_source(
+        specification,
+        source,
+        candidate_revision,
+        current,
+        None,
+        deploy_release.SourceRevisionPolicy(
+            refresh_when=deploy_release.SourceRevisionRefreshWhen.MISSING,
+        ),
+    )
 
-    assert resolved.revision == previous_revision
-    assert changed is False
+    assert result.source is not None
+    assert result.source.revision == previous_revision
+    assert result.inputs_changed is False
+
+
+def test_outside_candidate_history_retains_ancestor_previous_source_revision(tmp_path, monkeypatch):
+    previous_revision = "a" * 40
+    candidate_revision = "b" * 40
+    source, current, specification = _source_resolution_fixture(tmp_path, previous_revision, "sha256:same")
+    monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
+    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
+    monkeypatch.setattr(
+        deploy_release,
+        "commit_is_ancestor",
+        lambda previous, candidate: (previous, candidate) == (previous_revision, candidate_revision),
+    )
+
+    result = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
+
+    assert result.source is not None
+    assert result.source.revision == previous_revision
+    assert result.inputs_changed is False
+    assert result.refresh_reason is None
+
+
+def test_outside_candidate_history_refreshes_dangling_previous_source_revision(tmp_path, monkeypatch):
+    previous_revision = "a" * 40
+    candidate_revision = "b" * 40
+    source, current, specification = _source_resolution_fixture(tmp_path, previous_revision, "sha256:same")
+    monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
+    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
+    monkeypatch.setattr(deploy_release, "commit_is_ancestor", lambda *_args: False)
+
+    result = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
+
+    assert result.source is not None
+    assert result.source.revision == candidate_revision
+    assert result.inputs_changed is True
+    assert result.refresh_reason is not None
+    assert "outside candidate history" in result.refresh_reason
 
 
 def test_matching_input_hash_refreshes_unavailable_previous_source_revision(tmp_path, monkeypatch):
@@ -398,10 +455,11 @@ def test_matching_input_hash_refreshes_unavailable_previous_source_revision(tmp_
     monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
     monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: False)
 
-    resolved, changed = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
+    result = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
 
-    assert resolved.revision == candidate_revision
-    assert changed is True
+    assert result.source is not None
+    assert result.source.revision == candidate_revision
+    assert result.inputs_changed is True
 
 
 def test_changed_input_hash_uses_candidate_source_revision(tmp_path, monkeypatch):
@@ -411,13 +469,37 @@ def test_changed_input_hash_uses_candidate_source_revision(tmp_path, monkeypatch
     monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:new")
     monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
 
-    resolved, changed = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
+    result = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
 
-    assert resolved.revision == candidate_revision
-    assert changed is True
+    assert result.source is not None
+    assert result.source.revision == candidate_revision
+    assert result.inputs_changed is True
 
 
-def test_unavailable_retained_source_refreshes_desired_state_and_logs(tmp_path, monkeypatch, capsys):
+def test_source_less_unit_remains_without_a_resolved_source(tmp_path):
+    specification = deploy_release.parse_authored_unit_document(
+        {
+            "schema": 1,
+            "name": "frontend",
+            "driver": "frontend-s3-cloudfront",
+        },
+        "frontend",
+    )
+
+    result = deploy_release.resolved_unit_source(specification, tmp_path, "b" * 40, tmp_path / "current", None)
+
+    assert result.source is None
+    assert result.inputs_changed is False
+
+
+@pytest.mark.parametrize(
+    "refresh_when",
+    [
+        deploy_release.SourceRevisionRefreshWhen.MISSING,
+        deploy_release.SourceRevisionRefreshWhen.OUTSIDE_CANDIDATE_HISTORY,
+    ],
+)
+def test_unavailable_retained_source_refreshes_desired_state_and_logs(tmp_path, monkeypatch, capsys, refresh_when):
     previous_revision = "a" * 40
     candidate_revision = "b" * 40
     source, current, _ = _source_resolution_fixture(tmp_path, previous_revision, "sha256:same")
@@ -449,6 +531,7 @@ def test_unavailable_retained_source_refreshes_desired_state_and_logs(tmp_path, 
         None,
         candidate,
         dry=True,
+        source_revision_policy=deploy_release.SourceRevisionPolicy(refresh_when=refresh_when),
     )
 
     refreshed = deploy_release.load_desired_unit(candidate / "units/aws-application.json", "aws-application")
@@ -456,6 +539,50 @@ def test_unavailable_retained_source_refreshes_desired_state_and_logs(tmp_path, 
     assert refreshed.spec.source.revision == candidate_revision
     output = capsys.readouterr().err
     assert "REFRESH  aws-application: retained source aaaaaaaaaaaa unavailable; use candidate bbbbbbbbbbbb" in output
+
+
+def test_outside_candidate_history_refreshes_desired_state_and_logs(tmp_path, monkeypatch, capsys):
+    previous_revision = "a" * 40
+    candidate_revision = "b" * 40
+    source, current, _ = _source_resolution_fixture(tmp_path, previous_revision, "sha256:same")
+    _write_json(
+        source / "deployment/environments/dev/environment.json",
+        {"schema": 1, "name": "dev"},
+    )
+    _write_json(
+        source / "deployment/environments/dev/units/aws-application.json",
+        {
+            "schema": 1,
+            "name": "aws-application",
+            "driver": "terraform",
+            "source": {"path": "."},
+        },
+    )
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    observed.mkdir()
+    monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
+    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
+    monkeypatch.setattr(deploy_release, "commit_is_ancestor", lambda *_args: False)
+
+    deploy_release.build_desired_candidate(
+        "dev",
+        source,
+        candidate_revision,
+        current,
+        observed,
+        None,
+        candidate,
+        dry=True,
+        source_revision_policy=deploy_release.SourceRevisionPolicy(),
+    )
+
+    refreshed = deploy_release.load_desired_unit(candidate / "units/aws-application.json", "aws-application")
+    assert refreshed.spec.source.revision == candidate_revision
+    output = capsys.readouterr().err
+    assert (
+        "REFRESH  aws-application: retained source aaaaaaaaaaaa is outside candidate history; use bbbbbbbbbbbb"
+    ) in output
 
 
 def test_source_input_globs_hash_only_matching_files(tmp_path):
@@ -718,9 +845,9 @@ def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path
     monkeypatch.setattr(
         deploy_release,
         "resolved_unit_source",
-        lambda *_args: (
-            DesiredSource(path="infra/deploy", revision="a" * 40, inputHash="sha256:value"),
-            True,
+        lambda *_args: deploy_release.ResolvedUnitSourceResult(
+            source=DesiredSource(path="infra/deploy", revision="a" * 40, inputHash="sha256:value"),
+            inputs_changed=True,
         ),
     )
     context = deploy_release.PromotionContext(

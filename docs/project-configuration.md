@@ -28,6 +28,8 @@ spec:
       desired: gitopsctr/desired/{environment}
       observed: gitopsctr/observed/{environment}
       candidate: gitopsctr/candidates/{environment}/{id}
+  sourceRevisionPolicy:
+    refreshWhen: outside-candidate-history
 ```
 
 `metadata.name` is a DNS-1123 project name. `spec.writeFormat` accepts `yaml`
@@ -68,6 +70,19 @@ The fields are independent. Omitted fields retain the built-ins: `gitopsctr/desi
 `gitopsctr/observed/{environment}`, and `gitopsctr/candidates/{environment}/{id}`. An
 [Environment](apis/environment.md#deployment-refs) can replace them, and operation-specific CLI overrides take the
 highest priority. Expanded desired and observed refs must differ.
+
+## Source revision refresh policy
+
+`spec.sourceRevisionPolicy.refreshWhen` controls when a unit whose source inputs are unchanged is refreshed to the
+candidate source revision. It defaults to `outside-candidate-history`:
+
+| Value | Behavior |
+| --- | --- |
+| `missing` | Preserve the GitOpsCTR 0.2.1 behavior: refresh only when the previous commit cannot be resolved. |
+| `outside-candidate-history` | Retain the previous revision only when it is an ancestor of the candidate revision; otherwise refresh. |
+
+The history check uses `git merge-base --is-ancestor`. A dangling commit that can still be resolved locally is therefore
+refreshed when it is outside the candidate's history. Source-less units are not affected.
 
 Create an environment in that configured location with:
 

@@ -91,6 +91,22 @@ PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
                     "required": ["refs"],
                     "additionalProperties": False,
                 },
+                "sourceRevisionPolicy": {
+                    "type": "object",
+                    "properties": {
+                        "refreshWhen": {
+                            "type": "string",
+                            "enum": ["missing", "outside-candidate-history"],
+                            "default": "outside-candidate-history",
+                            "description": (
+                                "Refresh an unchanged unit source when the previous revision is missing or "
+                                "outside the candidate revision's history."
+                            ),
+                        }
+                    },
+                    "required": ["refreshWhen"],
+                    "additionalProperties": False,
+                },
             },
             "additionalProperties": False,
         },
@@ -127,12 +143,23 @@ class EnvironmentDefaults:
     refs: EnvironmentRefTemplates = EnvironmentRefTemplates()
 
 
+class SourceRevisionRefreshWhen(StrEnum):
+    MISSING = "missing"
+    OUTSIDE_CANDIDATE_HISTORY = "outside-candidate-history"
+
+
+@dataclass(frozen=True)
+class SourceRevisionPolicy:
+    refresh_when: SourceRevisionRefreshWhen = SourceRevisionRefreshWhen.OUTSIDE_CANDIDATE_HISTORY
+
+
 @dataclass(frozen=True)
 class Project:
     name: str
     write_format: DocumentFormat = DocumentFormat.YAML
     environments_path: PurePosixPath = PurePosixPath("deployment/environments")
     environment_defaults: EnvironmentDefaults = EnvironmentDefaults()
+    source_revision_policy: SourceRevisionPolicy = SourceRevisionPolicy()
 
 
 def project_config_path(root: Path) -> Path:
@@ -171,6 +198,7 @@ def validate_project_document(value: object, path: Path) -> Project:
         raise DocumentFormatError(f"invalid project config {path}: environmentsPath must stay inside the source tree")
     environment_defaults_document = cast(dict[str, Any], specification.get("environmentDefaults", {}))
     refs_document = cast(dict[str, Any], environment_defaults_document.get("refs", {}))
+    source_revision_policy_document = cast(dict[str, Any], specification.get("sourceRevisionPolicy", {}))
     return Project(
         name=project_name,
         write_format=DocumentFormat.JSON if selected == "json" else DocumentFormat.YAML,
@@ -180,6 +208,11 @@ def validate_project_document(value: object, path: Path) -> Project:
                 desired=cast(str, refs_document.get("desired", DEFAULT_DESIRED_REF_TEMPLATE)),
                 observed=cast(str, refs_document.get("observed", DEFAULT_OBSERVED_REF_TEMPLATE)),
                 candidate=cast(str, refs_document.get("candidate", DEFAULT_CANDIDATE_REF_TEMPLATE)),
+            )
+        ),
+        source_revision_policy=SourceRevisionPolicy(
+            refresh_when=SourceRevisionRefreshWhen(
+                source_revision_policy_document.get("refreshWhen", SourceRevisionRefreshWhen.OUTSIDE_CANDIDATE_HISTORY)
             )
         ),
     )

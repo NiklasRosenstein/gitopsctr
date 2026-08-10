@@ -67,6 +67,24 @@
           "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$",
           "type": "string"
         },
+        "sourceRevisionPolicy": {
+          "additionalProperties": false,
+          "properties": {
+            "refreshWhen": {
+              "default": "outside-candidate-history",
+              "description": "Refresh an unchanged unit source when the previous revision is missing or outside the candidate revision's history.",
+              "enum": [
+                "missing",
+                "outside-candidate-history"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "refreshWhen"
+          ],
+          "type": "object"
+        },
         "writeFormat": {
           "enum": [
             "yaml",
