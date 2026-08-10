@@ -1,10 +1,11 @@
 # Stacks and preview environments — living implementation spec
 
 > **Status:** Living implementation design. The lifecycle-aware desired-resource envelope, hardened Unit-specific
-> finalization slice, Stack/StackTemplate contracts, Stack projection, direct Stack instantiation, and Stack deletion
-> lifecycle are implemented, including terminal teardown evidence, explicit direct-Unit deletion, and direct Stack
-> source-pin creation/release. Forge merge enforcement, orphan recovery, explicit Stack dependency ordering, and
-> end-to-end acceptance remain pending. Field names, document layouts,
+> finalization slice, Stack/StackTemplate contracts, Stack projection, direct Stack instantiation, Stack deletion
+> lifecycle, Stack-owned convergence ordering, GitHub eligibility, and controller-owned pin recovery are implemented,
+> including terminal teardown evidence, explicit direct-Unit deletion, and direct Stack source-pin creation/release.
+> Forge merge enforcement, native GitLab eligibility, Argo manifest publication, and end-to-end external acceptance
+> remain pending. Field names, document layouts,
 > and command names are illustrative unless
 > explicitly marked **Settled**.
 
@@ -29,14 +30,17 @@ implementation.
 | Generated Stack resource graphs with UID-fenced ownership | **Implemented projection and closure** | `b441941` and `d071c1e` project source-authored/direct Stack-owned Units and retain a UID-fenced closure through deletion. |
 | Direct Stack instantiation | **Implemented** | `84d7ddb` adds replay-fenced `instantiate-stack` and exact template provenance. |
 | Direct and source-tracked Stack deletion/finalization | **Implemented core lifecycle** | `d071c1e` adds source-absence intents, direct UID/generation-fenced requests, child obligations, and root finalization after owned Units. |
-| Controller-owned source pins | **Lifecycle wired; orphan recovery pending** | `5d3a5a0` provides fenced Git refs; direct Stack instantiation creates them and successful finalization releases them. |
-| Forge eligibility/expiry/orphan recovery and Argo integration | **Pending** | Milestones 5–6. |
-| End-to-end acceptance, security, operations, and legacy retirement | **Pending** | Milestones 6–7. |
+| Controller-owned source pins | **Lifecycle wired; recovery is partial** | `5d3a5a0` provides fenced refs; `36a529b` enumerates pins and recovers direct Stacks that are still present. Pins left after failed publication/finalization do not yet have enough durable ownership metadata for safe cleanup. |
+| Forge eligibility/expiry/orphan recovery | **GitHub eligibility implemented; recovery is partial** | `36a529b` implements fail-closed GitHub eligibility, expiry, pin comparison, and UID-fenced cleanup requests for present roots. Orphan pins, GitLab-native lookup, and authoritative merge-time enforcement remain open. |
+| Stack dependency ordering | **Convergence integration implemented; multi-instance safety pending** | `3b25f04` includes Stack-generated and desired-only Stack Units in convergence/status and preserves explicit cross-kind Stack edges during teardown. Global Unit-name collisions between concurrent Stack instances still need a scoped naming design. |
+| Argo integration and external publication | **Boundary documented; publication pending** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. This repository does not yet publish or observe Argo manifests directly. |
+| End-to-end acceptance, security, operations, and legacy retirement | **Docs and focused recovery coverage implemented; external acceptance and retirement pending** | Operational/security guidance and focused restart/failure coverage are documented; external-inventory coverage, concurrent instances, and legacy migration completion remain open. |
 
-The repository verification suite currently passes (`498` tests), including the landed concurrency, recovery,
+The repository verification suite currently passes (`511` tests), including the landed concurrency, recovery,
 incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
-not sufficient, for the remaining preview-environment milestones because pin orphan recovery, forge merge enforcement,
-explicit Stack dependency ordering, and end-to-end acceptance contracts are still open.
+not sufficient, for the remaining preview-environment milestones because orphan-pin ownership, concurrent Stack
+instances, forge merge enforcement, native GitLab eligibility, Argo publication/observation, and end-to-end external
+acceptance contracts are still open.
 
 ## Problem and scope
 
@@ -152,8 +156,8 @@ whole-document blob identity immediately or through a compatibility period is **
 The current implementation covers source-tracked and explicitly direct Unit deletion intents, retained cleanup inputs,
 owned-child obligations, UID-/generation-fenced teardown evidence, effect leases, and Terraform destroy. Direct Unit
 roots retain their identity and cleanup inputs until explicit finalization; source absence never reclassifies a root as
-direct or source-tracked. Core Stack finalization and direct Stack source-pin lifecycle are now implemented; orphan
-recovery, forge enforcement, and acceptance work remain. The remaining Unit correctness work is listed in
+direct or source-tracked. Core Stack finalization, source-pin recovery, and GitHub eligibility are now implemented;
+forge enforcement, native GitLab lookup, and acceptance work remain. The remaining Unit correctness work is listed in
 [Unit lifecycle hardening](#unit-lifecycle-hardening).
 
 ## Unit lifecycle hardening
@@ -221,8 +225,9 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
   continuously follow later template changes in the first implementation.
 - A source-tracked Stack is a concrete source resource. Whether it may also track or promote changes from a
   StackTemplate remains **Open**.
-- StackTemplate dependency declarations are validated and retained in the projected graph, but their integration with
-  generic convergence/finalization ordering still needs an acceptance-backed implementation.
+- StackTemplate dependency declarations are validated and retained in the projected graph. `3b25f04` integrates them
+  into generic convergence/status and reverse teardown ordering, with restart and external-driver acceptance still to
+  be added.
 - Secrets are references to an external secret mechanism, not plaintext Stack parameters committed to Git.
 
 The implementation currently uses `deployment/environments/<environment>/stack-templates/` and `stacks/` for authored
@@ -240,8 +245,9 @@ Unit followed by Terraform or other infrastructure Units.
 
 Before forge refs can disappear, the workflow MUST pin the pull request head commit on a controller-owned Git ref.
 Teardown uses that retained source and releases the pin only after finalization. OCI source bundles may replace this
-later. Direct Stack creation and finalization now wire the controller-owned pin; scheduled orphan recovery is still
-pending, so missed events can leave pins until the recovery worker is implemented.
+later. Direct Stack creation and finalization wire the controller-owned pin, and `recover-orphaned-stacks` compares
+pins with direct Stack provenance before requesting normal deletion. A deployment scheduler and native GitLab adapter
+are still outside this repository's current implementation.
 
 Closing a pull request, whether merged or unmerged, removing its eligibility label, or reaching its expiry requests
 cleanup. A scheduled garbage collector compares direct Stack provenance with forge eligibility to recover missed
@@ -356,8 +362,8 @@ Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, `f9cc2ac`, and `88ae0b9` cov
 failure cleanup, same-name incarnation fencing, parseable GVK/driver replacement, resolved dependency preservation,
 pre-lease dependency revalidation, legacy application blocking, parseable opaque-root recovery, the terminal teardown
 evidence contract, explicit direct-Unit deletion, and local candidate freshness fencing. Source-pin, forge-side
-required-check/merge-queue enforcement, permanently
-unparseable-root operator resolution, and remaining acceptance scenarios remain pending.
+required-check/merge-queue enforcement, permanently unparseable-root operator resolution, and remaining acceptance
+scenarios remain pending.
 
 ## Implementation checklist
 
@@ -382,11 +388,12 @@ unparseable-root operator resolution, and remaining acceptance scenarios remain 
 
 ### Required to complete the Unit milestone
 
-- [ ] Close the remaining items in [Unit lifecycle hardening](#unit-lifecycle-hardening); lease, incarnation,
+- [x] Close the implemented items in [Unit lifecycle hardening](#unit-lifecycle-hardening); lease, incarnation,
   parseable-transition, legacy-safety, parseable-opaque-recovery, terminal evidence, and direct-Unit lifecycle items
   are complete in `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac`.
 - [x] Add controller-owned source-pin creation, retention, and UID-/revision-fenced release for direct Stacks.
-- [ ] Add scheduled orphan recovery for pins and direct Stacks whose forge events were missed.
+- [ ] Complete orphan-pin ownership/recovery after failed publication or finalization; present-root GitHub recovery is
+  implemented, while safe cleanup of pins without a current Stack is still pending.
 - [ ] Add the Unit hardening acceptance scenarios and recovery cases.
 
 ### Pending preview-environment feature work
@@ -396,11 +403,16 @@ unparseable-root operator resolution, and remaining acceptance scenarios remain 
 - [x] Add direct Stack instantiation with request and revision fencing.
 - [x] Add direct Stack deletion requests with UID/generation fencing.
 - [x] Generalize two-phase finalization and teardown ordering from Units to Stack-owned closures.
-- [ ] Integrate explicit StackTemplate dependencies into generic convergence/finalization ordering and acceptance.
-- [ ] Add the two Stack acceptance scenarios and restart/recovery cases.
+- [x] Integrate explicit StackTemplate dependencies, including cross-kind edges, into generic convergence/status and
+  reverse teardown ordering; concurrent Stack-instance naming and external acceptance remain separate items.
+- [x] Add focused Stack lifecycle, restart/recovery, and dependency-ordering acceptance coverage in
+  `tests/test_preview_acceptance.py`; real external-inventory/driver and remote integration acceptance remains.
+- [ ] Add instance-scoped generated Unit naming and acceptance coverage for two concurrent Stacks from one template.
 - [ ] Extend Docker/Terraform acceptance to observe Stack-driven cleanup.
-- [ ] Add GitHub/GitLab setup, Argo CD examples, operations, and security documentation.
-- [ ] Add scheduled orphan detection, forge eligibility, and expiry cleanup.
+- [x] Add Argo CD boundary examples, operations, and security documentation; native manifest publication/observation and
+  provider-specific setup remain pending.
+- [x] Add GitHub eligibility, expiry handling, and present-root recovery; complete orphan-pin ownership/recovery,
+  native GitLab lookup, and deployment scheduling as follow-up work.
 - [ ] Configure and verify required forge freshness checks or merge-queue/branch-protection enforcement at merge time.
 - [ ] Remove legacy implicit-root compatibility after the documented migration condition is met.
 

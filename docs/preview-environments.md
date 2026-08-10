@@ -77,6 +77,9 @@ metadata:
   name: previews
   namespace: argocd
 spec:
+  syncPolicy:
+    applicationsSync: sync
+    preserveResourcesOnDeletion: false
   generators:
     - pullRequest:
         github:
@@ -101,8 +104,6 @@ spec:
         automated: {}
         syncOptions:
           - CreateNamespace=true
-      # The Application must cascade its managed resources on removal.
-      preserveResourcesOnDeletion: false
 ```
 
 The exact ref/path templating is deployment-specific; the important boundary
@@ -111,10 +112,12 @@ is that the ApplicationSet and gitopsctr use the same eligibility decision.
 dedicated Namespace manifest should be included when namespace deletion is
 part of the preview contract.
 
-gitopsctr waits for the Application and its workloads to be absent before
-finalizing the Stack. External effects not represented by Kubernetes resources
-must use Unit teardown, such as Terraform destroy or a `PostDelete` hook whose
-completion is observable to the controller.
+The deployment adapter must wait for the Application and its workloads to be
+absent before invoking Stack finalization. This repository currently documents
+that handshake but does not publish or observe Argo Applications itself.
+External effects not represented by Kubernetes resources must use Unit teardown,
+such as Terraform destroy or a `PostDelete` hook whose completion is observable
+to the controller.
 
 ## Trust and operations
 
