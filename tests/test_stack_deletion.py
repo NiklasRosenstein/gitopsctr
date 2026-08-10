@@ -216,6 +216,7 @@ def test_finalize_stack_removes_root_and_releases_pin_after_children(tmp_path: P
     assert not list((published[0] / "stacks").glob("preview.*"))
     assert cli.load_desired_stack_deletion_intents(published[0]) == {}
     assert list((published[0] / "stack-templates").glob("preview.*"))
+    assert cli.load_desired_stack_incarnation_tombstones(published[0])["preview"].uid == "d1-stack-direct"
     assert released == [("stacks/dev/preview/d1-stack-direct", "a" * 40)]
 
 

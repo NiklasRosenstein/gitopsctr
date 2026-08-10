@@ -164,6 +164,7 @@ DESIRED_DELETION_INTENTS_PATH = PurePosixPath(".gitopsctr/deletion-intents/units
 DESIRED_STACK_DELETION_INTENTS_PATH = PurePosixPath(".gitopsctr/deletion-intents/stacks")
 DESIRED_EFFECT_LEASES_PATH = PurePosixPath(".gitopsctr/effect-leases/units")
 DESIRED_UNIT_INCARNATIONS_PATH = PurePosixPath(".gitopsctr/incarnations/units")
+DESIRED_STACK_INCARNATIONS_PATH = PurePosixPath(".gitopsctr/incarnations/stacks")
 OBSERVED_TEARDOWN_EVIDENCE_PATH = PurePosixPath(".gitopsctr/teardowns/units")
 EFFECT_LEASE_TTL_SECONDS = 300
 
@@ -761,7 +762,8 @@ def stack_dependency_edges(
                     expanded_by_name[dependency].apiVersion,
                     expanded_by_name[dependency].kind,
                     dependency,
-                ) in resources
+                )
+                in resources
             )
     return {name: tuple(sorted(dependencies)) for name, dependencies in sorted(edges.items())}
 
@@ -1737,14 +1739,20 @@ def _stack_root_metadata(
                     f"source-authored {kind} {name!r} collides with a non-source-tracked desired resource"
                 )
             return existing.metadata
-    return ResourceMetadata.source_tracked_from_provenance(
-        name,
-        json.dumps(
-            {"apiVersion": CORE_API_VERSION, "kind": kind, "name": name, "sourceRevision": source_revision},
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
+    provenance = json.dumps(
+        {"apiVersion": CORE_API_VERSION, "kind": kind, "name": name, "sourceRevision": source_revision},
+        sort_keys=True,
+        separators=(",", ":"),
     )
+    metadata = ResourceMetadata.source_tracked_from_provenance(name, provenance)
+    if kind == "Stack" and current_desired is not None:
+        previous_tombstone = load_desired_stack_incarnation_tombstones(current_desired).get(name)
+        if previous_tombstone is not None and metadata.uid == previous_tombstone.uid:
+            metadata = ResourceMetadata.source_tracked_from_provenance(
+                name,
+                provenance + "\0reincarnation:" + previous_tombstone.uid,
+            )
+    return metadata
 
 
 def _stack_owned_metadata(name: str, owner: DesiredOwnerReference) -> ResourceMetadata:
@@ -2725,6 +2733,43 @@ class UnitIncarnationTombstone:
         return cls(unit_name=expected_name, uid=uid, state="finalized")
 
 
+@dataclass(frozen=True)
+class StackIncarnationTombstone:
+    """Durable fence preventing a finalized Stack name from reusing its UID."""
+
+    stack_name: str
+    uid: str
+
+    def document(self) -> JsonObject:
+        return {
+            "schema": 1,
+            "kind": "StackIncarnationTombstone",
+            "stackName": self.stack_name,
+            "uid": self.uid,
+        }
+
+    @classmethod
+    def from_document(cls, document: object, expected_name: str) -> StackIncarnationTombstone:
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"schema", "kind", "stackName", "uid"}
+            or type(document.get("schema")) is not int
+            or document.get("schema") != 1
+            or document.get("kind") != "StackIncarnationTombstone"
+            or document.get("stackName") != expected_name
+        ):
+            raise ValueError("invalid Stack incarnation tombstone")
+        uid = document.get("uid")
+        if not isinstance(uid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", uid):
+            raise ValueError("invalid Stack incarnation tombstone UID")
+        ResourceMetadata(
+            name=expected_name,
+            uid=uid,
+            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
+        ).validate_desired()
+        return cls(stack_name=expected_name, uid=uid)
+
+
 class EffectLeaseUnavailable(OperationError):
     """The desired Git state currently grants the effect lease to another runner."""
 
@@ -3417,6 +3462,51 @@ def copy_unit_incarnation_tombstones(current: Path, candidate: Path) -> None:
         source_paths = document_candidates(current / DESIRED_UNIT_INCARNATIONS_PATH, tombstone.unit_name)
         if len(source_paths) != 1:
             raise OperationError(f"Unit incarnation tombstone for {tombstone.unit_name!r} is unavailable")
+        target = candidate / PurePosixPath(source_paths[0].relative_to(current).as_posix())
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_paths[0], target)
+
+
+def desired_stack_incarnation_paths(root: Path) -> tuple[Path, ...]:
+    directory = root / DESIRED_STACK_INCARNATIONS_PATH
+    if not directory.is_dir():
+        return ()
+    paths = sorted(path for path in directory.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"})
+    names: dict[str, Path] = {}
+    for path in paths:
+        if path.stem in names:
+            raise OperationError(f"multiple Stack incarnation formats exist for {path.stem!r}")
+        names[path.stem] = path
+    return tuple(paths)
+
+
+def load_desired_stack_incarnation_tombstones(root: Path) -> dict[str, StackIncarnationTombstone]:
+    tombstones: dict[str, StackIncarnationTombstone] = {}
+    for path in desired_stack_incarnation_paths(root):
+        name = path.stem
+        try:
+            tombstones[name] = StackIncarnationTombstone.from_document(load_json(path), name)
+        except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
+            raise OperationError(f"invalid Stack incarnation tombstone for {name!r}") from exc
+    return tombstones
+
+
+def write_stack_incarnation_tombstone(root: Path, tombstone: StackIncarnationTombstone) -> Path:
+    directory = root / DESIRED_STACK_INCARNATIONS_PATH
+    for path in document_candidates(directory, tombstone.stack_name):
+        path.unlink()
+    return write_document(
+        directory / f"{tombstone.stack_name}.json",
+        tombstone.document(),
+        format=DocumentFormat.JSON,
+    )
+
+
+def copy_stack_incarnation_tombstones(current: Path, candidate: Path) -> None:
+    for tombstone in load_desired_stack_incarnation_tombstones(current).values():
+        source_paths = document_candidates(current / DESIRED_STACK_INCARNATIONS_PATH, tombstone.stack_name)
+        if len(source_paths) != 1:
+            raise OperationError(f"Stack incarnation tombstone for {tombstone.stack_name!r} is unavailable")
         target = candidate / PurePosixPath(source_paths[0].relative_to(current).as_posix())
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_paths[0], target)
@@ -4490,6 +4580,7 @@ def build_desired_candidate(
     candidate_units.mkdir(parents=True)
     (candidate / "stack-templates").mkdir(parents=True)
     (candidate / "stacks").mkdir(parents=True)
+    copy_stack_incarnation_tombstones(current_desired, candidate)
     stack_projection = project_stack_resources(
         source_root, environment_name, source_revision, candidate, source_root, current_desired
     )
@@ -5769,6 +5860,12 @@ def copy_current_blocked_unit(current: Path, candidate: Path, unit_name: str) ->
 def merge_current_cleanup_state(current: Path, candidate: Path) -> None:
     """Carry only active current cleanup lifecycles through a historical rollback."""
 
+    stack_incarnation_directory = candidate / DESIRED_STACK_INCARNATIONS_PATH
+    if stack_incarnation_directory.is_dir():
+        for tombstone_path in stack_incarnation_directory.iterdir():
+            if tombstone_path.is_file() and tombstone_path.suffix in {".json", ".yaml", ".yml"}:
+                tombstone_path.unlink()
+    copy_stack_incarnation_tombstones(current, candidate)
     incarnation_directory = candidate / DESIRED_UNIT_INCARNATIONS_PATH
     if incarnation_directory.is_dir():
         for tombstone_path in incarnation_directory.iterdir():
@@ -6256,9 +6353,15 @@ def command_request_delete_direct_unit(args: argparse.Namespace) -> bool:
         return _command_request_delete_direct_unit(args)
 
 
-def _direct_stack_uid(environment: str, stack_name: str, request_identity: str, desired_revision: str) -> str:
+def _direct_stack_uid(
+    environment: str,
+    stack_name: str,
+    request_identity: str,
+    desired_revision: str,
+    previous_uid: str | None = None,
+) -> str:
     digest = hashlib.sha256(
-        f"gitopsctr/direct-stack-uid/v2\0{environment}\0{stack_name}\0{request_identity}\0{desired_revision}".encode()
+        f"gitopsctr/direct-stack-uid/v3\0{environment}\0{stack_name}\0{request_identity}\0{desired_revision}\0{previous_uid or ''}".encode()
     ).hexdigest()[:32]
     return f"d1-{digest}"
 
@@ -6375,7 +6478,14 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
         # the same head remain replay-idempotent, while a same-name request
         # after a finalized root has a new desired head and therefore cannot
         # reuse the old UID or its teardown evidence.
-        direct_uid = _direct_stack_uid(args.environment, args.stack, args.request_id, current_revision)
+        previous_tombstone = load_desired_stack_incarnation_tombstones(current).get(args.stack)
+        direct_uid = _direct_stack_uid(
+            args.environment,
+            args.stack,
+            args.request_id,
+            current_revision,
+            previous_tombstone.uid if previous_tombstone is not None else None,
+        )
         direct_metadata = ResourceMetadata(
             name=args.stack,
             uid=direct_uid,
@@ -6777,6 +6887,10 @@ def _command_finalize_stack(args: argparse.Namespace) -> bool:
             raise OperationError("active owned Units must be finalized first: " + ", ".join(sorted(active_children)))
         candidate = temporary / "candidate"
         shutil.copytree(current, candidate)
+        write_stack_incarnation_tombstone(
+            candidate,
+            StackIncarnationTombstone(stack_name=args.stack, uid=intent.uid),
+        )
         for path in document_candidates(candidate / "stacks", args.stack):
             path.unlink()
         for path in document_candidates(candidate / DESIRED_STACK_DELETION_INTENTS_PATH, args.stack):

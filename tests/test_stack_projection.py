@@ -131,6 +131,37 @@ def test_existing_stack_root_uids_are_preserved_across_source_revisions(tmp_path
         assert old.metadata.uid == new.metadata.uid
 
 
+def test_recreated_source_stack_does_not_reuse_finalized_uid(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = _project(source)
+    _write_stack_source(environment)
+    initial = tmp_path / "initial"
+    cli.project_stack_resources(source, "dev", "a" * 40, initial, source)
+    old_path = next((initial / "stacks").glob("web.*"))
+    old_stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(old_path), profile="desired", expected_name="web"
+    )
+    assert old_stack.metadata.uid is not None
+
+    current = tmp_path / "current"
+    shutil.copytree(initial, current)
+    for path in (current / "stacks").glob("web.*"):
+        path.unlink()
+    cli.write_stack_incarnation_tombstone(
+        current,
+        cli.StackIncarnationTombstone(stack_name="web", uid=old_stack.metadata.uid),
+    )
+
+    candidate = tmp_path / "candidate"
+    cli.project_stack_resources(source, "dev", "a" * 40, candidate, source, current)
+    new_stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(next((candidate / "stacks").glob("web.*"))),
+        profile="desired",
+        expected_name="web",
+    )
+    assert new_stack.metadata.uid != old_stack.metadata.uid
+
+
 def test_source_absent_stack_root_is_retained_for_owned_unit_cleanup(tmp_path: Path):
     source = tmp_path / "source"
     environment = _project(source)
