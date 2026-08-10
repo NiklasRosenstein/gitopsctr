@@ -117,10 +117,10 @@ is that the ApplicationSet and gitopsctr use the same eligibility decision.
 dedicated Namespace manifest should be included when namespace deletion is
 part of the preview contract.
 
-The deployment adapter must wait for the Application and its workloads to be
-absent before invoking Stack finalization. The Kubernetes/Argo acceptance job
-proves the external delivery and observation path, but this repository does not
-publish preview manifests or own ApplicationSet resources.
+The Argo-backed Kubernetes Unit waits for the Application to be absent before
+reporting teardown complete. The Kubernetes/Argo acceptance job proves the
+external delivery and observation path, but this repository does not publish
+preview manifests or own ApplicationSet resources.
 External effects not represented by Kubernetes resources must use Unit teardown,
 such as Terraform destroy or a `PostDelete` hook whose completion is observable
 to the controller.
