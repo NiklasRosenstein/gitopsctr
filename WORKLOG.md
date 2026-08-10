@@ -57,6 +57,18 @@ confirmed or plausible findings. Remaining Unit backlog: resolved dependency pre
 revalidation, legacy/opaque-root operator recovery, teardown evidence plumbing, direct-root deletion, source pins,
 and the remaining acceptance scenarios.
 
+### 2.2 Unit dependency and lease-CAS hardening — complete for this increment
+
+Commit `22d7814` preserves resolved receipt/artifact producer edges in deletion intents and teardown ordering,
+explicitly excludes promotion provenance, and validates malformed dependency keys fail closed. It also evaluates the
+teardown-dependent precondition inside every effect-lease CAS attempt and refreshes the local desired tree when the
+lease acquisition advances the revision.
+
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 427 tests,
+lint, typecheck, schema freshness, strict docs, actionlint, and formatting. Sol High review returned no confirmed or
+plausible findings. Remaining Unit backlog: legacy/opaque-root operator recovery, teardown evidence plumbing,
+direct-root deletion, controller-owned source pins, forge-side merge enforcement, and the remaining acceptance cases.
+
 ### 3. StackTemplate and Stack resolution — pending
 
 ### 4. Direct Stack operations and source pins — pending

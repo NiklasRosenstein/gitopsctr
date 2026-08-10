@@ -19,7 +19,7 @@ The current branch is a Unit-focused foundation rather than an end-to-end previe
 | Area | Status | Reconciliation |
 | --- | --- | --- |
 | Desired Unit identity, lifecycle authority, ownership, legacy retention, rollback, and schema profiles | **Implemented for Unit** | Keep the generic semantic model; extend it to Stack and StackTemplate later. |
-| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit; hardening in progress** | Commit `118429d` closes lease, incarnation, and parseable-transition defects; remaining dependency, recovery, evidence, direct-root, source-pin, and acceptance work is still open. |
+| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit; hardening in progress** | Commits `118429d` and `22d7814` close lease, incarnation, transition, resolved-dependency, and pre-lease-race defects; remaining recovery, evidence, direct-root, source-pin, and acceptance work is still open. |
 | StackTemplate contracts, Stack contracts, parameter expansion, and generated ownership graphs | **Pending** | Milestone 3. |
 | Direct Stack operations and UID-fenced deletion | **Pending** | Milestone 4. |
 | Controller-owned source pins, forge eligibility/expiry/orphan recovery, and Argo integration | **Pending** | Milestones 4–5. |
@@ -156,10 +156,10 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
 - **Done in `118429d` — identity transitions:** A parseable GVK or driver transition MUST create a durable cleanup/finalization path for
   the old identity, or a durable migration record that makes the replacement safe. Repeated advance MUST not retain
   the old Unit forever without an intent or actionable operator path.
-- **Resolved dependency preservation:** Teardown ordering MUST retain receipt/artifact dependencies after resolution,
+- **Done in `22d7814` — resolved dependency preservation:** Teardown ordering MUST retain receipt/artifact dependencies after resolution,
   either through `resolvedInputs`, deletion-intent metadata, or an equivalent normalized dependency graph. The
   producer MUST remain behind every dependent until the dependent's teardown is complete.
-- **Post-lease dependency revalidation:** Recheck the owned/dependent closure after acquiring the effect lease, or
+- **Done in `22d7814` — post-lease dependency revalidation:** Recheck the owned/dependent closure after acquiring the effect lease, or
   include the closure in the lease snapshot and reject changes to it. Candidate publication and external forge merges
   MUST not be able to introduce a new dependent into an already-running teardown without invalidating the operation.
 - **Legacy reconciliation safety:** Applying a legacy desired Unit without an authoritative advance MUST produce an
@@ -306,9 +306,9 @@ Before declaring the Unit implementation milestone complete, the harness MUST co
 Shared recovery coverage MUST prove that one destroy failure retains cleanup inputs across restart and that a stale
 delete request for an old UID cannot affect a recreated same-name resource.
 
-The first four Unit hardening scenarios above—finalization lease completion, pre-effect failure cleanup, same-name
-incarnation fencing, and parseable GVK/driver replacement—are covered by commit `118429d`. The concurrent dependency,
-legacy, opaque-root, teardown-evidence, direct-root, and source-pin scenarios remain pending.
+Commits `118429d` and `22d7814` cover finalization lease completion, pre-effect failure cleanup, same-name incarnation
+fencing, parseable GVK/driver replacement, resolved dependency preservation, and pre-lease dependency revalidation.
+The legacy, opaque-root, teardown-evidence, direct-root, source-pin, and remaining acceptance scenarios remain pending.
 
 ## Implementation checklist
 
