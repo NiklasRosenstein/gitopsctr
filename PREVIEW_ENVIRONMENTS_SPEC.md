@@ -1,8 +1,9 @@
 # Stacks and preview environments — living implementation spec
 
-> **Status:** Living implementation design. The lifecycle-aware desired-resource envelope and a hardened Unit-specific
-> finalization slice are implemented, including terminal teardown evidence and explicit direct-Unit deletion. Direct
-> Stack management, source pins, forge merge enforcement, Stack, and end-to-end acceptance remain pending. Field names, document layouts,
+> **Status:** Living implementation design. The lifecycle-aware desired-resource envelope, hardened Unit-specific
+> finalization slice, and typed Stack/StackTemplate contract foundation are implemented, including terminal teardown
+> evidence and explicit direct-Unit deletion. Stack projection/lifecycle, source pins, forge merge enforcement, and
+> end-to-end acceptance remain pending. Field names, document layouts,
 > and command names are illustrative unless
 > explicitly marked **Settled**.
 
@@ -22,12 +23,13 @@ The current branch is a Unit-focused foundation rather than an end-to-end previe
 | Desired Unit identity, lifecycle authority, ownership, legacy retention, rollback, and schema profiles | **Implemented for Unit** | Keep the generic semantic model; extend it to Stack and StackTemplate later. |
 | Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit** | Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac` close lease, incarnation, transition, dependency, legacy-safety, opaque-recovery, evidence-contract, and direct-root lifecycle defects; source pins, forge enforcement, and acceptance work remains. |
 | Change-gated candidate freshness | **Local verifier implemented** | `88ae0b9` rejects stale, rebased, multi-commit, merge, root, and missing-head candidates before review creation; required forge checks and merge-queue/branch-protection enforcement remain external work. |
-| StackTemplate contracts, Stack contracts, parameter expansion, and generated ownership graphs | **Pending** | Milestone 3. |
+| StackTemplate/Stack contracts and deterministic parameter expansion | **Implemented foundation** | Commit `eb0bcb9`; projection and generated ownership graphs remain Milestone 3 work. |
+| Generated Stack resource graphs with UID-fenced ownership | **Pending** | Milestone 3. |
 | Direct Stack operations and UID-fenced deletion | **Pending** | Milestone 4. |
 | Controller-owned source pins, forge eligibility/expiry/orphan recovery, and Argo integration | **Pending** | Milestones 4–5. |
 | End-to-end acceptance, security, operations, and legacy retirement | **Pending** | Milestones 6–7. |
 
-The repository verification suite currently passes (`468` tests), including the landed concurrency, recovery,
+The repository verification suite currently passes (`483` tests), including the landed concurrency, recovery,
 incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
 not sufficient, for the remaining preview-environment milestones because source pins, forge merge enforcement, Stack
 behavior, and end-to-end acceptance contracts are still open.
@@ -196,9 +198,12 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
   same-name recreation, GVK/driver replacement, resolved receipt/artifact dependencies, concurrent dependent
   insertion, legacy application, opaque-root recovery, and teardown evidence round trips.
 
-## Stack resolution — Proposed
+## Stack resolution — Proposed; contract foundation implemented
 
-- A StackTemplate declares typed parameters and a template for API resources plus their dependency relationships.
+- **Implemented in `eb0bcb9`:** A StackTemplate declares typed parameters and a template for API resources plus their
+  dependency relationships. Parameter values are validated strictly, recursively expanded, and cannot contain
+  receipt, artifact, or promotion references.
+- **Implemented in `eb0bcb9`:** Stack and StackTemplate authored/desired contracts and public schemas exist.
 - A Stack contains concrete parameter values and resolves to concrete desired resources in one desired snapshot.
 - Generated resources receive their own UIDs and a controlling owner reference to the Stack UID.
 - A direct Stack records the exact StackTemplate revision/path/digest as provenance and retains a cleanup-capable

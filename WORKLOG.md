@@ -126,7 +126,16 @@ race and advised this narrow verifier. Repository branch-protection or required-
 still needed for an authoritative merge-time guarantee; source pins, permanently unparseable-root operator
 resolution, and the remaining acceptance cases are also pending.
 
-### 3. StackTemplate and Stack resolution — pending
+### 3. StackTemplate and Stack contract foundation — complete; projection pending
+
+Commit `eb0bcb9` adds typed authored/desired StackTemplate and Stack contracts, public schema publication, strict
+parameter declarations for string/integer/number/boolean/object/array values, recursive `fromParameter` expansion,
+and deterministic dependency-graph validation. StackTemplates are represented as inert reusable definitions; this
+increment does not yet project Stack-owned Units or execute lifecycle effects.
+
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 483 tests,
+lint, typecheck, schema freshness, strict docs, actionlint, formatting, and diff checks. Remaining Milestone 3 work is
+source/candidate projection, generated Unit ownership, and generic desired-graph validation.
 
 ### 4. Direct Stack operations and source pins — pending
 
