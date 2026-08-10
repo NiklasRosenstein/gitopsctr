@@ -11,6 +11,7 @@ from gitopsctr import cli
 from gitopsctr.contracts import DesiredLifecycle, DesiredOwnerReference
 from gitopsctr.errors import OperationError
 from gitopsctr.resources import ResourceMetadata, StackResource, validate_desired_resource_graph
+from gitopsctr.state import ControllerPin
 
 
 def _project(root: Path) -> Path:
@@ -299,6 +300,15 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
     monkeypatch.setattr(cli, "build_desired_candidate", fake_build)
     monkeypatch.setattr(cli, "publish_desired_change", publish)
     monkeypatch.setattr(cli, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+    monkeypatch.setattr(
+        cli,
+        "state_store",
+        lambda: SimpleNamespace(
+            create_controller_pin=lambda name, revision: ControllerPin(
+                name, f"refs/heads/gitopsctr/pins/{name}", revision
+            )
+        ),
+    )
 
     args = cli.build_parser().parse_args(
         [

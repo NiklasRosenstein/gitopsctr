@@ -132,7 +132,7 @@ from gitopsctr.resources import (
     validate_desired_resource_graph,
 )
 from gitopsctr.schemas import encoded_schema, export_schemas, resource_schema_url, show_schema
-from gitopsctr.state import GatedCandidate, GitStateStore
+from gitopsctr.state import ControllerPin, GatedCandidate, GitStateStore
 from gitopsctr.templates import (
     ArtifactReference as ArtifactReferenceExpression,
 )
@@ -160,6 +160,7 @@ REPOSITORY_ROOT = Path.cwd().resolve()
 DESIRED_TRANSITION_BLOCKS_PATH = PurePosixPath(".gitopsctr/transition-blocks.json")
 DESIRED_CLEANUP_UNITS_PATH = PurePosixPath(".gitopsctr/cleanup/units")
 DESIRED_DELETION_INTENTS_PATH = PurePosixPath(".gitopsctr/deletion-intents/units")
+DESIRED_STACK_DELETION_INTENTS_PATH = PurePosixPath(".gitopsctr/deletion-intents/stacks")
 DESIRED_EFFECT_LEASES_PATH = PurePosixPath(".gitopsctr/effect-leases/units")
 DESIRED_UNIT_INCARNATIONS_PATH = PurePosixPath(".gitopsctr/incarnations/units")
 OBSERVED_TEARDOWN_EVIDENCE_PATH = PurePosixPath(".gitopsctr/teardowns/units")
@@ -678,6 +679,39 @@ def load_desired_resource_graph(root: Path) -> dict[tuple[str, str, str], UnitRe
     try:
         validate_desired_resource_graph(resources)
     except ValueError as exc:
+        # A Stack root remains in desired state while its owned Units are
+        # finalized in reverse dependency order. During that interval the
+        # contract's normal expansion completeness check sees the intentionally
+        # removed child. Admit only those exact missing children recorded by an
+        # active StackDeletionIntent; all other graph failures remain fatal.
+        message = str(exc)
+        missing = re.fullmatch(r"Stack '([^']+)' expansion is missing generated Unit '([^']+)'", message)
+        if missing is not None:
+            stack_name, unit_name = missing.groups()
+            stack_intent = load_desired_stack_deletion_intents(root).get(stack_name)
+            stack_key = (CORE_API_VERSION, "Stack", stack_name)
+            stack_resource = resources.get(stack_key)
+            template_resource = (
+                resources.get((CORE_API_VERSION, "StackTemplate", stack_resource.spec.template))
+                if isinstance(stack_resource, StackResource)
+                and isinstance(stack_resource.spec, (StackSpec, DesiredStackSpec))
+                else None
+            )
+            if (
+                stack_intent is not None
+                and isinstance(stack_resource, StackResource)
+                and isinstance(template_resource, StackResource)
+                and isinstance(template_resource.spec, StackTemplateSpec)
+                and isinstance(stack_resource.spec, (StackSpec, DesiredStackSpec))
+            ):
+                missing_units = {
+                    resource.name
+                    for resource in template_resource.spec.expand(stack_resource.spec.parameters)
+                    if (resource.apiVersion, resource.kind, resource.name) not in resources
+                }
+                closure_names = {identity.unit_name for identity in stack_intent.owned_unit_closure}
+                if missing_units and missing_units <= closure_names and unit_name in missing_units:
+                    return resources
         raise OperationError(f"invalid desired resource graph: {exc}") from exc
     return resources
 
@@ -1439,7 +1473,15 @@ def candidate_ref_template(source_root: Path, environment_name: str) -> str:
 
 
 def candidate_identifier(
-    operation: Literal["promotion", "rollback", "finalize", "request-delete-direct-unit", "instantiate-stack"],
+    operation: Literal[
+        "promotion",
+        "rollback",
+        "finalize",
+        "finalize-stack",
+        "request-delete-direct-unit",
+        "request-delete-direct-stack",
+        "instantiate-stack",
+    ],
     environment_name: str,
     candidate: Path,
     target_ref: str,
@@ -1465,7 +1507,15 @@ def candidate_identifier(
 def resolve_candidate_ref(
     source_root: Path,
     environment_name: str,
-    operation: Literal["promotion", "rollback", "finalize", "request-delete-direct-unit", "instantiate-stack"],
+    operation: Literal[
+        "promotion",
+        "rollback",
+        "finalize",
+        "finalize-stack",
+        "request-delete-direct-unit",
+        "request-delete-direct-stack",
+        "instantiate-stack",
+    ],
     candidate_id: str,
     override: str | None = None,
 ) -> str:
@@ -2271,6 +2321,214 @@ class RetainedCleanupIdentity:
 
 
 @dataclass(frozen=True)
+class StackOwnedUnitIdentity:
+    """The UID and deletion generation of one Unit in a Stack closure."""
+
+    unit_name: str
+    uid: str
+    deletion_generation: int
+
+    def document(self) -> JsonObject:
+        return {
+            "unitName": self.unit_name,
+            "uid": self.uid,
+            "deletionGeneration": self.deletion_generation,
+        }
+
+
+@dataclass(frozen=True)
+class StackCleanupIdentity:
+    """The retained desired Stack blob used to fence finalization."""
+
+    path: str
+    uid: str
+    blob: str
+
+    def document(self) -> JsonObject:
+        return {"path": self.path, "uid": self.uid, "blob": self.blob}
+
+
+@dataclass(frozen=True)
+class StackDeletionIntent:
+    """A durable, UID-fenced two-phase deletion intent for one direct Stack."""
+
+    stack_name: str
+    uid: str
+    deletion_generation: int
+    management_mode: Literal["sourceTracked", "direct"]
+    cleanup_identity: StackCleanupIdentity
+    retained_template: str
+    retained_parameters: JsonObjectValue
+    retained_provenance: StackInstantiationProvenance | None
+    owned_unit_closure: tuple[StackOwnedUnitIdentity, ...]
+    controller_pin: ControllerPin | None
+
+    def document(self) -> JsonObject:
+        return {
+            "schema": 1,
+            "kind": "StackDeletionIntent",
+            "stackName": self.stack_name,
+            "uid": self.uid,
+            "deletionGeneration": self.deletion_generation,
+            "managementMode": self.management_mode,
+            "cleanupIdentity": self.cleanup_identity.document(),
+            "retainedStack": {
+                "template": self.retained_template,
+                "parameters": self.retained_parameters,
+                "provenance": self.retained_provenance.to_dict() if self.retained_provenance is not None else None,
+            },
+            "ownedUnitClosure": [identity.document() for identity in self.owned_unit_closure],
+            "controllerPin": (
+                {
+                    "name": self.controller_pin.name,
+                    "ref": self.controller_pin.ref,
+                    "revision": self.controller_pin.revision,
+                }
+                if self.controller_pin is not None
+                else None
+            ),
+        }
+
+    @classmethod
+    def from_document(cls, document: object, expected_name: str) -> StackDeletionIntent:
+        expected_keys = {
+            "schema",
+            "kind",
+            "stackName",
+            "uid",
+            "deletionGeneration",
+            "managementMode",
+            "cleanupIdentity",
+            "retainedStack",
+            "ownedUnitClosure",
+            "controllerPin",
+        }
+        if not isinstance(document, dict) or set(document) != expected_keys:
+            raise ValueError("invalid Stack deletion intent envelope")
+        if (
+            type(document.get("schema")) is not int
+            or document.get("schema") != 1
+            or document.get("kind") != "StackDeletionIntent"
+            or document.get("stackName") != expected_name
+        ):
+            raise ValueError("invalid Stack deletion intent envelope")
+        management_mode = document.get("managementMode")
+        if management_mode not in {"sourceTracked", "direct"}:
+            raise ValueError("invalid Stack deletion intent management mode")
+        uid = document.get("uid")
+        generation = document.get("deletionGeneration")
+        if (
+            not isinstance(uid, str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", uid)
+            or type(generation) is not int
+            or generation < 1
+        ):
+            raise ValueError("invalid Stack deletion intent fence")
+
+        raw_cleanup = document.get("cleanupIdentity")
+        if not isinstance(raw_cleanup, dict) or set(raw_cleanup) != {"path", "uid", "blob"}:
+            raise ValueError("invalid Stack cleanup identity")
+        cleanup_path = raw_cleanup.get("path")
+        cleanup_uid = raw_cleanup.get("uid")
+        cleanup_blob = raw_cleanup.get("blob")
+        relative = PurePosixPath(cleanup_path) if isinstance(cleanup_path, str) else PurePosixPath(".")
+        if (
+            not isinstance(cleanup_path, str)
+            or not isinstance(cleanup_uid, str)
+            or cleanup_uid != uid
+            or not isinstance(cleanup_blob, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", cleanup_blob)
+            or relative.is_absolute()
+            or len(relative.parts) != 2
+            or relative.parts[0] != "stacks"
+            or relative.stem != expected_name
+            or relative.suffix not in {".json", ".yaml", ".yml"}
+        ):
+            raise ValueError("cleanup identity must retain a desired Stack path")
+
+        raw_stack = document.get("retainedStack")
+        if not isinstance(raw_stack, dict) or set(raw_stack) != {"template", "parameters", "provenance"}:
+            raise ValueError("invalid retained Stack identity")
+        template = raw_stack.get("template")
+        parameters = raw_stack.get("parameters")
+        if not isinstance(template, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", template):
+            raise ValueError("invalid retained Stack template identity")
+        if not isinstance(parameters, dict):
+            raise ValueError("retained Stack parameters must be an object")
+        try:
+            parsed_parameters = require_json_value(parameters)
+            if not isinstance(parsed_parameters, dict):
+                raise ValueError("retained Stack parameters must be an object")
+            retained_parameters = JsonObjectValue(cast(dict[str, Any], parsed_parameters))
+            raw_provenance = raw_stack.get("provenance")
+            provenance = StackInstantiationProvenance.from_dict(raw_provenance) if raw_provenance is not None else None
+            if (management_mode == "direct") != (provenance is not None):
+                raise ValueError("Stack deletion intent provenance does not match management mode")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid retained Stack provenance or parameters") from exc
+
+        raw_closure = document.get("ownedUnitClosure")
+        if not isinstance(raw_closure, list):
+            raise ValueError("owned Unit closure must be a list")
+        closure: list[StackOwnedUnitIdentity] = []
+        seen: set[str] = set()
+        for raw_identity in raw_closure:
+            if not isinstance(raw_identity, dict) or set(raw_identity) != {"unitName", "uid", "deletionGeneration"}:
+                raise ValueError("invalid owned Unit closure identity")
+            unit_name = raw_identity.get("unitName")
+            unit_uid = raw_identity.get("uid")
+            unit_generation = raw_identity.get("deletionGeneration")
+            if (
+                not isinstance(unit_name, str)
+                or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name)
+                or unit_name in seen
+                or not isinstance(unit_uid, str)
+                or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", unit_uid)
+                or type(unit_generation) is not int
+                or unit_generation < 1
+            ):
+                raise ValueError("invalid owned Unit closure identity")
+            seen.add(unit_name)
+            closure.append(StackOwnedUnitIdentity(unit_name, unit_uid, unit_generation))
+
+        raw_pin = document.get("controllerPin")
+        if raw_pin is None:
+            if management_mode == "direct":
+                raise ValueError("direct Stack deletion intent requires a controller pin")
+            pin = None
+        else:
+            if not isinstance(raw_pin, dict) or set(raw_pin) != {"name", "ref", "revision"}:
+                raise ValueError("invalid Stack controller pin identity")
+            pin_name = raw_pin.get("name")
+            pin_ref = raw_pin.get("ref")
+            pin_revision = raw_pin.get("revision")
+            if (
+                not isinstance(pin_name, str)
+                or not pin_name
+                or not isinstance(pin_ref, str)
+                or pin_ref != f"refs/heads/gitopsctr/pins/{pin_name}"
+                or not isinstance(pin_revision, str)
+                or not re.fullmatch(r"[0-9a-f]{40}", pin_revision)
+            ):
+                raise ValueError("invalid Stack controller pin identity")
+            if management_mode != "direct":
+                raise ValueError("source-tracked Stack deletion intent cannot own a controller pin")
+            pin = ControllerPin(pin_name, pin_ref, pin_revision)
+        return cls(
+            stack_name=expected_name,
+            uid=uid,
+            deletion_generation=generation,
+            management_mode=cast(Literal["sourceTracked", "direct"], management_mode),
+            cleanup_identity=StackCleanupIdentity(cleanup_path, cleanup_uid, cleanup_blob),
+            retained_template=template,
+            retained_parameters=retained_parameters,
+            retained_provenance=provenance,
+            owned_unit_closure=tuple(closure),
+            controller_pin=pin,
+        )
+
+
+@dataclass(frozen=True)
 class UnitIncarnationTombstone:
     """An internal Unit incarnation fence, including compatibility adoptions."""
 
@@ -2947,6 +3205,43 @@ def desired_deletion_intent_paths(root: Path) -> tuple[Path, ...]:
             raise OperationError(f"multiple deletion intent formats exist for {path.stem!r}")
         names[path.stem] = path
     return tuple(paths)
+
+
+def desired_stack_deletion_intent_paths(root: Path) -> tuple[Path, ...]:
+    directory = root / DESIRED_STACK_DELETION_INTENTS_PATH
+    if not directory.is_dir():
+        return ()
+    paths = sorted(path for path in directory.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"})
+    names: dict[str, Path] = {}
+    for path in paths:
+        if path.stem in names:
+            raise OperationError(f"multiple Stack deletion intent formats exist for {path.stem!r}")
+        names[path.stem] = path
+    return tuple(paths)
+
+
+def load_desired_stack_deletion_intents(root: Path) -> dict[str, StackDeletionIntent]:
+    intents: dict[str, StackDeletionIntent] = {}
+    for path in desired_stack_deletion_intent_paths(root):
+        name = path.stem
+        try:
+            intent = StackDeletionIntent.from_document(load_json(path), name)
+        except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
+            raise OperationError(f"invalid Stack deletion intent for {name!r}") from exc
+        intents[name] = intent
+    return intents
+
+
+def write_stack_deletion_intent(root: Path, intent: StackDeletionIntent) -> Path:
+    directory = root / DESIRED_STACK_DELETION_INTENTS_PATH
+    for path in document_candidates(directory, intent.stack_name):
+        path.unlink()
+    return write_document(directory / f"{intent.stack_name}.json", intent.document(), format=DocumentFormat.JSON)
+
+
+def copy_stack_deletion_intents(current: Path, candidate: Path) -> None:
+    for intent in load_desired_stack_deletion_intents(current).values():
+        write_stack_deletion_intent(candidate, intent)
 
 
 def desired_effect_lease_paths(root: Path) -> tuple[Path, ...]:
@@ -4078,6 +4373,69 @@ def build_desired_candidate(
     stack_projection = project_stack_resources(
         source_root, environment_name, source_revision, candidate, source_root, current_desired
     )
+    # Direct Stacks are controller-owned roots, so they must survive source
+    # advances just like direct Units. An active deletion intent is retained
+    # with the same root until finalization removes it explicitly.
+    source_stack_paths = _document_paths(project_environment_root(source_root, environment_name) / "stacks")
+    current_stack_resources: dict[tuple[str, str, str], UnitResource[Any] | StackResource] = {}
+    if _current_desired_stack_paths(current_desired, "Stack"):
+        try:
+            current_stack_resources = load_desired_resource_graph(current_desired)
+        except OperationError:
+            # Existing Unit compatibility/opaque-root handling below remains
+            # authoritative when the current tree cannot be parsed as a
+            # complete Stack graph. Do not make unrelated legacy cleanup
+            # depend on Stack-only inspection.
+            current_stack_resources = {}
+    stack_intents = load_desired_stack_deletion_intents(current_desired)
+    for stack_name, current_stack_path in _current_desired_stack_paths(current_desired, "Stack").items():
+        current_stack = RESOURCE_CATALOG.parse_stack(
+            RESOURCE_CATALOG.load_document(current_stack_path), profile="desired", expected_name=stack_name
+        )
+        lifecycle = current_stack.metadata.lifecycle
+        is_direct = (
+            lifecycle is not None
+            and lifecycle.owner is None
+            and lifecycle.management is not None
+            and lifecycle.management.mode == "direct"
+        )
+        is_source_tracked = (
+            lifecycle is not None
+            and lifecycle.owner is None
+            and lifecycle.management is not None
+            and lifecycle.management.mode == "sourceTracked"
+        )
+        if not is_direct and not is_source_tracked and stack_name not in stack_intents:
+            continue
+        if stack_name in source_stack_paths:
+            raise OperationError(f"source Stack {stack_name!r} collides with a directly managed desired Stack")
+        target = candidate / "stacks" / current_stack_path.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(current_stack_path, target)
+        if is_source_tracked and stack_name not in source_stack_paths and stack_name not in stack_intents:
+            owned_units = [
+                resource
+                for resource in current_stack_resources.values()
+                if isinstance(resource, UnitResource)
+                and resource.metadata.lifecycle is not None
+                and resource.metadata.lifecycle.owner is not None
+                and resource.metadata.lifecycle.owner.kind == "Stack"
+                and resource.metadata.lifecycle.owner.name == stack_name
+                and resource.metadata.lifecycle.owner.uid == current_stack.metadata.uid
+            ]
+            intent = _stack_intent_for_resource(
+                environment_name,
+                current_stack,
+                current_stack_path,
+                current_desired,
+                owned_units,
+                dry=True,
+            )
+            write_stack_deletion_intent(candidate, intent)
+            transition_blocks = load_desired_transition_blocks(candidate)
+            transition_blocks[stack_name] = f"Stack deletion intent active at generation {intent.deletion_generation}"
+            write_desired_transition_blocks(candidate, transition_blocks)
+    copy_stack_deletion_intents(current_desired, candidate)
     for unit_name, generated_unit in stack_projection.generated_units.items():
         if unit_name in specifications:
             raise OperationError(f"generated Stack Unit {unit_name!r} collides with a source Unit")
@@ -5781,6 +6139,10 @@ def _direct_stack_uid(environment: str, stack_name: str, request_identity: str) 
     return f"d1-{digest}"
 
 
+def _stack_pin_name(environment: str, stack_name: str, uid: str) -> str:
+    return f"stacks/{environment}/{stack_name}/{uid}"
+
+
 def _parse_stack_parameters(raw: str) -> JsonObjectValue:
     try:
         value = json.loads(raw)
@@ -5907,6 +6269,10 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
             name=args.stack,
             uid=direct_uid,
         )
+        if not args.dry:
+            state_store().create_controller_pin(
+                _stack_pin_name(args.environment, args.stack, direct_uid), source_revision
+            )
         for resource in expanded:
             unit_path = unit_document_path(candidate, resource.name)
             if not unit_path.is_file():
@@ -5964,6 +6330,271 @@ def command_instantiate_stack(args: argparse.Namespace) -> bool:
         return _command_instantiate_stack(args)
 
 
+def _stack_intent_for_resource(
+    environment: str,
+    stack: StackResource,
+    stack_path: Path,
+    current: Path,
+    owned_units: Sequence[UnitResource[Any]],
+    *,
+    dry: bool,
+) -> StackDeletionIntent:
+    if not isinstance(stack.spec, DesiredStackSpec):
+        raise OperationError("desired Stack is missing its canonical spec")
+    if stack.metadata.uid is None:
+        raise OperationError("direct Stack is missing its UID")
+    lifecycle = stack.metadata.lifecycle
+    if lifecycle is None or lifecycle.management is None:
+        raise OperationError("Stack deletion requires a root lifecycle authority")
+    management_mode = lifecycle.management.mode
+    if management_mode == "direct" and stack.spec.provenance is None:
+        raise OperationError("direct Stack is missing instantiation provenance")
+    if management_mode == "sourceTracked" and stack.spec.provenance is not None:
+        raise OperationError("source-tracked Stack cannot carry direct instantiation provenance")
+    pin_name = _stack_pin_name(environment, stack.name, stack.metadata.uid)
+    pin: ControllerPin | None = None
+    if stack.spec.provenance is not None:
+        pin = ControllerPin(
+            pin_name,
+            f"refs/heads/gitopsctr/pins/{pin_name}",
+            stack.spec.provenance.templateRevision,
+        )
+        if not dry:
+            pin = state_store().create_controller_pin(pin_name, pin.revision)
+    closure = tuple(
+        StackOwnedUnitIdentity(unit.name, unit.metadata.uid or "", 1)
+        for unit in sorted(owned_units, key=lambda item: item.name)
+    )
+    if any(not identity.uid for identity in closure):
+        raise OperationError("owned Stack Units must have canonical UIDs before deletion")
+    return StackDeletionIntent(
+        stack_name=stack.name,
+        uid=stack.metadata.uid,
+        deletion_generation=1,
+        management_mode=management_mode,
+        cleanup_identity=StackCleanupIdentity(
+            path=stack_path.relative_to(current).as_posix(),
+            uid=stack.metadata.uid,
+            blob=file_blob(stack_path),
+        ),
+        retained_template=stack.spec.template,
+        retained_parameters=stack.spec.parameters,
+        retained_provenance=stack.spec.provenance,
+        owned_unit_closure=closure,
+        controller_pin=pin,
+    )
+
+
+def _command_request_delete_direct_stack(args: argparse.Namespace) -> bool:
+    _resource_name(args.environment, "environment name")
+    _resource_name(args.stack, "Stack name")
+    if not isinstance(args.uid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args.uid):
+        raise OperationError("request-delete-direct-stack requires a valid --uid")
+    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, None)
+    current_revision = fetch_ref(desired_ref)
+    if current_revision is None:
+        raise OperationError(f"desired ref {desired_ref!r} has no state")
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary = Path(temporary_directory)
+        current = temporary / "current"
+        candidate = temporary / "candidate"
+        materialize_revision(current_revision, current)
+        stack_path = _current_desired_stack_paths(current, "Stack").get(args.stack)
+        if stack_path is None:
+            raise OperationError(f"desired Stack {args.stack!r} is not present")
+        stack = RESOURCE_CATALOG.parse_stack(
+            RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name=args.stack
+        )
+        stack.metadata.validate_desired()
+        lifecycle = stack.metadata.lifecycle
+        if lifecycle is None or lifecycle.owner is not None or lifecycle.management is None:
+            raise OperationError(f"desired Stack {args.stack!r} is not a root resource")
+        if lifecycle.management.mode != "direct":
+            raise OperationError(f"desired Stack {args.stack!r} is not directly managed")
+        if stack.metadata.uid != args.uid:
+            raise OperationError(f"stale desired Stack UID fence for {args.stack!r}")
+        existing = load_desired_stack_deletion_intents(current).get(args.stack)
+        if existing is not None:
+            if existing.uid != args.uid:
+                raise OperationError(f"desired Stack {args.stack!r} has a conflicting deletion intent")
+            return False
+        resources = load_desired_resource_graph(current)
+        owner_key = (CORE_API_VERSION, "Stack", args.stack)
+        owned_units: list[UnitResource[Any]] = []
+        for resource in resources.values():
+            if not isinstance(resource, UnitResource):
+                continue
+            resource.metadata.validate_desired()
+            resource_lifecycle = resource.metadata.lifecycle
+            if (
+                resource_lifecycle is not None
+                and resource_lifecycle.owner is not None
+                and (resource_lifecycle.owner.apiVersion, resource_lifecycle.owner.kind, resource_lifecycle.owner.name)
+                == owner_key
+                and resource_lifecycle.owner.uid == args.uid
+            ):
+                owned_units.append(resource)
+        shutil.copytree(current, candidate)
+        intent = _stack_intent_for_resource(
+            args.environment,
+            stack,
+            stack_path,
+            current,
+            owned_units,
+            dry=args.dry,
+        )
+        write_stack_deletion_intent(candidate, intent)
+        blocks = load_desired_transition_blocks(candidate)
+        blocks[args.stack] = f"Stack deletion intent active at generation {intent.deletion_generation}"
+        for unit in owned_units:
+            unit_path = unit_document_path(candidate, unit.name)
+            child_intents = load_desired_deletion_intents(candidate)
+            if unit.name not in child_intents:
+                write_deletion_intent(candidate, UnitDeletionIntent.from_unit(unit, unit_path, candidate))
+            blocks[unit.name] = deletion_intent_reason(load_desired_deletion_intents(candidate)[unit.name])
+        write_desired_transition_blocks(candidate, blocks)
+        load_desired_resource_graph(candidate)
+        candidate_id = candidate_identifier(
+            "request-delete-direct-stack",
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            {"stack": args.stack, "uid": args.uid, "deletionGeneration": intent.deletion_generation},
+        )
+        candidate_ref = resolve_candidate_ref(
+            REPOSITORY_ROOT,
+            args.environment,
+            "request-delete-direct-stack",
+            candidate_id,
+            args.candidate_ref,
+        )
+        revision, outcome = publish_desired_change(
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            candidate_ref,
+            f"Request deletion of direct Stack {args.stack} generation {intent.deletion_generation}",
+            f"Request deletion of direct Stack {args.stack}",
+            f"Create a UID-fenced deletion intent for directly managed Stack `{args.stack}`.",
+            args.dry,
+            current,
+        )
+        if args.dry:
+            return False
+        print(revision)
+        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
+        return True
+
+
+def command_request_delete_direct_stack(args: argparse.Namespace) -> bool:
+    with unit_effect_lock(args.environment, f"stack-{getattr(args, 'stack', '<invalid>')}"):
+        return _command_request_delete_direct_stack(args)
+
+
+def _command_finalize_stack(args: argparse.Namespace) -> bool:
+    _resource_name(args.environment, "environment name")
+    _resource_name(args.stack, "Stack name")
+    if not isinstance(args.uid, str) or not args.uid:
+        raise OperationError("finalize-stack requires --uid")
+    if not isinstance(args.deletion_generation, int) or args.deletion_generation < 1:
+        raise OperationError("finalize-stack requires --deletion-generation >= 1")
+    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
+    current_revision = fetch_ref(desired_ref)
+    if current_revision is None:
+        return False
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary = Path(temporary_directory)
+        current = temporary / "current"
+        materialize_revision(current_revision, current)
+        intent = load_desired_stack_deletion_intents(current).get(args.stack)
+        if intent is None:
+            return False
+        if intent.uid != args.uid:
+            raise OperationError(f"stale Stack deletion intent UID fence for {args.stack!r}")
+        if intent.deletion_generation != args.deletion_generation:
+            raise OperationError(f"stale Stack deletion generation fence for {args.stack!r}")
+        stack_path = _current_desired_stack_paths(current, "Stack").get(args.stack)
+        if stack_path is None:
+            return False
+        if file_blob(stack_path) != intent.cleanup_identity.blob:
+            raise OperationError(f"retained Stack cleanup root changed for {args.stack!r}")
+        resources = load_desired_resource_graph(current)
+        child_intents = load_desired_deletion_intents(current)
+        active_children = [
+            resource.name
+            for resource in resources.values()
+            if isinstance(resource, UnitResource)
+            and resource.metadata.lifecycle is not None
+            and resource.metadata.lifecycle.owner is not None
+            and resource.metadata.lifecycle.owner.kind == "Stack"
+            and resource.metadata.lifecycle.owner.name == args.stack
+            and resource.metadata.lifecycle.owner.uid == args.uid
+        ]
+        active_children.extend(
+            identity.unit_name
+            for identity in intent.owned_unit_closure
+            if identity.unit_name in child_intents and identity.unit_name not in active_children
+        )
+        if active_children:
+            raise OperationError("active owned Units must be finalized first: " + ", ".join(sorted(active_children)))
+        candidate = temporary / "candidate"
+        shutil.copytree(current, candidate)
+        for path in document_candidates(candidate / "stacks", args.stack):
+            path.unlink()
+        for path in document_candidates(candidate / DESIRED_STACK_DELETION_INTENTS_PATH, args.stack):
+            path.unlink()
+        blocks = load_desired_transition_blocks(candidate)
+        blocks.pop(args.stack, None)
+        write_desired_transition_blocks(candidate, blocks)
+        load_desired_resource_graph(candidate)
+        candidate_id = candidate_identifier(
+            "finalize-stack",
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            {"stack": args.stack, "uid": args.uid, "deletionGeneration": args.deletion_generation},
+        )
+        candidate_ref = resolve_candidate_ref(
+            REPOSITORY_ROOT,
+            args.environment,
+            "finalize-stack",
+            candidate_id,
+            args.candidate_ref,
+        )
+        revision, outcome = publish_desired_change(
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            candidate_ref,
+            f"Finalize direct Stack {args.stack} generation {args.deletion_generation}",
+            f"Finalize direct Stack {args.stack}",
+            f"Remove the finalized direct Stack `{args.stack}` after its owned Units are absent.",
+            args.dry,
+            current,
+        )
+        if args.dry:
+            return False
+        if outcome is None and intent.controller_pin is not None:
+            try:
+                state_store().release_controller_pin(intent.controller_pin.name, intent.controller_pin.revision)
+            except OperationError as exc:
+                log_status(
+                    "WAIT", f"Stack {args.stack}: desired state finalized; source pin release needs retry: {exc}"
+                )
+        print(revision)
+        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
+        return True
+
+
+def command_finalize_stack(args: argparse.Namespace) -> bool:
+    with unit_effect_lock(args.environment, f"stack-{getattr(args, 'stack', '<invalid>')}"):
+        return _command_finalize_stack(args)
+
+
 def _command_finalize(args: argparse.Namespace) -> bool:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
         raise OperationError(f"invalid unit name: {args.unit!r}")
@@ -5991,6 +6622,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
             log_status("KEEP", f"{style_unit(args.unit)}: no desired state")
             return False
         intents = load_desired_deletion_intents(current)
+        stack_intents = load_desired_stack_deletion_intents(current)
         intent = intents.get(args.unit)
         if intent is None:
             log_status("KEEP", f"{style_unit(args.unit)}: no deletion intent")
@@ -6031,8 +6663,13 @@ def _command_finalize(args: argparse.Namespace) -> bool:
             validate_unit_materialization(current, args.unit, unit)
             load_desired_resource_graph(current)
             if intent.retained_owner is not None:
-                owner_intent = intents.get(intent.retained_owner.name)
-                if owner_intent is None or owner_intent.uid != intent.retained_owner.uid:
+                if intent.retained_owner.kind == "Stack":
+                    owner_intent = stack_intents.get(intent.retained_owner.name)
+                    owner_uid = owner_intent.uid if owner_intent is not None else None
+                else:
+                    owner_intent = intents.get(intent.retained_owner.name)
+                    owner_uid = owner_intent.uid if owner_intent is not None else None
+                if owner_uid != intent.retained_owner.uid:
                     raise OperationError(
                         f"owner deletion intent for {args.unit!r} is not active; finalize the owner closure in order"
                     )
@@ -8048,7 +8685,16 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
             "Deployment",
             ("advance-desired", "instantiate-stack", "promote", "rollback", "recover-effect-lease", "resolve-desired"),
         ),
-        ("Recovery", ("recover-opaque-unit", "request-delete-direct-unit", "finalize")),
+        (
+            "Recovery",
+            (
+                "recover-opaque-unit",
+                "request-delete-direct-unit",
+                "request-delete-direct-stack",
+                "finalize",
+                "finalize-stack",
+            ),
+        ),
         ("Inspection", ("status", "list", "show", "verify", "dependencies")),
         ("Reconciliation", ("reconcile", "converge")),
         ("Git data", ("read-tree", "publish-tree")),
@@ -8303,6 +8949,21 @@ def build_parser() -> argparse.ArgumentParser:
     request_delete_direct.add_argument("--dry", action="store_true")
     request_delete_direct.set_defaults(handler=command_request_delete_direct_unit)
 
+    request_delete_direct_stack = commands.add_parser(
+        "request-delete-direct-stack",
+        help="request UID-fenced deletion of a directly managed desired Stack",
+    )
+    request_delete_direct_stack.add_argument("--environment", required=True)
+    request_delete_direct_stack.add_argument("--stack", required=True)
+    request_delete_direct_stack.add_argument("--uid", required=True, help="exact direct Stack UID fence")
+    request_delete_direct_stack.add_argument("--desired-ref", help="override the environment's desired ref")
+    request_delete_direct_stack.add_argument(
+        "--candidate-ref",
+        help="exact candidate ref override when the environment uses a pull-request change gate",
+    )
+    request_delete_direct_stack.add_argument("--dry", action="store_true")
+    request_delete_direct_stack.set_defaults(handler=command_request_delete_direct_stack)
+
     finalize = commands.add_parser(
         "finalize",
         help="finalize one durable deletion intent",
@@ -8325,6 +8986,28 @@ def build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--report", help="directory where the driver may write teardown reports")
     finalize.add_argument("--dry", action="store_true")
     finalize.set_defaults(handler=command_finalize)
+
+    finalize_stack = commands.add_parser(
+        "finalize-stack",
+        help="finalize one durable direct Stack deletion intent after owned Units are gone",
+    )
+    finalize_stack.add_argument("--environment", required=True)
+    finalize_stack.add_argument("--stack", required=True)
+    finalize_stack.add_argument("--uid", required=True, help="expected Stack deletion-intent UID fence")
+    finalize_stack.add_argument(
+        "--deletion-generation",
+        required=True,
+        type=int,
+        help="expected Stack deletion generation fence",
+    )
+    finalize_stack.add_argument("--desired-ref", help="override the environment's desired ref")
+    finalize_stack.add_argument("--observed-ref", help="override the environment's observed ref")
+    finalize_stack.add_argument(
+        "--candidate-ref",
+        help="exact candidate ref override when the environment uses a pull-request change gate",
+    )
+    finalize_stack.add_argument("--dry", action="store_true")
+    finalize_stack.set_defaults(handler=command_finalize_stack)
 
     resolve = commands.add_parser(
         "resolve-desired",
