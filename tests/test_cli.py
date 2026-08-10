@@ -2,12 +2,17 @@
 
 import io
 import json
+import shutil
 import subprocess
 import sys
+import threading
+import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from gitopsctr import cli as deploy_release
 from gitopsctr.contracts import DesiredSource, ResolvedInputs
@@ -373,6 +378,368 @@ def test_cleanup_root_loader_rejects_duplicate_document_formats(tmp_path):
 
     with pytest.raises(deploy_release.OperationError, match="multiple cleanup document formats"):
         deploy_release.load_desired_cleanup_roots(root)
+
+
+def test_effect_lease_is_cas_published_and_blocks_a_second_runner(tmp_path, monkeypatch):
+    desired = tmp_path / "desired"
+    desired.mkdir()
+    revisions = {"value": "a" * 40}
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: revisions["value"])
+    monkeypatch.setattr(deploy_release, "effect_lease_owner", lambda: "runner-a")
+    monkeypatch.setattr(deploy_release, "effect_lease_token", lambda: "lease-runner-a")
+
+    def materialize(_revision, output):
+        shutil.copytree(desired, output)
+
+    def publish(_ref, directory, _parent, _message):
+        shutil.rmtree(desired)
+        shutil.copytree(directory, desired)
+        revisions["value"] = "b" * 40
+        return revisions["value"]
+
+    monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
+    monkeypatch.setattr(deploy_release, "publish_tree", publish)
+
+    acquired = deploy_release.acquire_effect_lease("deploy/dev", "a" * 40, "application", "d1-application")
+    assert acquired.revision == "b" * 40
+    persisted = deploy_release.load_desired_effect_leases(desired)["application"]
+    assert persisted.token == "lease-runner-a"
+    assert persisted.expires_at is None
+
+    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="explicit UID/token recovery"):
+        deploy_release.acquire_effect_lease("deploy/dev", "b" * 40, "application", "d1-application")
+
+    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="recovery fence"):
+        deploy_release.recover_effect_lease("deploy/dev", "application", "d1-application", "wrong-token")
+    assert deploy_release.load_desired_effect_leases(desired)["application"].token == "lease-runner-a"
+
+    recovered = deploy_release.recover_effect_lease("deploy/dev", "application", "d1-application", "lease-runner-a")
+    assert recovered == "b" * 40
+    assert deploy_release.load_desired_effect_leases(desired) == {}
+
+
+def test_effect_lease_heartbeat_renews_before_expiry_during_long_effect(monkeypatch):
+    lease = deploy_release.EffectLease(
+        unit_name="application",
+        uid="d1-application",
+        token="lease-runner-a",
+        owner="runner-a",
+        desired_revision="a" * 40,
+        expires_at=None,
+    )
+    acquisition = deploy_release.EffectLeaseAcquisition(lease=lease, revision="a" * 40)
+    renewals = []
+
+    def renew(_ref, current):
+        renewals.append(current)
+        return deploy_release.EffectLeaseAcquisition(
+            lease=replace(current.lease, expires_at=None),
+            revision="a" * 40,
+        )
+
+    monkeypatch.setattr(deploy_release, "renew_effect_lease", renew)
+    heartbeat = deploy_release.start_effect_lease_heartbeat("deploy/dev", acquisition, interval_seconds=0.01)
+    time.sleep(0.04)
+    renewed = heartbeat.stop()
+
+    assert renewals
+    assert renewed.lease.token == lease.token
+    assert renewed.lease.expires_at is None
+
+
+def test_different_unit_heartbeats_rebase_and_preserve_each_other(monkeypatch, tmp_path):
+    desired = tmp_path / "desired"
+    state_lock = threading.Lock()
+    revision = {"value": "a" * 40}
+    next_revisions = iter(["b" * 40, "c" * 40] + [f"{value:040x}" for value in range(4, 30)])
+    tokens = iter(["lease-a", "lease-b"])
+    units = {name: _terraform_desired_resource(name) for name in ("application", "worker")}
+    for name, unit in units.items():
+        path = desired / f"units/{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(deploy_release.serialize_unit_document(unit)))
+
+    monkeypatch.setattr(deploy_release, "effect_lease_token", lambda: next(tokens))
+    monkeypatch.setattr(deploy_release, "effect_lease_owner", lambda: "runner")
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: revision["value"])
+
+    def materialize(_revision, output):
+        with state_lock:
+            shutil.copytree(desired, output)
+
+    def publish(_ref, directory, parent, _message):
+        with state_lock:
+            if parent != revision["value"]:
+                raise subprocess.CalledProcessError(1, "git push", stderr="non-fast-forward")
+            shutil.rmtree(desired)
+            shutil.copytree(directory, desired)
+            revision["value"] = next(next_revisions)
+            return revision["value"]
+
+    monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
+    monkeypatch.setattr(deploy_release, "publish_tree", publish)
+
+    application = deploy_release.acquire_effect_lease(
+        "deploy/dev", "a" * 40, "application", units["application"].metadata.uid
+    )
+    worker = deploy_release.acquire_effect_lease("deploy/dev", "b" * 40, "worker", units["worker"].metadata.uid)
+    results = {}
+    errors = []
+
+    def renew(name, acquisition):
+        try:
+            heartbeat = deploy_release.start_effect_lease_heartbeat("deploy/dev", acquisition, interval_seconds=0.01)
+            time.sleep(0.03)
+            results[name] = heartbeat.stop()
+        except Exception as exc:  # pragma: no cover - assertion below reports the error
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=renew, args=("application", application)),
+        threading.Thread(target=renew, args=("worker", worker)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert set(results) == {"application", "worker"}
+    leases = deploy_release.load_desired_effect_leases(desired)
+    assert leases["application"].token == "lease-a"
+    assert leases["worker"].token == "lease-b"
+
+
+def test_completion_rebases_after_unrelated_unit_renewal(tmp_path, monkeypatch):
+    desired = tmp_path / "desired"
+    local = tmp_path / "local"
+    revisions = {"value": "a" * 40}
+    units = {name: _terraform_desired_resource(name) for name in ("application", "worker")}
+    for name, unit in units.items():
+        path = desired / f"units/{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(deploy_release.serialize_unit_document(unit)))
+    deploy_release.write_effect_lease(
+        desired,
+        deploy_release.EffectLease(
+            unit_name="application",
+            uid=units["application"].metadata.uid,
+            token="lease-a",
+            owner="runner-a",
+            desired_revision="a" * 40,
+            expires_at=None,
+        ),
+    )
+    deploy_release.write_effect_lease(
+        desired,
+        deploy_release.EffectLease(
+            unit_name="worker",
+            uid=units["worker"].metadata.uid,
+            token="lease-b",
+            owner="runner-b",
+            desired_revision="a" * 40,
+            expires_at=None,
+        ),
+    )
+    shutil.copytree(desired, local)
+    application = deploy_release.load_desired_effect_leases(desired)["application"]
+    worker = deploy_release.load_desired_effect_leases(desired)["worker"]
+    deploy_release.write_effect_lease(desired, replace(worker, desired_revision="b" * 40))
+    revisions["value"] = "b" * 40
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: revisions["value"])
+    monkeypatch.setattr(
+        deploy_release, "materialize_revision", lambda _revision, output: shutil.copytree(desired, output)
+    )
+
+    rebased = deploy_release.rebase_effect_completion(
+        "deploy/dev",
+        deploy_release.EffectLeaseAcquisition(lease=application, revision="a" * 40),
+        "application",
+        units["application"].metadata.uid,
+        local,
+    )
+
+    assert rebased.revision == "b" * 40
+    assert deploy_release.load_desired_effect_leases(local)["application"].token == "lease-a"
+    assert deploy_release.load_desired_effect_leases(local)["worker"].desired_revision == "b" * 40
+
+
+def test_observation_publication_rebases_after_unrelated_lease_renewal(tmp_path, monkeypatch):
+    desired = tmp_path / "desired"
+    observed_publication: dict[str, bytes] = {}
+    revision = {"value": "a" * 40}
+    units = {name: _terraform_desired_resource(name) for name in ("application", "worker")}
+    for name, unit in units.items():
+        path = desired / f"units/{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(deploy_release.serialize_unit_document(unit)))
+    deploy_release.write_effect_lease(
+        desired,
+        deploy_release.EffectLease(
+            unit_name="application",
+            uid=units["application"].metadata.uid,
+            token="lease-a",
+            owner="runner-a",
+            desired_revision="a" * 40,
+            expires_at=None,
+        ),
+    )
+    deploy_release.write_effect_lease(
+        desired,
+        deploy_release.EffectLease(
+            unit_name="worker",
+            uid=units["worker"].metadata.uid,
+            token="lease-b",
+            owner="runner-b",
+            desired_revision="a" * 40,
+            expires_at=None,
+        ),
+    )
+    application_lease = deploy_release.load_desired_effect_leases(desired)["application"]
+    worker_lease = deploy_release.load_desired_effect_leases(desired)["worker"]
+    calls = 0
+
+    original_validate = deploy_release.validate_effect_lease_head
+
+    def validate_with_worker_renewal(_ref, unit_name, uid, token, snapshot):
+        nonlocal calls
+        calls += 1
+        result = original_validate(_ref, unit_name, uid, token, snapshot)
+        if calls == 1:
+            deploy_release.write_effect_lease(desired, replace(worker_lease, desired_revision="b" * 40))
+            revision["value"] = "b" * 40
+        elif calls == 4:
+            deploy_release.write_effect_lease(desired, replace(worker_lease, desired_revision="c" * 40))
+            revision["value"] = "c" * 40
+        return result
+
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: revision["value"])
+    monkeypatch.setattr(
+        deploy_release,
+        "materialize_revision",
+        lambda _revision, output: shutil.copytree(desired, output),
+    )
+    monkeypatch.setattr(deploy_release, "validate_effect_lease_head", validate_with_worker_renewal)
+    monkeypatch.setattr(deploy_release, "observed_tree", lambda _ref, output: output.mkdir(parents=True) or None)
+
+    def publish(_ref, directory, _parent, _message):
+        observed_publication.update(deploy_release.directory_files(directory))
+        return "c" * 40
+
+    monkeypatch.setattr(deploy_release, "publish_tree", publish)
+    receipt = receipt_resource(
+        "terraform",
+        "application",
+        {"revision": "a" * 40, "unitBlob": "application-blob"},
+    )
+    result = deploy_release.publish_observation_cas(
+        "observed/dev",
+        "application",
+        receipt,
+        units["application"],
+        {},
+        "a" * 40,
+        desired_ref="deploy/dev",
+        expected_uid=units["application"].metadata.uid,
+        lease_token=application_lease.token,
+        lease_snapshot=application_lease.snapshot,
+    )
+
+    assert result == "c" * 40
+    assert calls >= 3
+    receipt_path = next(path for path in observed_publication if path.startswith("units/application."))
+    assert yaml.safe_load(observed_publication[receipt_path])["spec"]["desired"]["revision"] == "b" * 40
+    assert deploy_release.load_desired_effect_leases(desired)["worker"].token == worker_lease.token
+    intent = deploy_release.UnitDeletionIntent.from_unit(
+        units["application"], desired / "units/application.json", desired
+    )
+    deploy_release.publish_teardown_observation_cas(
+        "observed/dev",
+        intent,
+        "b" * 40,
+        desired_ref="deploy/dev",
+        lease_token=application_lease.token,
+        lease_snapshot=application_lease.snapshot,
+    )
+    evidence = json.loads(
+        observed_publication[f".gitopsctr/teardowns/units/application.{units['application'].metadata.uid}.1.json"]
+    )
+    assert evidence["desiredRevision"] == "c" * 40
+
+
+def test_desired_mutation_cannot_drop_active_effect_lease(tmp_path, monkeypatch):
+    current = tmp_path / "current"
+    candidate = tmp_path / "candidate"
+    lease = deploy_release.EffectLease(
+        unit_name="application",
+        uid="d1-application",
+        token="lease-runner-a",
+        owner="runner-a",
+        desired_revision="a" * 40,
+        expires_at=100,
+    )
+    deploy_release.write_effect_lease(current, lease)
+    candidate.mkdir()
+    monkeypatch.setattr(deploy_release, "effect_lease_now", lambda: 1)
+    monkeypatch.setattr(
+        deploy_release, "materialize_revision", lambda _revision, output: shutil.copytree(current, output)
+    )
+
+    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="drop or alter"):
+        deploy_release.validate_effect_leases_preserved("deploy/dev", "a" * 40, candidate)
+
+    deploy_release.write_effect_lease(candidate, lease)
+    deploy_release.validate_effect_leases_preserved("deploy/dev", "a" * 40, candidate)
+
+
+def test_desired_mutation_cannot_change_leased_unit_payload(tmp_path):
+    current = tmp_path / "current"
+    candidate = tmp_path / "candidate"
+    unit_path = current / "units/application.json"
+    unit_path.parent.mkdir(parents=True)
+    unit = _terraform_desired_resource("application")
+    unit_path.write_text(json.dumps(deploy_release.serialize_unit_document(unit)))
+    deploy_release.write_opaque_cleanup_root(
+        current,
+        "application",
+        deploy_release.OpaqueCleanupRoot(
+            path=Path("application.json"),
+            payload={"cleanup": "original"},
+            metadata=ResourceMetadata(
+                name="application",
+                uid=unit.metadata.uid,
+                lifecycle=deploy_release.DesiredLifecycle(
+                    management=deploy_release.LifecycleManagement(mode="sourceTracked")
+                ),
+            ),
+            source=None,
+        ),
+    )
+    lease = deploy_release.EffectLease(
+        unit_name="application",
+        uid=unit.metadata.uid,
+        token="lease-runner-a",
+        owner="runner-a",
+        desired_revision="a" * 40,
+        expires_at=None,
+    )
+    deploy_release.write_effect_lease(current, lease)
+    shutil.copytree(current, candidate)
+    changed = json.loads((candidate / "units/application.json").read_text())
+    changed["spec"]["source"]["path"] = "different-source"
+    (candidate / "units/application.json").write_text(json.dumps(changed))
+
+    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="immutable leased resource"):
+        deploy_release.validate_effect_leases_preserved("deploy/dev", "a" * 40, candidate, current_root=current)
+
+    cleanup_candidate = tmp_path / "cleanup-candidate"
+    shutil.copytree(current, cleanup_candidate)
+    cleanup_path = cleanup_candidate / ".gitopsctr/cleanup/units/application.json"
+    changed_cleanup = json.loads(cleanup_path.read_text())
+    changed_cleanup["payload"]["cleanup"] = "changed"
+    cleanup_path.write_text(json.dumps(changed_cleanup))
+    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="immutable leased resource"):
+        deploy_release.validate_effect_leases_preserved("deploy/dev", "a" * 40, cleanup_candidate, current_root=current)
 
 
 @pytest.mark.parametrize("change", ["schema", "kind", "metadata", "payload"])

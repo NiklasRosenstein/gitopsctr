@@ -6,6 +6,7 @@ Desired and observed JSON remain the contract; GitHub Actions and local callers 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import glob as globlib
 import hashlib
 import json
@@ -16,7 +17,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import cache
@@ -33,6 +36,7 @@ from gitopsctr.contracts import (
     ArtifactDescriptor,
     AuthoredSource,
     DesiredLifecycle,
+    DesiredOwnerReference,
     DesiredSource,
     LifecycleManagement,
     MaterializationDocument,
@@ -149,7 +153,9 @@ REPOSITORY_ROOT = Path.cwd().resolve()
 DESIRED_TRANSITION_BLOCKS_PATH = PurePosixPath(".gitopsctr/transition-blocks.json")
 DESIRED_CLEANUP_UNITS_PATH = PurePosixPath(".gitopsctr/cleanup/units")
 DESIRED_DELETION_INTENTS_PATH = PurePosixPath(".gitopsctr/deletion-intents/units")
+DESIRED_EFFECT_LEASES_PATH = PurePosixPath(".gitopsctr/effect-leases/units")
 OBSERVED_TEARDOWN_EVIDENCE_PATH = PurePosixPath(".gitopsctr/teardowns/units")
+EFFECT_LEASE_TTL_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -2028,6 +2034,288 @@ class RetainedCleanupIdentity:
     uid: str
 
 
+class EffectLeaseUnavailable(OperationError):
+    """The desired Git state currently grants the effect lease to another runner."""
+
+
+@dataclass(frozen=True)
+class EffectLeaseSnapshot:
+    """Immutable identity of the desired and cleanup inputs fenced by a lease."""
+
+    unit_path: str | None
+    unit_blob: str | None
+    api_version: str | None
+    kind: str | None
+    driver: str | None
+    source_revision: str | None
+    deletion_intent_path: str | None
+    deletion_intent_blob: str | None
+    cleanup_path: str | None
+    cleanup_blob: str | None
+
+    def document(self) -> JsonObject:
+        return {
+            "unitPath": self.unit_path,
+            "unitBlob": self.unit_blob,
+            "apiVersion": self.api_version,
+            "kind": self.kind,
+            "driver": self.driver,
+            "sourceRevision": self.source_revision,
+            "deletionIntentPath": self.deletion_intent_path,
+            "deletionIntentBlob": self.deletion_intent_blob,
+            "cleanupPath": self.cleanup_path,
+            "cleanupBlob": self.cleanup_blob,
+        }
+
+    @classmethod
+    def from_document(cls, document: object) -> EffectLeaseSnapshot:
+        expected = {
+            "unitPath",
+            "unitBlob",
+            "apiVersion",
+            "kind",
+            "driver",
+            "sourceRevision",
+            "deletionIntentPath",
+            "deletionIntentBlob",
+            "cleanupPath",
+            "cleanupBlob",
+        }
+        if not isinstance(document, dict) or set(document) != expected:
+            raise ValueError("invalid effect lease snapshot")
+        values = {
+            "unit_path": document.get("unitPath"),
+            "unit_blob": document.get("unitBlob"),
+            "api_version": document.get("apiVersion"),
+            "kind": document.get("kind"),
+            "driver": document.get("driver"),
+            "source_revision": document.get("sourceRevision"),
+            "deletion_intent_path": document.get("deletionIntentPath"),
+            "deletion_intent_blob": document.get("deletionIntentBlob"),
+            "cleanup_path": document.get("cleanupPath"),
+            "cleanup_blob": document.get("cleanupBlob"),
+        }
+        if not all(value is None or isinstance(value, str) for value in values.values()):
+            raise ValueError("invalid effect lease snapshot values")
+        for key in ("unit_blob", "deletion_intent_blob", "cleanup_blob"):
+            value = values[key]
+            if value is not None and not re.fullmatch(r"[0-9a-f]{40}", value):
+                raise ValueError("invalid effect lease snapshot blob")
+        source_revision = values["source_revision"]
+        if source_revision is not None and not re.fullmatch(r"[0-9a-f]{40}", source_revision):
+            raise ValueError("invalid effect lease snapshot source revision")
+        return cls(
+            unit_path=values["unit_path"],
+            unit_blob=values["unit_blob"],
+            api_version=values["api_version"],
+            kind=values["kind"],
+            driver=values["driver"],
+            source_revision=source_revision,
+            deletion_intent_path=values["deletion_intent_path"],
+            deletion_intent_blob=values["deletion_intent_blob"],
+            cleanup_path=values["cleanup_path"],
+            cleanup_blob=values["cleanup_blob"],
+        )
+
+
+@dataclass(frozen=True)
+class EffectLease:
+    """A non-expiring, CAS-published lease for one desired Unit incarnation."""
+
+    unit_name: str
+    uid: str
+    token: str
+    owner: str
+    desired_revision: str
+    expires_at: int | None
+    snapshot: EffectLeaseSnapshot | None = None
+
+    def document(self) -> JsonObject:
+        return {
+            "schema": 1,
+            "kind": "UnitEffectLease",
+            "unitName": self.unit_name,
+            "uid": self.uid,
+            "token": self.token,
+            "owner": self.owner,
+            "desiredRevision": self.desired_revision,
+            "expiresAt": self.expires_at,
+            **({"snapshot": self.snapshot.document()} if self.snapshot is not None else {}),
+        }
+
+    @classmethod
+    def from_document(cls, document: object, expected_name: str) -> EffectLease:
+        if not isinstance(document, dict) or set(document) not in (
+            {
+                "schema",
+                "kind",
+                "unitName",
+                "uid",
+                "token",
+                "owner",
+                "desiredRevision",
+                "expiresAt",
+            },
+            {
+                "schema",
+                "kind",
+                "unitName",
+                "uid",
+                "token",
+                "owner",
+                "desiredRevision",
+                "expiresAt",
+                "snapshot",
+            },
+        ):
+            raise ValueError("invalid effect lease envelope")
+        uid = document.get("uid")
+        token = document.get("token")
+        owner = document.get("owner")
+        desired_revision = document.get("desiredRevision")
+        expires_at = document.get("expiresAt")
+        if (
+            type(document.get("schema")) is not int
+            or document.get("schema") != 1
+            or document.get("kind") != "UnitEffectLease"
+            or document.get("unitName") != expected_name
+            or not isinstance(uid, str)
+            or not isinstance(token, str)
+            or not isinstance(owner, str)
+            or not isinstance(desired_revision, str)
+            or (
+                expires_at is not None
+                and (not isinstance(expires_at, int) or isinstance(expires_at, bool) or expires_at < 1)
+            )
+            or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", uid)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", token)
+            or not owner
+            or not re.fullmatch(r"[0-9a-f]{40}", desired_revision)
+        ):
+            raise ValueError("invalid effect lease fence")
+        ResourceMetadata(
+            name=expected_name,
+            uid=uid,
+            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
+        ).validate_desired()
+        snapshot = EffectLeaseSnapshot.from_document(document["snapshot"]) if "snapshot" in document else None
+        return cls(
+            unit_name=expected_name,
+            uid=uid,
+            token=token,
+            owner=owner,
+            desired_revision=desired_revision,
+            expires_at=expires_at,
+            snapshot=snapshot,
+        )
+
+
+@dataclass(frozen=True)
+class EffectLeaseAcquisition:
+    lease: EffectLease
+    revision: str
+
+
+def renew_effect_lease(
+    desired_ref: str,
+    acquisition: EffectLeaseAcquisition,
+    *,
+    ttl_seconds: int = EFFECT_LEASE_TTL_SECONDS,
+) -> EffectLeaseAcquisition:
+    """Renew one lease against the latest head while fencing the same Unit snapshot."""
+
+    if ttl_seconds < 1:
+        raise OperationError("effect lease TTL must be positive")
+    for attempt in range(5):
+        current_revision = fetch_ref(desired_ref)
+        if current_revision is None:
+            raise EffectLeaseUnavailable(
+                f"desired ref disappeared while renewing the effect lease for {acquisition.lease.unit_name!r}"
+            )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            current = Path(temporary_directory) / "desired"
+            materialize_revision(current_revision, current)
+            existing = load_desired_effect_leases(current).get(acquisition.lease.unit_name)
+            if (
+                existing is None
+                or existing.token != acquisition.lease.token
+                or existing.uid != acquisition.lease.uid
+                or acquisition.lease.snapshot is None
+                or existing.snapshot != acquisition.lease.snapshot
+                or effect_lease_snapshot(current, acquisition.lease.unit_name, acquisition.lease.uid)
+                != acquisition.lease.snapshot
+            ):
+                raise EffectLeaseUnavailable(
+                    f"effect lease for {acquisition.lease.unit_name!r} no longer fences the same Unit snapshot"
+                )
+            renewed = replace(
+                existing,
+                desired_revision=current_revision,
+                expires_at=None,
+            )
+            write_effect_lease(current, renewed)
+            try:
+                published_revision = publish_tree(
+                    desired_ref,
+                    current,
+                    current_revision,
+                    f"Renew effect lease for {renewed.unit_name} ({renewed.token})",
+                )
+            except subprocess.CalledProcessError as exc:
+                if attempt == 4 or not retryable_push_failure(exc):
+                    raise
+                continue
+            return EffectLeaseAcquisition(lease=renewed, revision=published_revision)
+    raise EffectLeaseUnavailable(f"could not renew the effect lease for {acquisition.lease.unit_name!r}; retry")
+
+
+class EffectLeaseHeartbeat:
+    """Renew a desired-state lease while a driver effect is in progress."""
+
+    def __init__(self, desired_ref: str, acquisition: EffectLeaseAcquisition, interval_seconds: float):
+        self._desired_ref = desired_ref
+        self._latest = acquisition
+        self._interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._error: Exception | None = None
+        self._thread = threading.Thread(target=self._run, name="gitopsctr-effect-lease", daemon=True)
+
+    def start(self) -> EffectLeaseHeartbeat:
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            try:
+                with self._lock:
+                    self._latest = renew_effect_lease(self._desired_ref, self._latest)
+            except Exception as exc:
+                self._error = exc
+                self._stop.set()
+                return
+
+    def stop(self) -> EffectLeaseAcquisition:
+        self._stop.set()
+        self._thread.join()
+        if self._error is not None:
+            if isinstance(self._error, EffectLeaseUnavailable):
+                raise self._error
+            raise EffectLeaseUnavailable(f"effect lease heartbeat failed: {self._error}") from self._error
+        with self._lock:
+            return self._latest
+
+
+def start_effect_lease_heartbeat(
+    desired_ref: str,
+    acquisition: EffectLeaseAcquisition,
+    *,
+    interval_seconds: float | None = None,
+) -> EffectLeaseHeartbeat:
+    interval = interval_seconds if interval_seconds is not None else min(30.0, EFFECT_LEASE_TTL_SECONDS / 3)
+    return EffectLeaseHeartbeat(desired_ref, acquisition, max(0.01, interval)).start()
+
+
 @dataclass(frozen=True)
 class UnitDeletionIntent:
     """Durable, UID-fenced intent to finalize one source-tracked Unit."""
@@ -2042,17 +2330,25 @@ class UnitDeletionIntent:
     retained_kind: str
     retained_driver: str
     retained_source_revision: str | None
+    retained_owner: DesiredOwnerReference | None
+    retained_dependencies: tuple[str, ...]
+    retained_identity_known: bool = True
 
     @classmethod
     def from_unit(cls, unit: UnitResource[Any], path: Path, root: Path) -> UnitDeletionIntent:
         unit.metadata.validate_desired()
         lifecycle = unit.metadata.lifecycle
-        if lifecycle is None or lifecycle.management is None or lifecycle.management.mode != "sourceTracked":
+        if lifecycle is None or (
+            lifecycle.owner is None and (lifecycle.management is None or lifecycle.management.mode != "sourceTracked")
+        ):
             raise OperationError(f"{unit.name} cannot receive a source-tracked deletion intent")
         source = getattr(unit.spec, "source", None)
         if source is not None and not isinstance(source, DesiredSource):
             raise OperationError(f"{unit.name} has an invalid retained source identity")
         require_unit(unit, unit.name)
+        retained_dependencies = tuple(
+            sorted(observation_reference_units(unit.driver.desired_unit_contract.dump(unit.spec)))
+        )
         assert unit.metadata.uid is not None
         return cls(
             unit_name=unit.name,
@@ -2068,6 +2364,8 @@ class UnitDeletionIntent:
             retained_kind=unit.gvk.kind,
             retained_driver=unit.driver_name,
             retained_source_revision=source.revision if source is not None else None,
+            retained_owner=lifecycle.owner,
+            retained_dependencies=retained_dependencies,
         )
 
     def document(self) -> JsonObject:
@@ -2088,11 +2386,19 @@ class UnitDeletionIntent:
                 "kind": self.retained_kind,
                 "driver": self.retained_driver,
                 "sourceRevision": self.retained_source_revision,
+                "owner": self.retained_owner.to_dict() if self.retained_owner is not None else None,
+                "dependencies": list(self.retained_dependencies),
+                **({"identityKnown": False} if not self.retained_identity_known else {}),
             },
         }
 
     @classmethod
-    def from_document(cls, document: object, expected_name: str) -> UnitDeletionIntent:
+    def from_document(
+        cls,
+        document: object,
+        expected_name: str,
+        retained_unit: UnitResource[Any] | None = None,
+    ) -> UnitDeletionIntent:
         if not isinstance(document, dict):
             raise ValueError("deletion intent must be a mapping")
         expected_keys = {
@@ -2148,19 +2454,49 @@ class UnitDeletionIntent:
         ):
             raise ValueError("cleanup identity must retain a desired Unit path")
         raw_identity = document.get("retainedIdentity")
-        if not isinstance(raw_identity, dict) or set(raw_identity) != {
-            "unitBlob",
-            "apiVersion",
-            "kind",
-            "driver",
-            "sourceRevision",
-        }:
+        legacy_identity_keys = {"unitBlob", "apiVersion", "kind", "driver", "sourceRevision"}
+        canonical_identity_keys = legacy_identity_keys | {"owner", "dependencies"}
+        marked_identity_keys = canonical_identity_keys | {"identityKnown"}
+        if not isinstance(raw_identity, dict) or set(raw_identity) not in (
+            legacy_identity_keys,
+            canonical_identity_keys,
+            marked_identity_keys,
+        ):
             raise ValueError("invalid retained unit identity")
         retained_blob = raw_identity.get("unitBlob")
         retained_api_version = raw_identity.get("apiVersion")
         retained_kind = raw_identity.get("kind")
         retained_driver = raw_identity.get("driver")
         retained_source_revision = raw_identity.get("sourceRevision")
+        raw_owner = raw_identity.get("owner")
+        raw_dependencies = raw_identity.get("dependencies")
+        identity_known = True
+        if set(raw_identity) == legacy_identity_keys:
+            identity_known = False
+            if (
+                retained_unit is not None
+                and retained_unit.metadata.uid == uid
+                and retained_unit.gvk.api_version == retained_api_version
+                and retained_unit.gvk.kind == retained_kind
+                and retained_unit.driver_name == retained_driver
+            ):
+                retained_lifecycle = retained_unit.metadata.lifecycle
+                raw_owner = (
+                    retained_lifecycle.owner.to_dict()
+                    if retained_lifecycle is not None and retained_lifecycle.owner is not None
+                    else None
+                )
+                raw_dependencies = list(
+                    observation_reference_units(retained_unit.driver.desired_unit_contract.dump(retained_unit.spec))
+                )
+                identity_known = True
+            else:
+                raw_owner = None
+                raw_dependencies = []
+        elif "identityKnown" in raw_identity:
+            if type(raw_identity["identityKnown"]) is not bool:
+                raise ValueError("invalid retained unit identity marker")
+            identity_known = raw_identity["identityKnown"]
         if (
             not isinstance(retained_blob, str)
             or not re.fullmatch(r"[0-9a-f]{40}", retained_blob)
@@ -2168,8 +2504,15 @@ class UnitDeletionIntent:
             or not isinstance(retained_kind, str)
             or not isinstance(retained_driver, str)
             or (retained_source_revision is not None and not isinstance(retained_source_revision, str))
+            or (raw_owner is not None and not isinstance(raw_owner, dict))
+            or not isinstance(raw_dependencies, list)
+            or not all(isinstance(dependency, str) and dependency for dependency in raw_dependencies)
         ):
             raise ValueError("invalid retained unit identity")
+        try:
+            retained_owner = DesiredOwnerReference.from_dict(raw_owner) if raw_owner is not None else None
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid retained owner identity") from exc
         return cls(
             unit_name=expected_name,
             uid=uid,
@@ -2181,6 +2524,9 @@ class UnitDeletionIntent:
             retained_kind=retained_kind,
             retained_driver=retained_driver,
             retained_source_revision=retained_source_revision,
+            retained_owner=retained_owner,
+            retained_dependencies=tuple(sorted(set(raw_dependencies))),
+            retained_identity_known=identity_known,
         )
 
 
@@ -2257,12 +2603,322 @@ def desired_deletion_intent_paths(root: Path) -> tuple[Path, ...]:
     return tuple(paths)
 
 
+def desired_effect_lease_paths(root: Path) -> tuple[Path, ...]:
+    directory = root / DESIRED_EFFECT_LEASES_PATH
+    if not directory.is_dir():
+        return ()
+    paths = sorted(path for path in directory.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"})
+    names: dict[str, Path] = {}
+    for path in paths:
+        if path.stem in names:
+            raise OperationError(f"multiple effect lease formats exist for {path.stem!r}")
+        names[path.stem] = path
+    return tuple(paths)
+
+
+def load_desired_effect_leases(root: Path) -> dict[str, EffectLease]:
+    leases: dict[str, EffectLease] = {}
+    for path in desired_effect_lease_paths(root):
+        name = path.stem
+        try:
+            lease = EffectLease.from_document(load_json(path), name)
+        except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
+            raise OperationError(f"invalid effect lease for {name!r}") from exc
+        leases[name] = lease
+    return leases
+
+
+def effect_lease_snapshot(root: Path, unit_name: str, uid: str) -> EffectLeaseSnapshot:
+    unit_paths = document_candidates(root / "units", unit_name)
+    if len(unit_paths) > 1:
+        raise OperationError(f"multiple desired Unit formats exist for leased unit {unit_name!r}")
+    unit_path = unit_paths[0] if unit_paths else None
+    api_version = kind = driver = source_revision = unit_blob = None
+    if unit_path is not None:
+        unit = load_desired_unit(unit_path, unit_name)
+        unit.metadata.validate_desired()
+        if unit.metadata.uid != uid:
+            raise OperationError(f"leased desired Unit {unit_name!r} has a different UID")
+        source = getattr(unit.spec, "source", None)
+        unit_blob = file_blob(unit_path)
+        api_version = unit.gvk.api_version
+        kind = unit.gvk.kind
+        driver = unit.driver_name
+        source_revision = source.revision if isinstance(source, DesiredSource) else None
+
+    intent_paths = document_candidates(root / DESIRED_DELETION_INTENTS_PATH, unit_name)
+    if len(intent_paths) > 1:
+        raise OperationError(f"multiple deletion intent formats exist for leased unit {unit_name!r}")
+    cleanup_paths = document_candidates(root / DESIRED_CLEANUP_UNITS_PATH, unit_name)
+    if len(cleanup_paths) > 1:
+        raise OperationError(f"multiple cleanup formats exist for leased unit {unit_name!r}")
+    return EffectLeaseSnapshot(
+        unit_path=unit_path.relative_to(root).as_posix() if unit_path is not None else None,
+        unit_blob=unit_blob,
+        api_version=api_version,
+        kind=kind,
+        driver=driver,
+        source_revision=source_revision,
+        deletion_intent_path=(intent_paths[0].relative_to(root).as_posix() if intent_paths else None),
+        deletion_intent_blob=file_blob(intent_paths[0]) if intent_paths else None,
+        cleanup_path=cleanup_paths[0].relative_to(root).as_posix() if cleanup_paths else None,
+        cleanup_blob=file_blob(cleanup_paths[0]) if cleanup_paths else None,
+    )
+
+
+def write_effect_lease(root: Path, lease: EffectLease) -> Path:
+    if lease.snapshot is None:
+        lease = replace(lease, snapshot=effect_lease_snapshot(root, lease.unit_name, lease.uid))
+    directory = root / DESIRED_EFFECT_LEASES_PATH
+    for path in document_candidates(directory, lease.unit_name):
+        path.unlink()
+    return write_document(directory / f"{lease.unit_name}.json", lease.document(), format=DocumentFormat.JSON)
+
+
+def remove_effect_lease(root: Path, unit_name: str) -> None:
+    for path in document_candidates(root / DESIRED_EFFECT_LEASES_PATH, unit_name):
+        path.unlink()
+
+
+def effect_lease_owner() -> str:
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
+    host = os.uname().nodename
+    return f"{run_id or 'local'}-{attempt}-{host}-{os.getpid()}"
+
+
+def effect_lease_token() -> str:
+    return f"lease-{hashlib.sha256(os.urandom(32)).hexdigest()}"
+
+
+def effect_lease_now() -> int:
+    return int(datetime.now(UTC).timestamp())
+
+
+def effect_lease_active(_lease: EffectLease) -> bool:
+    """All persisted leases are active until token-fenced release or recovery."""
+
+    return True
+
+
+def acquire_effect_lease(
+    desired_ref: str,
+    desired_revision: str,
+    unit_name: str,
+    uid: str,
+    *,
+    ttl_seconds: int = EFFECT_LEASE_TTL_SECONDS,
+) -> EffectLeaseAcquisition:
+    if ttl_seconds < 1:
+        raise OperationError("effect lease TTL must be positive")
+    expected_snapshot: EffectLeaseSnapshot | None = None
+    for attempt in range(5):
+        current_revision = fetch_ref(desired_ref)
+        if current_revision is None:
+            raise EffectLeaseUnavailable(f"desired ref disappeared before acquiring the effect lease for {unit_name!r}")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            current = Path(temporary_directory) / "desired"
+            materialize_revision(current_revision, current)
+            if expected_snapshot is None:
+                if current_revision == desired_revision:
+                    expected_snapshot = effect_lease_snapshot(current, unit_name, uid)
+                else:
+                    with tempfile.TemporaryDirectory() as initial_directory:
+                        initial = Path(initial_directory) / "initial"
+                        materialize_revision(desired_revision, initial)
+                        expected_snapshot = effect_lease_snapshot(initial, unit_name, uid)
+            if effect_lease_snapshot(current, unit_name, uid) != expected_snapshot:
+                raise EffectLeaseUnavailable(
+                    f"desired Unit {unit_name!r} changed before acquiring its effect lease; retry"
+                )
+            leases = load_desired_effect_leases(current)
+            existing = leases.get(unit_name)
+            if existing is not None:
+                raise EffectLeaseUnavailable(
+                    f"effect lease for {unit_name!r} is held by {existing.owner}; explicit UID/token recovery is required"
+                )
+            snapshot = effect_lease_snapshot(current, unit_name, uid)
+            lease = EffectLease(
+                unit_name=unit_name,
+                uid=uid,
+                token=effect_lease_token(),
+                owner=effect_lease_owner(),
+                desired_revision=current_revision,
+                expires_at=None,
+                snapshot=snapshot,
+            )
+            write_effect_lease(current, lease)
+            try:
+                published_revision = publish_tree(
+                    desired_ref,
+                    current,
+                    current_revision,
+                    f"Acquire effect lease for {unit_name} ({lease.token})",
+                )
+            except subprocess.CalledProcessError as exc:
+                if attempt == 4 or not retryable_push_failure(exc):
+                    raise
+                continue
+            return EffectLeaseAcquisition(lease=lease, revision=published_revision)
+    raise EffectLeaseUnavailable(f"could not acquire the effect lease for {unit_name!r}; retry")
+
+
+def release_effect_lease(desired_ref: str, unit_name: str, token: str, uid: str | None = None) -> str | None:
+    for attempt in range(5):
+        current_revision = fetch_ref(desired_ref)
+        if current_revision is None:
+            return None
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            current = Path(temporary_directory) / "desired"
+            materialize_revision(current_revision, current)
+            leases = load_desired_effect_leases(current)
+            existing = leases.get(unit_name)
+            if existing is None:
+                return current_revision
+            if existing.token != token or (uid is not None and existing.uid != uid):
+                raise OperationError(f"effect lease for {unit_name!r} is held by another runner")
+            if (
+                existing.snapshot is None
+                or effect_lease_snapshot(current, unit_name, existing.uid) != existing.snapshot
+            ):
+                raise EffectLeaseUnavailable(f"effect lease for {unit_name!r} no longer fences the same Unit snapshot")
+            remove_effect_lease(current, unit_name)
+            try:
+                return publish_tree(
+                    desired_ref,
+                    current,
+                    current_revision,
+                    f"Release effect lease for {unit_name}",
+                )
+            except subprocess.CalledProcessError as exc:
+                if attempt == 4 or not retryable_push_failure(exc):
+                    raise
+    raise OperationError(f"could not release the effect lease for {unit_name!r}; explicit recovery remains available")
+
+
+def recover_effect_lease(desired_ref: str, unit_name: str, uid: str, token: str) -> str | None:
+    """Explicitly clear an abandoned lease after the external effect is verified stopped."""
+
+    for attempt in range(5):
+        current_revision = fetch_ref(desired_ref)
+        if current_revision is None:
+            return None
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            current = Path(temporary_directory) / "desired"
+            materialize_revision(current_revision, current)
+            existing = load_desired_effect_leases(current).get(unit_name)
+            if existing is None:
+                return current_revision
+            if existing.uid != uid or existing.token != token:
+                raise EffectLeaseUnavailable(
+                    f"effect lease recovery fence did not match the current {unit_name!r} lease"
+                )
+            remove_effect_lease(current, unit_name)
+            try:
+                return publish_tree(
+                    desired_ref,
+                    current,
+                    current_revision,
+                    f"Recover abandoned effect lease for {unit_name}",
+                )
+            except subprocess.CalledProcessError as exc:
+                if attempt == 4 or not retryable_push_failure(exc):
+                    raise
+    raise OperationError(f"could not recover the effect lease for {unit_name!r}; retry")
+
+
+def rebase_effect_completion(
+    desired_ref: str,
+    acquisition: EffectLeaseAcquisition,
+    unit_name: str,
+    uid: str,
+    current_root: Path,
+) -> EffectLeaseAcquisition:
+    """Refresh local desired state after an effect while preserving its Unit fence."""
+
+    if acquisition.lease.snapshot is None:
+        raise EffectLeaseUnavailable(
+            f"effect lease for {unit_name!r} lacks an immutable completion snapshot; retry or recover explicitly"
+        )
+    latest_revision = fetch_ref(desired_ref)
+    if latest_revision is None:
+        raise EffectLeaseUnavailable(f"desired ref disappeared before completing {unit_name!r}")
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        latest = Path(temporary_directory) / "desired"
+        materialize_revision(latest_revision, latest)
+        existing = load_desired_effect_leases(latest).get(unit_name)
+        if (
+            existing is None
+            or existing.token != acquisition.lease.token
+            or existing.uid != uid
+            or existing.snapshot != acquisition.lease.snapshot
+            or effect_lease_snapshot(latest, unit_name, uid) != acquisition.lease.snapshot
+        ):
+            raise EffectLeaseUnavailable(
+                f"desired Unit {unit_name!r} changed during effect completion; result was not published"
+            )
+        shutil.rmtree(current_root)
+        shutil.copytree(latest, current_root)
+        return EffectLeaseAcquisition(
+            lease=replace(existing, desired_revision=latest_revision),
+            revision=latest_revision,
+        )
+
+
+def validate_effect_lease_head(
+    desired_ref: str,
+    unit_name: str,
+    uid: str,
+    token: str,
+    snapshot: EffectLeaseSnapshot | None,
+) -> str:
+    """Validate one Unit fence at the latest desired head without fencing unrelated Units."""
+
+    if snapshot is None:
+        raise EffectLeaseUnavailable(f"effect lease for {unit_name!r} lacks an immutable snapshot")
+    latest_revision = fetch_ref(desired_ref)
+    if latest_revision is None:
+        raise EffectLeaseUnavailable(f"desired ref disappeared before publishing {unit_name!r}")
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        latest = Path(temporary_directory) / "desired"
+        materialize_revision(latest_revision, latest)
+        existing = load_desired_effect_leases(latest).get(unit_name)
+        if (
+            existing is None
+            or existing.token != token
+            or existing.uid != uid
+            or existing.snapshot != snapshot
+            or effect_lease_snapshot(latest, unit_name, uid) != snapshot
+        ):
+            raise EffectLeaseUnavailable(f"desired Unit {unit_name!r} changed before completion publication")
+    return latest_revision
+
+
 def load_desired_deletion_intents(root: Path) -> dict[str, UnitDeletionIntent]:
     intents: dict[str, UnitDeletionIntent] = {}
     for path in desired_deletion_intent_paths(root):
         name = path.stem
         try:
-            intent = UnitDeletionIntent.from_document(load_json(path), name)
+            document = load_json(path)
+            retained_unit = None
+            retained_path: Path | None = None
+            raw_cleanup = document.get("cleanupIdentity")
+            if isinstance(raw_cleanup, dict) and isinstance(raw_cleanup.get("path"), str):
+                retained_path = root / PurePosixPath(raw_cleanup["path"])
+                if retained_path.is_file():
+                    try:
+                        retained_unit = load_desired_unit(retained_path, name)
+                    except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError):
+                        retained_unit = None
+            intent = UnitDeletionIntent.from_document(document, name, retained_unit)
+            if retained_unit is not None and retained_path is not None:
+                try:
+                    validate_retained_deletion_unit(retained_unit, retained_path, intent)
+                except OperationError:
+                    intent = replace(
+                        UnitDeletionIntent.from_document(document, name),
+                        retained_identity_known=False,
+                    )
         except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
             raise OperationError(f"invalid deletion intent for {name!r}") from exc
         intents[name] = intent
@@ -2293,6 +2949,15 @@ def validate_retained_deletion_unit(
         source_revision = None
     if (source_revision.revision if source_revision is not None else None) != intent.retained_source_revision:
         raise OperationError(f"retained source revision for {intent.unit_name!r} changed after deletion was requested")
+    lifecycle = unit.metadata.lifecycle
+    owner = lifecycle.owner if lifecycle is not None else None
+    if owner != intent.retained_owner:
+        raise OperationError(f"retained owner identity for {intent.unit_name!r} changed after deletion was requested")
+    dependencies = tuple(sorted(observation_reference_units(unit.driver.desired_unit_contract.dump(unit.spec))))
+    if dependencies != intent.retained_dependencies:
+        raise OperationError(
+            f"retained dependency identity for {intent.unit_name!r} changed after deletion was requested"
+        )
     return require_unit(unit, intent.unit_name)
 
 
@@ -2322,14 +2987,62 @@ def deletion_intent_reason(intent: UnitDeletionIntent) -> str:
     )
 
 
-def load_teardown_evidence(root: Path, unit_name: str) -> TeardownEvidence | None:
-    paths = document_candidates(root / OBSERVED_TEARDOWN_EVIDENCE_PATH, unit_name)
-    if len(paths) > 1:
-        raise OperationError(f"multiple teardown evidence formats exist for {unit_name!r}")
-    if not paths:
+def teardown_evidence_filename(unit_name: str, uid: str, deletion_generation: int) -> str:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", uid):
+        raise OperationError("teardown evidence identity is not safe for a filename")
+    if deletion_generation < 1:
+        raise OperationError("teardown evidence generation must be positive")
+    return f"{unit_name}.{uid}.{deletion_generation}.json"
+
+
+def load_teardown_evidence(
+    root: Path,
+    unit_name: str,
+    uid: str | None = None,
+    deletion_generation: int | None = None,
+) -> TeardownEvidence | None:
+    directory = root / OBSERVED_TEARDOWN_EVIDENCE_PATH
+    if not directory.is_dir():
+        return None
+    candidates = sorted(
+        path
+        for path in directory.iterdir()
+        if path.is_file()
+        and path.suffix in {".json", ".yaml", ".yml"}
+        and (
+            path.name in {f"{unit_name}.json", f"{unit_name}.yaml", f"{unit_name}.yml"}
+            or path.name.startswith(f"{unit_name}.")
+        )
+    )
+    selected: list[Path] = []
+    for path in candidates:
+        try:
+            evidence = TeardownEvidence.from_document(load_json(path), unit_name)
+        except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
+            raise OperationError(f"invalid teardown evidence for {unit_name!r}") from exc
+        legacy_filename = f"{unit_name}{path.suffix}"
+        if path.name != legacy_filename and path.name != teardown_evidence_filename(
+            unit_name, evidence.uid, evidence.deletion_generation
+        ):
+            raise OperationError(f"teardown evidence filename does not match its fence for {unit_name!r}")
+        if uid is not None and deletion_generation is not None:
+            if evidence.uid == uid and evidence.deletion_generation == deletion_generation:
+                selected.append(path)
+        else:
+            selected.append(path)
+    if len(selected) > 1:
+        legacy = [
+            path for path in selected if path.name in {f"{unit_name}.json", f"{unit_name}.yaml", f"{unit_name}.yml"}
+        ]
+        keyed = [path for path in selected if path not in legacy]
+        if len(legacy) == 1 and len(keyed) == 1:
+            selected = keyed
+        else:
+            raise OperationError(f"multiple teardown evidence fences exist for {unit_name!r}")
+    if not selected:
         return None
     try:
-        return TeardownEvidence.from_document(load_json(paths[0]), unit_name)
+        return TeardownEvidence.from_document(load_json(selected[0]), unit_name)
     except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
         raise OperationError(f"invalid teardown evidence for {unit_name!r}") from exc
 
@@ -2338,24 +3051,49 @@ def publish_teardown_observation_cas(
     observed_ref: str,
     intent: UnitDeletionIntent,
     desired_revision: str,
+    *,
+    desired_ref: str | None = None,
+    lease_token: str | None = None,
+    lease_snapshot: EffectLeaseSnapshot | None = None,
 ) -> str:
-    evidence = TeardownEvidence(
-        unit_name=intent.unit_name,
-        uid=intent.uid,
-        deletion_generation=intent.deletion_generation,
-        desired_revision=desired_revision,
-    )
     for attempt in range(5):
         if attempt:
             log_status("RETRY", f"teardown observation publish attempt {attempt + 1}/5")
         with tempfile.TemporaryDirectory() as temporary_directory:
             observed = Path(temporary_directory) / "observed"
             observed_revision = observed_tree(observed_ref, observed)
-            existing = load_teardown_evidence(observed, intent.unit_name)
-            if existing is not None and (
-                existing.uid != evidence.uid or existing.deletion_generation != evidence.deletion_generation
-            ):
-                raise OperationError(f"observed teardown evidence for {intent.unit_name!r} has a different fence")
+            if desired_ref is not None and lease_token is not None:
+                desired_revision = validate_effect_lease_head(
+                    desired_ref,
+                    intent.unit_name,
+                    intent.uid,
+                    lease_token,
+                    lease_snapshot,
+                )
+            evidence = TeardownEvidence(
+                unit_name=intent.unit_name,
+                uid=intent.uid,
+                deletion_generation=intent.deletion_generation,
+                desired_revision=desired_revision,
+            )
+            existing = load_teardown_evidence(
+                observed,
+                intent.unit_name,
+                intent.uid,
+                intent.deletion_generation,
+            )
+            legacy_evidence_removed = False
+            for legacy_path in document_candidates(observed / OBSERVED_TEARDOWN_EVIDENCE_PATH, intent.unit_name):
+                try:
+                    legacy_evidence = TeardownEvidence.from_document(load_json(legacy_path), intent.unit_name)
+                except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
+                    raise OperationError(f"invalid teardown evidence for {intent.unit_name!r}") from exc
+                if (
+                    legacy_evidence.uid == intent.uid
+                    and legacy_evidence.deletion_generation == intent.deletion_generation
+                ):
+                    legacy_path.unlink()
+                    legacy_evidence_removed = True
             receipt_paths = document_candidates(observed / "units", intent.unit_name)
             artifact_path = observed / "artifacts" / intent.unit_name
             had_active_observation = bool(receipt_paths) or artifact_path.exists()
@@ -2365,9 +3103,34 @@ def publish_teardown_observation_cas(
                 shutil.rmtree(artifact_path)
             elif artifact_path.is_symlink():
                 artifact_path.unlink()
-            evidence_path = observed / OBSERVED_TEARDOWN_EVIDENCE_PATH / f"{intent.unit_name}.json"
+            evidence_path = (
+                observed
+                / OBSERVED_TEARDOWN_EVIDENCE_PATH
+                / teardown_evidence_filename(intent.unit_name, intent.uid, intent.deletion_generation)
+            )
+            if desired_ref is not None and lease_token is not None:
+                latest_revision = validate_effect_lease_head(
+                    desired_ref,
+                    intent.unit_name,
+                    intent.uid,
+                    lease_token,
+                    lease_snapshot,
+                )
+                if latest_revision != desired_revision:
+                    desired_revision = latest_revision
+                    evidence = TeardownEvidence(
+                        unit_name=intent.unit_name,
+                        uid=intent.uid,
+                        deletion_generation=intent.deletion_generation,
+                        desired_revision=desired_revision,
+                    )
             write_document(evidence_path, evidence.document(), format=DocumentFormat.JSON)
-            if existing is not None and not had_active_observation and observed_revision is not None:
+            if (
+                existing is not None
+                and not legacy_evidence_removed
+                and not had_active_observation
+                and observed_revision is not None
+            ):
                 return observed_revision
             try:
                 return publish_tree(
@@ -2515,7 +3278,10 @@ def load_desired_cleanup_roots(root: Path) -> dict[str, OpaqueCleanupRoot]:
 
 def write_opaque_cleanup_root(root: Path, name: str, opaque: OpaqueCleanupRoot) -> Path:
     suffix = opaque.path.suffix if opaque.path.suffix in {".json", ".yaml", ".yml"} else ".json"
-    path = root / DESIRED_CLEANUP_UNITS_PATH / f"{name}{suffix}"
+    directory = root / DESIRED_CLEANUP_UNITS_PATH
+    for existing in document_candidates(directory, name):
+        existing.unlink()
+    path = directory / f"{name}{suffix}"
     write_document(
         path,
         {
@@ -2908,6 +3674,44 @@ def build_desired_candidate(
             )
             if verbose:
                 log_status("WAIT", f"{style_unit(unit_name)}: {deletion_reason}")
+    # A source-absent parent makes its owned/dependent closure deletion obligations
+    # explicit as well, even when a child still appears in the source snapshot.
+    closure_changed = True
+    while closure_changed:
+        closure_changed = False
+        resources = load_desired_resource_graph(candidate)
+        for parent_name, parent_intent in tuple(deletion_intents.items()):
+            parent_key = (
+                parent_intent.retained_api_version,
+                parent_intent.retained_kind,
+                parent_name,
+            )
+            for _child_name, child in resources.items():
+                child_resource_name = child.name
+                if child_resource_name == parent_name or child_resource_name in deletion_intents:
+                    continue
+                lifecycle = child.metadata.lifecycle
+                owner = lifecycle.owner if lifecycle is not None else None
+                owner_match = (
+                    owner is not None
+                    and (owner.apiVersion, owner.kind, owner.name) == parent_key
+                    and owner.uid == parent_intent.uid
+                )
+                if not owner_match:
+                    continue
+                child_path = unit_document_path(candidate, child_resource_name)
+                child_intent = UnitDeletionIntent.from_unit(child, child_path, candidate)
+                deletion_intents[child_resource_name] = child_intent
+                write_deletion_intent(candidate, child_intent)
+                child_reason = deletion_intent_reason(child_intent)
+                blocked_transitions[child_resource_name] = child_reason
+                blocked[child_resource_name] = child_reason
+                cleanup_inputs[child_resource_name] = DesiredCleanupInput(
+                    unit_name=child_resource_name,
+                    desired=child,
+                    source=getattr(child.spec, "source", None),
+                )
+                closure_changed = True
     for unit_name, opaque in opaque_transitions.items():
         write_opaque_cleanup_root(candidate, unit_name, opaque)
         cleanup_inputs[unit_name] = DesiredCleanupInput(
@@ -3133,6 +3937,20 @@ def advance_desired(
             observed = temporary / "observed"
             candidate = temporary / "candidate"
             current_revision = observed_tree(desired_ref, current_desired)
+            if current_revision is not None:
+                active_leases = [
+                    lease
+                    for lease in load_desired_effect_leases(current_desired).values()
+                    if effect_lease_active(lease)
+                ]
+                if active_leases:
+                    if verbose:
+                        log_status(
+                            "WAIT",
+                            "desired state is leased for effect: "
+                            + ", ".join(f"{lease.unit_name} by {lease.owner}" for lease in active_leases),
+                        )
+                    return current_revision, False
             promotion = load_promotion_context(current_desired, temporary)
             if requested_source_revision is None and promotion is None:
                 raise OperationError(f"promotion-tracked environment {environment} requires a merged promotion")
@@ -3233,6 +4051,79 @@ def command_advance_desired(args: argparse.Namespace) -> None:
             stream.write(f"desired_revision={revision or ''}\n")
 
 
+def validate_effect_leases_preserved(
+    target_ref: str,
+    target_revision: str | None,
+    candidate: Path,
+    current_root: Path | None = None,
+    allow_removed_units: frozenset[str] = frozenset(),
+) -> None:
+    """Prevent a desired-ref mutation from dropping an in-flight effect fence."""
+
+    if target_revision is None:
+        return
+    temporary_directory = None
+    if current_root is None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        current = Path(temporary_directory.name) / "current"
+        materialize_revision(target_revision, current)
+    else:
+        current = current_root
+    try:
+        active = {
+            name: lease for name, lease in load_desired_effect_leases(current).items() if effect_lease_active(lease)
+        }
+        if not active:
+            return
+        candidate_leases = load_desired_effect_leases(candidate)
+        empty_snapshot = EffectLeaseSnapshot(
+            unit_path=None,
+            unit_blob=None,
+            api_version=None,
+            kind=None,
+            driver=None,
+            source_revision=None,
+            deletion_intent_path=None,
+            deletion_intent_blob=None,
+            cleanup_path=None,
+            cleanup_blob=None,
+        )
+        for name, lease in sorted(active.items()):
+            candidate_lease = candidate_leases.get(name)
+            if candidate_lease != lease:
+                raise EffectLeaseUnavailable(
+                    f"desired-state mutation would drop or alter active effect lease for {name!r}"
+                )
+            if lease.snapshot is None:
+                raise EffectLeaseUnavailable(
+                    f"active effect lease for {name!r} lacks an immutable snapshot; explicit recovery is required"
+                )
+            current_snapshot = effect_lease_snapshot(current, name, lease.uid)
+            if current_snapshot != lease.snapshot:
+                raise EffectLeaseUnavailable(
+                    f"leased desired state for {name!r} changed before publication; explicit recovery is required"
+                )
+            candidate_snapshot = effect_lease_snapshot(candidate, name, lease.uid)
+            if candidate_snapshot == lease.snapshot:
+                continue
+            if name in allow_removed_units and candidate_snapshot == empty_snapshot:
+                continue
+            raise EffectLeaseUnavailable(
+                f"desired-state mutation changed the immutable leased resource or cleanup input for {name!r}"
+            )
+    finally:
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
+
+
+def copy_active_effect_leases(current: Path, candidate: Path) -> None:
+    """Carry active effect fences into a promotion candidate built from source state."""
+
+    for lease in load_desired_effect_leases(current).values():
+        if effect_lease_active(lease):
+            write_effect_lease(candidate, lease)
+
+
 def publish_change_candidate(
     candidate: Path,
     candidate_ref: str,
@@ -3241,8 +4132,11 @@ def publish_change_candidate(
     commit_message: str,
     title: str,
     body: str,
+    current_root: Path | None = None,
+    allow_removed_units: frozenset[str] = frozenset(),
 ) -> tuple[str, ChangeRequestResult | ManualChangeRequest]:
     load_desired_resource_graph(candidate)
+    validate_effect_leases_preserved(target_ref, target_revision, candidate, current_root, allow_removed_units)
     if git("check-ref-format", "--branch", candidate_ref, check=False).returncode != 0:
         raise OperationError(f"invalid change candidate ref: {candidate_ref!r}")
     if candidate_ref == target_ref:
@@ -3388,6 +4282,8 @@ def command_promote(args: argparse.Namespace) -> None:
             promotion=promotion,
         )
         load_desired_resource_graph(candidate)
+        copy_active_effect_leases(current_target, candidate)
+        validate_effect_leases_preserved(target_desired_ref, target_revision, candidate)
 
         commit_message = f"Promote {args.from_environment} to {args.to_environment} from {source_desired_revision}"
         title = f"Promote {args.from_environment} to {args.to_environment}"
@@ -3428,6 +4324,7 @@ def command_promote(args: argparse.Namespace) -> None:
                 commit_message,
                 title,
                 body,
+                current_target,
             )
             log_status(
                 "CANDIDATE",
@@ -3499,8 +4396,11 @@ def publish_desired_change(
     title: str,
     body: str,
     dry: bool,
+    current_root: Path | None = None,
+    allow_removed_units: frozenset[str] = frozenset(),
 ) -> tuple[str, ChangeRequestResult | ManualChangeRequest | None]:
     load_desired_resource_graph(candidate)
+    validate_effect_leases_preserved(target_ref, target_revision, candidate, current_root, allow_removed_units)
     gate = change_gate(REPOSITORY_ROOT, environment)
     if dry:
         log_status("DRY", f"{style_branch(target_ref)} would receive {title.lower()}")
@@ -3514,6 +4414,8 @@ def publish_desired_change(
             commit_message,
             title,
             body,
+            current_root,
+            allow_removed_units,
         )
         log_status(
             "CANDIDATE",
@@ -3634,6 +4536,12 @@ def merge_current_cleanup_state(current: Path, candidate: Path) -> None:
             if getattr(retained_unit.spec, "materialization", None) is not None:
                 copy_unit_materialization(current, candidate, name, retained_unit)
         else:
+            current_root = current_roots.get(name)
+            if current_root is not None:
+                write_opaque_cleanup_root(candidate, name, current_root)
+                write_deletion_intent(candidate, intent)
+                merged_blocks[name] = deletion_intent_reason(intent)
+                continue
             payload = (
                 opaque_document_payload(retained_path)
                 if retained_path.is_file()
@@ -3667,28 +4575,67 @@ def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[s
     """Find active owned or observation-dependent descendants of a teardown target."""
 
     resources = load_desired_resource_graph(root)
-    target_key = (target.gvk.api_version, target.gvk.kind, target.name)
-    pending = [target_key]
+    intents = load_desired_deletion_intents(root)
+    opaque_roots = load_desired_cleanup_roots(root)
+    target_identity = (target.gvk.api_version, target.gvk.kind, target.name, target.metadata.uid or "")
+    pending = [target_identity]
     dependents: set[str] = set()
+    for opaque_name in opaque_roots:
+        if opaque_name != target.name and opaque_name not in intents:
+            dependents.add(f"{opaque_name} (opaque cleanup root lacks a validated deletion identity)")
     while pending:
-        parent_key = pending.pop()
-        for key, child in resources.items():
-            if key == parent_key or child.name in dependents:
+        parent_identity = pending.pop()
+        parent_names = {parent_identity[2]}
+        for _key, child in resources.items():
+            child_identity = (child.gvk.api_version, child.gvk.kind, child.name, child.metadata.uid or "")
+            if child_identity == parent_identity or child.name in dependents:
                 continue
             lifecycle = child.metadata.lifecycle
             owner = lifecycle.owner if lifecycle is not None else None
-            owner_matches = False
-            if owner is not None:
-                owner_key = (owner.apiVersion, owner.kind, owner.name)
-                parent = resources.get(owner_key)
-                owner_matches = owner_key == parent_key and parent is not None and parent.metadata.uid == owner.uid
+            owner_matches = (
+                owner is not None
+                and (
+                    owner.apiVersion,
+                    owner.kind,
+                    owner.name,
+                    owner.uid,
+                )
+                == parent_identity
+            )
             dependency_matches = bool(
-                observation_reference_units(child.driver.desired_unit_contract.dump(child.spec))
-                & {resources[parent_key].name}
+                observation_reference_units(child.driver.desired_unit_contract.dump(child.spec)) & parent_names
             )
             if owner_matches or dependency_matches:
                 dependents.add(child.name)
-                pending.append(key)
+                pending.append(child_identity)
+        for child_name, intent in intents.items():
+            if child_name in dependents or child_name == target.name:
+                continue
+            if not intent.retained_identity_known:
+                dependents.add(f"{child_name} (deletion intent lacks validated owner/dependency identity)")
+                continue
+            owner = intent.retained_owner
+            owner_matches = (
+                owner is not None
+                and (
+                    owner.apiVersion,
+                    owner.kind,
+                    owner.name,
+                    owner.uid,
+                )
+                == parent_identity
+            )
+            dependency_matches = bool(set(intent.retained_dependencies) & parent_names)
+            if owner_matches or dependency_matches:
+                dependents.add(child_name)
+                pending.append(
+                    (
+                        intent.retained_api_version,
+                        intent.retained_kind,
+                        child_name,
+                        intent.uid,
+                    )
+                )
     return tuple(sorted(dependents))
 
 
@@ -3712,6 +4659,12 @@ def command_rollback(args: argparse.Namespace) -> None:
         current_revision = observed_tree(desired_ref, current)
         if current_revision is None:
             raise OperationError(f"{desired_ref} does not exist")
+        active_leases = [lease for lease in load_desired_effect_leases(current).values() if effect_lease_active(lease)]
+        if active_leases:
+            raise OperationError(
+                "rollback is blocked by active desired-state effect lease(s): "
+                + ", ".join(f"{lease.unit_name} by {lease.owner}" for lease in active_leases)
+            )
         target_revision = resolve_ref(desired_ref, args.to_desired_revision)
         mode = "units" if args.unit else "full"
         if target_revision == current_revision:
@@ -3897,6 +4850,7 @@ def command_rollback(args: argparse.Namespace) -> None:
             title,
             body,
             args.dry,
+            current,
         )
         if args.dry:
             print(json.dumps(provenance, indent=2, sort_keys=True))
@@ -3905,7 +4859,7 @@ def command_rollback(args: argparse.Namespace) -> None:
         write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
 
 
-def command_finalize(args: argparse.Namespace) -> bool:
+def _command_finalize(args: argparse.Namespace) -> bool:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
         raise OperationError(f"invalid unit name: {args.unit!r}")
     if not isinstance(getattr(args, "uid", None), str) or not args.uid:
@@ -3950,14 +4904,24 @@ def command_finalize(args: argparse.Namespace) -> bool:
             lifecycle = unit.metadata.lifecycle
             if unit.is_legacy_compatibility or unit.metadata.uid != intent.uid:
                 raise OperationError("retained desired Unit is not the fenced canonical incarnation")
-            if lifecycle is None or lifecycle.management is None or lifecycle.management.mode != "sourceTracked":
+            if lifecycle is None:
                 raise OperationError("retained desired Unit is not source-tracked")
+            if lifecycle.owner is None and (
+                lifecycle.management is None or lifecycle.management.mode != "sourceTracked"
+            ):
+                raise OperationError("retained desired Unit is not source-tracked or UID-owned")
             if unit_contains_reference(unit):
                 raise OperationError("retained desired Unit contains unresolved inputs")
             require_unit(unit, args.unit)
             validate_retained_deletion_unit(unit, retained_path, intent)
             validate_unit_materialization(current, args.unit, unit)
             load_desired_resource_graph(current)
+            if intent.retained_owner is not None:
+                owner_intent = intents.get(intent.retained_owner.name)
+                if owner_intent is None or owner_intent.uid != intent.retained_owner.uid:
+                    raise OperationError(
+                        f"owner deletion intent for {args.unit!r} is not active; finalize the owner closure in order"
+                    )
             dependents = active_teardown_dependents(current, unit)
             if dependents:
                 raise OperationError(f"active owned/dependent Units must be finalized first: {', '.join(dependents)}")
@@ -3965,16 +4929,19 @@ def command_finalize(args: argparse.Namespace) -> bool:
             log_status("WAIT", f"{style_unit(args.unit)}: {exc}; deletion intent kept")
             return False
         observed_tree(observed_ref, observed)
-        existing_evidence = load_teardown_evidence(observed, args.unit)
-        if existing_evidence is not None and (
-            existing_evidence.uid != intent.uid or existing_evidence.deletion_generation != intent.deletion_generation
-        ):
-            raise OperationError(f"stale observed teardown evidence for {args.unit!r}")
+        existing_evidence = load_teardown_evidence(
+            observed,
+            args.unit,
+            intent.uid,
+            intent.deletion_generation,
+        )
         if existing_evidence is not None and args.dry:
             log_status("DRY", f"{style_unit(args.unit)}: teardown evidence already exists")
             return False
+        driver = unit.driver
+        source = getattr(unit.spec, "source", None)
+        source_root = None
         if existing_evidence is None:
-            driver = unit.driver
             if not isinstance(driver, TeardownCapability):
                 log_status(
                     "WAIT",
@@ -3982,25 +4949,35 @@ def command_finalize(args: argparse.Namespace) -> bool:
                     "install teardown support or resolve the intent explicitly",
                 )
                 return False
-            source = getattr(unit.spec, "source", None)
             if source is not None and not isinstance(source, DesiredSource):
                 log_status(
                     "WAIT", f"{style_unit(args.unit)}: retained source identity is invalid; deletion intent kept"
                 )
                 return False
-            source_root = None
-            if source is not None and source.revision is not None:
-                source_root = temporary / "source"
-                try:
-                    materialize_revision(source.revision, source_root)
-                except (DocumentFormatError, OperationError, subprocess.CalledProcessError) as exc:
-                    log_status("WAIT", f"{style_unit(args.unit)}: retained source is unavailable: {exc}")
-                    return False
             if args.dry:
                 log_status(
                     "DRY", f"{style_unit(args.unit)}: teardown would run at generation {intent.deletion_generation}"
                 )
                 return False
+        try:
+            lease_acquisition = acquire_effect_lease(desired_ref, current_revision, args.unit, intent.uid)
+        except EffectLeaseUnavailable as exc:
+            log_status("WAIT", f"{style_unit(args.unit)}: {exc}")
+            return False
+        write_effect_lease(current, lease_acquisition.lease)
+        current_revision = lease_acquisition.revision
+        assert_desired_ref_fence(desired_ref, current_revision, args.unit, intent.uid)
+        if existing_evidence is None and source is not None and source.revision is not None:
+            source_root = temporary / "source"
+            try:
+                materialize_revision(source.revision, source_root)
+            except (DocumentFormatError, OperationError, subprocess.CalledProcessError) as exc:
+                log_status("WAIT", f"{style_unit(args.unit)}: retained source is unavailable: {exc}")
+                return False
+        if existing_evidence is None:
+            assert isinstance(driver, TeardownCapability)
+            assert_desired_ref_fence(desired_ref, current_revision, args.unit, intent.uid)
+            heartbeat = start_effect_lease_heartbeat(desired_ref, lease_acquisition)
             try:
                 driver.teardown(
                     TeardownContext(
@@ -4019,63 +4996,168 @@ def command_finalize(args: argparse.Namespace) -> bool:
                     )
                 )
             except (DriverError, OperationError, subprocess.CalledProcessError) as exc:
+                try:
+                    heartbeat.stop()
+                except Exception:
+                    pass
                 detail = (exc.stderr or "").strip() if isinstance(exc, subprocess.CalledProcessError) else str(exc)
                 log_status("WAIT", f"{style_unit(args.unit)}: teardown failed: {detail or exc}; deletion intent kept")
                 return False
+            except BaseException:
+                try:
+                    heartbeat.stop()
+                except Exception:
+                    pass
+                raise
+            try:
+                lease_acquisition = heartbeat.stop()
+            except EffectLeaseUnavailable as exc:
+                log_status("WAIT", f"{style_unit(args.unit)}: {exc}; teardown evidence was not published")
+                return False
         try:
-            publish_teardown_observation_cas(observed_ref, intent, current_revision)
+            lease_acquisition = rebase_effect_completion(
+                desired_ref,
+                lease_acquisition,
+                args.unit,
+                intent.uid,
+                current,
+            )
+        except EffectLeaseUnavailable as exc:
+            log_status("WAIT", f"{style_unit(args.unit)}: {exc}; teardown evidence was not published")
+            return False
+        current_revision = lease_acquisition.revision
+        try:
+            publish_teardown_observation_cas(
+                observed_ref,
+                intent,
+                current_revision,
+                desired_ref=desired_ref,
+                lease_token=lease_acquisition.lease.token,
+                lease_snapshot=lease_acquisition.lease.snapshot,
+            )
         except (OperationError, subprocess.CalledProcessError) as exc:
             log_status("WAIT", f"{style_unit(args.unit)}: teardown evidence was not published: {exc}")
             return False
+        try:
+            lease_acquisition = rebase_effect_completion(
+                desired_ref,
+                lease_acquisition,
+                args.unit,
+                intent.uid,
+                current,
+            )
+        except EffectLeaseUnavailable as exc:
+            log_status("WAIT", f"{style_unit(args.unit)}: {exc}; teardown completion was not published")
+            return False
+        current_revision = lease_acquisition.revision
         candidate = temporary / "candidate"
-        shutil.copytree(current, candidate)
-        for path in document_candidates(candidate / "units", args.unit):
-            path.unlink()
-        for path in document_candidates(candidate / DESIRED_DELETION_INTENTS_PATH, args.unit):
-            path.unlink()
-        materialization = getattr(unit.spec, "materialization", None)
-        if materialization is not None:
-            materialized_path = candidate / materialization.path
-            if materialized_path.is_dir():
-                shutil.rmtree(materialized_path)
-        transition_blocks = load_desired_transition_blocks(candidate)
-        transition_blocks.pop(args.unit, None)
-        write_desired_transition_blocks(candidate, transition_blocks)
-        load_desired_resource_graph(candidate)
-        candidate_id = candidate_identifier(
-            "finalize",
-            args.environment,
-            candidate,
-            desired_ref,
-            current_revision,
-            {
-                "unit": args.unit,
-                "uid": intent.uid,
-                "deletionGeneration": intent.deletion_generation,
-            },
-        )
-        candidate_ref = resolve_candidate_ref(
-            REPOSITORY_ROOT,
-            args.environment,
-            "finalize",
-            candidate_id,
-            args.candidate_ref,
-        )
-        revision, outcome = publish_desired_change(
-            args.environment,
-            candidate,
-            desired_ref,
-            current_revision,
-            candidate_ref,
-            f"Finalize deletion of {args.unit} generation {intent.deletion_generation}",
-            f"Finalize deletion of {args.unit} generation {intent.deletion_generation}",
-            f"Finalize deletion of `{args.unit}` after successful UID-fenced teardown.",
-            False,
-        )
+        candidate_ref = ""
+        outcome: ChangeRequestResult | ManualChangeRequest | None = None
+        for attempt in range(5):
+            if attempt:
+                try:
+                    lease_acquisition = rebase_effect_completion(
+                        desired_ref,
+                        lease_acquisition,
+                        args.unit,
+                        intent.uid,
+                        current,
+                    )
+                except EffectLeaseUnavailable as exc:
+                    log_status("WAIT", f"{style_unit(args.unit)}: {exc}; finalization was not published")
+                    return False
+                current_revision = lease_acquisition.revision
+            if candidate.exists():
+                shutil.rmtree(candidate)
+            shutil.copytree(current, candidate)
+            for path in document_candidates(candidate / "units", args.unit):
+                path.unlink()
+            for path in document_candidates(candidate / DESIRED_DELETION_INTENTS_PATH, args.unit):
+                path.unlink()
+            materialization = getattr(unit.spec, "materialization", None)
+            if materialization is not None:
+                materialized_path = candidate / materialization.path
+                if materialized_path.is_dir():
+                    shutil.rmtree(materialized_path)
+            transition_blocks = load_desired_transition_blocks(candidate)
+            transition_blocks.pop(args.unit, None)
+            write_desired_transition_blocks(candidate, transition_blocks)
+            load_desired_resource_graph(candidate)
+            candidate_id = candidate_identifier(
+                "finalize",
+                args.environment,
+                candidate,
+                desired_ref,
+                current_revision,
+                {
+                    "unit": args.unit,
+                    "uid": intent.uid,
+                    "deletionGeneration": intent.deletion_generation,
+                },
+            )
+            candidate_ref = resolve_candidate_ref(
+                REPOSITORY_ROOT,
+                args.environment,
+                "finalize",
+                candidate_id,
+                args.candidate_ref,
+            )
+            try:
+                revision, outcome = publish_desired_change(
+                    args.environment,
+                    candidate,
+                    desired_ref,
+                    current_revision,
+                    candidate_ref,
+                    f"Finalize deletion of {args.unit} generation {intent.deletion_generation}",
+                    f"Finalize deletion of {args.unit} generation {intent.deletion_generation}",
+                    f"Finalize deletion of `{args.unit}` after successful UID-fenced teardown.",
+                    False,
+                    current,
+                    frozenset({args.unit}),
+                )
+                break
+            except (EffectLeaseUnavailable, subprocess.CalledProcessError) as exc:
+                if attempt == 4 or (isinstance(exc, subprocess.CalledProcessError) and not retryable_push_failure(exc)):
+                    log_status("WAIT", f"{style_unit(args.unit)}: finalization publication was fenced: {exc}")
+                    return False
+                log_status("RETRY", f"finalization publication attempt {attempt + 2}/5")
+        else:
+            return False
+        try:
+            released_revision = release_effect_lease(desired_ref, args.unit, lease_acquisition.lease.token, intent.uid)
+            if outcome:
+                release_effect_lease(candidate_ref, args.unit, lease_acquisition.lease.token, intent.uid)
+            elif released_revision is not None:
+                revision = released_revision
+        except OperationError as exc:
+            log_status("WAIT", f"{style_unit(args.unit)}: effect lease release pending expiry: {exc}")
         log_status("UPDATE", f"{style_branch(desired_ref)} advanced to {describe_revision(revision)}")
         print(revision)
         write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
         return True
+
+
+def command_finalize(args: argparse.Namespace) -> bool:
+    with unit_effect_lock(args.environment, getattr(args, "unit", "<invalid>")):
+        return _command_finalize(args)
+
+
+def command_recover_effect_lease(args: argparse.Namespace) -> None:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
+        raise OperationError(f"invalid unit name: {args.unit!r}")
+    if not args.confirm_stopped:
+        raise OperationError("lease recovery requires --confirm-stopped")
+    desired_ref, _observed_ref = deployment_refs(
+        REPOSITORY_ROOT,
+        args.environment,
+        args.desired_ref,
+        None,
+    )
+    with unit_effect_lock(args.environment, args.unit):
+        revision = recover_effect_lease(desired_ref, args.unit, args.uid, args.token)
+    if revision is not None:
+        print(revision)
 
 
 def command_resolve_desired(args: argparse.Namespace) -> None:
@@ -4389,6 +5471,36 @@ def observed_tree(ref: str, output: Path) -> str | None:
     return revision
 
 
+@contextmanager
+def unit_effect_lock(environment: str, unit_name: str):
+    """Serialize reconcile/finalize effects for one environment and Unit."""
+
+    identity = hashlib.sha256(f"{REPOSITORY_ROOT}\0{environment}\0{unit_name}".encode()).hexdigest()
+    path = Path(tempfile.gettempdir()) / f"gitopsctr-effect-{identity}.lock"
+    with path.open("a+") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def assert_desired_ref_fence(
+    desired_ref: str,
+    expected_revision: str,
+    unit_name: str,
+    expected_uid: str,
+) -> None:
+    actual_revision = fetch_ref(desired_ref)
+    if actual_revision != expected_revision:
+        raise OperationError(
+            f"desired Unit {unit_name!r} changed during effect preparation; "
+            f"expected revision {expected_revision}, found {actual_revision}"
+        )
+    if not expected_uid:
+        raise OperationError(f"desired Unit {unit_name!r} has no UID effect fence")
+
+
 def json_pointer(document: Any, pointer: str) -> Any:
     if pointer == "":
         return document
@@ -4496,6 +5608,11 @@ def publish_observation_cas(
     unit: UnitResource[Any],
     artifact_documents: Mapping[str, JsonObject],
     desired_revision: str,
+    *,
+    desired_ref: str | None = None,
+    expected_uid: str | None = None,
+    lease_token: str | None = None,
+    lease_snapshot: EffectLeaseSnapshot | None = None,
 ) -> str:
     for attempt in range(5):
         if attempt:
@@ -4503,6 +5620,21 @@ def publish_observation_cas(
         with tempfile.TemporaryDirectory() as temporary_directory:
             observed = Path(temporary_directory) / "observed"
             observed_revision = observed_tree(observed_ref, observed)
+            if desired_ref is not None and lease_token is not None:
+                desired_revision = validate_effect_lease_head(
+                    desired_ref,
+                    unit_name,
+                    expected_uid or "",
+                    lease_token,
+                    lease_snapshot,
+                )
+                receipt = replace(
+                    receipt,
+                    spec=replace(
+                        receipt.spec,
+                        desired=replace(receipt.spec.desired, revision=desired_revision),
+                    ),
+                )
             driver = receipt.driver_name
             if receipt.name != unit_name:
                 raise OperationError(f"candidate receipt name is not {unit_name!r}")
@@ -4526,6 +5658,23 @@ def publish_observation_cas(
                 spec=receipt.spec,
                 status=replace(receipt.status, artifacts=typed_descriptors or None),
             )
+            if desired_ref is not None and lease_token is not None:
+                latest_revision = validate_effect_lease_head(
+                    desired_ref,
+                    unit_name,
+                    expected_uid or "",
+                    lease_token,
+                    lease_snapshot,
+                )
+                if latest_revision != desired_revision:
+                    desired_revision = latest_revision
+                    candidate_receipt = replace(
+                        candidate_receipt,
+                        spec=replace(
+                            candidate_receipt.spec,
+                            desired=replace(candidate_receipt.spec.desired, revision=desired_revision),
+                        ),
+                    )
             validate_receipt_document(
                 RESOURCE_CATALOG.serialize_receipt(candidate_receipt),
                 f"candidate receipt for {unit_name}",
@@ -4549,6 +5698,29 @@ def publish_observation_cas(
                         f"duplicate {unit_name} receipt for the same desired unit has a different semantic result"
                     )
                 return observed_revision
+            if desired_ref is not None and lease_token is not None:
+                latest_revision = validate_effect_lease_head(
+                    desired_ref,
+                    unit_name,
+                    expected_uid or "",
+                    lease_token,
+                    lease_snapshot,
+                )
+                if latest_revision != desired_revision:
+                    desired_revision = latest_revision
+                    candidate_receipt = replace(
+                        candidate_receipt,
+                        spec=replace(
+                            candidate_receipt.spec,
+                            desired=replace(candidate_receipt.spec.desired, revision=desired_revision),
+                        ),
+                    )
+                    validate_receipt_document(
+                        RESOURCE_CATALOG.serialize_receipt(candidate_receipt),
+                        f"candidate receipt for {unit_name}",
+                    )
+            elif desired_ref is not None:
+                assert_desired_ref_fence(desired_ref, desired_revision, unit_name, expected_uid or "")
             write_preferred_document(receipt_path, candidate_receipt, REPOSITORY_ROOT)
             try:
                 return publish_tree(
@@ -4571,7 +5743,7 @@ def write_reconcile_outputs(changed: bool, desired_revision: str = "") -> None:
             stream.write(f"desired_revision={desired_revision}\n")
 
 
-def command_reconcile(args: argparse.Namespace) -> bool:
+def _command_reconcile(args: argparse.Namespace) -> bool:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
         raise OperationError(f"invalid unit name: {args.unit!r}")
     configured_environment = load_environment(REPOSITORY_ROOT, args.environment)
@@ -4747,46 +5919,95 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 write_reconcile_outputs(False, advanced_revision)
                 return False
 
-        log_status("RUN", f"execute {driver_name} {'planning' if args.plan else 'reconciliation'}")
-        source_root = temporary / "source" if source is not None else None
-        if source is not None:
-            assert source.revision is not None
-            assert source_root is not None
-            materialize_revision(source.revision, source_root)
-        execution: dict[str, Any] = {
-            "environment": args.environment,
-            "desired_root": desired,
-            "desired_revision": desired_revision,
-            "source_root": source_root,
-            "source_revision": source.revision if source is not None else None,
-            "source_path": source.path if source is not None else None,
-            "unit_name": args.unit,
-            "unit": unit.spec,
-            "report": report,
-            "execution": DriverExecution.console(),
-        }
-        if args.plan:
+        lease_acquisition: EffectLeaseAcquisition | None = None
+        if not args.plan:
+            assert unit.metadata.uid is not None
             try:
-                planner = PLANNING_DRIVERS[driver_name]
-            except KeyError as exc:
-                raise OperationError(f"{args.unit} uses {driver_name}, which does not support planning") from exc
-            planned = planner.plan(PlanningContext(**execution))
-            if planned is not None:
-                raise DriverError(f"{driver_name} planning returned a value; planning evidence belongs in reports")
-            log_status("PLAN", f"{driver_name} planning succeeded")
-            log_status("DONE", f"{style_unit(args.unit)}: no remote changes")
-            write_reconcile_outputs(False)
-            return False
-        try:
-            plugin = RECONCILIATION_DRIVERS[driver_name]
-        except KeyError as exc:
-            raise OperationError(f"{args.unit} uses {driver_name}, which does not support reconciliation") from exc
-        output = plugin.reconcile(
-            ReconciliationContext(
-                **execution,
-                previous_receipt=previous_receipt,
-            )
+                lease_acquisition = acquire_effect_lease(desired_ref, desired_revision, args.unit, unit.metadata.uid)
+            except EffectLeaseUnavailable as exc:
+                log_status("WAIT", f"{style_unit(args.unit)}: {exc}")
+                log_status("DONE", f"{style_unit(args.unit)}: no changes")
+                write_reconcile_outputs(False)
+                return False
+            write_effect_lease(desired, lease_acquisition.lease)
+            desired_revision = lease_acquisition.revision
+            assert_desired_ref_fence(desired_ref, desired_revision, args.unit, unit.metadata.uid)
+
+        log_status("RUN", f"execute {driver_name} {'planning' if args.plan else 'reconciliation'}")
+        heartbeat = (
+            start_effect_lease_heartbeat(desired_ref, lease_acquisition) if lease_acquisition is not None else None
         )
+        try:
+            source_root = temporary / "source" if source is not None else None
+            if source is not None:
+                assert source.revision is not None
+                assert source_root is not None
+                materialize_revision(source.revision, source_root)
+            execution: dict[str, Any] = {
+                "environment": args.environment,
+                "desired_root": desired,
+                "desired_revision": desired_revision,
+                "source_root": source_root,
+                "source_revision": source.revision if source is not None else None,
+                "source_path": source.path if source is not None else None,
+                "unit_name": args.unit,
+                "unit": unit.spec,
+                "report": report,
+                "execution": DriverExecution.console(),
+            }
+            if args.plan:
+                try:
+                    planner = PLANNING_DRIVERS[driver_name]
+                except KeyError as exc:
+                    raise OperationError(f"{args.unit} uses {driver_name}, which does not support planning") from exc
+                planned = planner.plan(PlanningContext(**execution))
+                if planned is not None:
+                    raise DriverError(f"{driver_name} planning returned a value; planning evidence belongs in reports")
+                log_status("PLAN", f"{driver_name} planning succeeded")
+                log_status("DONE", f"{style_unit(args.unit)}: no remote changes")
+                write_reconcile_outputs(False)
+                return False
+            try:
+                plugin = RECONCILIATION_DRIVERS[driver_name]
+            except KeyError as exc:
+                raise OperationError(f"{args.unit} uses {driver_name}, which does not support reconciliation") from exc
+            output = plugin.reconcile(
+                ReconciliationContext(
+                    **execution,
+                    previous_receipt=previous_receipt,
+                )
+            )
+        except BaseException:
+            if heartbeat is not None:
+                try:
+                    heartbeat.stop()
+                except Exception:
+                    pass
+            raise
+        if heartbeat is not None:
+            try:
+                lease_acquisition = heartbeat.stop()
+            except EffectLeaseUnavailable as exc:
+                log_status("WAIT", f"{style_unit(args.unit)}: {exc}; reconciliation result was not published")
+                log_status("DONE", f"{style_unit(args.unit)}: no changes")
+                write_reconcile_outputs(False)
+                return False
+            assert lease_acquisition is not None
+            assert unit.metadata.uid is not None
+            try:
+                lease_acquisition = rebase_effect_completion(
+                    desired_ref,
+                    lease_acquisition,
+                    args.unit,
+                    unit.metadata.uid,
+                    desired,
+                )
+            except EffectLeaseUnavailable as exc:
+                log_status("WAIT", f"{style_unit(args.unit)}: {exc}; reconciliation result was not published")
+                log_status("DONE", f"{style_unit(args.unit)}: no changes")
+                write_reconcile_outputs(False)
+                return False
+            desired_revision = lease_acquisition.revision
         if not isinstance(output, ReconciliationOutput):
             raise DriverError(f"{driver_name} reconciliation did not return ReconciliationOutput")
         receipt = ReceiptResource(
@@ -4814,15 +6035,32 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             unit,
             output.artifacts,
             desired_revision,
+            desired_ref=desired_ref,
+            expected_uid=unit.metadata.uid,
+            lease_token=lease_acquisition.lease.token if lease_acquisition is not None else None,
+            lease_snapshot=lease_acquisition.lease.snapshot if lease_acquisition is not None else None,
         )
         log_status(
             "OBSERVE",
             f"receipt published to {style_branch(observed_ref)} at {describe_revision(revision)}",
         )
+        if lease_acquisition is not None:
+            try:
+                release_effect_lease(desired_ref, args.unit, lease_acquisition.lease.token, unit.metadata.uid)
+            except OperationError as exc:
+                log_status("WAIT", f"{style_unit(args.unit)}: effect lease release pending expiry: {exc}")
+                write_reconcile_outputs(True, pre_advanced_revision)
+                log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully; desired advance deferred")
+                return True
         advanced_revision = advance_if_requested() or pre_advanced_revision
         write_reconcile_outputs(True, advanced_revision)
         log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully")
         return True
+
+
+def command_reconcile(args: argparse.Namespace) -> bool:
+    with unit_effect_lock(args.environment, getattr(args, "unit", "<invalid>")):
+        return _command_reconcile(args)
 
 
 def log_ref_advance(advance: RefAdvance) -> None:
@@ -5549,7 +6787,10 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
     COMMAND_GROUPS = (
         ("Project", ("create", "validate")),
         ("Schemas", ("schemas",)),
-        ("Deployment", ("advance-desired", "promote", "rollback", "resolve-desired")),
+        (
+            "Deployment",
+            ("advance-desired", "promote", "rollback", "recover-effect-lease", "resolve-desired"),
+        ),
         ("Inspection", ("status", "list", "show", "verify", "dependencies")),
         ("Reconciliation", ("reconcile", "converge")),
         ("Git data", ("read-tree", "publish-tree")),
@@ -5732,6 +6973,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rollback.add_argument("--dry", action="store_true")
     rollback.set_defaults(handler=command_rollback)
+
+    recover_effect_lease = commands.add_parser(
+        "recover-effect-lease",
+        help="recover an abandoned effect lease after verifying its effect stopped",
+    )
+    recover_effect_lease.add_argument("--environment", required=True)
+    recover_effect_lease.add_argument("--unit", required=True)
+    recover_effect_lease.add_argument("--uid", required=True, help="expected leased Unit UID fence")
+    recover_effect_lease.add_argument("--token", required=True, help="exact persisted lease token")
+    recover_effect_lease.add_argument(
+        "--confirm-stopped",
+        action="store_true",
+        required=True,
+        help="confirm that the external effect is no longer running",
+    )
+    recover_effect_lease.add_argument("--desired-ref", help="override the environment's desired ref")
+    recover_effect_lease.set_defaults(handler=command_recover_effect_lease)
 
     finalize = commands.add_parser(
         "finalize",

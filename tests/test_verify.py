@@ -15,6 +15,42 @@ from gitopsctr.driver import ReconciliationOutput, VerificationContext, Verifica
 from gitopsctr.resources import ResourceMetadata, UnitResource
 from tests.conftest import receipt_document
 
+
+@pytest.fixture(autouse=True)
+def _local_effect_lease(monkeypatch):
+    def acquire(_ref, revision, unit_name, uid, **_kwargs):
+        lease = deploy_release.EffectLease(
+            unit_name=unit_name,
+            uid=uid,
+            token="lease-test",
+            owner="test-runner",
+            desired_revision=revision,
+            expires_at=2_000_000_000,
+        )
+        return deploy_release.EffectLeaseAcquisition(lease=lease, revision=revision)
+
+    monkeypatch.setattr(deploy_release, "acquire_effect_lease", acquire)
+    monkeypatch.setattr(deploy_release, "release_effect_lease", lambda *_args, **_kwargs: None)
+
+    class NoopHeartbeat:
+        def __init__(self, acquisition):
+            self.acquisition = acquisition
+
+        def stop(self):
+            return self.acquisition
+
+    monkeypatch.setattr(
+        deploy_release,
+        "start_effect_lease_heartbeat",
+        lambda _ref, acquisition, **_kwargs: NoopHeartbeat(acquisition),
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "rebase_effect_completion",
+        lambda _ref, acquisition, _unit_name, _uid, _root: acquisition,
+    )
+
+
 DESIRED_REVISION = "d" * 40
 
 
@@ -234,12 +270,15 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
 
     monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
     monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: DESIRED_REVISION)
     monkeypatch.setattr(deploy_release, "file_blob", lambda _path: "same-unit")
     monkeypatch.setattr(deploy_release, "controller_evidence", lambda: {"revision": "c" * 40})
     monkeypatch.setattr(
         deploy_release,
         "publish_observation_cas",
-        lambda _ref, _unit, receipt, _desired, _artifacts, _revision: publications.append(receipt) or "p" * 40,
+        lambda _ref, _unit, receipt, _desired, _artifacts, _revision, **_kwargs: (
+            publications.append(receipt) or "p" * 40
+        ),
     )
     monkeypatch.setattr(
         deploy_release,

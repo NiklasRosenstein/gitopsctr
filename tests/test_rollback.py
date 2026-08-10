@@ -640,6 +640,8 @@ def test_rollback_keeps_the_promotion_that_drives_its_resulting_tree(units, expe
 
 def test_pull_request_gate_routes_rollback_through_candidate_submission(tmp_path, monkeypatch):
     candidate = tmp_path / "candidate"
+    current = tmp_path / "current"
+    current.mkdir()
     candidate_unit = deploy_release.parse_desired_unit_document(_desired_unit("base", "c" * 40, "candidate"), "base")
     _write_json(
         candidate / "units/base.json",
@@ -667,6 +669,7 @@ def test_pull_request_gate_routes_rollback_through_candidate_submission(tmp_path
         "Roll back prod",
         "Reason",
         False,
+        current,
     )
 
     assert result == ("d" * 40, outcome)

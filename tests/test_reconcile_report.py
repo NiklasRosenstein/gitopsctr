@@ -15,6 +15,41 @@ from gitopsctr.resources import ResourceMetadata
 from tests.conftest import receipt_document, write_test_document
 
 
+@pytest.fixture(autouse=True)
+def _local_effect_lease(monkeypatch):
+    def acquire(_ref, revision, unit_name, uid, **_kwargs):
+        lease = deploy_release.EffectLease(
+            unit_name=unit_name,
+            uid=uid,
+            token="lease-test",
+            owner="test-runner",
+            desired_revision=revision,
+            expires_at=2_000_000_000,
+        )
+        return deploy_release.EffectLeaseAcquisition(lease=lease, revision=revision)
+
+    monkeypatch.setattr(deploy_release, "acquire_effect_lease", acquire)
+    monkeypatch.setattr(deploy_release, "release_effect_lease", lambda *_args, **_kwargs: None)
+
+    class NoopHeartbeat:
+        def __init__(self, acquisition):
+            self.acquisition = acquisition
+
+        def stop(self):
+            return self.acquisition
+
+    monkeypatch.setattr(
+        deploy_release,
+        "start_effect_lease_heartbeat",
+        lambda _ref, acquisition, **_kwargs: NoopHeartbeat(acquisition),
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "rebase_effect_completion",
+        lambda _ref, acquisition, _unit_name, _uid, _root: acquisition,
+    )
+
+
 def _write_json(path: Path, value: dict[str, object]) -> None:
     write_test_document(path, value)
 
@@ -600,10 +635,12 @@ def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_p
         _write_json(
             output / "units/application-images.json",
             {
-                "schema": 1,
-                "name": "application-images",
-                "driver": "terraform",
-                "source": {"path": ".", "revision": "a" * 40},
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "Terraform",
+                "metadata": ResourceMetadata.source_tracked_from_provenance(
+                    "application-images", "reconcile-clean-test"
+                ).document(profile="desired"),
+                "spec": {"source": {"path": ".", "revision": "a" * 40}},
             },
         )
 
@@ -619,6 +656,7 @@ def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_p
     )
     monkeypatch.setattr(deploy_release, "resolve_ref", lambda *_args: "c" * 40)
     monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: "c" * 40)
     monkeypatch.setattr(deploy_release, "file_blob", lambda _path: "same-unit")
     monkeypatch.setattr(deploy_release, "advance_desired", fake_advance)
     monkeypatch.setattr(
@@ -675,10 +713,12 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
             _write_json(
                 output / "units/aws-application.json",
                 {
-                    "schema": 1,
-                    "name": "aws-application",
-                    "driver": "terraform",
-                    "source": {"path": "infra/deploy", "revision": "e" * 40},
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "metadata": ResourceMetadata.source_tracked_from_provenance(
+                        "aws-application", "reconcile-advance-test"
+                    ).document(profile="desired"),
+                    "spec": {"source": {"path": "infra/deploy", "revision": "e" * 40}},
                 },
             )
 
@@ -700,7 +740,7 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
             )
         )
 
-    def fake_publish(*_args):
+    def fake_publish(*_args, **_kwargs):
         events.append(("receipt",))
         return "f" * 40
 
@@ -711,6 +751,7 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
     monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
     monkeypatch.setattr(deploy_release, "advance_desired", fake_advance)
     monkeypatch.setattr(deploy_release, "observed_tree", fake_observed_tree)
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: "d" * 40)
     monkeypatch.setattr(deploy_release, "resolve_ref", unexpected_resolve)
     monkeypatch.setattr(deploy_release, "file_blob", lambda _path: "unit-blob")
     monkeypatch.setattr(deploy_release, "publish_observation_cas", fake_publish)
