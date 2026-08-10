@@ -141,6 +141,33 @@ def test_create_project_accepts_environment_ref_templates(tmp_path: Path):
     }
 
 
+def test_project_source_revision_policy_defaults_and_parses(tmp_path: Path):
+    write_yaml(tmp_path / "gitopsctr.yaml", project_document())
+    policy = cli.load_project_config(tmp_path).source_revision_policy
+    assert policy.unavailable_when.value == "outside-candidate-history"
+    assert policy.when_unavailable_during_advance.value == "refresh"
+    assert policy.when_unavailable_during_plan.value == "error"
+
+    document = project_document()
+    document["spec"]["sourceRevisionPolicy"] = {
+        "unavailableWhen": "missing",
+        "whenUnavailableDuringAdvance": "error",
+        "whenUnavailableDuringPlan": "refresh",
+    }
+    write_yaml(tmp_path / "gitopsctr.yaml", document)
+    policy = cli.load_project_config(tmp_path).source_revision_policy
+    assert policy.unavailable_when.value == "missing"
+    assert policy.when_unavailable_during_advance.value == "error"
+    assert policy.when_unavailable_during_plan.value == "refresh"
+
+    document["spec"]["sourceRevisionPolicy"] = {"whenUnavailableDuringPlan": "refresh"}
+    write_yaml(tmp_path / "gitopsctr.yaml", document)
+    policy = cli.load_project_config(tmp_path).source_revision_policy
+    assert policy.unavailable_when.value == "outside-candidate-history"
+    assert policy.when_unavailable_during_advance.value == "refresh"
+    assert policy.when_unavailable_during_plan.value == "refresh"
+
+
 def test_create_project_rejects_ambiguous_configuration_even_with_force(tmp_path: Path):
     write_yaml(tmp_path / "gitopsctr.yaml", project_document())
     write_yaml(tmp_path / ".gitopsctr.yml", project_document())

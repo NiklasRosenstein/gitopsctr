@@ -73,6 +73,9 @@ from gitopsctr.formats import (
     PROJECT_CONFIG_NAMES,
     DocumentFormat,
     DocumentFormatError,
+    SourceRevisionAction,
+    SourceRevisionPolicy,
+    SourceRevisionUnavailableWhen,
     document_candidates,
     load_document,
     load_project_config,
@@ -231,6 +234,7 @@ STATUS_ROLES = {
     "OBSERVE": "success",
     "MATERIALIZED": "success",
     "WAIT": "warning",
+    "REFRESH": "warning",
     "SKIP": "warning",
     "RETRY": "warning",
     "DRY": "warning",
@@ -240,6 +244,7 @@ STATUS_ROLES = {
     "APPROVE": "warning",
     "WARN": "warning",
     "FAILED": "error",
+    "ERROR": "error",
     "INVALID": "error",
     "READY": "focus",
     "RUN": "focus",
@@ -795,6 +800,11 @@ def commit_is_available(revision: str) -> bool:
     return git("cat-file", "-e", f"{revision}^{{commit}}", check=False).returncode == 0
 
 
+def commit_is_ancestor(previous: str, candidate: str) -> bool:
+    """Return whether ``previous`` is reachable from ``candidate``."""
+    return git("merge-base", "--is-ancestor", previous, candidate, check=False).returncode == 0
+
+
 def prior_unit_source(
     unit_name: str,
     current_desired: Path,
@@ -1137,20 +1147,43 @@ def resolve_template(
     )
 
 
+@dataclass(frozen=True)
+class ResolvedUnitSourceResult:
+    """Resolved source plus the input-change and refresh decisions for one unit."""
+
+    source: DesiredSource | None
+    inputs_changed: bool
+    refresh_reason: str | None = None
+
+
+class SourceRevisionUnavailableError(OperationError):
+    """A retained source revision is unavailable under the selected project policy."""
+
+    def __init__(self, unit_name: str, revision: str, operation: Literal["advance", "plan"]) -> None:
+        self.unit_name = unit_name
+        self.revision = revision
+        self.operation = operation
+        super().__init__(f"{unit_name} desired source {revision} is unavailable under project policy")
+
+
 def resolved_unit_source(
     specification: UnitResource[Any],
     source_root: Path,
     source_revision: str,
     current_desired: Path,
     legacy: dict[str, Any] | None,
-) -> tuple[DesiredSource | None, bool]:
+    source_revision_policy: SourceRevisionPolicy | None = None,
+    source_revision_operation: Literal["advance", "plan"] = "advance",
+) -> ResolvedUnitSourceResult:
+    source_revision_policy = source_revision_policy or SourceRevisionPolicy()
     driver, source = require_unit_specification(specification)
     if source is None:
-        return None, False
+        return ResolvedUnitSourceResult(source=None, inputs_changed=False)
     input_hash = unit_input_hash(specification, source_root)
     revision = source_revision
     prior = prior_unit_source(specification.name, current_desired, legacy)
     inputs_changed = prior is None
+    refresh_reason: str | None = None
     if prior is not None:
         prior_revision, prior_hash = prior
         previous_unit_path = unit_document_path(current_desired, specification.name)
@@ -1163,26 +1196,45 @@ def resolved_unit_source(
             if isinstance(previous_environment, str):
                 input_hash = prior_hash
         prior_available = commit_is_available(prior_revision)
-        if not prior_available:
-            inputs_changed = True
-        elif not prior_hash:
+        if prior_available and not prior_hash:
             with tempfile.TemporaryDirectory() as prior_directory:
                 prior_root = Path(prior_directory) / "source"
                 materialize_revision(prior_revision, prior_root)
                 prior_hash = unit_input_hash(specification, prior_root)
-        if prior_available and prior_hash == input_hash:
-            revision = prior_revision
+        if prior_hash == input_hash:
+            in_candidate_history = prior_available and (
+                source_revision_policy.unavailable_when is SourceRevisionUnavailableWhen.MISSING
+                or commit_is_ancestor(prior_revision, source_revision)
+            )
+            if in_candidate_history:
+                revision = prior_revision
+            else:
+                inputs_changed = True
+                action = (
+                    source_revision_policy.when_unavailable_during_plan
+                    if source_revision_operation == "plan"
+                    else source_revision_policy.when_unavailable_during_advance
+                )
+                if action is SourceRevisionAction.ERROR:
+                    raise SourceRevisionUnavailableError(specification.name, prior_revision, source_revision_operation)
+                unavailable_reason = "is outside candidate history" if prior_available else "is unavailable"
+                dry_suffix = " in the dry candidate only" if source_revision_operation == "plan" else ""
+                refresh_reason = (
+                    f"retained source {describe_revision(prior_revision)} {unavailable_reason}; "
+                    f"use {describe_revision(source_revision)}{dry_suffix}"
+                )
         else:
             inputs_changed = True
-    return (
-        DesiredSource(
+    return ResolvedUnitSourceResult(
+        source=DesiredSource(
             path=source.path,
             inputs=source.inputs,
             revision=revision,
             inputHash=input_hash,
             driverVersion=DRIVER_VERSIONS[driver],
         ),
-        inputs_changed,
+        inputs_changed=inputs_changed,
+        refresh_reason=refresh_reason,
     )
 
 
@@ -1866,6 +1918,8 @@ def build_desired_candidate(
     promotion: PromotionContext | None = None,
     dry: bool = False,
     verbose: bool = True,
+    source_revision_policy: SourceRevisionPolicy | None = None,
+    source_revision_operation: Literal["advance", "plan"] = "advance",
 ) -> BuildDesiredResult:
     if verbose:
         log_heading(f"Resolve desired state for {style_environment(environment_name)}")
@@ -1878,6 +1932,12 @@ def build_desired_candidate(
     legacy_path = current_desired / "release.json"
     legacy = load_json(legacy_path) if legacy_path.is_file() else None
     specifications = load_environment_specifications(source_root, environment_name)
+    if source_revision_policy is None:
+        source_revision_policy = (
+            load_project_config(source_root).source_revision_policy
+            if any((source_root / name).is_file() for name in PROJECT_CONFIG_NAMES)
+            else SourceRevisionPolicy()
+        )
     candidate_units = candidate / "units"
     candidate_units.mkdir(parents=True)
     if promotion is not None:
@@ -1885,35 +1945,31 @@ def build_desired_candidate(
 
     prepared: dict[str, tuple[UnitResource[Any], DesiredSource | None]] = {}
     for unit_name, specification in specifications.items():
-        resolved_source, source_changed = resolved_unit_source(
-            specification, source_root, source_revision, current_desired, legacy
+        source_resolution = resolved_unit_source(
+            specification,
+            source_root,
+            source_revision,
+            current_desired,
+            legacy,
+            source_revision_policy,
+            source_revision_operation,
         )
-        prepared[unit_name] = (specification, resolved_source)
+        prepared[unit_name] = (specification, source_resolution.source)
+        if source_resolution.refresh_reason is not None:
+            if verbose:
+                log_status("REFRESH", f"{style_unit(unit_name)}: {source_resolution.refresh_reason}")
+            continue
         previous_unit = unit_document_path(current_desired, unit_name)
-        previous_source = prior_unit_source(unit_name, current_desired, legacy)
-        refreshed = (
-            previous_unit.is_file()
-            and source_changed
-            and previous_source is not None
-            and resolved_source is not None
-            and previous_source[0] != resolved_source.revision
-            and previous_source[1] == resolved_source.inputHash
-        )
-        if refreshed:
-            source_resolution = (
-                f"retained source {describe_revision(previous_source[0])} unavailable; "
-                f"use candidate {describe_revision(source_revision)}"
-            )
-        elif not previous_unit.is_file():
-            source_resolution = "new unit; use candidate revision"
-        elif source_changed:
-            source_resolution = "inputs changed; use candidate revision"
-        elif resolved_source is None:
-            source_resolution = "source-less unit"
+        if not previous_unit.is_file():
+            resolution_message = "new unit; use candidate revision"
+        elif source_resolution.inputs_changed:
+            resolution_message = "inputs changed; use candidate revision"
+        elif source_resolution.source is None:
+            resolution_message = "source-less unit"
         else:
-            source_resolution = f"inputs unchanged; retain {describe_revision(resolved_source.revision)}"
+            resolution_message = f"inputs unchanged; retain {describe_revision(source_resolution.source.revision)}"
         if verbose:
-            log_status("REFRESH" if refreshed else "CHECK", f"{style_unit(unit_name)}: {source_resolution}")
+            log_status("CHECK", f"{style_unit(unit_name)}: {resolution_message}")
 
     unresolved = set(prepared)
     unavailable: dict[str, str] = {}
@@ -2261,6 +2317,7 @@ def advance_desired(
                 promotion=promotion,
                 dry=dry,
                 verbose=verbose,
+                source_revision_operation="advance",
             )
             if current_revision and directory_files(current_desired) == directory_files(candidate):
                 if verbose:
@@ -3403,6 +3460,7 @@ def command_reconcile(args: argparse.Namespace) -> bool:
                 observed_revision,
                 desired,
                 dry=True,
+                source_revision_operation="plan",
             )
             if args.unit in candidate_result.blocked:
                 log_status("WAIT", candidate_result.blocked[args.unit])
@@ -4655,6 +4713,25 @@ def main() -> int:
         if args.command != "schemas":
             REPOSITORY_ROOT = resolve_repository_root(args.repository)
         args.handler(args)
+    except SourceRevisionUnavailableError as exc:
+        log_status(
+            "ERROR",
+            f"{style_unit(exc.unit_name)}: desired source {describe_revision(exc.revision)} "
+            "is unavailable under project policy",
+        )
+        if exc.operation == "plan":
+            print(
+                "      Run advance-desired from a durable source revision before planning.",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                "      Run advance-desired from a durable source revision before retrying.",
+                file=sys.stderr,
+                flush=True,
+            )
+        return 1
     except (DriverError, OperationError, subprocess.CalledProcessError) as exc:
         if isinstance(exc, subprocess.CalledProcessError):
             detail = (exc.stderr or "").strip() or str(exc)

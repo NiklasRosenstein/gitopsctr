@@ -67,6 +67,39 @@
           "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$",
           "type": "string"
         },
+        "sourceRevisionPolicy": {
+          "additionalProperties": false,
+          "properties": {
+            "unavailableWhen": {
+              "default": "outside-candidate-history",
+              "description": "Treat a retained source as unavailable when its commit is missing or outside the candidate revision's history.",
+              "enum": [
+                "missing",
+                "outside-candidate-history"
+              ],
+              "type": "string"
+            },
+            "whenUnavailableDuringAdvance": {
+              "default": "refresh",
+              "description": "Action when an unavailable retained source is found during advancement.",
+              "enum": [
+                "refresh",
+                "error"
+              ],
+              "type": "string"
+            },
+            "whenUnavailableDuringPlan": {
+              "default": "error",
+              "description": "Action when an unavailable retained source is found during planning.",
+              "enum": [
+                "error",
+                "refresh"
+              ],
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
         "writeFormat": {
           "enum": [
             "yaml",

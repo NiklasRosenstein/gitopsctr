@@ -91,6 +91,33 @@ PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
                     "required": ["refs"],
                     "additionalProperties": False,
                 },
+                "sourceRevisionPolicy": {
+                    "type": "object",
+                    "properties": {
+                        "unavailableWhen": {
+                            "type": "string",
+                            "enum": ["missing", "outside-candidate-history"],
+                            "default": "outside-candidate-history",
+                            "description": (
+                                "Treat a retained source as unavailable when its commit is missing or outside "
+                                "the candidate revision's history."
+                            ),
+                        },
+                        "whenUnavailableDuringAdvance": {
+                            "type": "string",
+                            "enum": ["refresh", "error"],
+                            "default": "refresh",
+                            "description": "Action when an unavailable retained source is found during advancement.",
+                        },
+                        "whenUnavailableDuringPlan": {
+                            "type": "string",
+                            "enum": ["error", "refresh"],
+                            "default": "error",
+                            "description": "Action when an unavailable retained source is found during planning.",
+                        },
+                    },
+                    "additionalProperties": False,
+                },
             },
             "additionalProperties": False,
         },
@@ -127,12 +154,30 @@ class EnvironmentDefaults:
     refs: EnvironmentRefTemplates = EnvironmentRefTemplates()
 
 
+class SourceRevisionUnavailableWhen(StrEnum):
+    MISSING = "missing"
+    OUTSIDE_CANDIDATE_HISTORY = "outside-candidate-history"
+
+
+class SourceRevisionAction(StrEnum):
+    REFRESH = "refresh"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class SourceRevisionPolicy:
+    unavailable_when: SourceRevisionUnavailableWhen = SourceRevisionUnavailableWhen.OUTSIDE_CANDIDATE_HISTORY
+    when_unavailable_during_advance: SourceRevisionAction = SourceRevisionAction.REFRESH
+    when_unavailable_during_plan: SourceRevisionAction = SourceRevisionAction.ERROR
+
+
 @dataclass(frozen=True)
 class Project:
     name: str
     write_format: DocumentFormat = DocumentFormat.YAML
     environments_path: PurePosixPath = PurePosixPath("deployment/environments")
     environment_defaults: EnvironmentDefaults = EnvironmentDefaults()
+    source_revision_policy: SourceRevisionPolicy = SourceRevisionPolicy()
 
 
 def project_config_path(root: Path) -> Path:
@@ -171,6 +216,7 @@ def validate_project_document(value: object, path: Path) -> Project:
         raise DocumentFormatError(f"invalid project config {path}: environmentsPath must stay inside the source tree")
     environment_defaults_document = cast(dict[str, Any], specification.get("environmentDefaults", {}))
     refs_document = cast(dict[str, Any], environment_defaults_document.get("refs", {}))
+    source_revision_policy_document = cast(dict[str, Any], specification.get("sourceRevisionPolicy", {}))
     return Project(
         name=project_name,
         write_format=DocumentFormat.JSON if selected == "json" else DocumentFormat.YAML,
@@ -181,6 +227,19 @@ def validate_project_document(value: object, path: Path) -> Project:
                 observed=cast(str, refs_document.get("observed", DEFAULT_OBSERVED_REF_TEMPLATE)),
                 candidate=cast(str, refs_document.get("candidate", DEFAULT_CANDIDATE_REF_TEMPLATE)),
             )
+        ),
+        source_revision_policy=SourceRevisionPolicy(
+            unavailable_when=SourceRevisionUnavailableWhen(
+                source_revision_policy_document.get(
+                    "unavailableWhen", SourceRevisionUnavailableWhen.OUTSIDE_CANDIDATE_HISTORY
+                )
+            ),
+            when_unavailable_during_advance=SourceRevisionAction(
+                source_revision_policy_document.get("whenUnavailableDuringAdvance", SourceRevisionAction.REFRESH)
+            ),
+            when_unavailable_during_plan=SourceRevisionAction(
+                source_revision_policy_document.get("whenUnavailableDuringPlan", SourceRevisionAction.ERROR)
+            ),
         ),
     )
 

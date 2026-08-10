@@ -28,6 +28,10 @@ spec:
       desired: gitopsctr/desired/{environment}
       observed: gitopsctr/observed/{environment}
       candidate: gitopsctr/candidates/{environment}/{id}
+  sourceRevisionPolicy:
+    unavailableWhen: outside-candidate-history
+    whenUnavailableDuringAdvance: refresh
+    whenUnavailableDuringPlan: error
 ```
 
 `metadata.name` is a DNS-1123 project name. `spec.writeFormat` accepts `yaml`
@@ -68,6 +72,21 @@ The fields are independent. Omitted fields retain the built-ins: `gitopsctr/desi
 `gitopsctr/observed/{environment}`, and `gitopsctr/candidates/{environment}/{id}`. An
 [Environment](apis/environment.md#deployment-refs) can replace them, and operation-specific CLI overrides take the
 highest priority. Expanded desired and observed refs must differ.
+
+## Source revision refresh policy
+
+`spec.sourceRevisionPolicy` controls when a retained unit source is unavailable and whether an unavailable source is
+refreshed or rejected for each operation. It defaults to:
+
+| Field | Default | Behavior |
+| --- | --- | --- |
+| `unavailableWhen` | `outside-candidate-history` | A retained revision is available only when its commit is an ancestor of the candidate revision. `missing` checks only whether Git can resolve the commit object. |
+| `whenUnavailableDuringAdvance` | `refresh` | `advance-desired`, including `advance-desired --dry`, replaces the retained revision with the candidate revision. `error` leaves desired state unchanged. |
+| `whenUnavailableDuringPlan` | `error` | `reconcile --plan` fails before invoking the driver. `refresh` uses a refreshed source only in the dry candidate. |
+
+The history check uses `git merge-base --is-ancestor`. A dangling commit that can still be resolved locally is therefore
+unavailable under `outside-candidate-history`. Source-less units are not affected. When planning fails because of this
+policy, run `advance-desired` from a durable source revision before planning.
 
 Create an environment in that configured location with:
 
