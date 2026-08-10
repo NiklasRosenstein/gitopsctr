@@ -1,9 +1,10 @@
 # Stacks and preview environments — living implementation spec
 
 > **Status:** Living implementation design. The lifecycle-aware desired-resource envelope, hardened Unit-specific
-> finalization slice, Stack/StackTemplate contracts, Stack projection, and direct Stack instantiation are implemented,
-> including terminal teardown evidence and explicit direct-Unit deletion. Stack deletion/finalization, source-pin
-> lifecycle wiring, forge merge enforcement, and end-to-end acceptance remain pending. Field names, document layouts,
+> finalization slice, Stack/StackTemplate contracts, Stack projection, direct Stack instantiation, and Stack deletion
+> lifecycle are implemented, including terminal teardown evidence, explicit direct-Unit deletion, and direct Stack
+> source-pin creation/release. Forge merge enforcement, orphan recovery, explicit Stack dependency ordering, and
+> end-to-end acceptance remain pending. Field names, document layouts,
 > and command names are illustrative unless
 > explicitly marked **Settled**.
 
@@ -16,7 +17,8 @@ already landed.
 
 ## Current implementation status
 
-The current branch is a Unit-focused foundation rather than an end-to-end preview-environment implementation.
+The current branch now has the Unit and core Stack lifecycle foundations, rather than an end-to-end preview-environment
+implementation.
 
 | Area | Status | Reconciliation |
 | --- | --- | --- |
@@ -24,17 +26,17 @@ The current branch is a Unit-focused foundation rather than an end-to-end previe
 | Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit** | Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac` close lease, incarnation, transition, dependency, legacy-safety, opaque-recovery, evidence-contract, and direct-root lifecycle defects; source pins, forge enforcement, and acceptance work remains. |
 | Change-gated candidate freshness | **Local verifier implemented** | `88ae0b9` rejects stale, rebased, multi-commit, merge, root, and missing-head candidates before review creation; required forge checks and merge-queue/branch-protection enforcement remain external work. |
 | StackTemplate/Stack contracts and deterministic parameter expansion | **Implemented** | Commits `eb0bcb9` and `84d7ddb`; direct desired Stack provenance is typed and schema-published. |
-| Generated Stack resource graphs with UID-fenced ownership | **Implemented projection** | `b441941` projects source-authored and direct Stack-owned Units; Stack deletion closure remains pending. |
+| Generated Stack resource graphs with UID-fenced ownership | **Implemented projection and closure** | `b441941` and `d071c1e` project source-authored/direct Stack-owned Units and retain a UID-fenced closure through deletion. |
 | Direct Stack instantiation | **Implemented** | `84d7ddb` adds replay-fenced `instantiate-stack` and exact template provenance. |
-| Direct Stack deletion/finalization | **Pending** | Milestone 4; Unit child teardown must be wired to Stack intent. |
-| Controller-owned source pins | **Primitive implemented; lifecycle wiring pending** | `5d3a5a0` adds fenced Git refs; Stack creation/finalization integration remains. |
+| Direct and source-tracked Stack deletion/finalization | **Implemented core lifecycle** | `d071c1e` adds source-absence intents, direct UID/generation-fenced requests, child obligations, and root finalization after owned Units. |
+| Controller-owned source pins | **Lifecycle wired; orphan recovery pending** | `5d3a5a0` provides fenced Git refs; direct Stack instantiation creates them and successful finalization releases them. |
 | Forge eligibility/expiry/orphan recovery and Argo integration | **Pending** | Milestones 5–6. |
 | End-to-end acceptance, security, operations, and legacy retirement | **Pending** | Milestones 6–7. |
 
-The repository verification suite currently passes (`496` tests), including the landed concurrency, recovery,
+The repository verification suite currently passes (`498` tests), including the landed concurrency, recovery,
 incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
-not sufficient, for the remaining preview-environment milestones because source pins, forge merge enforcement, Stack
-behavior, and end-to-end acceptance contracts are still open.
+not sufficient, for the remaining preview-environment milestones because pin orphan recovery, forge merge enforcement,
+explicit Stack dependency ordering, and end-to-end acceptance contracts are still open.
 
 ## Problem and scope
 
@@ -150,8 +152,9 @@ whole-document blob identity immediately or through a compatibility period is **
 The current implementation covers source-tracked and explicitly direct Unit deletion intents, retained cleanup inputs,
 owned-child obligations, UID-/generation-fenced teardown evidence, effect leases, and Terraform destroy. Direct Unit
 roots retain their identity and cleanup inputs until explicit finalization; source absence never reclassifies a root as
-direct or source-tracked. Stack finalization and controller-owned source pins are not yet implemented. The remaining
-correctness and acceptance work is listed in [Unit lifecycle hardening](#unit-lifecycle-hardening).
+direct or source-tracked. Core Stack finalization and direct Stack source-pin lifecycle are now implemented; orphan
+recovery, forge enforcement, and acceptance work remain. The remaining Unit correctness work is listed in
+[Unit lifecycle hardening](#unit-lifecycle-hardening).
 
 ## Unit lifecycle hardening
 
@@ -200,7 +203,7 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
   same-name recreation, GVK/driver replacement, resolved receipt/artifact dependencies, concurrent dependent
   insertion, legacy application, opaque-root recovery, and teardown evidence round trips.
 
-## Stack resolution — Proposed; creation and projection implemented
+## Stack resolution — Proposed; core lifecycle implemented
 
 - **Implemented in `eb0bcb9` and `b441941`:** A StackTemplate declares typed parameters and a template for API resources plus their
   dependency relationships. Parameter values are validated strictly, recursively expanded, and cannot contain
@@ -210,13 +213,22 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
 - **Implemented in `b441941` and `84d7ddb`:** A Stack contains concrete parameter values and resolves to concrete
   desired resources in one desired snapshot. Generated resources receive their own UIDs and a controlling owner
   reference to the Stack UID.
-- A direct Stack retains a cleanup-capable
-  snapshot. It does not continuously follow later template changes in the first implementation.
+- **Implemented in `d071c1e`:** Source-tracked Stack disappearance creates a retained Stack deletion intent and
+  Unit child intents during authoritative advance. Direct deletion creates the same UID-/generation-fenced Stack
+  intent explicitly; Stack finalization removes the root only after every owned Unit and child intent is gone.
+- **Implemented in `84d7ddb` and `d071c1e`:** A direct Stack retains a cleanup-capable snapshot and pins its exact
+  template revision. The pin remains through teardown and is released only after successful finalization. It does not
+  continuously follow later template changes in the first implementation.
 - A source-tracked Stack is a concrete source resource. Whether it may also track or promote changes from a
   StackTemplate remains **Open**.
+- StackTemplate dependency declarations are validated and retained in the projected graph, but their integration with
+  generic convergence/finalization ordering still needs an acceptance-backed implementation.
 - Secrets are references to an external secret mechanism, not plaintext Stack parameters committed to Git.
 
-Exact resource schemas, source paths, generated desired paths, name scoping, and CLI commands remain **Open**.
+The implementation currently uses `deployment/environments/<environment>/stack-templates/` and `stacks/` for authored
+resources, `stack-templates/` and `stacks/` in desired state, and the `instantiate-stack`,
+`request-delete-direct-stack`, and `finalize-stack` commands. These names are **Settled for this increment**; future
+API compatibility review may still revise them before production.
 
 ## Preview orchestration
 
@@ -228,9 +240,8 @@ Unit followed by Terraform or other infrastructure Units.
 
 Before forge refs can disappear, the workflow MUST pin the pull request head commit on a controller-owned Git ref.
 Teardown uses that retained source and releases the pin only after finalization. OCI source bundles may replace this
-later. The controller-owned pin primitive is implemented, but Stack creation/finalization integration and orphan
-recovery are pending; until then,
-retaining only a source revision can leave finalization waiting after source garbage collection.
+later. Direct Stack creation and finalization now wire the controller-owned pin; scheduled orphan recovery is still
+pending, so missed events can leave pins until the recovery worker is implemented.
 
 Closing a pull request, whether merged or unmerged, removing its eligibility label, or reaching its expiry requests
 cleanup. A scheduled garbage collector compares direct Stack provenance with forge eligibility to recover missed
@@ -374,7 +385,8 @@ unparseable-root operator resolution, and remaining acceptance scenarios remain 
 - [ ] Close the remaining items in [Unit lifecycle hardening](#unit-lifecycle-hardening); lease, incarnation,
   parseable-transition, legacy-safety, parseable-opaque-recovery, terminal evidence, and direct-Unit lifecycle items
   are complete in `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac`.
-- [ ] Add controller-owned source-pin creation, retention, and UID-/revision-fenced release.
+- [x] Add controller-owned source-pin creation, retention, and UID-/revision-fenced release for direct Stacks.
+- [ ] Add scheduled orphan recovery for pins and direct Stacks whose forge events were missed.
 - [ ] Add the Unit hardening acceptance scenarios and recovery cases.
 
 ### Pending preview-environment feature work
@@ -382,8 +394,9 @@ unparseable-root operator resolution, and remaining acceptance scenarios remain 
 - [x] Add generic StackTemplate and Stack contracts plus deterministic parameter expansion.
 - [x] Add generated Stack resource graphs with UID-fenced controlling ownership.
 - [x] Add direct Stack instantiation with request and revision fencing.
-- [ ] Add direct Stack deletion requests with UID/generation fencing.
-- [ ] Generalize two-phase finalization and teardown ordering from Units to Stack-owned closures.
+- [x] Add direct Stack deletion requests with UID/generation fencing.
+- [x] Generalize two-phase finalization and teardown ordering from Units to Stack-owned closures.
+- [ ] Integrate explicit StackTemplate dependencies into generic convergence/finalization ordering and acceptance.
 - [ ] Add the two Stack acceptance scenarios and restart/recovery cases.
 - [ ] Extend Docker/Terraform acceptance to observe Stack-driven cleanup.
 - [ ] Add GitHub/GitLab setup, Argo CD examples, operations, and security documentation.
