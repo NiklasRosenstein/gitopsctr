@@ -21,7 +21,9 @@ The generated desired ref stores the corresponding roots under
 `stack-templates/` and `stacks/`, and generated Units under `units/`. A
 StackTemplate resource may declare `dependsOn` for generated Units. Those edges
 control convergence and reverse teardown order; receipt and artifact references
-remain separate dependency edges.
+remain separate dependency edges. Generated Unit names are scoped to the
+concrete Stack, for example `web--preview-app`, so multiple Stack instances can
+use one template in the same desired ref.
 
 ## Direct preview workflow
 
@@ -58,11 +60,11 @@ normal UID-fenced Stack deletion intent; it never deletes external resources or
 releases a pin through an out-of-band path. The Unit finalization commands must
 complete the owned closure before the Stack root can be finalized.
 
-GitHub eligibility is read through `gh pr view` and considers a pull request
-eligible only while it is open and, when configured, carries the required
-label. GitLab integrations should use the same lifecycle commands from a
-webhook or provide a `PreviewEligibilityAdapter`; the controller must not infer
-eligibility from an opaque request identity.
+GitHub eligibility is read through `gh pr view`. GitLab.com eligibility is read
+through `glab mr view`. Both consider a request eligible only while it is open
+and, when configured, carries the required label. Self-hosted GitLab and
+deployment-specific merge-request creation still require an external adapter;
+the controller must not infer eligibility from an opaque request identity.
 
 ## Argo CD boundary
 
