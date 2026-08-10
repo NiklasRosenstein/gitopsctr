@@ -6411,7 +6411,7 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
     _resource_name(args.stack, "Stack name")
     _resource_name(args.template, "StackTemplate name")
     parameters = _parse_stack_parameters(args.parameters)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/#-]{0,127}", args.request_id):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/#!-]{0,127}", args.request_id):
         raise OperationError("--request-id has an invalid format")
     desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
     current_revision = fetch_ref(desired_ref)

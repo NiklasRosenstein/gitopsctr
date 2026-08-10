@@ -230,6 +230,64 @@ def test_github_preview_adapter_reads_pull_request_state(tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    ("payload", "label", "status"),
+    [
+        ({"state": "opened", "labels": []}, None, "eligible"),
+        ({"state": "opened", "labels": ["preview"]}, "preview", "eligible"),
+        ({"state": "opened", "labels": []}, "preview", "ineligible"),
+        ({"state": "merged", "labels": ["preview"]}, "preview", "ineligible"),
+        ({"state": "locked", "labels": []}, None, "unknown"),
+    ],
+)
+def test_gitlab_preview_eligibility_is_fail_closed_and_label_aware(payload, label, status):
+    result = deployment_forges.gitlab_preview_eligibility(payload, label)
+
+    assert result.status == status
+
+
+@pytest.mark.parametrize(
+    ("identity", "expected"),
+    [
+        ("gitlab:group/project!17", ("group/project", 17)),
+        ("https://gitlab.com/group/subgroup/project/-/merge_requests/18", ("group/subgroup/project", 18)),
+        ("gitlab:group/project#17", None),
+        ("https://example.com/group/project/-/merge_requests/18", None),
+    ],
+)
+def test_gitlab_merge_request_identity_requires_canonical_form(identity, expected):
+    assert deployment_forges.gitlab_merge_request_identity(identity) == expected
+
+
+def test_gitlab_preview_adapter_reads_merge_request_state(tmp_path):
+    runner = FakeRunner(_completed(stdout='{"state":"opened","merged_at":null,"labels":["preview"]}\n'))
+
+    result = deployment_forges.preview_eligibility(
+        "gitlab:group/subgroup/example-deployment!17",
+        remote_url="git@gitlab.com:group/subgroup/example-deployment.git",
+        required_label="preview",
+        runner=runner,
+        cwd=tmp_path,
+    )
+
+    assert result.status == "eligible"
+    assert runner.calls == [
+        (
+            (
+                "glab",
+                "mr",
+                "view",
+                "17",
+                "--repo",
+                "group/subgroup/example-deployment",
+                "--output",
+                "json",
+            ),
+            tmp_path,
+        )
+    ]
+
+
 def test_opaque_preview_identity_does_not_guess_forge_state():
     result = deployment_forges.preview_eligibility(
         "pull-123",

@@ -67,6 +67,29 @@ def github_preview_eligibility(payload: object, required_label: str | None = Non
     return PreviewEligibility("eligible", f"required label {required_label!r} is present")
 
 
+def gitlab_preview_eligibility(payload: object, required_label: str | None = None) -> PreviewEligibility:
+    """Interpret a trusted GitLab merge-request payload fail-closed."""
+
+    if not isinstance(payload, dict):
+        return PreviewEligibility("unknown", "GitLab merge-request payload is missing")
+    state = payload.get("state") or payload.get("state_label")
+    if not isinstance(state, str):
+        return PreviewEligibility("unknown", "GitLab merge-request payload has no state")
+    normalized_state = state.upper()
+    if normalized_state in {"CLOSED", "MERGED"} or payload.get("merged_at") is not None:
+        return PreviewEligibility("ineligible", "merge request is closed or merged")
+    if normalized_state not in {"OPEN", "OPENED"}:
+        return PreviewEligibility("unknown", f"unsupported GitLab merge-request state {state!r}")
+    if required_label is None:
+        return PreviewEligibility("eligible", "merge request is open")
+    labels = payload.get("labels")
+    if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
+        return PreviewEligibility("unknown", "GitLab merge-request payload has no labels")
+    if required_label not in labels:
+        return PreviewEligibility("ineligible", f"required label {required_label!r} is absent")
+    return PreviewEligibility("eligible", f"required label {required_label!r} is present")
+
+
 def github_pull_request_identity(identity: str) -> tuple[str, int] | None:
     """Parse a forge-stable GitHub pull-request identity.
 
@@ -86,6 +109,24 @@ def github_pull_request_identity(identity: str) -> tuple[str, int] | None:
         return None
     match = re.fullmatch(r"/([^/]+/[^/]+)/pull/([1-9][0-9]*)/?", parsed.path)
     if match is None:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def gitlab_merge_request_identity(identity: str) -> tuple[str, int] | None:
+    """Parse a forge-stable GitLab merge-request identity."""
+
+    value = identity.strip()
+    if value.startswith("gitlab:"):
+        match = re.fullmatch(r"gitlab:(.+)!([1-9][0-9]*)", value)
+        if match and "/" in match.group(1):
+            return match.group(1), int(match.group(2))
+        return None
+    parsed = urlsplit(value)
+    if parsed.hostname not in {"gitlab.com", "www.gitlab.com"}:
+        return None
+    match = re.fullmatch(r"/(.+)/-/merge_requests/([1-9][0-9]*)/?", parsed.path)
+    if match is None or "/" not in match.group(1):
         return None
     return match.group(1), int(match.group(2))
 
@@ -198,7 +239,7 @@ ChangeRequestOutcome = ChangeRequestResult | ManualChangeRequest
 class ForgeLocation:
     """A supported forge and repository parsed from a Git remote URL."""
 
-    forge: Literal["github"]
+    forge: Literal["github", "gitlab"]
     repository: str
 
 
@@ -248,14 +289,20 @@ def detect_forge(remote_url: str) -> ForgeLocation | None:
     if remote is None:
         return None
     host, path = remote
-    if host not in {"github.com", "www.github.com"}:
+    if host in {"github.com", "www.github.com"}:
+        forge: Literal["github", "gitlab"] = "github"
+    elif host in {"gitlab.com", "www.gitlab.com"}:
+        forge = "gitlab"
+    else:
         return None
 
     repository_path = path.removesuffix(".git").rstrip("/")
     parts = repository_path.split("/")
-    if len(parts) != 2 or not all(parts):
+    if len(parts) < 2 or not all(parts):
         return None
-    return ForgeLocation(forge="github", repository="/".join(parts))
+    if forge == "github" and len(parts) != 2:
+        return None
+    return ForgeLocation(forge=forge, repository="/".join(parts))
 
 
 def _manual(
@@ -420,6 +467,32 @@ class GitHubPreviewEligibilityAdapter:
         return github_preview_eligibility(payload, required_label)
 
 
+@dataclass(frozen=True)
+class GitLabPreviewEligibilityAdapter:
+    """Read merge-request eligibility through the GitLab CLI."""
+
+    remote_url: str
+    runner: CommandRunner = run_command
+    cwd: Path | None = None
+
+    def preview_eligibility(self, request_identity: str, required_label: str | None = None) -> PreviewEligibility:
+        parsed = gitlab_merge_request_identity(request_identity)
+        if parsed is None:
+            return PreviewEligibility("unknown", "request identity is not a supported GitLab merge request")
+        repository, number = parsed
+        result = self.runner(
+            ("glab", "mr", "view", str(number), "--repo", repository, "--output", "json"),
+            cwd=self.cwd,
+        )
+        if result.returncode != 0:
+            return PreviewEligibility("unknown", _process_error(result, "GitLab CLI could not inspect merge request"))
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return PreviewEligibility("unknown", "GitLab CLI returned invalid merge-request data")
+        return gitlab_preview_eligibility(payload, required_label)
+
+
 def preview_eligibility(
     request_identity: str,
     *,
@@ -442,9 +515,14 @@ def preview_eligibility(
             return PreviewEligibility("unknown", _process_error(result, "could not read Git remote"))
         remote_url = result.stdout.strip()
     location = detect_forge(remote_url)
-    if location is None or location.forge != "github":
+    if location is None:
         return PreviewEligibility("unknown", f"no preview eligibility adapter is available for remote {remote_url!r}")
-    return GitHubPreviewEligibilityAdapter(remote_url, runner, cwd).preview_eligibility(
+    if location.forge == "github":
+        return GitHubPreviewEligibilityAdapter(remote_url, runner, cwd).preview_eligibility(
+            request_identity,
+            required_label,
+        )
+    return GitLabPreviewEligibilityAdapter(remote_url, runner, cwd).preview_eligibility(
         request_identity,
         required_label,
     )
