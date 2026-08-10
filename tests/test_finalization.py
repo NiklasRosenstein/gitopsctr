@@ -1310,3 +1310,63 @@ def test_finalize_revision_fence_blocks_stale_reconcile_effect(tmp_path, monkeyp
 
     with pytest.raises(OperationError, match="changed during effect preparation"):
         deploy_release.command_finalize(_finalize_args(uid=intent.uid, deletion_generation=1))
+
+
+def test_finalize_direct_intent_materializes_retained_source(tmp_path, monkeypatch):
+    current = tmp_path / "current"
+    unit_path = current / "units/application.json"
+    document = _terraform_unit("application", "direct-application")
+    document["metadata"] = deploy_release.ResourceMetadata(
+        name="application",
+        uid="direct-application",
+        lifecycle=deploy_release.DesiredLifecycle(management=deploy_release.LifecycleManagement(mode="direct")),
+    ).document(profile="desired")
+    _write_json(unit_path, document)
+    unit = deploy_release.load_desired_unit(unit_path, "application")
+    incarnation = deploy_release.UnitIncarnationTombstone(
+        unit_name="application",
+        uid="direct-application",
+        state="active",
+        next_deletion_generation=2,
+    )
+    deploy_release.write_unit_incarnation_tombstone(current, incarnation)
+    intent = deploy_release.UnitDeletionIntent.from_unit(unit, unit_path, current, 2)
+    deploy_release.write_deletion_intent(current, intent)
+    teardown_calls = []
+    publications = []
+
+    def observed_tree(ref: str, output: Path):
+        if ref == "deploy/dev":
+            shutil.copytree(current, output)
+            return "c" * 40
+        output.mkdir(parents=True, exist_ok=True)
+        return None
+
+    def publish_tree(ref: str, directory: Path, _parent: str | None, _message: str):
+        publications.append((ref, deploy_release.directory_files(directory)))
+        return "d" * 40
+
+    materialized_revisions = []
+
+    def materialize_revision(revision: str, output: Path):
+        materialized_revisions.append(revision)
+        output.mkdir(parents=True, exist_ok=True)
+
+    def teardown(_driver, context):
+        teardown_calls.append(context)
+        return TeardownResult()
+
+    monkeypatch.setattr(type(deploy_release.UNIT_DRIVERS["terraform"]), "teardown", teardown)
+    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(deploy_release, "materialize_revision", materialize_revision)
+    monkeypatch.setattr(deploy_release, "change_gate", lambda *_args: "none")
+    monkeypatch.setattr(deploy_release, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+    monkeypatch.setattr(deploy_release, "publish_tree", publish_tree)
+
+    assert deploy_release.command_finalize(_finalize_args(uid="direct-application", deletion_generation=2)) is True
+    assert len(teardown_calls) == 1
+    assert materialized_revisions == ["a" * 40]
+    assert teardown_calls[0].source_root is not None
+    assert publications[-1][0] == "deploy/dev"

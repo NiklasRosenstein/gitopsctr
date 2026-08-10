@@ -1413,7 +1413,7 @@ def candidate_ref_template(source_root: Path, environment_name: str) -> str:
 
 
 def candidate_identifier(
-    operation: Literal["promotion", "rollback", "finalize"],
+    operation: Literal["promotion", "rollback", "finalize", "request-delete-direct-unit"],
     environment_name: str,
     candidate: Path,
     target_ref: str,
@@ -1439,7 +1439,7 @@ def candidate_identifier(
 def resolve_candidate_ref(
     source_root: Path,
     environment_name: str,
-    operation: Literal["promotion", "rollback", "finalize"],
+    operation: Literal["promotion", "rollback", "finalize", "request-delete-direct-unit"],
     candidate_id: str,
     override: str | None = None,
 ) -> str:
@@ -2409,7 +2409,7 @@ def start_effect_lease_heartbeat(
 
 @dataclass(frozen=True)
 class UnitDeletionIntent:
-    """Durable, UID-fenced intent to finalize one source-tracked Unit."""
+    """Durable, UID-fenced intent to finalize one desired Unit."""
 
     unit_name: str
     uid: str
@@ -2423,6 +2423,7 @@ class UnitDeletionIntent:
     retained_source_revision: str | None
     retained_owner: DesiredOwnerReference | None
     retained_dependencies: tuple[str, ...]
+    management_mode: Literal["sourceTracked", "direct"] = "sourceTracked"
     retained_identity_known: bool = True
 
     @classmethod
@@ -2437,10 +2438,16 @@ class UnitDeletionIntent:
             raise OperationError("deletion generation must be positive")
         unit.metadata.validate_desired()
         lifecycle = unit.metadata.lifecycle
-        if lifecycle is None or (
-            lifecycle.owner is None and (lifecycle.management is None or lifecycle.management.mode != "sourceTracked")
-        ):
+        if lifecycle is None:
             raise OperationError(f"{unit.name} cannot receive a source-tracked deletion intent")
+        if lifecycle.owner is None and lifecycle.management is not None and lifecycle.management.mode == "direct":
+            management_mode: Literal["sourceTracked", "direct"] = "direct"
+        elif lifecycle.owner is not None or (
+            lifecycle.management is not None and lifecycle.management.mode == "sourceTracked"
+        ):
+            management_mode = "sourceTracked"
+        else:
+            raise OperationError(f"{unit.name} cannot receive a deletion intent")
         source = getattr(unit.spec, "source", None)
         if source is not None and not isinstance(source, DesiredSource):
             raise OperationError(f"{unit.name} has an invalid retained source identity")
@@ -2463,6 +2470,7 @@ class UnitDeletionIntent:
             retained_source_revision=source.revision if source is not None else None,
             retained_owner=lifecycle.owner,
             retained_dependencies=retained_dependencies,
+            management_mode=management_mode,
         )
 
     def document(self) -> JsonObject:
@@ -2472,6 +2480,7 @@ class UnitDeletionIntent:
             "unitName": self.unit_name,
             "uid": self.uid,
             "deletionGeneration": self.deletion_generation,
+            **({"managementMode": self.management_mode} if self.management_mode == "direct" else {}),
             "retainedSource": self.retained_source.to_dict() if self.retained_source is not None else None,
             "cleanupIdentity": {
                 "path": self.cleanup_identity.path,
@@ -2508,9 +2517,13 @@ class UnitDeletionIntent:
             "cleanupIdentity",
             "retainedIdentity",
         }
+        if not isinstance(document, dict) or set(document) not in (expected_keys, expected_keys | {"managementMode"}):
+            raise ValueError("invalid deletion intent envelope")
+        raw_management_mode = document.get("managementMode", "sourceTracked")
+        if not isinstance(raw_management_mode, str) or raw_management_mode not in {"sourceTracked", "direct"}:
+            raise ValueError("invalid deletion intent management mode")
         if (
-            set(document) != expected_keys
-            or type(document.get("schema")) is not int
+            type(document.get("schema")) is not int
             or document.get("schema") != 2
             or document.get("kind") != "UnitDeletionIntent"
             or document.get("unitName") != expected_name
@@ -2608,6 +2621,8 @@ class UnitDeletionIntent:
             retained_owner = DesiredOwnerReference.from_dict(raw_owner) if raw_owner is not None else None
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("invalid retained owner identity") from exc
+        if raw_management_mode == "direct" and retained_owner is not None:
+            raise ValueError("direct deletion intent cannot retain an owner")
         return cls(
             unit_name=expected_name,
             uid=uid,
@@ -2621,6 +2636,7 @@ class UnitDeletionIntent:
             retained_source_revision=retained_source_revision,
             retained_owner=retained_owner,
             retained_dependencies=tuple(sorted(set(raw_dependencies))),
+            management_mode=cast(Literal["sourceTracked", "direct"], raw_management_mode),
             retained_identity_known=identity_known,
         )
 
@@ -3126,6 +3142,20 @@ def validate_retained_deletion_unit(
         raise OperationError(f"retained source revision for {intent.unit_name!r} changed after deletion was requested")
     lifecycle = unit.metadata.lifecycle
     owner = lifecycle.owner if lifecycle is not None else None
+    if intent.management_mode == "direct":
+        if (
+            lifecycle is None
+            or owner is not None
+            or lifecycle.management is None
+            or lifecycle.management.mode != "direct"
+        ):
+            raise OperationError(
+                f"retained desired Unit for {intent.unit_name!r} no longer has direct lifecycle authority"
+            )
+    elif lifecycle is None or (
+        owner is None and (lifecycle.management is None or lifecycle.management.mode != "sourceTracked")
+    ):
+        raise OperationError(f"retained desired Unit for {intent.unit_name!r} is not source-tracked or UID-owned")
     if owner != intent.retained_owner:
         raise OperationError(f"retained owner identity for {intent.unit_name!r} changed after deletion was requested")
     dependencies = tuple(sorted(desired_observation_reference_units(unit)))
@@ -5395,6 +5425,116 @@ def command_rollback(args: argparse.Namespace) -> None:
         write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
 
 
+def _command_request_delete_direct_unit(args: argparse.Namespace) -> bool:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
+        raise OperationError(f"invalid unit name: {args.unit!r}")
+    if not isinstance(args.uid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args.uid):
+        raise OperationError("request-delete-direct-unit requires a valid --uid")
+    desired_ref, observed_ref = deployment_refs(
+        REPOSITORY_ROOT,
+        args.environment,
+        args.desired_ref,
+        None,
+    )
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary = Path(temporary_directory)
+        current = temporary / "current"
+        candidate = temporary / "candidate"
+        current_revision = observed_tree(desired_ref, current)
+        if current_revision is None:
+            raise OperationError(f"desired ref {desired_ref!r} has no state")
+        unit_paths = document_candidates(current / "units", args.unit)
+        if not unit_paths:
+            raise OperationError(f"desired Unit {args.unit!r} is not present")
+        unit_path = unit_paths[0]
+        unit = load_desired_unit(unit_path, args.unit)
+        if unit.is_legacy_compatibility:
+            raise OperationError(f"desired Unit {args.unit!r} is legacy; advance desired state first")
+        unit.metadata.validate_desired()
+        lifecycle = unit.metadata.lifecycle
+        if lifecycle is not None and lifecycle.owner is not None:
+            raise OperationError(f"desired Unit {args.unit!r} is UID-owned, not directly managed")
+        if lifecycle is None or lifecycle.management is None or lifecycle.management.mode != "direct":
+            raise OperationError(f"desired Unit {args.unit!r} is not directly managed")
+        if unit.metadata.uid != args.uid:
+            raise OperationError(f"stale desired Unit UID fence for {args.unit!r}")
+
+        intents = load_desired_deletion_intents(current)
+        existing_intent = intents.get(args.unit)
+        if existing_intent is not None:
+            if existing_intent.uid != args.uid or existing_intent.management_mode != "direct":
+                raise OperationError(f"desired Unit {args.unit!r} has a conflicting deletion intent")
+            return False
+
+        incarnations = load_desired_unit_incarnation_tombstones(current)
+        incarnation = incarnations.get(args.unit)
+        if incarnation is not None:
+            if incarnation.uid != args.uid:
+                raise OperationError(f"desired Unit {args.unit!r} conflicts with its incarnation fence")
+            if incarnation.state == "finalized":
+                raise OperationError(f"desired Unit {args.unit!r} has already been finalized")
+        else:
+            incarnation = UnitIncarnationTombstone(
+                unit_name=args.unit,
+                uid=args.uid,
+                state="active",
+                next_deletion_generation=2,
+            )
+
+        shutil.copytree(current, candidate)
+        write_unit_incarnation_tombstone(candidate, incarnation)
+        intent = UnitDeletionIntent.from_unit(
+            unit,
+            unit_path,
+            current,
+            incarnation.next_deletion_generation,
+        )
+        write_deletion_intent(candidate, intent)
+        transition_blocks = load_desired_transition_blocks(candidate)
+        transition_blocks[args.unit] = deletion_intent_reason(intent)
+        write_desired_transition_blocks(candidate, transition_blocks)
+        load_desired_resource_graph(candidate)
+        candidate_id = candidate_identifier(
+            "request-delete-direct-unit",
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            {"unit": args.unit, "uid": args.uid, "deletionGeneration": intent.deletion_generation},
+        )
+        candidate_ref = resolve_candidate_ref(
+            REPOSITORY_ROOT,
+            args.environment,
+            "request-delete-direct-unit",
+            candidate_id,
+            args.candidate_ref,
+        )
+        if candidate_ref in {desired_ref, observed_ref}:
+            raise OperationError("direct deletion candidate ref conflicts with deployment state")
+        revision, outcome = publish_desired_change(
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            candidate_ref,
+            f"Request deletion of direct Unit {args.unit} generation {intent.deletion_generation}",
+            f"Request deletion of direct Unit {args.unit}",
+            f"Create a UID-fenced deletion intent for directly managed `{args.unit}`.",
+            args.dry,
+            current,
+        )
+        if args.dry:
+            return False
+        print(revision)
+        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
+        return True
+
+
+def command_request_delete_direct_unit(args: argparse.Namespace) -> bool:
+    with unit_effect_lock(args.environment, getattr(args, "unit", "<invalid>")):
+        return _command_request_delete_direct_unit(args)
+
+
 def _command_finalize(args: argparse.Namespace) -> bool:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
         raise OperationError(f"invalid unit name: {args.unit!r}")
@@ -5440,12 +5580,21 @@ def _command_finalize(args: argparse.Namespace) -> bool:
             lifecycle = unit.metadata.lifecycle
             if unit.is_legacy_compatibility or unit.metadata.uid != intent.uid:
                 raise OperationError("retained desired Unit is not the fenced canonical incarnation")
-            if lifecycle is None:
-                raise OperationError("retained desired Unit is not source-tracked")
-            if lifecycle.owner is None and (
-                lifecycle.management is None or lifecycle.management.mode != "sourceTracked"
-            ):
-                raise OperationError("retained desired Unit is not source-tracked or UID-owned")
+            if intent.management_mode == "direct":
+                if (
+                    lifecycle is None
+                    or lifecycle.owner is not None
+                    or lifecycle.management is None
+                    or lifecycle.management.mode != "direct"
+                ):
+                    raise OperationError("retained desired Unit is not directly managed")
+            else:
+                if lifecycle is None:
+                    raise OperationError("retained desired Unit is not source-tracked")
+                if lifecycle.owner is None and (
+                    lifecycle.management is None or lifecycle.management.mode != "sourceTracked"
+                ):
+                    raise OperationError("retained desired Unit is not source-tracked or UID-owned")
             if unit_contains_reference(unit):
                 raise OperationError("retained desired Unit contains unresolved inputs")
             require_unit(unit, args.unit)
@@ -5492,6 +5641,9 @@ def _command_finalize(args: argparse.Namespace) -> bool:
             log_status("DRY", f"{style_unit(args.unit)}: teardown evidence already exists")
             return False
         driver = unit.driver
+        # Direct lifecycle authority controls who may initiate deletion, not
+        # whether the driver gets the deployment source it needs to tear down
+        # the retained Unit.
         source = getattr(unit.spec, "source", None)
         source_root = None
         if existing_evidence is None:
@@ -7467,7 +7619,7 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
             "Deployment",
             ("advance-desired", "promote", "rollback", "recover-effect-lease", "resolve-desired"),
         ),
-        ("Recovery", ("recover-opaque-unit", "finalize")),
+        ("Recovery", ("recover-opaque-unit", "request-delete-direct-unit", "finalize")),
         ("Inspection", ("status", "list", "show", "verify", "dependencies")),
         ("Reconciliation", ("reconcile", "converge")),
         ("Git data", ("read-tree", "publish-tree")),
@@ -7688,9 +7840,24 @@ def build_parser() -> argparse.ArgumentParser:
     recover_opaque.add_argument("--dry", action="store_true")
     recover_opaque.set_defaults(handler=command_recover_opaque_unit)
 
+    request_delete_direct = commands.add_parser(
+        "request-delete-direct-unit",
+        help="request UID-fenced deletion of a directly managed desired Unit",
+    )
+    request_delete_direct.add_argument("--environment", required=True)
+    request_delete_direct.add_argument("--unit", required=True)
+    request_delete_direct.add_argument("--uid", required=True, help="exact direct Unit UID fence")
+    request_delete_direct.add_argument("--desired-ref", help="override the environment's desired ref")
+    request_delete_direct.add_argument(
+        "--candidate-ref",
+        help="exact candidate ref override when the environment uses a pull-request change gate",
+    )
+    request_delete_direct.add_argument("--dry", action="store_true")
+    request_delete_direct.set_defaults(handler=command_request_delete_direct_unit)
+
     finalize = commands.add_parser(
         "finalize",
-        help="finalize one durable source-tracked deletion intent",
+        help="finalize one durable deletion intent",
     )
     finalize.add_argument("--environment", required=True)
     finalize.add_argument("--unit", required=True)
