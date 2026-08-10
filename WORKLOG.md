@@ -99,6 +99,20 @@ which Luna High fixed centrally with regression coverage. Remaining Unit backlog
 controller-owned source pins, permanently unparseable-root operator resolution, forge-side merge enforcement, and the
 remaining acceptance cases.
 
+### 2.5 Direct Unit deletion lifecycle — complete for this increment
+
+Commit `f9cc2ac` adds `request-delete-direct-unit` with exact UID fencing, canonical direct-management validation,
+durable deletion intent, retained direct roots when authored source is absent, change-gated candidate publication, and
+reuse of the existing finalization path. Repeated requests for the same direct UID and intent are inert. Directness
+controls deletion authority; retained source is still materialized for Terraform finalization when present. Source-
+tracked, owned, legacy, and stale-UID requests are rejected.
+
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 456 tests,
+lint, typecheck, schema freshness, strict docs, actionlint, and formatting. Sol High's review found and Luna High
+fixed the direct finalization source-materialization and repeated-request defects. The remaining gaps are
+controller-owned source pins, permanently unparseable-root operator resolution, forge-side stale-candidate merge
+enforcement, and the remaining acceptance cases.
+
 ### 3. StackTemplate and Stack resolution — pending
 
 ### 4. Direct Stack operations and source pins — pending

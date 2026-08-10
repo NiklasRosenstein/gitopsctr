@@ -1,8 +1,9 @@
 # Stacks and preview environments — living implementation spec
 
 > **Status:** Living implementation design. The lifecycle-aware desired-resource envelope and a hardened Unit-specific
-> finalization slice are implemented. Teardown-evidence plumbing, direct-management, source pins, Stack, forge, and
-> end-to-end acceptance remain pending. Field names, document layouts, and command names are illustrative unless
+> finalization slice are implemented, including terminal teardown evidence and explicit direct-Unit deletion. Direct
+> Stack management, source pins, Stack, forge, and end-to-end acceptance remain pending. Field names, document layouts,
+> and command names are illustrative unless
 > explicitly marked **Settled**.
 
 Last updated: 2026-08-10
@@ -19,16 +20,16 @@ The current branch is a Unit-focused foundation rather than an end-to-end previe
 | Area | Status | Reconciliation |
 | --- | --- | --- |
 | Desired Unit identity, lifecycle authority, ownership, legacy retention, rollback, and schema profiles | **Implemented for Unit** | Keep the generic semantic model; extend it to Stack and StackTemplate later. |
-| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit; final hardening in progress** | Commits `118429d`, `22d7814`, `816a8a4`, and `26982bf` close lease, incarnation, transition, dependency, legacy-safety, opaque-recovery, and evidence-contract defects; direct-root, source-pin, and acceptance work remains. |
+| Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit** | Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac` close lease, incarnation, transition, dependency, legacy-safety, opaque-recovery, evidence-contract, and direct-root lifecycle defects; source pins, forge enforcement, and acceptance work remains. |
 | StackTemplate contracts, Stack contracts, parameter expansion, and generated ownership graphs | **Pending** | Milestone 3. |
 | Direct Stack operations and UID-fenced deletion | **Pending** | Milestone 4. |
 | Controller-owned source pins, forge eligibility/expiry/orphan recovery, and Argo integration | **Pending** | Milestones 4–5. |
 | End-to-end acceptance, security, operations, and legacy retirement | **Pending** | Milestones 6–7. |
 
-The repository verification suite currently passes (`437` tests), including the landed concurrency, recovery, and
-incarnation regressions. Passing verification is therefore necessary, not sufficient, for the remaining Unit
-finalization milestone because teardown-evidence, direct-root, source-pin, and end-to-end acceptance contracts are
-still open.
+The repository verification suite currently passes (`456` tests), including the landed concurrency, recovery,
+incarnation, evidence, and direct-root regressions. Passing verification is therefore necessary, not sufficient, for
+the remaining preview-environment milestones because source pins, forge enforcement, Stack behavior, and end-to-end
+acceptance contracts are still open.
 
 ## Problem and scope
 
@@ -141,10 +142,11 @@ driver operation; the current contract does not invent a separate in-progress ev
 eventually distinguish resource incarnation and semantic desired generation. Whether this replaces the current
 whole-document blob identity immediately or through a compatibility period is **Open**.
 
-The current implementation covers source-tracked Unit deletion intents, retained cleanup inputs, owned-child
-obligations, UID/generation-fenced teardown evidence, effect leases, and Terraform destroy. It does not yet implement
-direct-root deletion, Stack finalization, or controller-owned source pins. The correctness hardening required before
-this Unit slice is complete is listed in [Unit lifecycle hardening](#unit-lifecycle-hardening).
+The current implementation covers source-tracked and explicitly direct Unit deletion intents, retained cleanup inputs,
+owned-child obligations, UID-/generation-fenced teardown evidence, effect leases, and Terraform destroy. Direct Unit
+roots retain their identity and cleanup inputs until explicit finalization; source absence never reclassifies a root as
+direct or source-tracked. Stack finalization and controller-owned source pins are not yet implemented. The remaining
+correctness and acceptance work is listed in [Unit lifecycle hardening](#unit-lifecycle-hardening).
 
 ## Unit lifecycle hardening
 
@@ -178,8 +180,12 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
   terminal evidence is controller-owned and suppresses repeat teardown. `TeardownResult.details` are validated as
   strict JSON and persisted in UID-/generation-fenced observed evidence, with legacy evidence defaulting to empty
   details. A pre-publication crash remains a normal idempotent driver retry rather than an in-progress evidence state.
-- **Direct-root lifecycle:** Add explicit UID-fenced deletion intent and finalization for directly managed roots. A
-  direct root MUST not be inferred as source-tracked merely because its source is absent.
+- **Done in `f9cc2ac` — direct-Unit lifecycle:** `request-delete-direct-unit` creates an exact UID-/generation-fenced
+  deletion intent only for a canonical directly managed root, retains the root even when authored source is absent,
+  and reuses the existing finalization path. Source-tracked, owned, legacy, and stale-UID requests are rejected;
+  repeated requests for the same direct intent are inert. Source material remains available to Terraform finalization
+  when present. Forge-side enforcement preventing a stale change-gated candidate from merging after same-name
+  recreation remains open.
 - **Acceptance coverage:** Add restart and failure-injection tests for every item above, including lease recovery,
   same-name recreation, GVK/driver replacement, resolved receipt/artifact dependencies, concurrent dependent
   insertion, legacy application, opaque-root recovery, and teardown evidence round trips.
@@ -312,15 +318,18 @@ Before declaring the Unit implementation milestone complete, the harness MUST co
 - Pass a relevance-fenced prior receipt into teardown and prove driver result details survive restart after successful
   evidence publication while remaining UID/generation fenced. **Covered for the terminal-evidence contract by
   `26982bf`; pre-publication crash retry remains an idempotence requirement.**
+- Request deletion of a direct Unit with an exact UID, remove authored source if any, restart, and prove the direct Unit
+  remains retained until finalization. **Covered by `f9cc2ac`; forge-side stale-candidate merge enforcement remains
+  pending.**
 
 Shared recovery coverage MUST prove that one destroy failure retains cleanup inputs across restart and that a stale
 delete request for an old UID cannot affect a recreated same-name resource.
 
-Commits `118429d`, `22d7814`, `816a8a4`, and `26982bf` cover finalization lease completion, pre-effect failure cleanup,
-same-name incarnation fencing, parseable GVK/driver replacement, resolved dependency preservation, pre-lease
-dependency revalidation, legacy application blocking, parseable opaque-root recovery, and the terminal teardown
-evidence contract. Direct-root, source-pin, permanently unparseable-root operator resolution, and remaining
-acceptance scenarios remain pending.
+Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac` cover finalization lease completion, pre-effect
+failure cleanup, same-name incarnation fencing, parseable GVK/driver replacement, resolved dependency preservation,
+pre-lease dependency revalidation, legacy application blocking, parseable opaque-root recovery, the terminal teardown
+evidence contract, and explicit direct-Unit deletion. Source-pin, forge-side merge enforcement, permanently
+unparseable-root operator resolution, and remaining acceptance scenarios remain pending.
 
 ## Implementation checklist
 
@@ -338,12 +347,14 @@ acceptance scenarios remain pending.
   opaque cleanup roots, including source-absent and identity-transition cases.
 - [x] Pass relevant prior receipts to teardown and persist strict-JSON driver details in UID-/generation-fenced terminal
   observed evidence, including legacy evidence compatibility.
+- [x] Add explicit UID-fenced deletion requests and finalization for direct Unit roots without inferring direct
+  management from source absence.
 
 ### Required to complete the Unit milestone
 
 - [ ] Close the remaining items in [Unit lifecycle hardening](#unit-lifecycle-hardening); lease, incarnation,
-  parseable-transition, legacy-safety, parseable-opaque-recovery, and terminal evidence items are complete in
-  `118429d`, `22d7814`, `816a8a4`, and `26982bf`.
+  parseable-transition, legacy-safety, parseable-opaque-recovery, terminal evidence, and direct-Unit lifecycle items
+  are complete in `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac`.
 - [ ] Add controller-owned source-pin creation, retention, and UID-/revision-fenced release.
 - [ ] Add the Unit hardening acceptance scenarios and recovery cases.
 
