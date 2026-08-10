@@ -31,9 +31,13 @@ from gitopsctr.formats import CANDIDATE_REF_TEMPLATE_PATTERN
 from gitopsctr.templates import (
     REFERENCE_KEYS,
     ArtifactReference,
+    ParameterTemplateObject,
     PromotionReference,
     ReceiptReference,
+    TemplateError,
     TemplateObject,
+    resolve_parameter_value,
+    validate_parameter_values,
 )
 
 SCHEMA_ROOT = "https://niklasrosenstein.github.io/gitopsctr/schemas"
@@ -50,6 +54,8 @@ class _ContractSchemaPlugin(BasePlugin):
     ) -> JSONSchema | None:
         if instance.type is TemplateObject:
             return JSONSchema(title="__gitopsctr_template_object__")
+        if instance.type is ParameterTemplateObject:
+            return JSONSchema(title="__gitopsctr_parameter_template_object__")
         reference_type = {
             ReceiptReference: "fromReceipt",
             ArtifactReference: "fromArtifact",
@@ -152,12 +158,54 @@ def _template_definitions() -> JsonObject:
     return cast(JsonObject, {"TemplateValue": {"oneOf": variants}})
 
 
+def _parameter_template_definitions() -> JsonObject:
+    return cast(
+        JsonObject,
+        {
+            "ParameterTemplateValue": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "fromParameter": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "pattern": DESIRED_UID_PATTERN,
+                                    }
+                                },
+                                "required": ["name"],
+                                "additionalProperties": False,
+                            }
+                        },
+                        "required": ["fromParameter"],
+                        "additionalProperties": False,
+                    },
+                    {"type": "null"},
+                    {"type": "boolean"},
+                    {"type": "number"},
+                    {"type": "string"},
+                    {"type": "array", "items": {"$ref": "#/$defs/ParameterTemplateValue"}},
+                    {
+                        "type": "object",
+                        "propertyNames": {"not": {"enum": sorted((*REFERENCE_KEYS, "fromParameter"))}},
+                        "additionalProperties": {"$ref": "#/$defs/ParameterTemplateValue"},
+                    },
+                ]
+            }
+        },
+    )
+
+
 def _expand_special_schemas(schema: JsonObject) -> JsonObject:
     used_template = False
+    used_parameter_template = False
     used_resolved_json = False
 
     def visit(value: JsonValue) -> JsonValue:
         nonlocal used_template
+        nonlocal used_parameter_template
         nonlocal used_resolved_json
         if isinstance(value, list):
             return [visit(item) for item in value]
@@ -171,6 +219,16 @@ def _expand_special_schemas(schema: JsonObject) -> JsonObject:
                     "type": "object",
                     "propertyNames": {"not": {"enum": sorted(REFERENCE_KEYS)}},
                     "additionalProperties": {"$ref": "#/$defs/TemplateValue"},
+                },
+            )
+        if value.get("title") == "__gitopsctr_parameter_template_object__":
+            used_parameter_template = True
+            return cast(
+                JsonObject,
+                {
+                    "type": "object",
+                    "propertyNames": {"not": {"enum": sorted((*REFERENCE_KEYS, "fromParameter"))}},
+                    "additionalProperties": {"$ref": "#/$defs/ParameterTemplateValue"},
                 },
             )
         reference_marker = value.get("title")
@@ -194,6 +252,9 @@ def _expand_special_schemas(schema: JsonObject) -> JsonObject:
     if used_template:
         definitions = cast(JsonObject, expanded.setdefault("$defs", {}))
         definitions.update(_template_definitions())
+    if used_parameter_template:
+        definitions = cast(JsonObject, expanded.setdefault("$defs", {}))
+        definitions.update(_parameter_template_definitions())
     if used_resolved_json:
         definitions = cast(JsonObject, expanded.setdefault("$defs", {}))
         definitions["ResolvedJsonValue"] = cast(
@@ -277,6 +338,160 @@ class DesiredResourceMetadata(StrictModel):
             raise ValueError("desired resource metadata.name must not be empty")
         if not re.fullmatch(DESIRED_UID_PATTERN, self.uid):
             raise ValueError("desired resource metadata.uid has an invalid format")
+
+
+@dataclass(frozen=True, kw_only=True)
+class AuthoredResourceMetadata(StrictModel):
+    """Source-authored metadata for a Stack or StackTemplate."""
+
+    name: str
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("authored resource metadata.name must not be empty")
+
+
+ParameterType = Literal["string", "integer", "number", "boolean", "object", "array"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class ParameterDeclaration(StrictModel):
+    """A required, typed StackTemplate parameter."""
+
+    name: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    type: ParameterType
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(DESIRED_UID_PATTERN, self.name):
+            raise ValueError(f"invalid parameter name: {self.name!r}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateResource(StrictModel):
+    """One parameterized Unit resource in a StackTemplate graph."""
+
+    apiVersion: Annotated[str, Pattern(r"^[^/]+/[^/]+$")]
+    kind: Annotated[str, Pattern(r"^[A-Z][A-Za-z0-9]*$")]
+    name: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    spec: ParameterTemplateObject
+    dependsOn: list[Annotated[str, Pattern(DESIRED_UID_PATTERN)]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(DESIRED_UID_PATTERN, self.name):
+            raise ValueError(f"invalid template resource name: {self.name!r}")
+        if len(set(self.dependsOn)) != len(self.dependsOn):
+            raise ValueError(f"template resource {self.name!r} has duplicate dependencies")
+        if self.name in self.dependsOn:
+            raise ValueError(f"template resource {self.name!r} cannot depend on itself")
+
+    def resolved(self, parameters: Mapping[str, JsonValue]) -> StackTemplateResource:
+        resolved = resolve_parameter_value(self.spec, parameters)
+        if not isinstance(resolved, dict):
+            raise TemplateError(f"template resource {self.name!r} spec must resolve to an object")
+        return StackTemplateResource(
+            apiVersion=self.apiVersion,
+            kind=self.kind,
+            name=self.name,
+            spec=ParameterTemplateObject(cast(Any, resolved)),
+            dependsOn=list(self.dependsOn),
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateSpec(StrictModel):
+    parameters: list[ParameterDeclaration]
+    resources: list[StackTemplateResource]
+
+    def __post_init__(self) -> None:
+        names = [parameter.name for parameter in self.parameters]
+        if len(set(names)) != len(names):
+            raise ValueError("StackTemplate parameter names must be unique")
+        resource_names = [resource.name for resource in self.resources]
+        if len(set(resource_names)) != len(resource_names):
+            raise ValueError("StackTemplate resource names must be unique")
+        known = set(resource_names)
+        for resource in self.resources:
+            missing = [name for name in resource.dependsOn if name not in known]
+            if missing:
+                raise ValueError(f"template resource {resource.name!r} has missing dependencies: {', '.join(missing)}")
+        self._validate_acyclic()
+
+    def _validate_acyclic(self) -> None:
+        resources = {resource.name: resource for resource in self.resources}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(name: str) -> None:
+            if name in visiting:
+                raise ValueError("StackTemplate resource dependencies must be acyclic")
+            if name in visited:
+                return
+            visiting.add(name)
+            for dependency in resources[name].dependsOn:
+                visit(dependency)
+            visiting.remove(name)
+            visited.add(name)
+
+        for resource in self.resources:
+            visit(resource.name)
+
+    def expand(self, parameters: Mapping[str, object]) -> tuple[StackTemplateResource, ...]:
+        """Resolve parameters in authored order, admitting only installed Unit kinds."""
+
+        values = validate_parameter_values(cast(Any, self.parameters), parameters)
+        from gitopsctr.registry import UNIT_DRIVERS
+
+        for resource in self.resources:
+            if resource.apiVersion != "unit.gitopsctr.io/v1" or resource.kind not in {
+                driver.kind for driver in UNIT_DRIVERS.values()
+            }:
+                raise TemplateError(
+                    f"StackTemplate resource {resource.name!r} must be an installed Unit kind, "
+                    f"got {resource.apiVersion}/{resource.kind}"
+                )
+        return tuple(resource.resolved(values) for resource in self.resources)
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackSpec(StrictModel):
+    template: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    parameters: JsonObjectValue
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(DESIRED_UID_PATTERN, self.template):
+            raise ValueError(f"invalid Stack template name: {self.template!r}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateDocument(SchemaDocument):
+    apiVersion: Literal["gitopsctr.io/v1"]
+    kind: Literal["StackTemplate"]
+    metadata: AuthoredResourceMetadata
+    spec: StackTemplateSpec
+
+
+@dataclass(frozen=True, kw_only=True)
+class DesiredStackTemplateDocument(SchemaDocument):
+    apiVersion: Literal["gitopsctr.io/v1"]
+    kind: Literal["StackTemplate"]
+    metadata: DesiredResourceMetadata
+    spec: StackTemplateSpec
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackDocument(SchemaDocument):
+    apiVersion: Literal["gitopsctr.io/v1"]
+    kind: Literal["Stack"]
+    metadata: AuthoredResourceMetadata
+    spec: StackSpec
+
+
+@dataclass(frozen=True, kw_only=True)
+class DesiredStackDocument(SchemaDocument):
+    apiVersion: Literal["gitopsctr.io/v1"]
+    kind: Literal["Stack"]
+    metadata: DesiredResourceMetadata
+    spec: StackSpec
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -544,6 +759,22 @@ CORE_CONTRACTS: dict[str, DocumentContract] = {
         f"{SCHEMA_ROOT}/core/v1/materialization.schema.json",
     ),
     "receipt": MashumaroContract(ReceiptDocument, f"{SCHEMA_ROOT}/core/v1/receipt.schema.json"),
+    "stack-template-authored": MashumaroContract(
+        StackTemplateDocument,
+        f"{SCHEMA_ROOT}/core/v1/stack-template-authored.schema.json",
+    ),
+    "stack-template-desired": MashumaroContract(
+        DesiredStackTemplateDocument,
+        f"{SCHEMA_ROOT}/core/v1/stack-template-desired.schema.json",
+    ),
+    "stack-authored": MashumaroContract(
+        StackDocument,
+        f"{SCHEMA_ROOT}/core/v1/stack-authored.schema.json",
+    ),
+    "stack-desired": MashumaroContract(
+        DesiredStackDocument,
+        f"{SCHEMA_ROOT}/core/v1/stack-desired.schema.json",
+    ),
 }
 
 

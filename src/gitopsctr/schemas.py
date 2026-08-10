@@ -15,6 +15,8 @@ from gitopsctr.contracts import (
     DesiredResourceMetadata,
     MashumaroContract,
     ResolvedInputs,
+    StackSpec,
+    StackTemplateSpec,
     artifact_descriptors_schema,
 )
 from gitopsctr.document import DocumentContract, JsonObject
@@ -53,6 +55,14 @@ def _specification_schema(contract: DocumentContract) -> JsonObject:
 
 def _resolved_inputs_schema() -> JsonObject:
     schema = MashumaroContract(ResolvedInputs, f"{SCHEMA_ROOT}/core/v1/resolved-inputs.schema.json").json_schema()
+    schema.pop("$schema", None)
+    schema.pop("$id", None)
+    schema.pop("title", None)
+    return schema
+
+
+def _model_specification_schema(model: type[Any], schema_name: str) -> JsonObject:
+    schema = MashumaroContract(model, f"{SCHEMA_ROOT}/core/v1/{schema_name}.schema.json").json_schema()
     schema.pop("$schema", None)
     schema.pop("$id", None)
     schema.pop("title", None)
@@ -208,7 +218,7 @@ def receipt_resource_schema(driver: str) -> JsonObject:
     }
 
 
-def core_resource_schema(kind: str) -> JsonObject:
+def core_resource_schema(kind: str, profile: str = "authored") -> JsonObject:
     if kind == "Environment":
         specification = _specification_schema(CORE_CONTRACTS["environment"])
     elif kind == "Promotion":
@@ -217,13 +227,18 @@ def core_resource_schema(kind: str) -> JsonObject:
         schema = deepcopy(CORE_CONTRACTS["receipt"].json_schema())
         schema["$id"] = resource_schema_url("gitopsctr.io/v1", kind)
         return schema
+    elif kind == "StackTemplate":
+        specification = _model_specification_schema(StackTemplateSpec, "stack-template-spec")
+    elif kind == "Stack":
+        specification = _model_specification_schema(StackSpec, "stack-spec")
     else:
         raise ValueError(f"unknown core resource kind: {kind}")
     return _resource_schema(
-        schema_id=resource_schema_url("gitopsctr.io/v1", kind),
+        schema_id=resource_schema_url("gitopsctr.io/v1", kind, profile if kind in {"StackTemplate", "Stack"} else None),
         api_version="gitopsctr.io/v1",
         kind=kind,
         spec=specification,
+        profile=profile,
     )
 
 
@@ -259,6 +274,11 @@ def show_schema(scope: str, kind: str) -> JsonObject:
     if scope == "gitopsctr.io/v1":
         if kind == "Project":
             return project_resource_schema()
+        if kind.startswith(("StackTemplate/", "Stack/")):
+            resource_kind, profile = kind.split("/", 1)
+            if profile not in {"authored", "desired"}:
+                raise ValueError(f"unknown core schema profile: {profile}")
+            return core_resource_schema(resource_kind, profile)
         return core_resource_schema(kind)
     api_kind = API_KINDS.get(GVK(scope, kind)) if "/" in scope else None
     if api_kind is not None and isinstance(api_kind.spec, ArtifactApi):
@@ -290,6 +310,11 @@ def schema_documents() -> dict[Path, JsonObject]:
         path = Path("apis/gitopsctr.io/v1") / f"{kind}.schema.json"
         documents[path] = project_resource_schema() if kind == "Project" else core_resource_schema(kind)
         index["apis"][f"gitopsctr.io/v1/{kind}"] = path.as_posix()
+    for kind in ("StackTemplate", "Stack"):
+        for profile in ("authored", "desired"):
+            path = Path("apis/gitopsctr.io/v1") / kind / f"{profile}.schema.json"
+            documents[path] = core_resource_schema(kind, profile)
+            index["apis"][f"gitopsctr.io/v1/{kind}/{profile}"] = path.as_posix()
     for gvk, api_kind in sorted(API_KINDS.items()):
         if not isinstance(api_kind.spec, ArtifactApi):
             continue

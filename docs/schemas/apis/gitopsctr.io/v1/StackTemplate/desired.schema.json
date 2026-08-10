@@ -1,0 +1,268 @@
+{
+  "$defs": {
+    "ParameterTemplateValue": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fromParameter": {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "fromParameter"
+          ],
+          "type": "object"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/ParameterTemplateValue"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/ParameterTemplateValue"
+          },
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "fromArtifact",
+                "fromParameter",
+                "fromPromotion",
+                "fromReceipt"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/StackTemplate/desired.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "apiVersion": {
+      "const": "gitopsctr.io/v1"
+    },
+    "kind": {
+      "const": "StackTemplate"
+    },
+    "metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "lifecycle": {
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "not": {
+                "required": [
+                  "owner"
+                ]
+              },
+              "required": [
+                "management"
+              ]
+            },
+            {
+              "not": {
+                "required": [
+                  "management"
+                ]
+              },
+              "required": [
+                "owner"
+              ]
+            }
+          ],
+          "properties": {
+            "management": {
+              "additionalProperties": false,
+              "properties": {
+                "mode": {
+                  "enum": [
+                    "sourceTracked",
+                    "direct"
+                  ]
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "title": "LifecycleManagement",
+              "type": "object"
+            },
+            "owner": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "kind": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "name": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "uid": {
+                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "name",
+                "uid"
+              ],
+              "title": "DesiredOwnerReference",
+              "type": "object"
+            }
+          },
+          "title": "DesiredLifecycle",
+          "type": "object"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "uid": {
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "uid",
+        "lifecycle"
+      ],
+      "type": "object"
+    },
+    "spec": {
+      "additionalProperties": false,
+      "properties": {
+        "parameters": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "string",
+                  "integer",
+                  "number",
+                  "boolean",
+                  "object",
+                  "array"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "type"
+            ],
+            "title": "ParameterDeclaration",
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "resources": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "apiVersion": {
+                "pattern": "^[^/]+/[^/]+$",
+                "type": "string"
+              },
+              "dependsOn": {
+                "items": {
+                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "pattern": "^[A-Z][A-Za-z0-9]*$",
+                "type": "string"
+              },
+              "name": {
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                "type": "string"
+              },
+              "spec": {
+                "additionalProperties": {
+                  "$ref": "#/$defs/ParameterTemplateValue"
+                },
+                "propertyNames": {
+                  "not": {
+                    "enum": [
+                      "fromArtifact",
+                      "fromParameter",
+                      "fromPromotion",
+                      "fromReceipt"
+                    ]
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "apiVersion",
+              "kind",
+              "name",
+              "spec"
+            ],
+            "title": "StackTemplateResource",
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "parameters",
+        "resources"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "title": "StackTemplate (gitopsctr.io/v1)",
+  "type": "object"
+}
