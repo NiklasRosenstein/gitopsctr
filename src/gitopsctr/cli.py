@@ -48,6 +48,7 @@ from gitopsctr.dependencies import (
     convergence_order,
     convergence_scope,
     dependency_graph,
+    desired_observation_reference_units,
     downstream_unit_closure,
     observation_reference_units,
 )
@@ -469,6 +470,17 @@ def resolve_ref(ref: str, revision: str | None = None) -> str:
 
 def materialize_revision(revision: str, output: Path) -> None:
     state_store().materialize(revision, output)
+
+
+def refresh_materialized_root(revision: str, output: Path) -> None:
+    """Replace a local desired tree with the exact revision used by an effect."""
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        refreshed = Path(temporary_directory) / "desired"
+        materialize_revision(revision, refreshed)
+        if output.exists():
+            shutil.rmtree(output)
+        shutil.copytree(refreshed, output)
 
 
 def command_read_tree(args: argparse.Namespace) -> None:
@@ -2432,9 +2444,7 @@ class UnitDeletionIntent:
         if source is not None and not isinstance(source, DesiredSource):
             raise OperationError(f"{unit.name} has an invalid retained source identity")
         require_unit(unit, unit.name)
-        retained_dependencies = tuple(
-            sorted(observation_reference_units(unit.driver.desired_unit_contract.dump(unit.spec)))
-        )
+        retained_dependencies = tuple(sorted(desired_observation_reference_units(unit)))
         assert unit.metadata.uid is not None
         return cls(
             unit_name=unit.name,
@@ -2572,9 +2582,7 @@ class UnitDeletionIntent:
                     if retained_lifecycle is not None and retained_lifecycle.owner is not None
                     else None
                 )
-                raw_dependencies = list(
-                    observation_reference_units(retained_unit.driver.desired_unit_contract.dump(retained_unit.spec))
-                )
+                raw_dependencies = list(desired_observation_reference_units(retained_unit))
                 identity_known = True
             else:
                 raw_owner = None
@@ -2839,6 +2847,7 @@ def acquire_effect_lease(
     uid: str,
     *,
     ttl_seconds: int = EFFECT_LEASE_TTL_SECONDS,
+    precondition: Callable[[Path], None] | None = None,
 ) -> EffectLeaseAcquisition:
     if ttl_seconds < 1:
         raise OperationError("effect lease TTL must be positive")
@@ -2878,6 +2887,8 @@ def acquire_effect_lease(
                 expires_at=None,
                 snapshot=snapshot,
             )
+            if precondition is not None:
+                precondition(current)
             write_effect_lease(current, lease)
             try:
                 published_revision = publish_tree(
@@ -3103,7 +3114,7 @@ def validate_retained_deletion_unit(
     owner = lifecycle.owner if lifecycle is not None else None
     if owner != intent.retained_owner:
         raise OperationError(f"retained owner identity for {intent.unit_name!r} changed after deletion was requested")
-    dependencies = tuple(sorted(observation_reference_units(unit.driver.desired_unit_contract.dump(unit.spec))))
+    dependencies = tuple(sorted(desired_observation_reference_units(unit)))
     if dependencies != intent.retained_dependencies:
         raise OperationError(
             f"retained dependency identity for {intent.unit_name!r} changed after deletion was requested"
@@ -4843,9 +4854,7 @@ def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[s
                 )
                 == parent_identity
             )
-            dependency_matches = bool(
-                observation_reference_units(child.driver.desired_unit_contract.dump(child.spec)) & parent_names
-            )
+            dependency_matches = bool(desired_observation_reference_units(child) & parent_names)
             if owner_matches or dependency_matches:
                 dependents.add(child.name)
                 pending.append(child_identity)
@@ -5213,8 +5222,26 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                 except (DocumentFormatError, OperationError, subprocess.CalledProcessError) as exc:
                     log_status("WAIT", f"{style_unit(args.unit)}: retained source is unavailable: {exc}")
                     return False
+
+        def assert_no_active_teardown_dependents(desired_root: Path) -> None:
+            latest_unit = load_desired_unit(unit_document_path(desired_root, args.unit), args.unit)
+            if latest_unit.metadata.uid != intent.uid:
+                raise EffectLeaseUnavailable(f"desired Unit {args.unit!r} changed before dependency validation; retry")
+            latest_dependents = active_teardown_dependents(desired_root, latest_unit)
+            if latest_dependents:
+                raise EffectLeaseUnavailable(
+                    "active owned/dependent Units appeared before effect lease acquisition: "
+                    + ", ".join(latest_dependents)
+                )
+
         try:
-            lease_acquisition = acquire_effect_lease(desired_ref, current_revision, args.unit, intent.uid)
+            lease_acquisition = acquire_effect_lease(
+                desired_ref,
+                current_revision,
+                args.unit,
+                intent.uid,
+                precondition=assert_no_active_teardown_dependents,
+            )
         except EffectLeaseUnavailable as exc:
             log_status("WAIT", f"{style_unit(args.unit)}: {exc}")
             return False
@@ -5222,7 +5249,10 @@ def _command_finalize(args: argparse.Namespace) -> bool:
         teardown_driver: TeardownCapability | None = None
         driver_started = False
         try:
-            write_effect_lease(current, lease_acquisition.lease)
+            if lease_acquisition.revision == current_revision:
+                write_effect_lease(current, lease_acquisition.lease)
+            else:
+                refresh_materialized_root(lease_acquisition.revision, current)
             current_revision = lease_acquisition.revision
             if existing_evidence is None:
                 assert_desired_ref_fence(desired_ref, current_revision, args.unit, intent.uid)
@@ -6233,7 +6263,10 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 write_reconcile_outputs(False)
                 return False
             try:
-                write_effect_lease(desired, lease_acquisition.lease)
+                if lease_acquisition.revision == desired_revision:
+                    write_effect_lease(desired, lease_acquisition.lease)
+                else:
+                    refresh_materialized_root(lease_acquisition.revision, desired)
                 desired_revision = lease_acquisition.revision
                 assert_desired_ref_fence(desired_ref, desired_revision, args.unit, unit.metadata.uid)
             except BaseException:

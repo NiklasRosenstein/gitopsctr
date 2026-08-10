@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -55,6 +56,34 @@ def observation_reference_units(value: object, pointer: str = "") -> frozenset[s
         for reference in references(expression)
         if isinstance(reference, (ReceiptReference, ArtifactReference))
     )
+
+
+_UNIT_NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+
+
+def _validated_unit_name(value: object, description: str) -> str:
+    if not isinstance(value, str) or _UNIT_NAME_PATTERN.fullmatch(value) is None:
+        raise OperationError(f"invalid {description} unit name: {value!r}")
+    return value
+
+
+def desired_observation_reference_units(unit: UnitResource) -> frozenset[str]:
+    """Return authored and persisted observation producers for a desired Unit."""
+
+    producers = set(observation_reference_units(unit.driver.desired_unit_contract.dump(unit.spec)))
+    resolved_inputs = getattr(unit.spec, "resolvedInputs", None)
+    if resolved_inputs is None:
+        return frozenset(producers)
+    for producer in resolved_inputs.receipts or {}:
+        producers.add(_validated_unit_name(producer, "receipt producer"))
+    for key in resolved_inputs.artifacts or {}:
+        if not isinstance(key, str) or key.count("/") != 1:
+            raise OperationError(f"invalid artifact dependency key: {key!r}")
+        producer, artifact = key.split("/", 1)
+        _validated_unit_name(producer, "artifact producer")
+        _validated_unit_name(artifact, "artifact")
+        producers.add(producer)
+    return frozenset(producers)
 
 
 def _authored_document(unit: UnitResource) -> object:

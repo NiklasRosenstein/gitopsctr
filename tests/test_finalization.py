@@ -70,6 +70,7 @@ def _terraform_unit(
     uid: str,
     source_revision: str = "a" * 40,
     owner: DesiredOwnerReference | None = None,
+    resolved_inputs: dict[str, object] | None = None,
 ) -> dict[str, object]:
     metadata = deploy_release.ResourceMetadata(
         name=name,
@@ -80,7 +81,7 @@ def _terraform_unit(
             else deploy_release.DesiredLifecycle(management=deploy_release.LifecycleManagement(mode="sourceTracked"))
         ),
     )
-    return {
+    specification: dict[str, object] = {
         "apiVersion": "unit.gitopsctr.io/v1",
         "kind": "Terraform",
         "metadata": metadata.document(profile="desired"),
@@ -94,6 +95,9 @@ def _terraform_unit(
             "terraform": {"backend": {}, "variables": {}, "observeOutputs": []},
         },
     }
+    if resolved_inputs is not None:
+        specification["spec"]["resolvedInputs"] = resolved_inputs  # type: ignore[index]
+    return specification
 
 
 def _vite_unit(name: str, uid: str) -> dict[str, object]:
@@ -696,6 +700,49 @@ def test_opaque_child_without_intent_conservatively_blocks_parent(tmp_path):
     assert dependents == ("child (opaque cleanup root lacks a validated deletion identity)",)
 
 
+def test_resolved_observation_inputs_preserve_teardown_dependencies_and_ignore_promotions(tmp_path):
+    current = tmp_path / "current"
+    parent_path = current / "units/parent.json"
+    child_path = current / "units/child.json"
+    _write_json(parent_path, _terraform_unit("parent", "d1-parent"))
+    _write_json(
+        child_path,
+        _terraform_unit(
+            "child",
+            "d1-child",
+            resolved_inputs={
+                "receipts": {"parent": "receipt-fingerprint"},
+                "artifacts": {"parent/image": "artifact-fingerprint"},
+                "promotions": {"parent#/outputs/value": "promotion-fingerprint"},
+            },
+        ),
+    )
+    child = deploy_release.load_desired_unit(child_path, "child")
+    parent = deploy_release.load_desired_unit(parent_path, "parent")
+
+    assert deploy_release.desired_observation_reference_units(child) == frozenset({"parent"})
+    intent = deploy_release.UnitDeletionIntent.from_unit(child, child_path, current)
+    assert intent.retained_dependencies == ("parent",)
+    deploy_release.write_deletion_intent(current, intent)
+    assert deploy_release.active_teardown_dependents(current, parent) == ("child",)
+
+
+def test_resolved_artifact_dependency_key_fails_closed(tmp_path):
+    path = tmp_path / "units/child.json"
+    _write_json(
+        path,
+        _terraform_unit(
+            "child",
+            "d1-child",
+            resolved_inputs={"artifacts": {"parent/not/a-safe-key": "fingerprint"}},
+        ),
+    )
+    child = deploy_release.load_desired_unit(path, "child")
+
+    with pytest.raises(OperationError, match="invalid artifact dependency key"):
+        deploy_release.UnitDeletionIntent.from_unit(child, path, tmp_path)
+
+
 def test_schema_two_deletion_intent_migrates_owner_and_dependencies(tmp_path):
     current = tmp_path / "current"
     parent_path = current / "units/parent.json"
@@ -712,6 +759,11 @@ def test_schema_two_deletion_intent_migrates_owner_and_dependencies(tmp_path):
                 name="parent",
                 uid="d1-parent",
             ),
+            resolved_inputs={
+                "receipts": {"parent": "receipt-fingerprint"},
+                "artifacts": {"parent/image": "artifact-fingerprint"},
+                "promotions": {"parent#/outputs/value": "promotion-fingerprint"},
+            },
         ),
     )
     child = deploy_release.load_desired_unit(child_path, "child")
@@ -725,7 +777,7 @@ def test_schema_two_deletion_intent_migrates_owner_and_dependencies(tmp_path):
     migrated = deploy_release.load_desired_deletion_intents(current)["child"]
     assert migrated.retained_owner is not None
     assert migrated.retained_owner.uid == "d1-parent"
-    assert migrated.retained_dependencies == ()
+    assert migrated.retained_dependencies == ("parent",)
 
 
 def test_schema_two_opaque_intent_preserves_unknown_identity_and_blocks_parent(tmp_path):

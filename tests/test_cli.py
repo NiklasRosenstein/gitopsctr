@@ -496,6 +496,50 @@ def test_effect_lease_is_cas_published_and_blocks_a_second_runner(tmp_path, monk
     assert deploy_release.load_desired_effect_leases(desired) == {}
 
 
+def test_effect_lease_precondition_rechecks_after_publish_race(tmp_path, monkeypatch):
+    desired = tmp_path / "desired"
+    unit = _terraform_desired_resource("application")
+    unit_path = desired / "units/application.json"
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    unit_path.write_text(json.dumps(deploy_release.serialize_unit_document(unit)))
+    revisions = {"value": "a" * 40}
+    publish_attempts = 0
+    precondition_calls: list[Path] = []
+
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: revisions["value"])
+    monkeypatch.setattr(deploy_release, "effect_lease_owner", lambda: "runner-a")
+    monkeypatch.setattr(deploy_release, "effect_lease_token", lambda: "lease-runner-a")
+
+    def materialize(_revision, output):
+        shutil.copytree(desired, output)
+
+    def publish(_ref, _directory, _parent, _message):
+        nonlocal publish_attempts
+        publish_attempts += 1
+        raise subprocess.CalledProcessError(1, "git push", stderr="non-fast-forward")
+
+    def precondition(root: Path) -> None:
+        precondition_calls.append(root)
+        if len(precondition_calls) == 2:
+            raise deploy_release.EffectLeaseUnavailable("new dependent appeared")
+
+    monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
+    monkeypatch.setattr(deploy_release, "publish_tree", publish)
+
+    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="new dependent appeared"):
+        deploy_release.acquire_effect_lease(
+            "deploy/dev",
+            "a" * 40,
+            "application",
+            unit.metadata.uid,
+            precondition=precondition,
+        )
+
+    assert publish_attempts == 1
+    assert len(precondition_calls) == 2
+    assert deploy_release.load_desired_effect_leases(desired) == {}
+
+
 def test_effect_lease_heartbeat_renews_before_expiry_during_long_effect(monkeypatch):
     lease = deploy_release.EffectLease(
         unit_name="application",
