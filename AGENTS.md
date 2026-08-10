@@ -11,6 +11,11 @@
 - Regenerate schemas with `mise run schemas` whenever a model changes.
 - Run `mise run check`; CI checks schema freshness and performs a strict MkDocs build.
 
+## Commit readiness
+
+- Before committing, run `mise run lint` and `uv run ruff format --check .`; both linting and formatting must pass.
+- Run `mise run check` for the full repository verification suite before committing.
+
 Public document schemas are organized by `apiVersion` and `kind`. Runtime validation treats `$schema` only as an
 untrusted editor hint and must never fetch it.
 

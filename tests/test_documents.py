@@ -111,9 +111,7 @@ def test_project_environment_ref_templates_can_be_configured_independently(tmp_p
         "gitopsctr/candidates/{environment",
     ],
 )
-def test_project_candidate_ref_template_requires_environment_and_known_placeholders(
-    tmp_path: Path, template: str
-):
+def test_project_candidate_ref_template_requires_environment_and_known_placeholders(tmp_path: Path, template: str):
     specification = {"environmentDefaults": {"refs": {"candidate": template}}}
     (tmp_path / "gitopsctr.yaml").write_text(project_document(spec=json.dumps(specification)))
 

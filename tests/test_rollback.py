@@ -519,9 +519,7 @@ def test_pull_request_gate_routes_rollback_through_candidate_submission(tmp_path
         ("manual/rollback", "manual/rollback"),
     ],
 )
-def test_gated_rollback_uses_candidate_template_or_exact_override(
-    override, expected_ref, monkeypatch
-):
+def test_gated_rollback_uses_candidate_template_or_exact_override(override, expected_ref, monkeypatch):
     revisions, _publications = _install_rollback_simulation(monkeypatch, gate="pullRequest")
     captured = []
     outcome = deploy_release.ChangeRequestResult(status="created", url="https://github.example/pull/1")

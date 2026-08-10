@@ -1381,9 +1381,7 @@ def test_candidate_ref_templates_use_project_and_environment_configuration(tmp_p
     environment = tmp_path / "deployment/environments/staging/environment.json"
     _write_json(environment, {"schema": 1, "name": "staging"})
 
-    assert deploy_release.candidate_ref_template(tmp_path, "staging") == (
-        "gitopsctr/candidates/{environment}/{id}"
-    )
+    assert deploy_release.candidate_ref_template(tmp_path, "staging") == ("gitopsctr/candidates/{environment}/{id}")
     assert deploy_release.resolve_candidate_ref(tmp_path, "staging", "promotion", "abc123") == (
         "gitopsctr/candidates/staging/abc123"
     )
@@ -1394,11 +1392,7 @@ def test_candidate_ref_templates_use_project_and_environment_configuration(tmp_p
             "apiVersion": "gitopsctr.io/v1",
             "kind": "Project",
             "metadata": {"name": "test-project"},
-            "spec": {
-                "environmentDefaults": {
-                    "refs": {"candidate": "changes/{environment}/{operation}/{id}"}
-                }
-            },
+            "spec": {"environmentDefaults": {"refs": {"candidate": "changes/{environment}/{operation}/{id}"}}},
         },
     )
     assert deploy_release.resolve_candidate_ref(tmp_path, "staging", "rollback", "def456") == (
@@ -1413,16 +1407,17 @@ def test_candidate_ref_templates_use_project_and_environment_configuration(tmp_p
             "refs": {"candidate": "candidate/{environment}"},
         },
     )
-    assert deploy_release.resolve_candidate_ref(tmp_path, "staging", "promotion", "ignored") == (
-        "candidate/staging"
+    assert deploy_release.resolve_candidate_ref(tmp_path, "staging", "promotion", "ignored") == ("candidate/staging")
+    assert (
+        deploy_release.resolve_candidate_ref(
+            tmp_path,
+            "staging",
+            "promotion",
+            "ignored",
+            "manual/candidate",
+        )
+        == "manual/candidate"
     )
-    assert deploy_release.resolve_candidate_ref(
-        tmp_path,
-        "staging",
-        "promotion",
-        "ignored",
-        "manual/candidate",
-    ) == "manual/candidate"
 
 
 def test_environment_candidate_ref_template_rejects_unknown_placeholders(tmp_path):
