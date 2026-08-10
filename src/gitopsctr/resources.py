@@ -12,12 +12,20 @@ from uuid import uuid4
 from gitopsctr.api import GVK
 from gitopsctr.artifacts import ArtifactApi
 from gitopsctr.contracts import (
+    CORE_CONTRACTS,
     ArtifactDescriptor,
+    AuthoredResourceMetadata,
     DesiredLifecycle,
     DesiredResourceMetadata,
+    DesiredStackDocument,
+    DesiredStackTemplateDocument,
     LifecycleManagement,
     ReceiptDesired,
     ResolvedInputs,
+    StackDocument,
+    StackSpec,
+    StackTemplateDocument,
+    StackTemplateSpec,
     StrictModel,
 )
 from gitopsctr.document import ContractError, JsonObject, JsonObjectValue, TypedDocumentContract
@@ -123,7 +131,27 @@ class UnitResource[ModelT: StrictModel]:
         return UnitResource(self.gvk, self.metadata, self.driver, spec)
 
 
-def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], UnitResource[Any]]) -> None:
+@dataclass(frozen=True)
+class StackResource:
+    """A typed Stack or StackTemplate resource in the desired graph."""
+
+    gvk: GVK
+    metadata: ResourceMetadata
+    spec: StackSpec | StackTemplateSpec
+
+    @property
+    def name(self) -> str:
+        return self.metadata.name
+
+    @property
+    def is_legacy_compatibility(self) -> bool:
+        return self.metadata.is_legacy_compatibility
+
+
+DesiredGraphResource = UnitResource[Any] | StackResource
+
+
+def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], DesiredGraphResource]) -> None:
     """Validate UID fencing and acyclicity for resources from one desired ref.
 
     The mapping is deliberately scoped to one desired ref: the current document
@@ -131,7 +159,7 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Uni
     must not combine resources from different refs here.
     """
 
-    identities: dict[tuple[str, str, str], UnitResource[Any]] = {}
+    identities: dict[tuple[str, str, str], DesiredGraphResource] = {}
     legacy_keys: set[tuple[str, str, str]] = set()
     for key, unit in resources.items():
         expected_key = (unit.gvk.api_version, unit.gvk.kind, unit.name)
@@ -182,6 +210,46 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Uni
 
     for key in identities:
         visit(key)
+
+    # StackTemplate dependency declarations are retained in the desired
+    # StackTemplate document. Re-check them after expansion so a projected
+    # graph cannot silently omit a generated Unit or its dependency edge.
+    templates = {
+        resource.name: resource
+        for resource in identities.values()
+        if isinstance(resource, StackResource) and resource.gvk.kind == "StackTemplate"
+    }
+    for stack in (
+        resource
+        for resource in identities.values()
+        if isinstance(resource, StackResource) and resource.gvk.kind == "Stack"
+    ):
+        assert isinstance(stack.spec, StackSpec)
+        template = templates.get(stack.spec.template)
+        if template is None:
+            raise ValueError(
+                f"Stack {stack.name!r} references missing StackTemplate {stack.spec.template!r} in this ref"
+            )
+        assert isinstance(template.spec, StackTemplateSpec)
+        expanded = template.spec.expand(stack.spec.parameters)
+        expanded_by_name = {resource.name: resource for resource in expanded}
+        for generated in expanded:
+            generated_key = (generated.apiVersion, generated.kind, generated.name)
+            if generated_key not in identities:
+                raise ValueError(f"Stack {stack.name!r} expansion is missing generated Unit {generated.name!r}")
+            for dependency in generated.dependsOn:
+                dependency_resource = expanded_by_name.get(dependency)
+                if dependency_resource is None:
+                    raise ValueError(
+                        f"Stack {stack.name!r} Unit {generated.name!r} depends on missing generated Unit {dependency!r}"
+                    )
+                dependency_key = (
+                    dependency_resource.apiVersion,
+                    dependency_resource.kind,
+                    dependency_resource.name,
+                )
+                if dependency_key not in identities:
+                    raise ValueError(f"Stack {stack.name!r} dependency {dependency!r} is absent from this ref")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -348,6 +416,88 @@ class ResourceCatalog:
         }[profile]
         model = self.parse_contract(contract, specification, f"{profile} {driver.driver_name} unit {name}")
         return cast(UnitResource[ModelT], UnitResource(gvk, metadata_model, driver, model))
+
+    @staticmethod
+    def _stack_metadata(document: AuthoredResourceMetadata | DesiredResourceMetadata) -> ResourceMetadata:
+        if isinstance(document, AuthoredResourceMetadata):
+            return ResourceMetadata(name=document.name)
+        return ResourceMetadata(name=document.name, uid=document.uid, lifecycle=document.lifecycle)
+
+    def parse_stack_template(
+        self,
+        document: JsonObject,
+        *,
+        profile: Literal["authored", "desired"],
+        expected_name: str | None = None,
+    ) -> StackResource:
+        contract = cast(TypedDocumentContract[Any], CORE_CONTRACTS[f"stack-template-{profile}"])
+        parsed = self.parse_contract(contract, document, f"{profile} StackTemplate")
+        metadata = self._stack_metadata(parsed.metadata)  # type: ignore[union-attr]
+        if expected_name is not None and metadata.name != expected_name:
+            raise OperationError(f"StackTemplate metadata.name must be {expected_name!r}")
+        return StackResource(GVK(CORE_API_VERSION, "StackTemplate"), metadata, parsed.spec)  # type: ignore[union-attr]
+
+    def parse_stack(
+        self,
+        document: JsonObject,
+        *,
+        profile: Literal["authored", "desired"],
+        expected_name: str | None = None,
+    ) -> StackResource:
+        contract = cast(TypedDocumentContract[Any], CORE_CONTRACTS[f"stack-{profile}"])
+        parsed = self.parse_contract(contract, document, f"{profile} Stack")
+        metadata = self._stack_metadata(parsed.metadata)  # type: ignore[union-attr]
+        if expected_name is not None and metadata.name != expected_name:
+            raise OperationError(f"Stack metadata.name must be {expected_name!r}")
+        return StackResource(GVK(CORE_API_VERSION, "Stack"), metadata, parsed.spec)  # type: ignore[union-attr]
+
+    def serialize_stack_resource(
+        self,
+        resource: StackResource,
+        *,
+        profile: Literal["authored", "desired"],
+    ) -> JsonObject:
+        if resource.gvk.kind == "StackTemplate":
+            if not isinstance(resource.spec, StackTemplateSpec):
+                raise OperationError("StackTemplate resource has an invalid spec")
+            if profile == "authored":
+                document = StackTemplateDocument(
+                    apiVersion=CORE_API_VERSION,
+                    kind="StackTemplate",
+                    metadata=AuthoredResourceMetadata(name=resource.name),
+                    spec=resource.spec,
+                )
+            else:
+                document = DesiredStackTemplateDocument(
+                    apiVersion=CORE_API_VERSION,
+                    kind="StackTemplate",
+                    metadata=resource.metadata.as_desired(),
+                    spec=resource.spec,
+                )
+            contract = cast(TypedDocumentContract[Any], CORE_CONTRACTS[f"stack-template-{profile}"])
+        elif resource.gvk.kind == "Stack":
+            if not isinstance(resource.spec, StackSpec):
+                raise OperationError("Stack resource has an invalid spec")
+            if profile == "authored":
+                document = StackDocument(
+                    apiVersion=CORE_API_VERSION,
+                    kind="Stack",
+                    metadata=AuthoredResourceMetadata(name=resource.name),
+                    spec=resource.spec,
+                )
+            else:
+                document = DesiredStackDocument(
+                    apiVersion=CORE_API_VERSION,
+                    kind="Stack",
+                    metadata=resource.metadata.as_desired(),
+                    spec=resource.spec,
+                )
+            contract = cast(TypedDocumentContract[Any], CORE_CONTRACTS[f"stack-{profile}"])
+        else:
+            raise OperationError(f"unsupported Stack resource kind: {resource.gvk.kind!r}")
+        value = contract.dump(document)
+        value["$schema"] = resource_schema_url(CORE_API_VERSION, resource.gvk.kind, profile)
+        return value
 
     def serialize_environment(self, environment: JsonObject) -> JsonObject:
         name = environment.get("name")

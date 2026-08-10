@@ -41,6 +41,8 @@ from gitopsctr.contracts import (
     LifecycleManagement,
     MaterializationDocument,
     ReceiptDesired,
+    StackSpec,
+    StackTemplateSpec,
     StrictModel,
     with_schema,
 )
@@ -123,6 +125,7 @@ from gitopsctr.resources import (
     ReceiptSubject,
     ResourceCatalog,
     ResourceMetadata,
+    StackResource,
     UnitResource,
     validate_desired_resource_graph,
 )
@@ -645,16 +648,31 @@ def write_desired_candidate_unit(path: Path, unit: UnitResource[Any], project_ro
     return write_document(path, serialize_unit_document(unit, profile="desired"), format=selected)
 
 
-def load_desired_resource_graph(root: Path) -> dict[tuple[str, str, str], UnitResource[Any]]:
-    """Load and validate every desired Unit in one desired ref before effects."""
+def load_desired_resource_graph(root: Path) -> dict[tuple[str, str, str], UnitResource[Any] | StackResource]:
+    """Load and validate every desired resource in one desired ref before effects."""
 
-    resources: dict[tuple[str, str, str], UnitResource[Any]] = {}
+    resources: dict[tuple[str, str, str], UnitResource[Any] | StackResource] = {}
     for unit_name, path in _current_desired_unit_paths(root).items():
         unit = load_desired_unit(path, unit_name)
         key = (unit.gvk.api_version, unit.gvk.kind, unit.name)
         if key in resources:
             raise OperationError(f"duplicate desired resource identity: {key!r}")
         resources[key] = unit
+    for kind in ("StackTemplate", "Stack"):
+        for resource_name, path in _current_desired_stack_paths(root, kind).items():
+            resource = (
+                RESOURCE_CATALOG.parse_stack_template(
+                    RESOURCE_CATALOG.load_document(path), profile="desired", expected_name=resource_name
+                )
+                if kind == "StackTemplate"
+                else RESOURCE_CATALOG.parse_stack(
+                    RESOURCE_CATALOG.load_document(path), profile="desired", expected_name=resource_name
+                )
+            )
+            key = (resource.gvk.api_version, resource.gvk.kind, resource.name)
+            if key in resources:
+                raise OperationError(f"duplicate desired resource identity: {key!r}")
+            resources[key] = resource
     try:
         validate_desired_resource_graph(resources)
     except ValueError as exc:
@@ -1520,6 +1538,202 @@ def load_environment_specifications(source_root: Path, environment_name: str) ->
                         f"producer declares {driver.artifact_outputs[artifact_name].gvk}"
                     )
     return specifications
+
+
+def _document_paths(directory: Path) -> dict[str, Path]:
+    """Return one deterministic document path per resource name in a directory."""
+
+    paths: dict[str, Path] = {}
+    stems = sorted(
+        {path.stem for path in directory.glob("*") if path.is_file() and path.suffix in {".json", ".yaml", ".yml"}}
+    )
+    for stem in stems:
+        candidates = document_candidates(directory, stem)
+        if len(candidates) > 1:
+            raise OperationError(f"multiple document formats exist for resource {stem}")
+        if candidates:
+            paths[stem] = candidates[0]
+    return paths
+
+
+def _load_authored_stack_resources(
+    source_root: Path, environment_name: str
+) -> tuple[dict[str, StackResource], dict[str, StackResource]]:
+    """Load the inert templates and concrete stacks from the environment source tree."""
+
+    environment_root = project_environment_root(source_root, environment_name)
+    templates: dict[str, StackResource] = {}
+    for name, path in _document_paths(environment_root / "stack-templates").items():
+        templates[name] = RESOURCE_CATALOG.parse_stack_template(
+            RESOURCE_CATALOG.load_document(path), profile="authored", expected_name=name
+        )
+    stacks: dict[str, StackResource] = {}
+    for name, path in _document_paths(environment_root / "stacks").items():
+        stacks[name] = RESOURCE_CATALOG.parse_stack(
+            RESOURCE_CATALOG.load_document(path), profile="authored", expected_name=name
+        )
+    return templates, stacks
+
+
+def _current_desired_stack_paths(root: Path, kind: Literal["StackTemplate", "Stack"]) -> dict[str, Path]:
+    directory = root / ("stack-templates" if kind == "StackTemplate" else "stacks")
+    return _document_paths(directory)
+
+
+@dataclass(frozen=True)
+class StackProjection:
+    generated_units: dict[str, UnitResource[Any]]
+    owners: dict[str, DesiredOwnerReference]
+    dependencies: dict[str, tuple[str, ...]]
+
+
+def _write_desired_stack_resource(path: Path, resource: StackResource, project_root: Path) -> Path:
+    document = RESOURCE_CATALOG.serialize_stack_resource(resource, profile="desired")
+    if resource_documents_enabled(project_root):
+        selected = load_project_config(project_root).write_format
+        path = path.with_suffix(selected.suffix)
+    else:
+        selected = DocumentFormat.YAML if path.suffix in {".yaml", ".yml"} else DocumentFormat.JSON
+    return write_document(path, document, format=selected)
+
+
+def _stack_root_metadata(
+    kind: Literal["StackTemplate", "Stack"],
+    name: str,
+    source_revision: str,
+    current_desired: Path | None = None,
+) -> ResourceMetadata:
+    if current_desired is not None:
+        existing_path = _current_desired_stack_paths(current_desired, kind).get(name)
+        if existing_path is not None:
+            existing = (
+                RESOURCE_CATALOG.parse_stack_template(
+                    RESOURCE_CATALOG.load_document(existing_path), profile="desired", expected_name=name
+                )
+                if kind == "StackTemplate"
+                else RESOURCE_CATALOG.parse_stack(
+                    RESOURCE_CATALOG.load_document(existing_path), profile="desired", expected_name=name
+                )
+            )
+            existing.metadata.validate_desired()
+            lifecycle = existing.metadata.lifecycle
+            if lifecycle is None or lifecycle.management is None or lifecycle.management.mode != "sourceTracked":
+                raise OperationError(
+                    f"source-authored {kind} {name!r} collides with a non-source-tracked desired resource"
+                )
+            return existing.metadata
+    return ResourceMetadata.source_tracked_from_provenance(
+        name,
+        json.dumps(
+            {"apiVersion": CORE_API_VERSION, "kind": kind, "name": name, "sourceRevision": source_revision},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def _stack_owned_metadata(name: str, owner: DesiredOwnerReference) -> ResourceMetadata:
+    root = ResourceMetadata.source_tracked_from_provenance(
+        name,
+        json.dumps(
+            {
+                "apiVersion": UNIT_API_VERSION,
+                "kind": "generated",
+                "name": name,
+                "stack": owner.name,
+                "stackUid": owner.uid,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+    return ResourceMetadata(
+        name=name,
+        uid=root.uid,
+        lifecycle=DesiredLifecycle(
+            owner=DesiredOwnerReference(
+                apiVersion=owner.apiVersion,
+                kind=owner.kind,
+                name=owner.name,
+                uid=owner.uid,
+            )
+        ),
+    )
+
+
+def project_stack_resources(
+    source_root: Path,
+    environment_name: str,
+    source_revision: str,
+    candidate: Path,
+    project_root: Path,
+    current_desired: Path | None = None,
+) -> StackProjection:
+    """Persist Stack roots and expand concrete Stacks into authored Unit inputs."""
+
+    (candidate / "stack-templates").mkdir(parents=True, exist_ok=True)
+    (candidate / "stacks").mkdir(parents=True, exist_ok=True)
+    templates, stacks = _load_authored_stack_resources(source_root, environment_name)
+    generated: dict[str, UnitResource[Any]] = {}
+    owners: dict[str, DesiredOwnerReference] = {}
+    dependencies: dict[str, tuple[str, ...]] = {}
+    for name, template in templates.items():
+        desired = StackResource(
+            template.gvk,
+            _stack_root_metadata("StackTemplate", name, source_revision, current_desired),
+            template.spec,
+        )
+        _write_desired_stack_resource(candidate / "stack-templates" / f"{name}.json", desired, project_root)
+    for name, authored_stack in stacks.items():
+        assert isinstance(authored_stack.spec, StackSpec)
+        template_name = authored_stack.spec.template
+        template = templates.get(template_name)
+        if template is None:
+            raise OperationError(f"Stack {name!r} references missing StackTemplate {template_name!r}")
+        stack = StackResource(
+            authored_stack.gvk,
+            _stack_root_metadata("Stack", name, source_revision, current_desired),
+            authored_stack.spec,
+        )
+        _write_desired_stack_resource(candidate / "stacks" / f"{name}.json", stack, project_root)
+        assert isinstance(template.spec, StackTemplateSpec)
+        for resource in template.spec.expand(authored_stack.spec.parameters):
+            document: JsonObject = {
+                "apiVersion": resource.apiVersion,
+                "kind": resource.kind,
+                "metadata": {"name": resource.name},
+                "spec": cast(JsonObjectValue, resource.spec),
+            }
+            unit = RESOURCE_CATALOG.parse_unit(document, profile="authored", expected_name=resource.name)
+            require_unit_specification(unit, resource.name)
+            if resource.name in generated:
+                raise OperationError(
+                    f"generated Unit {resource.name!r} is produced by more than one Stack; names must be globally unique"
+                )
+            generated[resource.name] = unit
+            dependencies[resource.name] = tuple(resource.dependsOn)
+            assert stack.metadata.uid is not None
+            owners[resource.name] = DesiredOwnerReference(
+                apiVersion=stack.gvk.api_version,
+                kind=stack.gvk.kind,
+                name=stack.name,
+                uid=stack.metadata.uid,
+            )
+    # Keep desired Stack roots available while their owned Units are being
+    # finalized.  The generic Unit deletion path can retain the generated
+    # children today; dropping their UID-fenced owner in the same candidate
+    # would make the desired graph invalid.  Stack deletion intents will make
+    # this retention durable and removable in the next lifecycle milestone.
+    if current_desired is not None:
+        for kind in ("StackTemplate", "Stack"):
+            source_names = set(templates if kind == "StackTemplate" else stacks)
+            for name, previous_path in _current_desired_stack_paths(current_desired, kind).items():
+                if name in source_names:
+                    continue
+                target = candidate / ("stack-templates" if kind == "StackTemplate" else "stacks") / previous_path.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(previous_path, target)
+    return StackProjection(generated, owners, dependencies)
 
 
 def require_environment_unit(source_root: Path, environment_name: str, unit_name: str) -> None:
@@ -3855,14 +4069,23 @@ def build_desired_candidate(
     legacy_path = current_desired / "release.json"
     legacy = load_json(legacy_path) if legacy_path.is_file() else None
     specifications = load_environment_specifications(source_root, environment_name)
+    candidate_units = candidate / "units"
+    candidate_units.mkdir(parents=True)
+    (candidate / "stack-templates").mkdir(parents=True)
+    (candidate / "stacks").mkdir(parents=True)
+    stack_projection = project_stack_resources(
+        source_root, environment_name, source_revision, candidate, source_root, current_desired
+    )
+    for unit_name, generated_unit in stack_projection.generated_units.items():
+        if unit_name in specifications:
+            raise OperationError(f"generated Stack Unit {unit_name!r} collides with a source Unit")
+        specifications[unit_name] = generated_unit
     if source_revision_policy is None:
         source_revision_policy = (
             load_project_config(source_root).source_revision_policy
             if any((source_root / name).is_file() for name in PROJECT_CONFIG_NAMES)
             else SourceRevisionPolicy()
         )
-    candidate_units = candidate / "units"
-    candidate_units.mkdir(parents=True)
     copy_unit_incarnation_tombstones(current_desired, candidate)
     if promotion is not None:
         write_preferred_document(candidate / "promotion.json", promotion.document(), source_root)
@@ -4085,8 +4308,11 @@ def build_desired_candidate(
             previous_unit = unit_document_path(current_desired, unit_name)
             previous = load_desired_unit(previous_unit, unit_name) if previous_unit.is_file() else None
             previous_incarnation = incarnation_tombstones.get(unit_name) if previous is None else None
+            owner = stack_projection.owners.get(unit_name)
             resolved = resolved.with_metadata(
-                desired_metadata_for_candidate(
+                _stack_owned_metadata(unit_name, owner)
+                if owner is not None
+                else desired_metadata_for_candidate(
                     authored,
                     previous,
                     resolved_source,
@@ -4234,6 +4460,8 @@ def build_desired_candidate(
                 parent_name,
             )
             for _child_name, child in resources.items():
+                if not isinstance(child, UnitResource):
+                    continue
                 child_resource_name = child.name
                 if child_resource_name == parent_name or child_resource_name in deletion_intents:
                     continue
@@ -5172,7 +5400,9 @@ def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[s
                 )
                 == parent_identity
             )
-            dependency_matches = bool(desired_observation_reference_units(child) & parent_names)
+            dependency_matches = isinstance(child, UnitResource) and bool(
+                desired_observation_reference_units(child) & parent_names
+            )
             if owner_matches or dependency_matches:
                 dependents.add(child.name)
                 pending.append(child_identity)
