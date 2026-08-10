@@ -161,7 +161,8 @@ Stacks, child deletion obligations, UID/generation fencing, and `finalize-stack`
 499-test repository check pass. Restart acceptance and external-driver cleanup coverage remain open; dependency
 ordering is now implemented and covered by focused graph tests. Commit `1a4bf66` adds focused acceptance coverage
 for source-tracked cleanup across a desired-state restart, direct finalization retry after publication failure, and
-public dependency ordering. Real external-inventory/driver acceptance remains open.
+public dependency ordering. Commit `a18c23f` adds a desired-head incarnation fence and exact owner checks; a durable
+Stack tombstone/request ledger and real external-inventory/driver acceptance remain open.
 
 ### 6. Forge recovery and operational boundary — core recovery complete; external integrations pending
 

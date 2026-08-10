@@ -28,7 +28,7 @@ implementation.
 | Change-gated candidate freshness | **Local verifier implemented** | `88ae0b9` rejects stale, rebased, multi-commit, merge, root, and missing-head candidates before review creation; required forge checks and merge-queue/branch-protection enforcement remain external work. |
 | StackTemplate/Stack contracts and deterministic parameter expansion | **Implemented** | Commits `eb0bcb9` and `84d7ddb`; direct desired Stack provenance is typed and schema-published. |
 | Generated Stack resource graphs with UID-fenced ownership | **Implemented projection and closure** | `b441941` and `d071c1e` project source-authored/direct Stack-owned Units and retain a UID-fenced closure through deletion. |
-| Direct Stack instantiation | **Implemented** | `84d7ddb` adds replay-fenced `instantiate-stack` and exact template provenance. |
+| Direct Stack instantiation | **Implemented with interim incarnation fencing** | `84d7ddb` adds replay-fenced `instantiate-stack` and exact template provenance; `a18c23f` includes the desired head in the UID, while a durable Stack tombstone/request ledger remains open. |
 | Direct and source-tracked Stack deletion/finalization | **Implemented core lifecycle** | `d071c1e` adds source-absence intents, direct UID/generation-fenced requests, child obligations, and root finalization after owned Units. |
 | Controller-owned source pins | **Lifecycle wired; recovery is partial** | `5d3a5a0` provides fenced refs; `36a529b` enumerates pins and recovers direct Stacks that are still present. Pins left after failed publication/finalization do not yet have enough durable ownership metadata for safe cleanup. |
 | Forge eligibility/expiry/orphan recovery | **GitHub eligibility implemented; recovery is partial** | `36a529b` implements fail-closed GitHub eligibility, expiry, pin comparison, and UID-fenced cleanup requests for present roots. Orphan pins, GitLab-native lookup, and authoritative merge-time enforcement remain open. |
@@ -401,6 +401,8 @@ scenarios remain pending.
 - [x] Add generic StackTemplate and Stack contracts plus deterministic parameter expansion.
 - [x] Add generated Stack resource graphs with UID-fenced controlling ownership.
 - [x] Add direct Stack instantiation with request and revision fencing.
+- [ ] Add a durable Stack incarnation tombstone/request ledger; the current desired-head UID fence prevents normal
+  post-finalization reuse but is not a history-independent tombstone.
 - [x] Add direct Stack deletion requests with UID/generation fencing.
 - [x] Generalize two-phase finalization and teardown ordering from Units to Stack-owned closures.
 - [x] Integrate explicit StackTemplate dependencies, including cross-kind edges, into generic convergence/status and
