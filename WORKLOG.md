@@ -138,7 +138,7 @@ dependencies into generic convergence/status and reverse teardown ordering; the 
 preserves cross-kind edges. Generated Unit names are now Stack-scoped, allowing concurrent instances from one
 template; the external restart/acceptance harness remains pending.
 
-Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 533 tests,
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 538 tests,
 lint, typecheck, schema freshness, strict docs, actionlint, formatting, and diff checks. Remaining Milestone 3 work is
 restart/failure-injection and direct/source-tracked Stack owner-graph acceptance.
 
@@ -159,10 +159,10 @@ work.
 ### 5. Direct Stack lifecycle — core complete; acceptance pending
 
 Commit `84d7ddb` adds `instantiate-stack`, exact template revision/path/digest provenance, request replay fencing,
-direct management metadata, and Stack-owned generated Units. The focused CLI/contract/graph tests and full 533-test
+direct management metadata, and Stack-owned generated Units. The focused CLI/contract/graph tests and full 538-test
 repository check pass. Commit `d071c1e` adds `request-delete-direct-stack`, source-absence handling for source-tracked
 Stacks, child deletion obligations, UID/generation fencing, and `finalize-stack`; the focused Stack suite and full
-533-test repository check pass. Restart acceptance and external-driver cleanup coverage remain open; dependency
+538-test repository check pass. Restart acceptance and external-driver cleanup coverage remain open; dependency
 ordering is now implemented and covered by focused graph tests. Commit `1a4bf66` adds focused acceptance coverage
 for source-tracked cleanup across a desired-state restart, direct finalization retry after publication failure, and
 public dependency ordering. Commit `a18c23f` adds a desired-head incarnation fence and exact owner checks. Commit
@@ -178,18 +178,19 @@ normal Stack deletion intents. The correctness pass accepts canonical GitHub ide
 UIDs, preserves cross-kind dependency edges, and makes recovery dry-run inspect pins. Commit `46c2a67` documents the
 ApplicationSet, security, and cleanup boundary for Argo CD. Commit `57dd132` adds finalized-tombstone and
 pre-publication orphan-pin cleanup safeguards. The current increment adds CAS-fenced pin claims and reaping. The
-read-only GitLab.com eligibility adapter uses `glab`; the repository still does not publish/observe Argo manifests or
-configure forge-side required checks/merge queues. CI now runs for GitHub `merge_group` requests.
+read-only GitLab.com eligibility adapter uses `glab`; the repository still does not publish preview manifests or own
+ApplicationSet resources, and forge-side required checks/merge queues remain deployment configuration. CI now runs for
+GitHub `merge_group` requests and verifies the exact candidate/base commit shape.
 
-Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 533 tests,
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 538 tests,
 lint, typecheck, schema freshness, strict docs, actionlint, formatting, and diff checks.
 
 ### 7. Acceptance harness and security/operations documentation — documentation complete; acceptance pending
 
 The operational/security guide is published at `docs/preview-environments.md` and linked from the MkDocs navigation.
-The remaining work is the real temporary-repository acceptance harness, deterministic external-inventory cleanup
-coverage, and verification of the deployment-specific
-Argo/forge setup.
+Docker/Terraform, Kubernetes, and Argo acceptance jobs are present. The temporary-repository Stack harness now proves
+restart recovery, UID retention, reverse teardown, and same-name recreation against a deterministic inventory. The
+remaining work is driver-backed Stack cleanup, required forge policy configuration, and legacy migration completion.
 
 ### 8. Remove legacy compatibility after migration condition — pending
 
