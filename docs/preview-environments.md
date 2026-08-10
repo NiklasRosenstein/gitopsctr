@@ -42,9 +42,10 @@ gitopsctr instantiate-stack \
   --request-id github:example-org/application#123
 ```
 
-Instantiation pins the exact template revision on a controller-owned ref. The
-pin remains available while the Stack and its Units are being torn down and is
-released only after successful `finalize-stack` publication.
+Instantiation creates a CAS-fenced controller claim and pins the exact template
+revision on a controller-owned ref. The pin remains available while the Stack
+and its Units are being torn down and is released only after successful
+`finalize-stack` publication. Recovery retains unclaimed legacy pins.
 
 When a pull request closes, loses its required label, or expires, a webhook may
 request deletion immediately. A scheduled job can recover missed events:
@@ -55,10 +56,12 @@ gitopsctr recover-orphaned-stacks \
   --required-label preview
 ```
 
-The recovery operation is fail-closed when forge state is unknown. It creates a
-normal UID-fenced Stack deletion intent; it never deletes external resources or
-releases a pin through an out-of-band path. The Unit finalization commands must
-complete the owned closure before the Stack root can be finalized.
+The recovery operation is fail-closed when forge state or claim evidence is
+unknown. It changes a claim to `reaping` with a revision fence, rechecks current
+and candidate ownership, then releases the pin and claim. It creates a normal
+UID-fenced Stack deletion intent for a present root; it never deletes external
+resources or releases a pin through an out-of-band path. The Unit finalization
+commands must complete the owned closure before the Stack root can be finalized.
 
 GitHub eligibility is read through `gh pr view`. GitLab.com eligibility is read
 through `glab mr view`. Both consider a request eligible only while it is open

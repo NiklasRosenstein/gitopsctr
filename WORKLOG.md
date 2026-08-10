@@ -138,11 +138,11 @@ dependencies into generic convergence/status and reverse teardown ordering; the 
 preserves cross-kind edges. Generated Unit names are now Stack-scoped, allowing concurrent instances from one
 template; the external restart/acceptance harness remains pending.
 
-Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 524 tests,
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 533 tests,
 lint, typecheck, schema freshness, strict docs, actionlint, formatting, and diff checks. Remaining Milestone 3 work is
 restart/failure-injection and direct/source-tracked Stack owner-graph acceptance.
 
-### 4. Controller-owned source-pin lifecycle — lifecycle complete; orphan recovery partial
+### 4. Controller-owned source-pin lifecycle — lifecycle and claim recovery complete
 
 Commit `5d3a5a0` adds idempotent controller-owned Git pin creation and UID/revision-fenced release without force-push,
 with bare-repository coverage for create, repeat, mismatched create, matching release, stale release, and missing
@@ -150,18 +150,19 @@ release. Commits `84d7ddb` and `d071c1e` wire pin creation into direct Stack ins
 Stack finalization, retaining the pin through change-gated teardown. Commit `36a529b` adds validated pin enumeration,
 fail-closed GitHub eligibility/expiry evaluation, and `recover-orphaned-stacks`, which routes ineligible direct Stacks
 through the normal UID-fenced deletion lifecycle. Commit `57dd132` releases pins confirmed by finalized Stack
-tombstones and cleans up pins when publication is proven not to have reached a desired/candidate ref. Candidate-aware
-ownership for unknown orphan pins remains open.
-Native GitLab.com lookup is now provided by the read-only `glab` adapter. Self-hosted GitLab setup, scheduler wiring,
-and authoritative merge-time forge enforcement remain external follow-up work.
+tombstones and cleans up pins when publication is proven not to have reached a desired/candidate ref. The current
+increment adds CAS-fenced `gitopsctr/pin-claims/stacks/...` records, candidate ownership checks, reaping, and claim
+cleanup. Unclaimed legacy pins remain retained. Native GitLab.com lookup is provided by the read-only `glab` adapter.
+Self-hosted GitLab setup, scheduler wiring, and authoritative merge-time forge enforcement remain external follow-up
+work.
 
 ### 5. Direct Stack lifecycle — core complete; acceptance pending
 
 Commit `84d7ddb` adds `instantiate-stack`, exact template revision/path/digest provenance, request replay fencing,
-direct management metadata, and Stack-owned generated Units. The focused CLI/contract/graph tests and full 524-test
+direct management metadata, and Stack-owned generated Units. The focused CLI/contract/graph tests and full 533-test
 repository check pass. Commit `d071c1e` adds `request-delete-direct-stack`, source-absence handling for source-tracked
 Stacks, child deletion obligations, UID/generation fencing, and `finalize-stack`; the focused Stack suite and full
-524-test repository check pass. Restart acceptance and external-driver cleanup coverage remain open; dependency
+533-test repository check pass. Restart acceptance and external-driver cleanup coverage remain open; dependency
 ordering is now implemented and covered by focused graph tests. Commit `1a4bf66` adds focused acceptance coverage
 for source-tracked cleanup across a desired-state restart, direct finalization retry after publication failure, and
 public dependency ordering. Commit `a18c23f` adds a desired-head incarnation fence and exact owner checks. Commit
@@ -176,17 +177,18 @@ label-ineligible previews, optional expiry handling, controller-pin enumeration,
 normal Stack deletion intents. The correctness pass accepts canonical GitHub identities, enforces exact Stack owner
 UIDs, preserves cross-kind dependency edges, and makes recovery dry-run inspect pins. Commit `46c2a67` documents the
 ApplicationSet, security, and cleanup boundary for Argo CD. Commit `57dd132` adds finalized-tombstone and
-pre-publication orphan-pin cleanup safeguards. The read-only GitLab.com eligibility adapter uses `glab`; the
-repository still does not publish/observe Argo manifests or configure forge-side required checks/merge queues.
+pre-publication orphan-pin cleanup safeguards. The current increment adds CAS-fenced pin claims and reaping. The
+read-only GitLab.com eligibility adapter uses `glab`; the repository still does not publish/observe Argo manifests or
+configure forge-side required checks/merge queues. CI now runs for GitHub `merge_group` requests.
 
-Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 524 tests,
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 533 tests,
 lint, typecheck, schema freshness, strict docs, actionlint, formatting, and diff checks.
 
 ### 7. Acceptance harness and security/operations documentation — documentation complete; acceptance pending
 
 The operational/security guide is published at `docs/preview-environments.md` and linked from the MkDocs navigation.
 The remaining work is the real temporary-repository acceptance harness, deterministic external-inventory cleanup
-coverage, candidate-aware orphan-pin ownership/recovery, and verification of the deployment-specific
+coverage, and verification of the deployment-specific
 Argo/forge setup.
 
 ### 8. Remove legacy compatibility after migration condition — pending
