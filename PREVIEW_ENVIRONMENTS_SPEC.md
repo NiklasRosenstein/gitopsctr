@@ -2,7 +2,7 @@
 
 > **Status:** Living implementation design. The lifecycle-aware desired-resource envelope and a hardened Unit-specific
 > finalization slice are implemented, including terminal teardown evidence and explicit direct-Unit deletion. Direct
-> Stack management, source pins, Stack, forge, and end-to-end acceptance remain pending. Field names, document layouts,
+> Stack management, source pins, forge merge enforcement, Stack, and end-to-end acceptance remain pending. Field names, document layouts,
 > and command names are illustrative unless
 > explicitly marked **Settled**.
 
@@ -21,15 +21,16 @@ The current branch is a Unit-focused foundation rather than an end-to-end previe
 | --- | --- | --- |
 | Desired Unit identity, lifecycle authority, ownership, legacy retention, rollback, and schema profiles | **Implemented for Unit** | Keep the generic semantic model; extend it to Stack and StackTemplate later. |
 | Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit** | Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac` close lease, incarnation, transition, dependency, legacy-safety, opaque-recovery, evidence-contract, and direct-root lifecycle defects; source pins, forge enforcement, and acceptance work remains. |
+| Change-gated candidate freshness | **Local verifier implemented** | `88ae0b9` rejects stale, rebased, multi-commit, merge, root, and missing-head candidates before review creation; required forge checks and merge-queue/branch-protection enforcement remain external work. |
 | StackTemplate contracts, Stack contracts, parameter expansion, and generated ownership graphs | **Pending** | Milestone 3. |
 | Direct Stack operations and UID-fenced deletion | **Pending** | Milestone 4. |
 | Controller-owned source pins, forge eligibility/expiry/orphan recovery, and Argo integration | **Pending** | Milestones 4–5. |
 | End-to-end acceptance, security, operations, and legacy retirement | **Pending** | Milestones 6–7. |
 
-The repository verification suite currently passes (`456` tests), including the landed concurrency, recovery,
-incarnation, evidence, and direct-root regressions. Passing verification is therefore necessary, not sufficient, for
-the remaining preview-environment milestones because source pins, forge enforcement, Stack behavior, and end-to-end
-acceptance contracts are still open.
+The repository verification suite currently passes (`468` tests), including the landed concurrency, recovery,
+incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
+not sufficient, for the remaining preview-environment milestones because source pins, forge merge enforcement, Stack
+behavior, and end-to-end acceptance contracts are still open.
 
 ## Problem and scope
 
@@ -186,6 +187,11 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
   repeated requests for the same direct intent are inert. Source material remains available to Terraform finalization
   when present. Forge-side enforcement preventing a stale change-gated candidate from merging after same-name
   recreation remains open.
+- **Done in `88ae0b9` — candidate freshness verifier:** Change-gated publication now requires the candidate commit to
+  have exactly one parent equal to the target head and exactly one commit after that parent. Roots, stale/rebased,
+  multi-commit, merge, and missing-head candidates fail closed. The forge seam validates exact candidate/base heads
+  for GitHub `pull_request` and `merge_group` payloads. Repository branch protection or a required check/merge queue
+  is still needed to make this guarantee authoritative at merge time.
 - **Acceptance coverage:** Add restart and failure-injection tests for every item above, including lease recovery,
   same-name recreation, GVK/driver replacement, resolved receipt/artifact dependencies, concurrent dependent
   insertion, legacy application, opaque-root recovery, and teardown evidence round trips.
@@ -319,16 +325,17 @@ Before declaring the Unit implementation milestone complete, the harness MUST co
   evidence publication while remaining UID/generation fenced. **Covered for the terminal-evidence contract by
   `26982bf`; pre-publication crash retry remains an idempotence requirement.**
 - Request deletion of a direct Unit with an exact UID, remove authored source if any, restart, and prove the direct Unit
-  remains retained until finalization. **Covered by `f9cc2ac`; forge-side stale-candidate merge enforcement remains
-  pending.**
+  remains retained until finalization. **Covered by `f9cc2ac`; local candidate freshness is covered by `88ae0b9`, while
+  forge-side required-check/merge-queue enforcement remains pending.**
 
 Shared recovery coverage MUST prove that one destroy failure retains cleanup inputs across restart and that a stale
 delete request for an old UID cannot affect a recreated same-name resource.
 
-Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac` cover finalization lease completion, pre-effect
+Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, `f9cc2ac`, and `88ae0b9` cover finalization lease completion, pre-effect
 failure cleanup, same-name incarnation fencing, parseable GVK/driver replacement, resolved dependency preservation,
 pre-lease dependency revalidation, legacy application blocking, parseable opaque-root recovery, the terminal teardown
-evidence contract, and explicit direct-Unit deletion. Source-pin, forge-side merge enforcement, permanently
+evidence contract, explicit direct-Unit deletion, and local candidate freshness fencing. Source-pin, forge-side
+required-check/merge-queue enforcement, permanently
 unparseable-root operator resolution, and remaining acceptance scenarios remain pending.
 
 ## Implementation checklist
@@ -349,6 +356,8 @@ unparseable-root operator resolution, and remaining acceptance scenarios remain 
   observed evidence, including legacy evidence compatibility.
 - [x] Add explicit UID-fenced deletion requests and finalization for direct Unit roots without inferring direct
   management from source absence.
+- [x] Reject stale or structurally unsafe change-gated candidates before creating a review request, and validate
+  GitHub candidate/base head identity at the forge seam.
 
 ### Required to complete the Unit milestone
 
@@ -368,6 +377,7 @@ unparseable-root operator resolution, and remaining acceptance scenarios remain 
 - [ ] Extend Docker/Terraform acceptance to observe Stack-driven cleanup.
 - [ ] Add GitHub/GitLab setup, Argo CD examples, operations, and security documentation.
 - [ ] Add scheduled orphan detection, forge eligibility, and expiry cleanup.
+- [ ] Configure and verify required forge freshness checks or merge-queue/branch-protection enforcement at merge time.
 - [ ] Remove legacy implicit-root compatibility after the documented migration condition is met.
 
 ## Open decisions

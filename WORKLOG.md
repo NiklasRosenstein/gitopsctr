@@ -113,6 +113,19 @@ fixed the direct finalization source-materialization and repeated-request defect
 controller-owned source pins, permanently unparseable-root operator resolution, forge-side stale-candidate merge
 enforcement, and the remaining acceptance cases.
 
+### 2.6 Change-gated candidate freshness — local hardening complete
+
+Commit `88ae0b9` adds a fail-closed Git commit-graph verifier for every locally published change candidate. A candidate
+must be exactly one controller commit whose sole parent is the target desired head; stale, rebased, multi-commit,
+merge, root, and missing-head candidates are rejected before a review request is opened. The forge seam also validates
+exact candidate/base heads for GitHub `pull_request` and `merge_group` event payloads.
+
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 468 tests,
+lint, typecheck, schema freshness, strict docs, actionlint, and formatting. Sol High confirmed the original stale-merge
+race and advised this narrow verifier. Repository branch-protection or required-check/merge-queue configuration is
+still needed for an authoritative merge-time guarantee; source pins, permanently unparseable-root operator
+resolution, and the remaining acceptance cases are also pending.
+
 ### 3. StackTemplate and Stack resolution — pending
 
 ### 4. Direct Stack operations and source pins — pending
