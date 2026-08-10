@@ -12,7 +12,7 @@ from gitopsctr import cli as deploy_release
 from gitopsctr.contracts import DesiredOwnerReference, DesiredSource
 from gitopsctr.driver import TeardownResult
 from gitopsctr.errors import OperationError
-from tests.conftest import write_test_document
+from tests.conftest import receipt_document, write_test_document
 
 
 @pytest.fixture(autouse=True)
@@ -519,8 +519,15 @@ def test_finalize_tears_down_then_publishes_absent_state_and_is_idempotent(tmp_p
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(content)
             return "c" * 40
-        (output / "units/application.json").parent.mkdir(parents=True, exist_ok=True)
-        (output / "units/application.json").write_text("stale receipt")
+        _write_json(
+            output / "units/application.json",
+            receipt_document(
+                "terraform",
+                "application",
+                {"unitBlob": deploy_release.file_blob(unit_path), "revision": "c" * 40},
+                {"applied": {"sourceRevision": "c" * 40}, "outputs": {}},
+            ),
+        )
         artifact = output / "artifacts/application/output.txt"
         artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_text("stale artifact")
@@ -553,8 +560,12 @@ def test_finalize_tears_down_then_publishes_absent_state_and_is_idempotent(tmp_p
     assert len(teardown_calls) == 1
     assert teardown_calls[0].resource_uid == intent.uid
     assert teardown_calls[0].deletion_generation == 1
+    assert teardown_calls[0].previous_receipt is not None
+    assert teardown_calls[0].previous_receipt.spec.desired.unitBlob == deploy_release.file_blob(unit_path)
     evidence_files = publications[0]["files"]
     assert ".gitopsctr/teardowns/units/application.d1-application.1.json" in evidence_files
+    evidence = json.loads(evidence_files[".gitopsctr/teardowns/units/application.d1-application.1.json"].decode())
+    assert evidence["details"] == {"uid": intent.uid, "generation": 1}
     assert "units/application.json" not in evidence_files
     assert "artifacts/application/output.txt" not in evidence_files
     files = publications[-1]["files"]
@@ -700,6 +711,8 @@ def test_finalize_failure_keeps_intent_for_retry(tmp_path, monkeypatch, capsys):
     def fail_teardown(_driver, _context):
         raise deploy_release.DriverError("destroy failed")
 
+    published: list[dict[str, object]] = []
+
     monkeypatch.setattr(type(deploy_release.UNIT_DRIVERS["terraform"]), "teardown", fail_teardown)
     monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
     monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
@@ -707,8 +720,14 @@ def test_finalize_failure_keeps_intent_for_retry(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         deploy_release, "materialize_revision", lambda _revision, output: output.mkdir(parents=True, exist_ok=True)
     )
+    monkeypatch.setattr(
+        deploy_release,
+        "publish_teardown_observation_cas",
+        lambda *_args, **kwargs: published.append(kwargs),
+    )
 
     assert deploy_release.command_finalize(_finalize_args()) is False
+    assert published == []
     assert deploy_release.load_desired_deletion_intents(current)["application"].deletion_generation == 1
     assert "teardown failed: destroy failed" in capsys.readouterr().err
 
@@ -1101,7 +1120,9 @@ def test_legacy_teardown_evidence_is_superseded_by_keyed_evidence(tmp_path, monk
         unit_name="application", uid=intent.uid, deletion_generation=1, desired_revision="c" * 40
     )
     legacy_path = observed_source / ".gitopsctr/teardowns/units/application.json"
-    deploy_release.write_document(legacy_path, legacy.document(), format=deploy_release.DocumentFormat.JSON)
+    legacy_document = legacy.document()
+    legacy_document.pop("details")
+    deploy_release.write_document(legacy_path, legacy_document, format=deploy_release.DocumentFormat.JSON)
     publications: list[dict[str, bytes]] = []
 
     def observed_tree(_ref, output):
@@ -1168,6 +1189,107 @@ def test_teardown_evidence_is_selected_by_uid_and_generation(tmp_path):
 
     assert deploy_release.load_teardown_evidence(observed, "application", "d1-new", 1) is None
     assert deploy_release.load_teardown_evidence(observed, "application", "d1-old", 1) == old
+
+
+def test_teardown_evidence_details_round_trip_and_legacy_default():
+    evidence = deploy_release.TeardownEvidence(
+        unit_name="application",
+        uid="d1-application",
+        deletion_generation=2,
+        desired_revision="a" * 40,
+        details={"resource": {"id": "example", "count": 1}},
+    )
+
+    assert deploy_release.TeardownEvidence.from_document(evidence.document(), "application") == evidence
+    legacy_document = evidence.document()
+    legacy_document.pop("details")
+    restored = deploy_release.TeardownEvidence.from_document(legacy_document, "application")
+    assert restored.details == {}
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_teardown_evidence_rejects_non_finite_details(value):
+    evidence = deploy_release.TeardownEvidence(
+        unit_name="application",
+        uid="d1-application",
+        deletion_generation=2,
+        desired_revision="a" * 40,
+    ).document()
+    evidence["details"] = {"value": value}
+
+    with pytest.raises(ValueError, match="invalid teardown evidence details"):
+        deploy_release.TeardownEvidence.from_document(evidence, "application")
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["unit_blob", "subject_name", "subject_api_version", "subject_kind", "driver"],
+)
+def test_finalize_filters_stale_previous_receipt_identity(tmp_path, monkeypatch, field):
+    current = tmp_path / "current"
+    unit_path = current / "units/application.json"
+    _write_json(unit_path, _terraform_unit("application", "d1-application"))
+    unit = deploy_release.load_desired_unit(unit_path, "application")
+    intent = deploy_release.UnitDeletionIntent.from_unit(unit, unit_path, current)
+    deploy_release.write_deletion_intent(current, intent)
+    desired_files = deploy_release.directory_files(current)
+    teardown_calls = []
+
+    receipt = deploy_release.RESOURCE_CATALOG.parse_receipt(
+        receipt_document(
+            "terraform",
+            "application",
+            {"unitBlob": intent.retained_unit_blob, "revision": "c" * 40},
+            {"applied": {"sourceRevision": "c" * 40}, "outputs": {}},
+        ),
+        "application",
+    )
+    valid_receipt = receipt
+    if field == "unit_blob":
+        receipt = replace(receipt, spec=replace(receipt.spec, desired=replace(receipt.spec.desired, unitBlob="e" * 40)))
+    elif field == "subject_name":
+        receipt = replace(receipt, spec=replace(receipt.spec, subject=replace(receipt.spec.subject, name="other")))
+    elif field == "subject_api_version":
+        receipt = replace(
+            receipt, spec=replace(receipt.spec, subject=replace(receipt.spec.subject, apiVersion="other.io/v1"))
+        )
+    elif field == "subject_kind":
+        receipt = replace(receipt, spec=replace(receipt.spec, subject=replace(receipt.spec.subject, kind="Other")))
+    else:
+        receipt = replace(receipt, driver=deploy_release.UNIT_DRIVERS["vite-oci-bundle"])
+    monkeypatch.setattr(deploy_release, "load_receipt", lambda *_args, **_kwargs: receipt)
+
+    def observed_tree(ref: str, output: Path):
+        output.mkdir(parents=True, exist_ok=True)
+        if ref == "deploy/dev":
+            for relative, content in desired_files.items():
+                target = output / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+        else:
+            _write_json(
+                output / "units/application.json", deploy_release.RESOURCE_CATALOG.serialize_receipt(valid_receipt)
+            )
+        return "c" * 40 if ref == "deploy/dev" else None
+
+    def teardown(_driver, context):
+        teardown_calls.append(context)
+        return TeardownResult()
+
+    monkeypatch.setattr(type(deploy_release.UNIT_DRIVERS["terraform"]), "teardown", teardown)
+    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(
+        deploy_release, "materialize_revision", lambda _revision, output: output.mkdir(parents=True, exist_ok=True)
+    )
+    monkeypatch.setattr(deploy_release, "change_gate", lambda *_args: "none")
+    monkeypatch.setattr(deploy_release, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+    monkeypatch.setattr(deploy_release, "publish_tree", lambda *_args, **_kwargs: "d" * 40)
+
+    assert deploy_release.command_finalize(_finalize_args()) is True
+    assert len(teardown_calls) == 1
+    assert teardown_calls[0].previous_receipt is None
 
 
 def test_finalize_revision_fence_blocks_stale_reconcile_effect(tmp_path, monkeypatch):

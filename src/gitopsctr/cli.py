@@ -52,7 +52,7 @@ from gitopsctr.dependencies import (
     downstream_unit_closure,
     observation_reference_units,
 )
-from gitopsctr.document import ContractError, DocumentContract, JsonObject, JsonObjectValue
+from gitopsctr.document import ContractError, DocumentContract, JsonObject, JsonObjectValue, require_json_value
 from gitopsctr.driver import (
     DriverError,
     MaterializationContext,
@@ -63,6 +63,7 @@ from gitopsctr.driver import (
     ReconciliationOutput,
     TeardownCapability,
     TeardownContext,
+    TeardownResult,
     UnitResolutionContext,
     VerificationContext,
     VerificationStatus,
@@ -2632,6 +2633,7 @@ class TeardownEvidence:
     uid: str
     deletion_generation: int
     desired_revision: str
+    details: JsonObject = field(default_factory=dict)
 
     def document(self) -> JsonObject:
         return {
@@ -2641,22 +2643,28 @@ class TeardownEvidence:
             "uid": self.uid,
             "deletionGeneration": self.deletion_generation,
             "desiredRevision": self.desired_revision,
+            "details": self.details,
         }
 
     @classmethod
     def from_document(cls, document: object, expected_name: str) -> TeardownEvidence:
-        if not isinstance(document, dict) or set(document) != {
+        required_fields = {
             "schema",
             "kind",
             "unitName",
             "uid",
             "deletionGeneration",
             "desiredRevision",
-        }:
+        }
+        if not isinstance(document, dict) or set(document) not in (
+            required_fields,
+            required_fields | {"details"},
+        ):
             raise ValueError("invalid teardown evidence envelope")
         raw_uid = document.get("uid")
         raw_generation = document.get("deletionGeneration")
         raw_revision = document.get("desiredRevision")
+        raw_details = document.get("details", {})
         if (
             type(document.get("schema")) is not int
             or document.get("schema") != 1
@@ -2667,6 +2675,7 @@ class TeardownEvidence:
             or isinstance(raw_generation, bool)
             or raw_generation < 1
             or not isinstance(raw_revision, str)
+            or not isinstance(raw_details, dict)
         ):
             raise ValueError("invalid teardown evidence envelope")
         ResourceMetadata(
@@ -2676,11 +2685,16 @@ class TeardownEvidence:
         ).validate_desired()
         if not re.fullmatch(r"[0-9a-f]{40}", raw_revision):
             raise ValueError("invalid teardown evidence desired revision")
+        try:
+            details = cast(JsonObject, require_json_value(raw_details))
+        except ValueError as exc:
+            raise ValueError("invalid teardown evidence details") from exc
         return cls(
             unit_name=expected_name,
             uid=raw_uid,
             deletion_generation=raw_generation,
             desired_revision=raw_revision,
+            details=details,
         )
 
 
@@ -3216,6 +3230,7 @@ def publish_teardown_observation_cas(
     desired_ref: str | None = None,
     lease_token: str | None = None,
     lease_snapshot: EffectLeaseSnapshot | None = None,
+    details: Mapping[str, object] | None = None,
 ) -> str:
     for attempt in range(5):
         if attempt:
@@ -3231,17 +3246,27 @@ def publish_teardown_observation_cas(
                     lease_token,
                     lease_snapshot,
                 )
-            evidence = TeardownEvidence(
-                unit_name=intent.unit_name,
-                uid=intent.uid,
-                deletion_generation=intent.deletion_generation,
-                desired_revision=desired_revision,
-            )
             existing = load_teardown_evidence(
                 observed,
                 intent.unit_name,
                 intent.uid,
                 intent.deletion_generation,
+            )
+            try:
+                evidence_details = cast(
+                    JsonObject,
+                    require_json_value(
+                        dict(existing.details if details is None and existing is not None else details or {})
+                    ),
+                )
+            except (TypeError, ValueError) as exc:
+                raise OperationError("teardown returned non-JSON evidence details") from exc
+            evidence = TeardownEvidence(
+                unit_name=intent.unit_name,
+                uid=intent.uid,
+                deletion_generation=intent.deletion_generation,
+                desired_revision=desired_revision,
+                details=evidence_details,
             )
             legacy_evidence_removed = False
             for legacy_path in document_candidates(observed / OBSERVED_TEARDOWN_EVIDENCE_PATH, intent.unit_name):
@@ -3284,6 +3309,7 @@ def publish_teardown_observation_cas(
                         uid=intent.uid,
                         deletion_generation=intent.deletion_generation,
                         desired_revision=desired_revision,
+                        details=evidence_details,
                     )
             write_document(evidence_path, evidence.document(), format=DocumentFormat.JSON)
             if (
@@ -5445,6 +5471,23 @@ def _command_finalize(args: argparse.Namespace) -> bool:
             intent.uid,
             intent.deletion_generation,
         )
+        previous_receipt = None
+        receipt_paths = document_candidates(observed / "units", args.unit)
+        if receipt_paths:
+            try:
+                candidate_receipt = load_receipt(receipt_paths[0], args.unit)
+                if (
+                    candidate_receipt.spec.desired.unitBlob == intent.retained_unit_blob
+                    and candidate_receipt.spec.subject.name == intent.unit_name
+                    and candidate_receipt.spec.subject.apiVersion == intent.retained_api_version
+                    and candidate_receipt.spec.subject.kind == intent.retained_kind
+                    and candidate_receipt.driver_name == intent.retained_driver
+                ):
+                    previous_receipt = candidate_receipt
+            except (DocumentFormatError, OperationError, KeyError, TypeError, ValueError):
+                # Finalization historically removed malformed observations. Keep
+                # that behavior while passing valid receipts to retrying drivers.
+                previous_receipt = None
         if existing_evidence is not None and args.dry:
             log_status("DRY", f"{style_unit(args.unit)}: teardown evidence already exists")
             return False
@@ -5503,6 +5546,9 @@ def _command_finalize(args: argparse.Namespace) -> bool:
         heartbeat: EffectLeaseHeartbeat | None = None
         teardown_driver: TeardownCapability | None = None
         driver_started = False
+        teardown_details: Mapping[str, object] | None = (
+            existing_evidence.details if existing_evidence is not None else None
+        )
         try:
             if lease_acquisition.revision == current_revision:
                 write_effect_lease(current, lease_acquisition.lease)
@@ -5529,7 +5575,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
             try:
                 assert teardown_driver is not None
                 driver_started = True
-                teardown_driver.teardown(
+                teardown_result = teardown_driver.teardown(
                     TeardownContext(
                         environment=args.environment,
                         desired_root=current,
@@ -5541,10 +5587,14 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                         unit=unit.spec,
                         resource_uid=intent.uid,
                         deletion_generation=intent.deletion_generation,
+                        previous_receipt=previous_receipt,
                         report=Path(args.report).resolve() if args.report else None,
                         execution=DriverExecution.console(),
                     )
                 )
+                if teardown_result is not None and not isinstance(teardown_result, TeardownResult):
+                    raise DriverError("teardown returned an invalid result")
+                teardown_details = teardown_result.details if teardown_result is not None else {}
             except (DriverError, OperationError, subprocess.CalledProcessError) as exc:
                 try:
                     if heartbeat is not None:
@@ -5601,6 +5651,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                 desired_ref=desired_ref,
                 lease_token=lease_acquisition.lease.token,
                 lease_snapshot=lease_acquisition.lease.snapshot,
+                details=teardown_details,
             )
         except (OperationError, subprocess.CalledProcessError) as exc:
             log_status("WAIT", f"{style_unit(args.unit)}: teardown evidence was not published: {exc}")

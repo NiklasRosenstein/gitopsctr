@@ -167,13 +167,20 @@ class TeardownContext[DesiredT: StrictModel]:
     unit: DesiredT
     resource_uid: str
     deletion_generation: int
+    previous_receipt: ReceiptResource[Any] | None = None
     report: Path | None = None
     execution: DriverExecution = field(default_factory=default_driver_execution)
 
 
 @dataclass(frozen=True)
 class TeardownResult:
-    """Optional driver evidence from a successful, idempotent teardown."""
+    """Optional evidence persisted with terminal observed teardown state.
+
+    The details become durable only after the controller publishes that
+    observed state. A crash before publication causes a retry, so teardown
+    implementations must remain idempotent and must not rely on these details
+    being available during a later attempt.
+    """
 
     details: Mapping[str, object] = field(default_factory=dict)
 
