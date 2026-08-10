@@ -19,6 +19,7 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from functools import cache
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
@@ -1147,13 +1148,34 @@ def resolve_template(
     )
 
 
+class SourceResolutionDisposition(StrEnum):
+    """The source identity decision made while preparing one desired unit."""
+
+    UNCHANGED = "unchanged"
+    INPUTS_CHANGED = "inputs-changed"
+    REVISION_REFRESHED = "revision-refreshed"
+
+
 @dataclass(frozen=True)
 class ResolvedUnitSourceResult:
-    """Resolved source plus the input-change and refresh decisions for one unit."""
+    """Resolved source plus the explicit input and provenance disposition."""
 
     source: DesiredSource | None
-    inputs_changed: bool
+    # Retained as a compatibility input for callers constructing this result directly.
+    inputs_changed: bool | None = None
     refresh_reason: str | None = None
+    disposition: SourceResolutionDisposition | None = None
+
+    def __post_init__(self) -> None:
+        disposition = self.disposition
+        if disposition is None:
+            disposition = (
+                SourceResolutionDisposition.INPUTS_CHANGED
+                if self.inputs_changed
+                else SourceResolutionDisposition.UNCHANGED
+            )
+        object.__setattr__(self, "disposition", disposition)
+        object.__setattr__(self, "inputs_changed", disposition is SourceResolutionDisposition.INPUTS_CHANGED)
 
 
 class SourceRevisionUnavailableError(OperationError):
@@ -1178,11 +1200,11 @@ def resolved_unit_source(
     source_revision_policy = source_revision_policy or SourceRevisionPolicy()
     driver, source = require_unit_specification(specification)
     if source is None:
-        return ResolvedUnitSourceResult(source=None, inputs_changed=False)
+        return ResolvedUnitSourceResult(source=None, disposition=SourceResolutionDisposition.UNCHANGED)
     input_hash = unit_input_hash(specification, source_root)
     revision = source_revision
     prior = prior_unit_source(specification.name, current_desired, legacy)
-    inputs_changed = prior is None
+    disposition = SourceResolutionDisposition.INPUTS_CHANGED if prior is None else SourceResolutionDisposition.UNCHANGED
     refresh_reason: str | None = None
     if prior is not None:
         prior_revision, prior_hash = prior
@@ -1209,7 +1231,6 @@ def resolved_unit_source(
             if in_candidate_history:
                 revision = prior_revision
             else:
-                inputs_changed = True
                 action = (
                     source_revision_policy.when_unavailable_during_plan
                     if source_revision_operation == "plan"
@@ -1217,6 +1238,7 @@ def resolved_unit_source(
                 )
                 if action is SourceRevisionAction.ERROR:
                     raise SourceRevisionUnavailableError(specification.name, prior_revision, source_revision_operation)
+                disposition = SourceResolutionDisposition.REVISION_REFRESHED
                 unavailable_reason = "is outside candidate history" if prior_available else "is unavailable"
                 dry_suffix = " in the dry candidate only" if source_revision_operation == "plan" else ""
                 refresh_reason = (
@@ -1224,7 +1246,7 @@ def resolved_unit_source(
                     f"use {describe_revision(source_revision)}{dry_suffix}"
                 )
         else:
-            inputs_changed = True
+            disposition = SourceResolutionDisposition.INPUTS_CHANGED
     return ResolvedUnitSourceResult(
         source=DesiredSource(
             path=source.path,
@@ -1233,7 +1255,7 @@ def resolved_unit_source(
             inputHash=input_hash,
             driverVersion=DRIVER_VERSIONS[driver],
         ),
-        inputs_changed=inputs_changed,
+        disposition=disposition,
         refresh_reason=refresh_reason,
     )
 
@@ -1900,6 +1922,61 @@ def materialize_resolved_unit(
     return desired
 
 
+def carry_forward_refreshed_unit(
+    project_root: Path,
+    current_desired: Path,
+    candidate: Path,
+    candidate_units: Path,
+    authored: UnitResource[Any],
+    source_resolution: ResolvedUnitSourceResult,
+) -> bool:
+    """Carry a complete prior unit across a provenance-only source refresh.
+
+    The input hash is the equivalence boundary for the authored source and driver
+    specification. The persisted desired unit is still validated before its
+    resolved values or materialization are copied into the refreshed identity.
+    """
+
+    if source_resolution.disposition is not SourceResolutionDisposition.REVISION_REFRESHED:
+        return False
+    source = source_resolution.source
+    previous_path = unit_document_path(current_desired, authored.name)
+    if source is None or not previous_path.is_file():
+        return False
+
+    try:
+        previous = load_desired_unit(previous_path, authored.name)
+        previous_source = getattr(previous.spec, "source", None)
+        authored_source = getattr(authored.spec, "source", None)
+        if (
+            previous.driver_name != authored.driver_name
+            or previous.gvk != authored.gvk
+            or not isinstance(previous_source, DesiredSource)
+            or not isinstance(authored_source, AuthoredSource)
+            or previous_source.inputHash != source.inputHash
+            or previous_source.path != source.path
+            or previous_source.inputs != source.inputs
+            or previous_source.driverVersion != source.driverVersion
+            or source.driverVersion != DRIVER_VERSIONS[authored.driver_name]
+            or authored_source.path != source.path
+            or authored_source.inputs != source.inputs
+            or unit_contains_reference(previous)
+        ):
+            return False
+
+        # This validation is intentionally performed before copying. A matching
+        # input hash permits the existing payload to remain valid for the new
+        # provenance, but a corrupt or incomplete payload must not be carried.
+        validate_unit_materialization(current_desired, authored.name, previous)
+        carried = previous.with_spec(replace(previous.spec, source=source))
+        copy_unit_materialization(current_desired, candidate, authored.name, previous)
+        validate_unit_materialization(candidate, authored.name, carried)
+        write_unit(candidate_units / f"{authored.name}.json", carried, project_root)
+    except (DriverError, OperationError, TypeError, ValueError):
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class BuildDesiredResult:
     """Outcome of desired-state construction, including units blocked by unavailable inputs."""
@@ -1943,7 +2020,7 @@ def build_desired_candidate(
     if promotion is not None:
         write_preferred_document(candidate / "promotion.json", promotion.document(), source_root)
 
-    prepared: dict[str, tuple[UnitResource[Any], DesiredSource | None]] = {}
+    prepared: dict[str, tuple[UnitResource[Any], ResolvedUnitSourceResult]] = {}
     for unit_name, specification in specifications.items():
         source_resolution = resolved_unit_source(
             specification,
@@ -1954,7 +2031,7 @@ def build_desired_candidate(
             source_revision_policy,
             source_revision_operation,
         )
-        prepared[unit_name] = (specification, source_resolution.source)
+        prepared[unit_name] = (specification, source_resolution)
         if source_resolution.refresh_reason is not None:
             if verbose:
                 log_status("REFRESH", f"{style_unit(unit_name)}: {source_resolution.refresh_reason}")
@@ -1962,7 +2039,7 @@ def build_desired_candidate(
         previous_unit = unit_document_path(current_desired, unit_name)
         if not previous_unit.is_file():
             resolution_message = "new unit; use candidate revision"
-        elif source_resolution.inputs_changed:
+        elif source_resolution.disposition is SourceResolutionDisposition.INPUTS_CHANGED:
             resolution_message = "inputs changed; use candidate revision"
         elif source_resolution.source is None:
             resolution_message = "source-less unit"
@@ -1977,7 +2054,8 @@ def build_desired_candidate(
     while unresolved:
         progressed = False
         for unit_name in sorted(unresolved):
-            authored, resolved_source = prepared[unit_name]
+            authored, source_resolution = prepared[unit_name]
+            resolved_source = source_resolution.source
             try:
                 resolution = authored.driver.resolve_unit(
                     authored.spec,
@@ -2051,18 +2129,31 @@ def build_desired_candidate(
 
     for unit_name in sorted(unresolved):
         previous = unit_document_path(current_desired, unit_name)
+        authored, source_resolution = prepared[unit_name]
         previous_driver = persisted_unit_driver_name(previous) if previous.is_file() else None
-        next_driver = prepared[unit_name][0].driver_name
-        if previous_driver == next_driver:
+        next_driver = authored.driver_name
+        if carry_forward_refreshed_unit(
+            source_root, current_desired, candidate, candidate_units, authored, source_resolution
+        ):
+            resolution = "preserve last resolved inputs"
+            if verbose:
+                log_status(
+                    "CARRY",
+                    f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}",
+                )
+        elif previous_driver == next_driver:
             shutil.copy2(previous, candidate_units / previous.name)
             copy_unit_materialization(current_desired, candidate, unit_name, load_desired_unit(previous, unit_name))
             resolution = "retain previous desired state"
-        elif previous_driver is not None:
-            resolution = f"omit previous {previous_driver} desired state while transitioning to {next_driver}"
+            if verbose:
+                log_status("WAIT", f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}")
         else:
-            resolution = "omit until its inputs are available"
-        if verbose:
-            log_status("WAIT", f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}")
+            if previous_driver is not None:
+                resolution = f"omit previous {previous_driver} desired state while transitioning to {next_driver}"
+            else:
+                resolution = "omit until its inputs are available"
+            if verbose:
+                log_status("WAIT", f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}")
         blocked[unit_name] = unavailable[unit_name]
     return BuildDesiredResult(blocked=blocked)
 
