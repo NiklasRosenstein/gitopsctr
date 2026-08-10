@@ -18,6 +18,7 @@ from gitopsctr.contracts import (
     DesiredLifecycle,
     DesiredResourceMetadata,
     DesiredStackDocument,
+    DesiredStackSpec,
     DesiredStackTemplateDocument,
     LifecycleManagement,
     ReceiptDesired,
@@ -137,7 +138,7 @@ class StackResource:
 
     gvk: GVK
     metadata: ResourceMetadata
-    spec: StackSpec | StackTemplateSpec
+    spec: StackSpec | DesiredStackSpec | StackTemplateSpec
 
     @property
     def name(self) -> str:
@@ -224,7 +225,8 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
         for resource in identities.values()
         if isinstance(resource, StackResource) and resource.gvk.kind == "Stack"
     ):
-        assert isinstance(stack.spec, StackSpec)
+        if not isinstance(stack.spec, (StackSpec, DesiredStackSpec)):
+            raise ValueError(f"Stack {stack.name!r} has an invalid Stack spec")
         template = templates.get(stack.spec.template)
         if template is None:
             raise ValueError(
@@ -232,6 +234,14 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
             )
         assert isinstance(template.spec, StackTemplateSpec)
         expanded = template.spec.expand(stack.spec.parameters)
+        lifecycle = stack.metadata.lifecycle
+        if lifecycle is None or lifecycle.management is None:
+            raise ValueError(f"Stack {stack.name!r} must be a root resource")
+        has_provenance = isinstance(stack.spec, DesiredStackSpec) and stack.spec.provenance is not None
+        if lifecycle.management.mode == "direct" and not has_provenance:
+            raise ValueError(f"direct Stack {stack.name!r} is missing instantiation provenance")
+        if lifecycle.management.mode == "sourceTracked" and has_provenance:
+            raise ValueError(f"source-tracked Stack {stack.name!r} must not carry direct instantiation provenance")
         expanded_by_name = {resource.name: resource for resource in expanded}
         for generated in expanded:
             generated_key = (generated.apiVersion, generated.kind, generated.name)
@@ -476,9 +486,11 @@ class ResourceCatalog:
                 )
             contract = cast(TypedDocumentContract[Any], CORE_CONTRACTS[f"stack-template-{profile}"])
         elif resource.gvk.kind == "Stack":
-            if not isinstance(resource.spec, StackSpec):
+            if not isinstance(resource.spec, (StackSpec, DesiredStackSpec)):
                 raise OperationError("Stack resource has an invalid spec")
             if profile == "authored":
+                if not isinstance(resource.spec, StackSpec) or getattr(resource.spec, "provenance", None) is not None:
+                    raise OperationError("authored Stack metadata may not contain controller provenance")
                 document = StackDocument(
                     apiVersion=CORE_API_VERSION,
                     kind="Stack",
@@ -486,11 +498,16 @@ class ResourceCatalog:
                     spec=resource.spec,
                 )
             else:
+                desired_spec = (
+                    resource.spec
+                    if isinstance(resource.spec, DesiredStackSpec)
+                    else DesiredStackSpec(template=resource.spec.template, parameters=resource.spec.parameters)
+                )
                 document = DesiredStackDocument(
                     apiVersion=CORE_API_VERSION,
                     kind="Stack",
                     metadata=resource.metadata.as_desired(),
-                    spec=resource.spec,
+                    spec=desired_spec,
                 )
             contract = cast(TypedDocumentContract[Any], CORE_CONTRACTS[f"stack-{profile}"])
         else:

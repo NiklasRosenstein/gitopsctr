@@ -38,9 +38,11 @@ from gitopsctr.contracts import (
     DesiredLifecycle,
     DesiredOwnerReference,
     DesiredSource,
+    DesiredStackSpec,
     LifecycleManagement,
     MaterializationDocument,
     ReceiptDesired,
+    StackInstantiationProvenance,
     StackSpec,
     StackTemplateSpec,
     StrictModel,
@@ -1437,7 +1439,7 @@ def candidate_ref_template(source_root: Path, environment_name: str) -> str:
 
 
 def candidate_identifier(
-    operation: Literal["promotion", "rollback", "finalize", "request-delete-direct-unit"],
+    operation: Literal["promotion", "rollback", "finalize", "request-delete-direct-unit", "instantiate-stack"],
     environment_name: str,
     candidate: Path,
     target_ref: str,
@@ -1463,7 +1465,7 @@ def candidate_identifier(
 def resolve_candidate_ref(
     source_root: Path,
     environment_name: str,
-    operation: Literal["promotion", "rollback", "finalize", "request-delete-direct-unit"],
+    operation: Literal["promotion", "rollback", "finalize", "request-delete-direct-unit", "instantiate-stack"],
     candidate_id: str,
     override: str | None = None,
 ) -> str:
@@ -5772,6 +5774,196 @@ def command_request_delete_direct_unit(args: argparse.Namespace) -> bool:
         return _command_request_delete_direct_unit(args)
 
 
+def _direct_stack_uid(environment: str, stack_name: str, request_identity: str) -> str:
+    digest = hashlib.sha256(
+        f"gitopsctr/direct-stack-uid/v1\0{environment}\0{stack_name}\0{request_identity}".encode()
+    ).hexdigest()[:32]
+    return f"d1-{digest}"
+
+
+def _parse_stack_parameters(raw: str) -> JsonObjectValue:
+    try:
+        value = json.loads(raw)
+        validated = require_json_value(value)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise OperationError(f"--parameters must be a finite JSON object: {exc}") from exc
+    if not isinstance(validated, dict):
+        raise OperationError("--parameters must contain a JSON object")
+    return JsonObjectValue(validated)
+
+
+def _command_instantiate_stack(args: argparse.Namespace) -> bool:
+    _resource_name(args.environment, "environment name")
+    _resource_name(args.stack, "Stack name")
+    _resource_name(args.template, "StackTemplate name")
+    parameters = _parse_stack_parameters(args.parameters)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", args.request_id):
+        raise OperationError("--request-id has an invalid format")
+    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
+    current_revision = fetch_ref(desired_ref)
+    if current_revision is None:
+        raise OperationError(f"desired ref {desired_ref!r} has no state")
+    source_revision_result = git("rev-parse", f"{args.source_revision}^{{commit}}", check=False)
+    if source_revision_result.returncode != 0:
+        raise OperationError(f"source revision {args.source_revision!r} is not a valid Git commit")
+    source_revision = source_revision_result.stdout.strip()
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary = Path(temporary_directory)
+        current = temporary / "current"
+        observed = temporary / "observed"
+        source = temporary / "source"
+        synthetic_source = temporary / "synthetic-source"
+        candidate = temporary / "candidate"
+        materialize_revision(current_revision, current)
+
+        existing_paths = _current_desired_stack_paths(current, "Stack").get(args.stack)
+        if existing_paths is not None:
+            existing = RESOURCE_CATALOG.parse_stack(
+                RESOURCE_CATALOG.load_document(existing_paths), profile="desired", expected_name=args.stack
+            )
+            lifecycle = existing.metadata.lifecycle
+            if lifecycle is None or lifecycle.management is None or lifecycle.management.mode != "direct":
+                raise OperationError(f"desired Stack {args.stack!r} already exists and is not directly managed")
+            if not isinstance(existing.spec, DesiredStackSpec) or existing.spec.provenance is None:
+                raise OperationError(f"desired Stack {args.stack!r} is missing direct instantiation provenance")
+            provenance = existing.spec.provenance
+            if (
+                provenance.requestIdentity == args.request_id
+                and provenance.templateRevision == source_revision
+                and existing.spec.template == args.template
+                and existing.spec.parameters == parameters
+            ):
+                return False
+            raise OperationError(f"desired Stack {args.stack!r} already exists with a different instantiation request")
+
+        materialize_revision(source_revision, source)
+        template_root = project_environment_root(source, args.environment) / "stack-templates"
+        template_paths = document_candidates(template_root, args.template)
+        if len(template_paths) != 1:
+            raise OperationError(f"expected exactly one StackTemplate document for {args.template!r}")
+        template_path = template_paths[0]
+        template = RESOURCE_CATALOG.parse_stack_template(
+            RESOURCE_CATALOG.load_document(template_path), profile="authored", expected_name=args.template
+        )
+        if not isinstance(template.spec, StackTemplateSpec):
+            raise OperationError(f"StackTemplate {args.template!r} has an invalid specification")
+        expanded = template.spec.expand(parameters)
+        template_provenance = StackInstantiationProvenance(
+            templateRevision=source_revision,
+            templatePath=template_path.relative_to(source).as_posix(),
+            templateDigest=hashlib.sha256(template_path.read_bytes()).hexdigest(),
+            requestIdentity=args.request_id,
+        )
+
+        shutil.copytree(source, synthetic_source)
+        synthetic_environment = project_environment_root(synthetic_source, args.environment)
+        source_stacks = _document_paths(synthetic_environment / "stacks")
+        if args.stack in source_stacks:
+            raise OperationError(f"Stack {args.stack!r} is source-authored; direct instantiation would collide")
+        project = load_project_config(synthetic_source)
+        synthetic_stack_path = synthetic_environment / "stacks" / f"{args.stack}{project.write_format.suffix}"
+        write_document(
+            synthetic_stack_path,
+            {
+                "apiVersion": CORE_API_VERSION,
+                "kind": "Stack",
+                "metadata": {"name": args.stack},
+                "spec": {"template": args.template, "parameters": dict(parameters)},
+            },
+            format=project.write_format,
+        )
+
+        observed_revision = observed_tree(observed_ref, observed)
+        build_desired_candidate(
+            args.environment,
+            synthetic_source,
+            source_revision,
+            current,
+            observed,
+            observed_revision,
+            candidate,
+            dry=args.dry,
+        )
+        direct_uid = _direct_stack_uid(args.environment, args.stack, args.request_id)
+        direct_metadata = ResourceMetadata(
+            name=args.stack,
+            uid=direct_uid,
+            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
+        )
+        direct_spec = DesiredStackSpec(
+            template=args.template,
+            parameters=parameters,
+            provenance=template_provenance,
+        )
+        direct_stack = StackResource(GVK(CORE_API_VERSION, "Stack"), direct_metadata, direct_spec)
+        stack_path = _current_desired_stack_paths(candidate, "Stack").get(args.stack)
+        if stack_path is None:
+            raise OperationError(f"instantiated Stack {args.stack!r} was not projected into desired state")
+        _write_desired_stack_resource(stack_path, direct_stack, REPOSITORY_ROOT)
+        owner = DesiredOwnerReference(
+            apiVersion=CORE_API_VERSION,
+            kind="Stack",
+            name=args.stack,
+            uid=direct_uid,
+        )
+        for resource in expanded:
+            unit_path = unit_document_path(candidate, resource.name)
+            if not unit_path.is_file():
+                raise OperationError(f"generated Unit {resource.name!r} is unresolved in the desired candidate")
+            unit = load_desired_unit(unit_path, resource.name)
+            if unit_contains_reference(unit):
+                raise OperationError(f"generated Unit {resource.name!r} is unresolved in the desired candidate")
+            write_desired_candidate_unit(
+                unit_path,
+                unit.with_metadata(_stack_owned_metadata(resource.name, owner)),
+                REPOSITORY_ROOT,
+            )
+        load_desired_resource_graph(candidate)
+        candidate_id = candidate_identifier(
+            "instantiate-stack",
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            {
+                "stack": args.stack,
+                "template": args.template,
+                "requestIdentity": args.request_id,
+                "templateRevision": source_revision,
+            },
+        )
+        candidate_ref = resolve_candidate_ref(
+            REPOSITORY_ROOT,
+            args.environment,
+            "instantiate-stack",
+            candidate_id,
+            args.candidate_ref,
+        )
+        revision, outcome = publish_desired_change(
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            candidate_ref,
+            f"Instantiate direct Stack {args.stack}",
+            f"Instantiate direct Stack {args.stack}",
+            f"Create a UID-fenced direct Stack `{args.stack}` from StackTemplate `{args.template}`.",
+            args.dry,
+            current,
+        )
+        if args.dry:
+            return False
+        print(revision)
+        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
+        return True
+
+
+def command_instantiate_stack(args: argparse.Namespace) -> bool:
+    with unit_effect_lock(args.environment, f"stack-{getattr(args, 'stack', '<invalid>')}"):
+        return _command_instantiate_stack(args)
+
+
 def _command_finalize(args: argparse.Namespace) -> bool:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
         raise OperationError(f"invalid unit name: {args.unit!r}")
@@ -7854,7 +8046,7 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
         ("Schemas", ("schemas",)),
         (
             "Deployment",
-            ("advance-desired", "promote", "rollback", "recover-effect-lease", "resolve-desired"),
+            ("advance-desired", "instantiate-stack", "promote", "rollback", "recover-effect-lease", "resolve-desired"),
         ),
         ("Recovery", ("recover-opaque-unit", "request-delete-direct-unit", "finalize")),
         ("Inspection", ("status", "list", "show", "verify", "dependencies")),
@@ -7998,6 +8190,25 @@ def build_parser() -> argparse.ArgumentParser:
     advance.add_argument("--require-source-ref")
     advance.add_argument("--dry", action="store_true")
     advance.set_defaults(handler=command_advance_desired)
+
+    instantiate_stack = commands.add_parser(
+        "instantiate-stack",
+        help="instantiate a directly managed Stack from a trusted StackTemplate revision",
+    )
+    instantiate_stack.add_argument("--environment", required=True)
+    instantiate_stack.add_argument("--stack", required=True)
+    instantiate_stack.add_argument("--template", required=True)
+    instantiate_stack.add_argument("--source-revision", required=True, help="trusted full Git revision or ref")
+    instantiate_stack.add_argument("--parameters", required=True, help="concrete Stack parameters as a JSON object")
+    instantiate_stack.add_argument("--request-id", required=True, help="stable replay identity for this request")
+    instantiate_stack.add_argument("--desired-ref", help="override the environment's desired ref")
+    instantiate_stack.add_argument("--observed-ref", help="override the environment's observed ref")
+    instantiate_stack.add_argument(
+        "--candidate-ref",
+        help="exact candidate ref override when the environment uses a pull-request change gate",
+    )
+    instantiate_stack.add_argument("--dry", action="store_true")
+    instantiate_stack.set_defaults(handler=command_instantiate_stack)
 
     promote = commands.add_parser(
         "promote",

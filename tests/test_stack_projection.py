@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -242,3 +243,92 @@ def test_stack_rejects_missing_template_during_projection(tmp_path: Path):
 
     with pytest.raises(OperationError, match="missing StackTemplate"):
         cli.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate", source)
+
+
+def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    environment = _project(source)
+    _write_stack_source(environment)
+    (environment / "stacks/web.json").unlink()
+    current = tmp_path / "current"
+    current.mkdir()
+    published: list[Path] = []
+    source_revision = "a" * 40
+
+    def materialize(revision: str, output: Path) -> None:
+        shutil.copytree(source if revision == source_revision else current, output)
+
+    def fake_build(_environment, source_root, revision, _current, _observed, _observed_revision, candidate, **_kwargs):
+        projection = cli.project_stack_resources(source_root, "dev", revision, candidate, source_root)
+        for name in projection.generated_units:
+            unit_document = {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "Terraform",
+                "metadata": {
+                    "name": name,
+                    "uid": "d1-generated-unit",
+                    "lifecycle": {"management": {"mode": "sourceTracked"}},
+                },
+                "spec": {
+                    "source": {
+                        "path": ".",
+                        "revision": source_revision,
+                        "inputHash": "sha256:" + "0" * 64,
+                        "driverVersion": cli.DRIVER_VERSIONS["terraform"],
+                    },
+                    "terraform": {"backend": {}, "variables": {}, "observeOutputs": []},
+                },
+            }
+            unit = cli.RESOURCE_CATALOG.parse_unit(unit_document, profile="desired", expected_name=name)
+            cli.write_desired_candidate_unit(candidate / "units" / f"{name}.json", unit, source_root)
+
+    def publish(_environment, candidate, *_args, **_kwargs):
+        snapshot = tmp_path / "published"
+        shutil.copytree(candidate, snapshot)
+        published.append(snapshot)
+        return "c" * 40, None
+
+    monkeypatch.setattr(cli, "REPOSITORY_ROOT", source)
+    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(cli, "fetch_ref", lambda ref: "b" * 40 if ref == "deploy/dev" else None)
+    monkeypatch.setattr(cli, "materialize_revision", materialize)
+    monkeypatch.setattr(cli, "observed_tree", lambda _ref, output: output.mkdir(parents=True) or None)
+    monkeypatch.setattr(
+        cli, "git", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=source_revision + "\n")
+    )
+    monkeypatch.setattr(cli, "build_desired_candidate", fake_build)
+    monkeypatch.setattr(cli, "publish_desired_change", publish)
+    monkeypatch.setattr(cli, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+
+    args = cli.build_parser().parse_args(
+        [
+            "instantiate-stack",
+            "--environment",
+            "dev",
+            "--stack",
+            "web",
+            "--template",
+            "preview",
+            "--source-revision",
+            source_revision,
+            "--parameters",
+            '{"source-path":"."}',
+            "--request-id",
+            "pull-123",
+        ]
+    )
+    assert cli.command_instantiate_stack(args) is True
+    candidate = published[0]
+    stack_path = next((candidate / "stacks").glob("web.*"))
+    stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name="web"
+    )
+    assert stack.metadata.lifecycle is not None
+    assert stack.metadata.lifecycle.management is not None
+    assert stack.metadata.lifecycle.management.mode == "direct"
+    assert isinstance(stack.spec, cli.DesiredStackSpec)
+    assert stack.spec.provenance is not None
+    unit = cli.load_desired_unit(next((candidate / "units").glob("preview-app.*")), "preview-app")
+    assert unit.metadata.lifecycle is not None
+    assert unit.metadata.lifecycle.owner is not None
+    assert unit.metadata.lifecycle.owner.uid == stack.metadata.uid

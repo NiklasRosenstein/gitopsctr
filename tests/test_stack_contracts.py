@@ -12,8 +12,11 @@ from gitopsctr.contracts import (
     AuthoredResourceMetadata,
     DesiredLifecycle,
     DesiredResourceMetadata,
+    DesiredStackDocument,
+    DesiredStackSpec,
     LifecycleManagement,
     StackDocument,
+    StackInstantiationProvenance,
     StackSpec,
     StackTemplateDocument,
     StackTemplateResource,
@@ -70,6 +73,48 @@ def test_stack_and_stack_template_authored_and_desired_contracts_are_typed():
         spec=StackSpec(template="preview", parameters=JsonObjectValue({"name": "web"})),
     )
     assert CORE_CONTRACTS["stack-authored"].parse(CORE_CONTRACTS["stack-authored"].dump(stack)) == stack
+
+
+def test_direct_stack_provenance_is_desired_only_and_round_trips():
+    provenance = StackInstantiationProvenance(
+        templateRevision="a" * 40,
+        templatePath="deployment/environments/dev/stack-templates/preview.yaml",
+        templateDigest="b" * 64,
+        requestIdentity="pull-123",
+    )
+    desired = DesiredStackDocument(
+        apiVersion="gitopsctr.io/v1",
+        kind="Stack",
+        metadata=DesiredResourceMetadata(
+            name="preview",
+            uid="d1-preview",
+            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
+        ),
+        spec=DesiredStackSpec(
+            template="preview",
+            parameters=JsonObjectValue({"namespace": "preview-123"}),
+            provenance=provenance,
+        ),
+    )
+    assert CORE_CONTRACTS["stack-desired"].parse(CORE_CONTRACTS["stack-desired"].dump(desired)) == desired
+    with pytest.raises(ContractError):
+        CORE_CONTRACTS["stack-authored"].parse(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "Stack",
+                "metadata": {"name": "preview"},
+                "spec": {
+                    "template": "preview",
+                    "parameters": {},
+                    "provenance": {
+                        "templateRevision": "a" * 40,
+                        "templatePath": "preview.yaml",
+                        "templateDigest": "b" * 64,
+                        "requestIdentity": "pull-123",
+                    },
+                },
+            }
+        )
 
 
 @pytest.mark.parametrize(

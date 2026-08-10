@@ -13,6 +13,7 @@ from gitopsctr.contracts import (
     CORE_CONTRACTS,
     SCHEMA_ROOT,
     DesiredResourceMetadata,
+    DesiredStackSpec,
     MashumaroContract,
     ResolvedInputs,
     StackSpec,
@@ -230,7 +231,10 @@ def core_resource_schema(kind: str, profile: str = "authored") -> JsonObject:
     elif kind == "StackTemplate":
         specification = _model_specification_schema(StackTemplateSpec, "stack-template-spec")
     elif kind == "Stack":
-        specification = _model_specification_schema(StackSpec, "stack-spec")
+        specification = _model_specification_schema(
+            DesiredStackSpec if profile == "desired" and kind == "Stack" else StackSpec,
+            "stack-spec",
+        )
     else:
         raise ValueError(f"unknown core resource kind: {kind}")
     return _resource_schema(

@@ -111,6 +111,43 @@
         "parameters": {
           "type": "object"
         },
+        "provenance": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "requestIdentity": {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                  "type": "string"
+                },
+                "templateDigest": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "templatePath": {
+                  "pattern": "^[^/].*",
+                  "type": "string"
+                },
+                "templateRevision": {
+                  "pattern": "^[0-9a-f]{40}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "templateRevision",
+                "templatePath",
+                "templateDigest",
+                "requestIdentity"
+              ],
+              "title": "StackInstantiationProvenance",
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "template": {
           "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
           "type": "string"

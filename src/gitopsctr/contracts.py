@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal, cast
 
 from jsonschema import Draft202012Validator
@@ -454,8 +455,43 @@ class StackTemplateSpec(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class StackSpec(StrictModel):
+    """Source-authored Stack reference and parameter values."""
+
     template: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
     parameters: JsonObjectValue
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(DESIRED_UID_PATTERN, self.template):
+            raise ValueError(f"invalid Stack template name: {self.template!r}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackInstantiationProvenance(StrictModel):
+    """Controller evidence for a directly instantiated Stack."""
+
+    templateRevision: Annotated[str, Pattern(r"^[0-9a-f]{40}$")]
+    templatePath: Annotated[str, Pattern(r"^[^/].*")]
+    templateDigest: Annotated[str, Pattern(r"^[0-9a-f]{64}$")]
+    requestIdentity: Annotated[str, Pattern(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")]
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[0-9a-f]{40}", self.templateRevision):
+            raise ValueError("templateRevision must be a full Git commit")
+        if not self.templatePath or self.templatePath.startswith("/") or ".." in PurePosixPath(self.templatePath).parts:
+            raise ValueError("templatePath must be repository-relative")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.templateDigest):
+            raise ValueError("templateDigest must be a SHA-256 digest")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", self.requestIdentity):
+            raise ValueError("requestIdentity has an invalid format")
+
+
+@dataclass(frozen=True, kw_only=True)
+class DesiredStackSpec(StrictModel):
+    """Desired Stack spec; provenance is controller-only and optional for source roots."""
+
+    template: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    parameters: JsonObjectValue
+    provenance: StackInstantiationProvenance | None = None
 
     def __post_init__(self) -> None:
         if not re.fullmatch(DESIRED_UID_PATTERN, self.template):
@@ -491,7 +527,7 @@ class DesiredStackDocument(SchemaDocument):
     apiVersion: Literal["gitopsctr.io/v1"]
     kind: Literal["Stack"]
     metadata: DesiredResourceMetadata
-    spec: StackSpec
+    spec: DesiredStackSpec
 
 
 @dataclass(frozen=True, kw_only=True)
