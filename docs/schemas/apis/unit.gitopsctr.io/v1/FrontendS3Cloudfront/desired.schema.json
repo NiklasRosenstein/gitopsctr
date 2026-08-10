@@ -15,13 +15,93 @@
     "metadata": {
       "additionalProperties": false,
       "properties": {
+        "lifecycle": {
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "not": {
+                "required": [
+                  "owner"
+                ]
+              },
+              "required": [
+                "management"
+              ]
+            },
+            {
+              "not": {
+                "required": [
+                  "management"
+                ]
+              },
+              "required": [
+                "owner"
+              ]
+            }
+          ],
+          "properties": {
+            "management": {
+              "additionalProperties": false,
+              "properties": {
+                "mode": {
+                  "enum": [
+                    "sourceTracked",
+                    "direct"
+                  ]
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "title": "LifecycleManagement",
+              "type": "object"
+            },
+            "owner": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "kind": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "name": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "uid": {
+                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "apiVersion",
+                "kind",
+                "name",
+                "uid"
+              ],
+              "title": "DesiredOwnerReference",
+              "type": "object"
+            }
+          },
+          "title": "DesiredLifecycle",
+          "type": "object"
+        },
         "name": {
           "minLength": 1,
+          "type": "string"
+        },
+        "uid": {
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
           "type": "string"
         }
       },
       "required": [
-        "name"
+        "name",
+        "uid",
+        "lifecycle"
       ],
       "type": "object"
     },

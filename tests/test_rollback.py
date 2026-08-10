@@ -481,7 +481,13 @@ def test_rollback_keeps_the_promotion_that_drives_its_resulting_tree(units, expe
 
 def test_pull_request_gate_routes_rollback_through_candidate_submission(tmp_path, monkeypatch):
     candidate = tmp_path / "candidate"
-    _write_json(candidate / "units/base.json", {"name": "base"})
+    candidate_unit = deploy_release.parse_desired_unit_document(_desired_unit("base", "c" * 40, "candidate"), "base")
+    _write_json(
+        candidate / "units/base.json",
+        deploy_release.serialize_unit_document(
+            candidate_unit.with_metadata(deploy_release.ResourceMetadata.new_source_tracked("base"))
+        ),
+    )
     captured = []
     outcome = deploy_release.ChangeRequestResult(status="created", url="https://github.example/pull/1")
     monkeypatch.setattr(deploy_release, "change_gate", lambda *_args: "pullRequest")

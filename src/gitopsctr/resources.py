@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 from gitopsctr.api import GVK
 from gitopsctr.artifacts import ArtifactApi
-from gitopsctr.contracts import ArtifactDescriptor, ReceiptDesired, ResolvedInputs, StrictModel
+from gitopsctr.contracts import (
+    ArtifactDescriptor,
+    DesiredLifecycle,
+    DesiredResourceMetadata,
+    LifecycleManagement,
+    ReceiptDesired,
+    ResolvedInputs,
+    StrictModel,
+)
 from gitopsctr.document import ContractError, JsonObject, JsonObjectValue, TypedDocumentContract
 from gitopsctr.driver import InstalledUnitDriver
 from gitopsctr.errors import OperationError
@@ -29,6 +39,48 @@ UNIT_API_VERSION = "unit.gitopsctr.io/v1"
 @dataclass(frozen=True, kw_only=True)
 class ResourceMetadata(StrictModel):
     name: str
+    uid: str | None = None
+    lifecycle: DesiredLifecycle | None = None
+
+    @property
+    def is_legacy_compatibility(self) -> bool:
+        return self.uid is None and self.lifecycle is None
+
+    def validate_desired(self) -> None:
+        if self.is_legacy_compatibility:
+            return
+        if self.uid is None or self.lifecycle is None:
+            raise ValueError("desired metadata requires both uid and lifecycle")
+        DesiredResourceMetadata(name=self.name, uid=self.uid, lifecycle=self.lifecycle)
+
+    def as_desired(self) -> DesiredResourceMetadata:
+        self.validate_desired()
+        if self.is_legacy_compatibility:
+            raise ValueError("legacy metadata has no desired identity")
+        assert self.uid is not None
+        assert self.lifecycle is not None
+        return DesiredResourceMetadata(name=self.name, uid=self.uid, lifecycle=self.lifecycle)
+
+    @classmethod
+    def new_source_tracked(cls, name: str) -> ResourceMetadata:
+        return cls(
+            name=name,
+            uid=uuid4().hex,
+            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
+        )
+
+    def document(self, *, profile: Literal["authored", "desired"]) -> JsonObject:
+        if profile == "authored":
+            if self.uid is not None or self.lifecycle is not None:
+                raise ValueError("authored metadata may contain only name")
+            return {"name": self.name}
+        if self.is_legacy_compatibility:
+            raise ValueError("desired metadata must be canonical; adopt legacy identity before serialization")
+        document = self.as_desired().to_dict()
+        lifecycle = document.get("lifecycle")
+        if isinstance(lifecycle, dict):
+            document["lifecycle"] = {key: value for key, value in lifecycle.items() if value is not None}
+        return document
 
 
 @dataclass(frozen=True)
@@ -48,8 +100,76 @@ class UnitResource[ModelT: StrictModel]:
     def driver_name(self) -> str:
         return self.driver.driver_name
 
+    @property
+    def is_legacy_compatibility(self) -> bool:
+        return self.metadata.is_legacy_compatibility
+
+    def with_metadata(self, metadata: ResourceMetadata) -> UnitResource[ModelT]:
+        return UnitResource(self.gvk, metadata, self.driver, self.spec)
+
     def with_spec[NextT: StrictModel](self, spec: NextT) -> UnitResource[NextT]:
         return UnitResource(self.gvk, self.metadata, self.driver, spec)
+
+
+def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], UnitResource[Any]]) -> None:
+    """Validate UID fencing and acyclicity for resources from one desired ref.
+
+    The mapping is deliberately scoped to one desired ref: the current document
+    loader has no ref identifier in an individual resource envelope, so callers
+    must not combine resources from different refs here.
+    """
+
+    identities: dict[tuple[str, str, str], UnitResource[Any]] = {}
+    legacy_keys: set[tuple[str, str, str]] = set()
+    for key, unit in resources.items():
+        expected_key = (unit.gvk.api_version, unit.gvk.kind, unit.name)
+        if expected_key in identities:
+            raise ValueError(f"duplicate desired resource identity: {expected_key!r}")
+        if key != expected_key:
+            raise ValueError(f"desired resource mapping key {key!r} does not match resource identity {expected_key!r}")
+        if unit.is_legacy_compatibility:
+            # Legacy desired documents are compatibility roots. They may gate
+            # graph publication while migration is in progress, but cannot
+            # participate in UID-fenced ownership until explicitly adopted.
+            legacy_keys.add(key)
+        identities[key] = unit
+    edges: dict[tuple[str, str, str], tuple[str, str, str]] = {}
+    for key, unit in identities.items():
+        if key in legacy_keys:
+            continue
+        unit.metadata.validate_desired()
+        lifecycle = unit.metadata.lifecycle
+        assert lifecycle is not None
+        owner = lifecycle.owner
+        if owner is None:
+            continue
+        owner_key = (owner.apiVersion, owner.kind, owner.name)
+        if owner_key in legacy_keys:
+            raise ValueError(f"desired owner reference for {key[2]!r} cannot target a legacy compatibility root")
+        owner_resource = identities.get(owner_key)
+        if owner_resource is None:
+            raise ValueError(f"desired owner reference for {key[2]!r} does not identify a resource in this ref")
+        if owner_resource.metadata.uid != owner.uid:
+            raise ValueError(f"desired owner reference for {key[2]!r} is fenced by a different UID")
+        edges[key] = owner_key
+
+    visiting: set[tuple[str, str, str]] = set()
+    visited: set[tuple[str, str, str]] = set()
+
+    def visit(key: tuple[str, str, str]) -> None:
+        if key in visiting:
+            raise ValueError("desired resource ownership must be acyclic")
+        if key in visited:
+            return
+        visiting.add(key)
+        owner = edges.get(key)
+        if owner is not None:
+            visit(owner)
+        visiting.remove(key)
+        visited.add(key)
+
+    for key in identities:
+        visit(key)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -190,13 +310,30 @@ class ResourceCatalog:
             gvk = GVK(api_version, kind)
         if not isinstance(name, str) or not name or (expected_name is not None and name != expected_name):
             raise OperationError(f"unit metadata.name must be {expected_name or 'a non-empty name'!r}")
+        if document.get("apiVersion") is None:
+            metadata_model = ResourceMetadata(name=name)
+        elif profile == "authored":
+            if set(metadata) != {"name"}:
+                raise OperationError("authored unit metadata may contain only name")
+            metadata_model = ResourceMetadata(name=name)
+        elif profile == "desired":
+            try:
+                if set(metadata) == {"name"}:
+                    metadata_model = ResourceMetadata(name=name)
+                else:
+                    metadata_model = ResourceMetadata.from_dict(metadata)
+                    metadata_model.validate_desired()
+            except (TypeError, ValueError, KeyError) as exc:
+                raise OperationError(f"desired unit {name} has invalid lifecycle metadata: {exc}") from exc
+        else:
+            metadata_model = ResourceMetadata(name=name)
         contract = {
             "authored": driver.unit_contract,
             "resolved": driver.resolved_unit_contract,
             "desired": driver.desired_unit_contract,
         }[profile]
         model = self.parse_contract(contract, specification, f"{profile} {driver.driver_name} unit {name}")
-        return cast(UnitResource[ModelT], UnitResource(gvk, ResourceMetadata(name=name), driver, model))
+        return cast(UnitResource[ModelT], UnitResource(gvk, metadata_model, driver, model))
 
     def serialize_environment(self, environment: JsonObject) -> JsonObject:
         name = environment.get("name")
@@ -233,11 +370,15 @@ class ResourceCatalog:
         except (TypeError, ValueError) as exc:
             raise OperationError(f"invalid typed {profile} {unit.driver_name} unit {unit.name}: {exc}") from exc
         api_version, kind = unit.gvk.api_version, unit.gvk.kind
+        try:
+            metadata_document = unit.metadata.document(profile=profile)
+        except ValueError as exc:
+            raise OperationError(f"invalid {profile} metadata for {unit.name}: {exc}") from exc
         return {
             "$schema": resource_schema_url(api_version, kind, "authored" if profile == "authored" else "desired"),
             "apiVersion": api_version,
             "kind": kind,
-            "metadata": unit.metadata.to_dict(),
+            "metadata": metadata_document,
             "spec": specification,
         }
 
@@ -343,7 +484,7 @@ class ResourceCatalog:
             "$schema": resource_schema_url(receipt.gvk.api_version, receipt.gvk.kind, "receipt"),
             "apiVersion": CORE_API_VERSION,
             "kind": "Receipt",
-            "metadata": receipt.metadata.to_dict(),
+            "metadata": {"name": receipt.metadata.name},
             "spec": specification,
             "status": status,
         }

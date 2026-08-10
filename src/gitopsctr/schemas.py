@@ -12,6 +12,7 @@ from gitopsctr.artifacts import ArtifactApi, require_artifact_api
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
     SCHEMA_ROOT,
+    DesiredResourceMetadata,
     MashumaroContract,
     ResolvedInputs,
     artifact_descriptors_schema,
@@ -58,12 +59,38 @@ def _resolved_inputs_schema() -> JsonObject:
     return schema
 
 
+def _desired_metadata_schema() -> JsonObject:
+    schema = MashumaroContract(
+        DesiredResourceMetadata,
+        f"{SCHEMA_ROOT}/core/v1/desired-resource-metadata.schema.json",
+    ).json_schema()
+    schema.pop("$schema", None)
+    schema.pop("$id", None)
+    schema.pop("title", None)
+    lifecycle = cast(dict[str, Any], cast(dict[str, Any], schema["properties"])["lifecycle"])
+    lifecycle_properties = cast(dict[str, Any], lifecycle["properties"])
+    metadata_properties = cast(dict[str, Any], schema["properties"])
+    metadata_properties["name"]["minLength"] = 1
+    for key in ("management", "owner"):
+        property_schema = cast(dict[str, Any], lifecycle_properties[key])
+        lifecycle_properties[key] = cast(list[dict[str, Any]], property_schema["anyOf"])[0]
+    owner_properties = cast(dict[str, Any], lifecycle_properties["owner"]["properties"])
+    for key in ("apiVersion", "kind", "name"):
+        owner_properties[key]["minLength"] = 1
+    lifecycle["oneOf"] = [
+        {"required": ["management"], "not": {"required": ["owner"]}},
+        {"required": ["owner"], "not": {"required": ["management"]}},
+    ]
+    return schema
+
+
 def _resource_schema(
     *,
     schema_id: str,
     api_version: str,
     kind: str,
     spec: JsonObject,
+    profile: str = "authored",
 ) -> JsonObject:
     definitions = spec.pop("$defs", None)
     resource: JsonObject = {
@@ -75,7 +102,9 @@ def _resource_schema(
             "$schema": {"type": "string"},
             "apiVersion": {"const": api_version},
             "kind": {"const": kind},
-            "metadata": {
+            "metadata": _desired_metadata_schema()
+            if profile == "desired"
+            else {
                 "type": "object",
                 "properties": {"name": {"type": "string", "minLength": 1}},
                 "required": ["name"],
@@ -103,6 +132,7 @@ def unit_resource_schema(driver: str, profile: str = "authored") -> JsonObject:
         api_version=driver_instance.api_version,
         kind=kind,
         spec=_specification_schema(contract),
+        profile=profile,
     )
 
 

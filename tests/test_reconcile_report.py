@@ -11,6 +11,7 @@ import pytest
 from gitopsctr import cli as deploy_release
 from gitopsctr.contrib.drivers.terraform import AppliedTerraformModel, TerraformResultModel
 from gitopsctr.driver import ReconciliationOutput
+from gitopsctr.resources import ResourceMetadata
 from tests.conftest import receipt_document, write_test_document
 
 
@@ -210,7 +211,7 @@ def test_promotion_reference_reads_typed_resource_spec_before_applying_pointer(t
                         },
                     },
                     "aws-application",
-                )
+                ).with_metadata(ResourceMetadata.new_source_tracked("aws-application"))
             )
         )
     )

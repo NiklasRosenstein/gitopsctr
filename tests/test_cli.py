@@ -13,6 +13,7 @@ from gitopsctr import cli as deploy_release
 from gitopsctr.contracts import DesiredSource, ResolvedInputs
 from gitopsctr.contrib.drivers.frontend_s3_cloudfront import FrontendDesiredUnit
 from gitopsctr.driver import UnitResolution
+from gitopsctr.resources import ResourceMetadata
 from tests.conftest import receipt_document, receipt_resource, write_test_document
 
 
@@ -33,7 +34,7 @@ def _promotion_context(root: Path) -> deploy_release.PromotionContext:
 
 
 def _terraform_desired_resource(name: str = "aws-application"):
-    return deploy_release.RESOURCE_CATALOG.parse_unit(
+    resource = deploy_release.RESOURCE_CATALOG.parse_unit(
         {
             "name": name,
             "driver": "terraform",
@@ -42,6 +43,7 @@ def _terraform_desired_resource(name: str = "aws-application"):
         profile="desired",
         expected_name=name,
     )
+    return resource.with_metadata(ResourceMetadata.new_source_tracked(name))
 
 
 def test_root_help_groups_commands_and_describes_each_command():
@@ -241,13 +243,10 @@ def test_blocked_driver_transition_omits_previous_unit_and_reports_wait(tmp_path
 
     deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate)
 
-    assert not (candidate / "units/frontend.json").exists()
-    assert deploy_release.reconciliation_statuses(["frontend"], candidate, observed) == [
-        ("frontend", "WAIT", "desired inputs are not materialized")
-    ]
-    assert (
-        "omit previous vite-s3-cloudfront desired state while transitioning to frontend-s3-cloudfront"
-    ) in capsys.readouterr().err
+    assert deploy_release.load_json(candidate / "units/frontend.json") == deploy_release.load_json(
+        current / "units/frontend.json"
+    )
+    assert "retain legacy cleanup root" in capsys.readouterr().err
 
 
 def test_blocked_unit_with_same_driver_retains_previous_desired_state(tmp_path, monkeypatch):
@@ -307,7 +306,10 @@ def test_blocked_unit_with_same_driver_retains_previous_desired_state(tmp_path, 
 
     result = deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate)
 
-    assert (candidate / "units/frontend.json").read_bytes() == previous.read_bytes()
+    retained = deploy_release.load_desired_unit(candidate / "units/frontend.json", "frontend")
+    assert retained.is_legacy_compatibility is False
+    assert retained.metadata.uid
+    assert retained.metadata.lifecycle is not None
     assert "frontend" in result.blocked
 
 
@@ -1021,7 +1023,10 @@ def test_promoted_advance_uses_reviewed_specification_revision(tmp_path, monkeyp
     def fake_build(environment, source_root, source_revision, *_args, **kwargs):
         built.append(source_revision)
         candidate = _args[3]
-        _write_json(candidate / "units/aws-application.json", {"name": environment})
+        _write_json(
+            candidate / "units/aws-application.json",
+            deploy_release.serialize_unit_document(_terraform_desired_resource("aws-application")),
+        )
         _write_json(candidate / "promotion.json", kwargs["promotion"].document())
 
     monkeypatch.setattr(deploy_release, "build_desired_candidate", fake_build)
@@ -1127,7 +1132,10 @@ def _install_promotion_simulation(monkeypatch, gate: str):
     monkeypatch.setattr(
         deploy_release,
         "build_desired_candidate",
-        lambda *_args, **_kwargs: _write_json(_args[6] / "units/application.json", {"candidate": True}),
+        lambda *_args, **_kwargs: _write_json(
+            _args[6] / "units/application.json",
+            deploy_release.serialize_unit_document(_terraform_desired_resource("application")),
+        ),
     )
     monkeypatch.setattr(deploy_release, "publish_tree", publish)
     monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: None)
@@ -1807,7 +1815,8 @@ def test_candidate_identifier_covers_operation_target_context_and_tree(tmp_path)
 
 def test_occupied_candidate_slot_reuses_only_the_same_proposal(tmp_path, monkeypatch):
     candidate = tmp_path / "candidate"
-    _write_json(candidate / "units/application.json", {"value": "one"})
+    desired_document = deploy_release.serialize_unit_document(_terraform_desired_resource("application"))
+    _write_json(candidate / "units/application.json", desired_document)
     target_revision = "b" * 40
     existing_revision = "c" * 40
     outcome = deploy_release.ChangeRequestResult(status="existing", url="https://github.example/pull/1")
@@ -1815,7 +1824,7 @@ def test_occupied_candidate_slot_reuses_only_the_same_proposal(tmp_path, monkeyp
     monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: existing_revision)
 
     def materialize(_revision, output):
-        _write_json(output / "units/application.json", {"value": "one"})
+        _write_json(output / "units/application.json", desired_document)
 
     monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
 

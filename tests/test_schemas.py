@@ -16,7 +16,7 @@ from gitopsctr.driver import DriverError, MaterializationCapability, UnitResolut
 from gitopsctr.errors import ReferenceUnavailable
 from gitopsctr.registry import UNIT_DRIVERS
 from gitopsctr.resolution import FingerprintedValue, ResolutionContext, resolve_template
-from gitopsctr.resources import UnitResource
+from gitopsctr.resources import ResourceMetadata, UnitResource
 
 ROOT = Path(__file__).parents[1]
 REVISION = "a" * 40
@@ -73,7 +73,7 @@ def desired_example(unit: UnitResource) -> UnitResource:
                 metadata=JsonObjectValue(metadata),
             ),
         )
-    return unit.with_spec(desired)
+    return unit.with_spec(desired).with_metadata(ResourceMetadata.new_source_tracked(unit.name))
 
 
 def has_incomplete_frontend_inputs(unit: UnitResource) -> bool:

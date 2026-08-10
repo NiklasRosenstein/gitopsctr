@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -225,6 +226,57 @@ class StrictModel(DataClassDictMixin):
 @dataclass(frozen=True, kw_only=True)
 class SchemaDocument(StrictModel):
     schema_hint: str | None = field(default=None, metadata={"alias": "$schema"})
+
+
+@dataclass(frozen=True, kw_only=True)
+class LifecycleManagement(StrictModel):
+    """Root lifecycle authority for a desired resource."""
+
+    mode: Literal["sourceTracked", "direct"]
+
+
+DESIRED_UID_PATTERN = r"^[a-z0-9][a-z0-9-]{0,62}$"
+
+
+@dataclass(frozen=True, kw_only=True)
+class DesiredOwnerReference(StrictModel):
+    """A UID-fenced owner in the same desired-resource graph."""
+
+    apiVersion: str
+    kind: str
+    name: str
+    uid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+
+    def __post_init__(self) -> None:
+        if not self.apiVersion or not self.kind or not self.name or not re.fullmatch(DESIRED_UID_PATTERN, self.uid):
+            raise ValueError("owner reference requires apiVersion, kind, name, and uid")
+
+
+@dataclass(frozen=True, kw_only=True)
+class DesiredLifecycle(StrictModel):
+    """Exactly one root-management or owner authority for a desired resource."""
+
+    management: LifecycleManagement | None = None
+    owner: DesiredOwnerReference | None = None
+
+    def __post_init__(self) -> None:
+        if (self.management is None) == (self.owner is None):
+            raise ValueError("desired lifecycle requires exactly one of management or owner")
+
+
+@dataclass(frozen=True, kw_only=True)
+class DesiredResourceMetadata(StrictModel):
+    """Canonical desired-resource metadata for one immutable incarnation."""
+
+    name: str
+    uid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    lifecycle: DesiredLifecycle
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("desired resource metadata.name must not be empty")
+        if not re.fullmatch(DESIRED_UID_PATTERN, self.uid):
+            raise ValueError("desired resource metadata.uid has an invalid format")
 
 
 @dataclass(frozen=True, kw_only=True)

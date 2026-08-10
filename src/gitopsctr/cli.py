@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import cache
 from importlib.metadata import version
@@ -114,6 +114,7 @@ from gitopsctr.resources import (
     ResourceCatalog,
     ResourceMetadata,
     UnitResource,
+    validate_desired_resource_graph,
 )
 from gitopsctr.schemas import encoded_schema, export_schemas, resource_schema_url, show_schema
 from gitopsctr.state import GitStateStore
@@ -599,6 +600,38 @@ reference_document_path = RESOURCE_CATALOG.reference_document_path
 
 def write_unit(path: Path, unit: UnitResource[Any], project_root: Path) -> Path:
     return RESOURCE_CATALOG.write_unit(path, unit, project_root)
+
+
+def write_desired_candidate_unit(path: Path, unit: UnitResource[Any], project_root: Path) -> Path:
+    """Write canonical desired state while retaining legacy-path format when unconfigured."""
+
+    if resource_documents_enabled(project_root):
+        return write_unit(path, unit, project_root)
+    selected = DocumentFormat.YAML if path.suffix in {".yaml", ".yml"} else DocumentFormat.JSON
+    return write_document(path, serialize_unit_document(unit, profile="desired"), format=selected)
+
+
+def load_desired_resource_graph(root: Path) -> dict[tuple[str, str, str], UnitResource[Any]]:
+    """Load and validate every desired Unit in one desired ref before effects."""
+
+    resources: dict[tuple[str, str, str], UnitResource[Any]] = {}
+    for unit_name, path in _current_desired_unit_paths(root).items():
+        unit = load_desired_unit(path, unit_name)
+        key = (unit.gvk.api_version, unit.gvk.kind, unit.name)
+        if key in resources:
+            raise OperationError(f"duplicate desired resource identity: {key!r}")
+        resources[key] = unit
+    try:
+        validate_desired_resource_graph(resources)
+    except ValueError as exc:
+        raise OperationError(f"invalid desired resource graph: {exc}") from exc
+    return resources
+
+
+def ensure_desired_units_materialized(root: Path) -> None:
+    for unit_name, path in _current_desired_unit_paths(root).items():
+        if raw_unit_contains_reference(load_json(path)):
+            raise OperationError(f"{unit_name} desired state is not fully materialized")
 
 
 parse_artifact_document = RESOURCE_CATALOG.parse_artifact
@@ -1905,6 +1938,59 @@ class BuildDesiredResult:
     """Outcome of desired-state construction, including units blocked by unavailable inputs."""
 
     blocked: Mapping[str, str]
+    cleanup_inputs: Mapping[str, DesiredCleanupInput] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DesiredCleanupInput:
+    """Retained source identity needed before a source-absent unit can be finalized."""
+
+    unit_name: str
+    desired: UnitResource[Any] | None
+    source: DesiredSource | None
+    raw_document: JsonObject | None = None
+
+
+def desired_metadata_for_candidate(authored: UnitResource[Any], previous: UnitResource[Any] | None) -> ResourceMetadata:
+    """Select a durable desired identity without reusing a colliding incarnation."""
+
+    if previous is None:
+        return ResourceMetadata.new_source_tracked(authored.name)
+    if previous.is_legacy_compatibility:
+        return ResourceMetadata.new_source_tracked(authored.name)
+    previous.metadata.validate_desired()
+    lifecycle = previous.metadata.lifecycle
+    if lifecycle is None:
+        raise OperationError(f"{authored.name} has no desired lifecycle authority")
+    if lifecycle.owner is not None:
+        raise OperationError(
+            f"desired unit {authored.name!r} collides with a UID-fenced owned resource; refusing source adoption"
+        )
+    assert lifecycle.management is not None
+    if lifecycle.management.mode != "sourceTracked":
+        raise OperationError(
+            f"desired unit {authored.name!r} collides with a directly managed resource; refusing source adoption"
+        )
+    if previous.gvk != authored.gvk or previous.driver_name != authored.driver_name:
+        raise OperationError(
+            f"desired unit {authored.name!r} changes GVK/driver; retain the previous source-tracked resource first"
+        )
+    return previous.metadata
+
+
+def _current_desired_unit_paths(current_desired: Path) -> dict[str, Path]:
+    units = current_desired / "units"
+    paths: dict[str, Path] = {}
+    stems = sorted(
+        {path.stem for path in units.glob("*") if path.is_file() and path.suffix in {".json", ".yaml", ".yml"}}
+    )
+    for stem in stems:
+        candidates = document_candidates(units, stem)
+        if len(candidates) > 1:
+            raise OperationError(f"multiple document formats exist for source-absent unit {stem}")
+        if candidates:
+            paths[stem] = candidates[0]
+    return paths
 
 
 def build_desired_candidate(
@@ -1944,7 +2030,64 @@ def build_desired_candidate(
         write_preferred_document(candidate / "promotion.json", promotion.document(), source_root)
 
     prepared: dict[str, tuple[UnitResource[Any], DesiredSource | None]] = {}
+    retained_transitions: dict[str, UnitResource[Any]] = {}
+    retained_raw_transitions: dict[str, tuple[Path, JsonObject]] = {}
     for unit_name, specification in specifications.items():
+        previous_unit = unit_document_path(current_desired, unit_name)
+        previous_driver = persisted_unit_driver_name(previous_unit) if previous_unit.is_file() else None
+        if previous_unit.is_file() and previous_driver not in {None, specification.driver_name}:
+            raw_previous = load_json(previous_unit)
+            raw_metadata = raw_previous.get("metadata")
+            if isinstance(raw_metadata, dict) and set(raw_metadata) != {"name"}:
+                try:
+                    persisted_metadata = ResourceMetadata.from_dict(raw_metadata)
+                    persisted_metadata.validate_desired()
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise OperationError(
+                        f"desired unit {unit_name!r} has invalid persisted lifecycle metadata"
+                    ) from exc
+                lifecycle = persisted_metadata.lifecycle
+                if lifecycle is not None and (
+                    lifecycle.owner is not None
+                    or (lifecycle.management is not None and lifecycle.management.mode == "direct")
+                ):
+                    raise OperationError(
+                        f"desired unit {unit_name!r} collides with a directly managed or UID-owned resource"
+                    )
+            retained_raw_transitions[unit_name] = (previous_unit, raw_previous)
+            if verbose:
+                log_status(
+                    "RETAIN",
+                    f"{style_unit(unit_name)}: unavailable previous driver; retain legacy cleanup root",
+                )
+            continue
+        previous = load_desired_unit(previous_unit, unit_name) if previous_unit.is_file() else None
+        if previous is not None and not previous.is_legacy_compatibility:
+            previous.metadata.validate_desired()
+            lifecycle = previous.metadata.lifecycle
+            assert lifecycle is not None
+            if lifecycle.owner is not None or (
+                lifecycle.management is not None and lifecycle.management.mode == "direct"
+            ):
+                if previous.gvk != specification.gvk or previous.driver_name != specification.driver_name:
+                    raise OperationError(
+                        f"desired unit {unit_name!r} collides with a directly managed or UID-owned resource"
+                    )
+        if previous is not None and (
+            previous.gvk != specification.gvk or previous.driver_name != specification.driver_name
+        ):
+            retained = (
+                previous.with_metadata(ResourceMetadata.new_source_tracked(unit_name))
+                if previous.is_legacy_compatibility
+                else previous
+            )
+            retained_transitions[unit_name] = retained
+            if verbose:
+                log_status(
+                    "RETAIN",
+                    f"{style_unit(unit_name)}: GVK/driver changed; retain previous desired cleanup root",
+                )
+            continue
         source_resolution = resolved_unit_source(
             specification,
             source_root,
@@ -1959,7 +2102,6 @@ def build_desired_candidate(
             if verbose:
                 log_status("REFRESH", f"{style_unit(unit_name)}: {source_resolution.refresh_reason}")
             continue
-        previous_unit = unit_document_path(current_desired, unit_name)
         if not previous_unit.is_file():
             resolution_message = "new unit; use candidate revision"
         elif source_resolution.inputs_changed:
@@ -2010,9 +2152,10 @@ def build_desired_candidate(
                 current_desired,
                 candidate,
             )
-            candidate_unit = write_unit(candidate_units / f"{unit_name}.json", resolved, source_root)
             previous_unit = unit_document_path(current_desired, unit_name)
             previous = load_desired_unit(previous_unit, unit_name) if previous_unit.is_file() else None
+            resolved = resolved.with_metadata(desired_metadata_for_candidate(authored, previous))
+            candidate_unit = write_desired_candidate_unit(candidate_units / f"{unit_name}.json", resolved, source_root)
             previous_inputs = getattr(previous.spec, "resolvedInputs", None) if previous is not None else None
             previous_receipts = previous_inputs.receipts if previous_inputs is not None else None
             previous_artifacts = previous_inputs.artifacts if previous_inputs is not None else None
@@ -2054,8 +2197,12 @@ def build_desired_candidate(
         previous_driver = persisted_unit_driver_name(previous) if previous.is_file() else None
         next_driver = prepared[unit_name][0].driver_name
         if previous_driver == next_driver:
-            shutil.copy2(previous, candidate_units / previous.name)
-            copy_unit_materialization(current_desired, candidate, unit_name, load_desired_unit(previous, unit_name))
+            previous_resource = load_desired_unit(previous, unit_name)
+            retained = previous_resource.with_metadata(
+                desired_metadata_for_candidate(prepared[unit_name][0], previous_resource)
+            )
+            write_desired_candidate_unit(candidate_units / previous.name, retained, source_root)
+            copy_unit_materialization(current_desired, candidate, unit_name, previous_resource)
             resolution = "retain previous desired state"
         elif previous_driver is not None:
             resolution = f"omit previous {previous_driver} desired state while transitioning to {next_driver}"
@@ -2064,7 +2211,69 @@ def build_desired_candidate(
         if verbose:
             log_status("WAIT", f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}")
         blocked[unit_name] = unavailable[unit_name]
-    return BuildDesiredResult(blocked=blocked)
+
+    cleanup_inputs: dict[str, DesiredCleanupInput] = {}
+    for unit_name, (previous_path, raw_previous) in retained_raw_transitions.items():
+        selected = DocumentFormat.YAML if previous_path.suffix in {".yaml", ".yml"} else DocumentFormat.JSON
+        write_document(candidate_units / previous_path.name, raw_previous, format=selected)
+        raw_specification = raw_previous.get("spec", raw_previous)
+        raw_source = raw_specification.get("source") if isinstance(raw_specification, dict) else None
+        cleanup_source = None
+        if isinstance(raw_source, dict) and isinstance(raw_source.get("path"), str):
+            cleanup_revision = raw_source.get("revision")
+            cleanup_driver_version = raw_source.get("driverVersion")
+            cleanup_input_hash = raw_source.get("inputHash")
+            cleanup_raw_inputs = raw_source.get("inputs")
+            cleanup_inputs_value = (
+                cast(list[str], cleanup_raw_inputs)
+                if isinstance(cleanup_raw_inputs, list) and all(isinstance(value, str) for value in cleanup_raw_inputs)
+                else None
+            )
+            cleanup_source = DesiredSource(
+                path=cast(str, raw_source["path"]),
+                revision=cleanup_revision if isinstance(cleanup_revision, str) else None,
+                driverVersion=cleanup_driver_version if isinstance(cleanup_driver_version, int) else None,
+                inputHash=cleanup_input_hash if isinstance(cleanup_input_hash, str) else None,
+                inputs=cleanup_inputs_value,
+            )
+        cleanup_inputs[unit_name] = DesiredCleanupInput(
+            unit_name=unit_name,
+            desired=None,
+            source=cleanup_source,
+            raw_document=raw_previous,
+        )
+        blocked[unit_name] = "previous desired driver is unavailable; legacy cleanup root retained"
+    for unit_name, retained in retained_transitions.items():
+        previous_path = unit_document_path(current_desired, unit_name)
+        write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
+        if getattr(retained.spec, "materialization", None) is not None:
+            copy_unit_materialization(current_desired, candidate, unit_name, retained)
+        cleanup_inputs[unit_name] = DesiredCleanupInput(
+            unit_name=unit_name,
+            desired=retained,
+            source=getattr(retained.spec, "source", None),
+        )
+        blocked[unit_name] = "desired resource identity changed; previous cleanup root retained"
+    for unit_name, previous_path in _current_desired_unit_paths(current_desired).items():
+        if unit_name in specifications:
+            continue
+        previous = load_desired_unit(previous_path, unit_name)
+        retained = previous
+        if previous.is_legacy_compatibility:
+            retained = previous.with_metadata(ResourceMetadata.new_source_tracked(unit_name))
+        write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
+        if getattr(retained.spec, "materialization", None) is not None:
+            copy_unit_materialization(current_desired, candidate, unit_name, previous)
+        lifecycle = retained.metadata.lifecycle
+        if lifecycle is not None and lifecycle.management is not None and lifecycle.management.mode == "sourceTracked":
+            cleanup_inputs[unit_name] = DesiredCleanupInput(
+                unit_name=unit_name,
+                desired=retained,
+                source=getattr(retained.spec, "source", None),
+            )
+            if verbose:
+                log_status("RETAIN", f"{style_unit(unit_name)}: source absent; cleanup inputs retained")
+    return BuildDesiredResult(blocked=blocked, cleanup_inputs=cleanup_inputs)
 
 
 def retryable_push_failure(exc: subprocess.CalledProcessError) -> bool:
@@ -2319,6 +2528,7 @@ def advance_desired(
                 verbose=verbose,
                 source_revision_operation="advance",
             )
+            load_desired_resource_graph(candidate)
             if current_revision and directory_files(current_desired) == directory_files(candidate):
                 if verbose:
                     log_status(
@@ -2379,6 +2589,7 @@ def publish_change_candidate(
     title: str,
     body: str,
 ) -> tuple[str, ChangeRequestResult | ManualChangeRequest]:
+    load_desired_resource_graph(candidate)
     if git("check-ref-format", "--branch", candidate_ref, check=False).returncode != 0:
         raise OperationError(f"invalid change candidate ref: {candidate_ref!r}")
     if candidate_ref == target_ref:
@@ -2523,6 +2734,7 @@ def command_promote(args: argparse.Namespace) -> None:
             candidate,
             promotion=promotion,
         )
+        load_desired_resource_graph(candidate)
 
         commit_message = f"Promote {args.from_environment} to {args.to_environment} from {source_desired_revision}"
         title = f"Promote {args.from_environment} to {args.to_environment}"
@@ -2635,6 +2847,7 @@ def publish_desired_change(
     body: str,
     dry: bool,
 ) -> tuple[str, ChangeRequestResult | ManualChangeRequest | None]:
+    load_desired_resource_graph(candidate)
     gate = change_gate(REPOSITORY_ROOT, environment)
     if dry:
         log_status("DRY", f"{style_branch(target_ref)} would receive {title.lower()}")
@@ -3108,6 +3321,8 @@ def command_verify(args: argparse.Namespace) -> None:
             )
         if not selected:
             raise OperationError(f"{desired_ref} has no materialized units")
+        ensure_desired_units_materialized(desired)
+        load_desired_resource_graph(desired)
 
         prepared: list[tuple[str, str, UnitResource[Any], DesiredSource | None]] = []
         for unit_name in selected:
@@ -3485,6 +3700,8 @@ def command_reconcile(args: argparse.Namespace) -> bool:
             log_status("DONE", f"{style_unit(args.unit)}: no changes")
             write_reconcile_outputs(False)
             return False
+        ensure_desired_units_materialized(desired)
+        load_desired_resource_graph(desired)
         if raw_unit_contains_reference(load_json(unit_path)):
             log_status("WAIT", "desired inputs are not materialized")
             log_status("DONE", f"{style_unit(args.unit)}: no changes")

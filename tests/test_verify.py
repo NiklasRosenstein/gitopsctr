@@ -12,7 +12,7 @@ from gitopsctr import cli as deploy_release
 from gitopsctr.contrib.drivers.terraform import AppliedTerraformModel, TerraformResultModel
 from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import ReconciliationOutput, VerificationContext, VerificationResult, VerificationStatus
-from gitopsctr.resources import UnitResource
+from gitopsctr.resources import ResourceMetadata, UnitResource
 from tests.conftest import receipt_document
 
 DESIRED_REVISION = "d" * 40
@@ -24,7 +24,7 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
 
 
 def _unit(name: str, driver: str, revision: str) -> UnitResource:
-    return deploy_release.parse_desired_unit_document(
+    unit = deploy_release.parse_desired_unit_document(
         {
             "schema": 1,
             "name": name,
@@ -38,6 +38,7 @@ def _unit(name: str, driver: str, revision: str) -> UnitResource:
         },
         name,
     )
+    return unit.with_metadata(ResourceMetadata.new_source_tracked(name))
 
 
 def _install_desired_state(monkeypatch, units: list[UnitResource]) -> list[str]:
