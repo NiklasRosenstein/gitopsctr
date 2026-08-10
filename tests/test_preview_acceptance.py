@@ -12,7 +12,7 @@ import pytest
 from gitopsctr import cli
 from gitopsctr.errors import OperationError
 from gitopsctr.resources import ResourceMetadata
-from gitopsctr.state import ControllerPin
+from gitopsctr.state import ControllerPin, ControllerPinClaim
 from tests.test_stack_deletion import _args, _fake_git, _stack_tree
 from tests.test_stack_projection import _project, _write_stack_source
 
@@ -129,14 +129,30 @@ def test_direct_stack_finalization_retries_after_injected_publication_failure(tm
     stack_uid, unit_name = _stack_tree(current)
     published: list[Path] = []
     released: list[tuple[str, str]] = []
+    deleted_claims: list[tuple[str, str]] = []
     pin = ControllerPin(
         "stacks/dev/preview/d1-stack-direct",
         "refs/heads/gitopsctr/pins/stacks/dev/preview/d1-stack-direct",
         "a" * 40,
     )
+    claim = ControllerPinClaim(
+        environment="dev",
+        stack_name="preview",
+        uid=stack_uid,
+        pin_name=pin.name,
+        pin_revision=pin.revision,
+        target_ref="deploy/dev",
+        target_revision="c" * 40,
+        candidate_ref="candidate/dev",
+        candidate_revision=None,
+        state="active",
+        revision="e" * 40,
+    )
     store = SimpleNamespace(
         create_controller_pin=lambda _name, _revision: pin,
         release_controller_pin=lambda name, revision: released.append((name, revision)) or True,
+        read_controller_pin_claim=lambda _name: claim,
+        delete_controller_pin_claim=lambda name, revision: deleted_claims.append((name, revision)) or True,
     )
 
     monkeypatch.setattr(cli, "REPOSITORY_ROOT", tmp_path)
@@ -180,6 +196,7 @@ def test_direct_stack_finalization_retries_after_injected_publication_failure(tm
     assert cli.load_desired_stack_deletion_intents(published[-1]) == {}
     assert not list((published[-1] / "stacks").glob("preview.*"))
     assert released == [("stacks/dev/preview/d1-stack-direct", "a" * 40)]
+    assert deleted_claims == [("stacks/dev/preview/d1-stack-direct", "e" * 40)]
 
 
 def test_dependencies_cli_preserves_explicit_stack_order_after_restart(tmp_path: Path, monkeypatch, capsys):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,7 +18,7 @@ from gitopsctr.contracts import (
 )
 from gitopsctr.errors import OperationError
 from gitopsctr.resources import ResourceMetadata, StackResource, validate_desired_resource_graph
-from gitopsctr.state import ControllerPin
+from gitopsctr.state import ControllerPin, ControllerPinClaim
 
 
 def _project(root: Path) -> Path:
@@ -370,6 +371,7 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
     current = tmp_path / "current"
     current.mkdir()
     published: list[Path] = []
+    events: list[str] = []
     source_revision = "a" * 40
 
     def materialize(revision: str, output: Path) -> None:
@@ -400,6 +402,7 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
             cli.write_desired_candidate_unit(candidate / "units" / f"{name}.json", unit, source_root)
 
     def publish(_environment, candidate, *_args, **_kwargs):
+        events.append("publish")
         snapshot = tmp_path / "published"
         shutil.copytree(candidate, snapshot)
         published.append(snapshot)
@@ -416,14 +419,30 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
     monkeypatch.setattr(cli, "build_desired_candidate", fake_build)
     monkeypatch.setattr(cli, "publish_desired_change", publish)
     monkeypatch.setattr(cli, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+
+    def create_claim(claim: ControllerPinClaim) -> ControllerPinClaim:
+        events.append("claim")
+        return replace(claim, revision="d" * 40)
+
+    def create_pin(name: str, revision: str) -> ControllerPin:
+        events.append("pin")
+        return ControllerPin(name, f"refs/heads/gitopsctr/pins/{name}", revision)
+
+    def update_claim(claim: ControllerPinClaim, expected_revision: str) -> ControllerPinClaim:
+        assert expected_revision == "d" * 40
+        assert claim.state == "active"
+        events.append("activate")
+        return replace(claim, revision="e" * 40)
+
+    store = SimpleNamespace(
+        create_controller_pin_claim=create_claim,
+        create_controller_pin=create_pin,
+        update_controller_pin_claim=update_claim,
+    )
     monkeypatch.setattr(
         cli,
         "state_store",
-        lambda: SimpleNamespace(
-            create_controller_pin=lambda name, revision: ControllerPin(
-                name, f"refs/heads/gitopsctr/pins/{name}", revision
-            )
-        ),
+        lambda: store,
     )
 
     args = cli.build_parser().parse_args(
@@ -444,6 +463,7 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
         ]
     )
     assert cli.command_instantiate_stack(args) is True
+    assert events == ["claim", "pin", "publish", "activate"]
     candidate = published[0]
     stack_path = next((candidate / "stacks").glob("web.*"))
     stack = cli.RESOURCE_CATALOG.parse_stack(

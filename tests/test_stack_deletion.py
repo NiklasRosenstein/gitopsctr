@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 from argparse import Namespace
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,7 +22,7 @@ from gitopsctr.contracts import (
 from gitopsctr.document import JsonObjectValue
 from gitopsctr.errors import OperationError
 from gitopsctr.resources import ResourceMetadata, StackResource
-from gitopsctr.state import ControllerPin
+from gitopsctr.state import ControllerPin, ControllerPinClaim, GitRefSnapshot
 from gitopsctr.templates import ParameterTemplateObject
 
 
@@ -296,3 +297,290 @@ def test_recover_orphan_pin_releases_only_after_finalized_stack_tombstone(tmp_pa
 
     assert args.handler(args) is True
     assert released == [(pin.name, pin.revision)]
+
+
+def test_recover_orphan_pin_retains_pin_owned_by_published_direct_stack_candidate(tmp_path: Path, monkeypatch):
+    current = tmp_path / "current"
+    _stack_tree(current)
+    (current / "stacks/preview.json").unlink()
+    (current / "units/preview--preview-app.json").unlink()
+    candidate = tmp_path / "candidate"
+    _stack_tree(candidate)
+    pin = ControllerPin(
+        "stacks/dev/preview/d1-stack-direct",
+        "refs/heads/gitopsctr/pins/stacks/dev/preview/d1-stack-direct",
+        "a" * 40,
+    )
+    candidate_ref = "candidate/dev/0123456789ab"
+    released: list[tuple[str, str]] = []
+    store = SimpleNamespace(
+        list_controller_pins=lambda: [pin],
+        list_remote_refs=lambda: (GitRefSnapshot(candidate_ref, "b" * 40),),
+        release_controller_pin=lambda name, revision: released.append((name, revision)) or True,
+    )
+    monkeypatch.setattr(cli, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(
+        cli,
+        "fetch_ref",
+        lambda ref: {"deploy/dev": "c" * 40, candidate_ref: "b" * 40}.get(ref),
+    )
+    monkeypatch.setattr(
+        cli,
+        "materialize_revision",
+        lambda revision, output: shutil.copytree(candidate if revision == "b" * 40 else current, output),
+    )
+    monkeypatch.setattr(cli, "candidate_ref_template", lambda *_args, **_kwargs: "candidate/{environment}/{id}")
+    monkeypatch.setattr(cli, "state_store", lambda: store)
+
+    args = cli.build_parser().parse_args(
+        ["recover-orphaned-stacks", "--environment", "dev", "--desired-ref", "deploy/dev"]
+    )
+
+    assert args.handler(args) is False
+    assert released == []
+
+
+def test_recover_orphan_pin_retains_pin_owned_by_published_deletion_candidate(tmp_path: Path, monkeypatch):
+    current = tmp_path / "current"
+    _stack_tree(current)
+    (current / "stacks/preview.json").unlink()
+    (current / "units/preview--preview-app.json").unlink()
+    candidate = tmp_path / "candidate"
+    stack_uid, unit_name = _stack_tree(candidate)
+    stack_path = candidate / "stacks/preview.json"
+    stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name="preview"
+    )
+    intent = cli._stack_intent_for_resource(
+        "dev",
+        stack,
+        stack_path,
+        candidate,
+        [cli.load_desired_unit(candidate / "units" / f"{unit_name}.json", unit_name)],
+        dry=True,
+    )
+    cli.write_stack_deletion_intent(candidate, intent)
+    stack_path.unlink()
+    pin = ControllerPin(
+        "stacks/dev/preview/" + stack_uid,
+        "refs/heads/gitopsctr/pins/stacks/dev/preview/" + stack_uid,
+        "a" * 40,
+    )
+    candidate_ref = "candidate/dev/0123456789ab"
+    released: list[tuple[str, str]] = []
+    store = SimpleNamespace(
+        list_controller_pins=lambda: [pin],
+        list_remote_refs=lambda: (GitRefSnapshot(candidate_ref, "b" * 40),),
+        release_controller_pin=lambda name, revision: released.append((name, revision)) or True,
+    )
+    monkeypatch.setattr(cli, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(
+        cli,
+        "fetch_ref",
+        lambda ref: {"deploy/dev": "c" * 40, candidate_ref: "b" * 40}.get(ref),
+    )
+    monkeypatch.setattr(
+        cli,
+        "materialize_revision",
+        lambda revision, output: shutil.copytree(candidate if revision == "b" * 40 else current, output),
+    )
+    monkeypatch.setattr(cli, "candidate_ref_template", lambda *_args, **_kwargs: "candidate/{environment}/{id}")
+    monkeypatch.setattr(cli, "state_store", lambda: store)
+
+    args = cli.build_parser().parse_args(
+        ["recover-orphaned-stacks", "--environment", "dev", "--desired-ref", "deploy/dev"]
+    )
+
+    assert args.handler(args) is False
+    assert released == []
+
+
+def test_recover_orphan_pin_without_claim_remains_retained_after_complete_candidate_scan(tmp_path: Path, monkeypatch):
+    current = tmp_path / "current"
+    _stack_tree(current)
+    (current / "stacks/preview.json").unlink()
+    (current / "units/preview--preview-app.json").unlink()
+    pin = ControllerPin(
+        "stacks/dev/preview/d1-stack-direct",
+        "refs/heads/gitopsctr/pins/stacks/dev/preview/d1-stack-direct",
+        "a" * 40,
+    )
+    released: list[tuple[str, str]] = []
+    store = SimpleNamespace(
+        list_controller_pins=lambda: [pin],
+        list_remote_refs=lambda: (),
+        release_controller_pin=lambda name, revision: released.append((name, revision)) or True,
+    )
+    monkeypatch.setattr(cli, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(cli, "fetch_ref", lambda ref: "c" * 40 if ref == "deploy/dev" else None)
+    monkeypatch.setattr(cli, "materialize_revision", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, "candidate_ref_template", lambda *_args, **_kwargs: "candidate/{environment}/{id}")
+    monkeypatch.setattr(cli, "state_store", lambda: store)
+
+    args = cli.build_parser().parse_args(
+        ["recover-orphaned-stacks", "--environment", "dev", "--desired-ref", "deploy/dev"]
+    )
+
+    assert args.handler(args) is False
+    assert released == []
+
+
+def test_recover_orphan_pin_reaps_claim_before_release(tmp_path: Path, monkeypatch):
+    current = tmp_path / "current"
+    _stack_tree(current)
+    (current / "stacks/preview.json").unlink()
+    (current / "units/preview--preview-app.json").unlink()
+    pin = ControllerPin(
+        "stacks/dev/preview/d1-stack-direct",
+        "refs/heads/gitopsctr/pins/stacks/dev/preview/d1-stack-direct",
+        "a" * 40,
+    )
+    claim = ControllerPinClaim(
+        environment="dev",
+        stack_name="preview",
+        uid="d1-stack-direct",
+        pin_name=pin.name,
+        pin_revision=pin.revision,
+        target_ref="deploy/dev",
+        target_revision="c" * 40,
+        candidate_ref="candidate/dev/0123456789ab",
+        candidate_revision=None,
+        state="active",
+        revision="d" * 40,
+    )
+    released: list[tuple[str, str]] = []
+    updates: list[tuple[str, str]] = []
+    deleted: list[tuple[str, str]] = []
+
+    def update_claim(updated: ControllerPinClaim, expected: str) -> ControllerPinClaim:
+        updates.append((updated.state, expected))
+        return replace(updated, revision="e" * 40)
+
+    store = SimpleNamespace(
+        list_controller_pins=lambda: [pin],
+        list_controller_pin_claims=lambda: [claim],
+        list_remote_refs=lambda: (),
+        update_controller_pin_claim=update_claim,
+        release_controller_pin=lambda name, revision: released.append((name, revision)) or True,
+        delete_controller_pin_claim=lambda name, revision: deleted.append((name, revision)) or True,
+    )
+    monkeypatch.setattr(cli, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(cli, "fetch_ref", lambda ref: "c" * 40 if ref == "deploy/dev" else None)
+    monkeypatch.setattr(cli, "materialize_revision", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, "candidate_ref_template", lambda *_args, **_kwargs: "candidate/{environment}/{id}")
+    monkeypatch.setattr(cli, "state_store", lambda: store)
+
+    args = cli.build_parser().parse_args(
+        ["recover-orphaned-stacks", "--environment", "dev", "--desired-ref", "deploy/dev"]
+    )
+
+    assert args.handler(args) is True
+    assert updates == [("reaping", "d" * 40)]
+    assert released == [(pin.name, pin.revision)]
+    assert deleted == [(claim.ref.removeprefix("gitopsctr/pin-claims/"), "e" * 40)]
+
+
+@pytest.mark.parametrize(
+    ("claim_revision", "candidate_revision", "fetch_values"),
+    [
+        (None, None, {"deploy/dev": "f" * 40, "candidate/dev/0123456789ab": "a" * 40}),
+        ("a" * 40, "b" * 40, {"deploy/dev": "c" * 40, "candidate/dev/0123456789ab": "e" * 40}),
+    ],
+)
+def test_recover_orphan_pin_retains_claim_when_a_fence_changed(
+    tmp_path: Path,
+    monkeypatch,
+    claim_revision: str | None,
+    candidate_revision: str | None,
+    fetch_values: dict[str, str],
+):
+    current = tmp_path / "current"
+    _stack_tree(current)
+    (current / "stacks/preview.json").unlink()
+    (current / "units/preview--preview-app.json").unlink()
+    pin = ControllerPin(
+        "stacks/dev/preview/d1-stack-direct",
+        "refs/heads/gitopsctr/pins/stacks/dev/preview/d1-stack-direct",
+        "a" * 40,
+    )
+    claim = ControllerPinClaim(
+        environment="dev",
+        stack_name="preview",
+        uid="d1-stack-direct",
+        pin_name=pin.name,
+        pin_revision=pin.revision,
+        target_ref="deploy/dev",
+        target_revision="c" * 40,
+        candidate_ref="candidate/dev/0123456789ab",
+        candidate_revision=claim_revision,
+        state="active",
+        revision="d" * 40,
+    )
+    released: list[tuple[str, str]] = []
+    store = SimpleNamespace(
+        list_controller_pins=lambda: [pin],
+        list_controller_pin_claims=lambda: [claim],
+        list_remote_refs=lambda: (),
+        update_controller_pin_claim=lambda *_args: pytest.fail("changed claim must not be reaped"),
+        release_controller_pin=lambda name, revision: released.append((name, revision)) or True,
+        delete_controller_pin_claim=lambda *_args: pytest.fail("changed claim must not be deleted"),
+    )
+    monkeypatch.setattr(cli, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(cli, "fetch_ref", lambda ref: fetch_values.get(ref))
+    monkeypatch.setattr(cli, "materialize_revision", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, "candidate_ref_template", lambda *_args, **_kwargs: "candidate/{environment}/{id}")
+    monkeypatch.setattr(cli, "state_store", lambda: store)
+
+    args = cli.build_parser().parse_args(
+        ["recover-orphaned-stacks", "--environment", "dev", "--desired-ref", "deploy/dev"]
+    )
+
+    assert args.handler(args) is False
+    assert released == []
+
+
+def test_recover_orphan_pin_uses_custom_candidate_ref_template_without_id(tmp_path: Path, monkeypatch):
+    current = tmp_path / "current"
+    _stack_tree(current)
+    (current / "stacks/preview.json").unlink()
+    (current / "units/preview--preview-app.json").unlink()
+    candidate = tmp_path / "candidate"
+    _stack_tree(candidate)
+    pin = ControllerPin(
+        "stacks/dev/preview/d1-stack-direct",
+        "refs/heads/gitopsctr/pins/stacks/dev/preview/d1-stack-direct",
+        "a" * 40,
+    )
+    candidate_ref = "candidate/dev"
+    released: list[tuple[str, str]] = []
+    store = SimpleNamespace(
+        list_controller_pins=lambda: [pin],
+        list_remote_refs=lambda: (GitRefSnapshot(candidate_ref, "b" * 40),),
+        release_controller_pin=lambda name, revision: released.append((name, revision)) or True,
+    )
+    monkeypatch.setattr(cli, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(
+        cli,
+        "fetch_ref",
+        lambda ref: {"deploy/dev": "c" * 40, candidate_ref: "b" * 40}.get(ref),
+    )
+    monkeypatch.setattr(
+        cli,
+        "materialize_revision",
+        lambda revision, output: shutil.copytree(candidate if revision == "b" * 40 else current, output),
+    )
+    monkeypatch.setattr(cli, "candidate_ref_template", lambda *_args, **_kwargs: "candidate/{environment}")
+    monkeypatch.setattr(cli, "state_store", lambda: store)
+
+    args = cli.build_parser().parse_args(
+        ["recover-orphaned-stacks", "--environment", "dev", "--desired-ref", "deploy/dev"]
+    )
+
+    assert args.handler(args) is False
+    assert released == []
