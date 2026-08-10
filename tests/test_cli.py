@@ -1858,6 +1858,13 @@ def test_promotion_without_a_change_gate_publishes_target_directly(monkeypatch, 
 def test_promotion_with_a_change_gate_creates_a_pull_request(monkeypatch):
     publications = _install_promotion_simulation(monkeypatch, "pullRequest")
     requests = []
+    monkeypatch.setattr(
+        deploy_release,
+        "verify_gated_candidate",
+        lambda _candidate_revision, target_revision: deploy_release.GatedCandidate(
+            "e" * 40, target_revision, target_revision
+        ),
+    )
 
     def ensure(specification, **_kwargs):
         requests.append(specification)
@@ -2534,6 +2541,13 @@ def test_occupied_candidate_slot_reuses_only_the_same_proposal(tmp_path, monkeyp
 
     monkeypatch.setattr(deploy_release, "git", fake_git)
     monkeypatch.setattr(deploy_release, "ensure_change_request", lambda *_args, **_kwargs: outcome)
+    monkeypatch.setattr(
+        deploy_release,
+        "verify_gated_candidate",
+        lambda _candidate_revision, _target_revision: deploy_release.GatedCandidate(
+            existing_revision, target_revision, target_revision
+        ),
+    )
     monkeypatch.setattr(
         deploy_release,
         "publish_tree",

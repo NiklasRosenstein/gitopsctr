@@ -26,6 +26,15 @@ class PublishedTree:
 
 
 @dataclass(frozen=True)
+class GatedCandidate:
+    """A candidate proven to be one commit directly on the target head."""
+
+    revision: str
+    target_revision: str
+    parent: str
+
+
+@dataclass(frozen=True)
 class GitStateStore:
     root: Path
     author_name: str = "gitopsctr"
@@ -88,6 +97,47 @@ class GitStateStore:
             stream.seek(0)
             with tarfile.open(fileobj=stream, mode="r:") as tar:
                 tar.extractall(output, filter="data")
+
+    def verify_gated_candidate(self, candidate_revision: str | None, target_revision: str | None) -> GatedCandidate:
+        """Verify the fail-closed commit shape required by a change-gated candidate.
+
+        A valid candidate is exactly one commit whose only parent is the current target
+        head.  Checking both the parent list and the revision range rejects roots,
+        stale candidates, rebases, multi-commit proposals, and merge commits.
+        """
+
+        if not candidate_revision:
+            raise OperationError("gated candidate is missing its head revision")
+        if not target_revision:
+            raise OperationError("gated candidate is missing the current target head revision")
+
+        candidate = self.git("rev-parse", "--verify", f"{candidate_revision}^{{commit}}", check=False)
+        if candidate.returncode != 0:
+            raise OperationError("gated candidate head revision is missing or invalid")
+        target = self.git("rev-parse", "--verify", f"{target_revision}^{{commit}}", check=False)
+        if target.returncode != 0:
+            raise OperationError("gated candidate target head revision is missing or invalid")
+        resolved_candidate = candidate.stdout.strip()
+        resolved_target = target.stdout.strip()
+
+        parents = self.git("rev-list", "--parents", "-n", "1", resolved_candidate, check=False)
+        if parents.returncode != 0:
+            raise OperationError("gated candidate head commit cannot be inspected")
+        parent_revisions = parents.stdout.split()
+        if len(parent_revisions) != 2:
+            raise OperationError(
+                "gated candidate must contain exactly one controller commit with one parent; "
+                "roots and merge candidates are rejected"
+            )
+        parent = parent_revisions[1]
+        if parent != resolved_target:
+            raise OperationError("gated candidate is stale or rebased against a different target head")
+
+        count = self.git("rev-list", "--count", f"{resolved_target}..{resolved_candidate}", check=False)
+        if count.returncode != 0 or count.stdout.strip() != "1":
+            raise OperationError("gated candidate must contain exactly one commit after the target head")
+
+        return GatedCandidate(resolved_candidate, resolved_target, parent)
 
     def publish(self, ref: str, directory: Path, parent: str | None, message: str) -> PublishedTree:
         files = sorted(path for path in directory.rglob("*") if path.is_file())

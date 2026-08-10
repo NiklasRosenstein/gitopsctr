@@ -15,6 +15,80 @@ from pathlib import Path
 from typing import Literal, Protocol
 from urllib.parse import urlsplit
 
+from gitopsctr.errors import OperationError
+
+GitHubCandidateEventName = Literal["pull_request", "merge_group"]
+
+
+@dataclass(frozen=True)
+class GitHubCandidateHeads:
+    """Head data extracted from a GitHub gated-candidate event."""
+
+    event: GitHubCandidateEventName
+    candidate_revision: str
+    target_revision: str
+
+
+def _github_revision(value: object, field: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value):
+        raise OperationError(f"GitHub event is missing a valid {field}")
+    return value.lower()
+
+
+def github_candidate_heads(payload: object, event: str) -> GitHubCandidateHeads:
+    """Extract exact candidate and target heads from supported GitHub event payloads.
+
+    This validates only forge-provided identity data.  It does not claim that GitHub
+    branch protection or merge rules are configured; callers must still run the local
+    commit-graph verifier before accepting the candidate.
+    """
+
+    if event == "pull_request":
+        if not isinstance(payload, dict):
+            raise OperationError("GitHub pull_request event payload is missing")
+        pull_request = payload.get("pull_request")
+        if not isinstance(pull_request, dict):
+            raise OperationError("GitHub pull_request event is missing pull_request data")
+        head = pull_request.get("head")
+        base = pull_request.get("base")
+        if not isinstance(head, dict) or not isinstance(base, dict):
+            raise OperationError("GitHub pull_request event is missing head or base data")
+        return GitHubCandidateHeads(
+            event="pull_request",
+            candidate_revision=_github_revision(head.get("sha"), "pull_request.head.sha"),
+            target_revision=_github_revision(base.get("sha"), "pull_request.base.sha"),
+        )
+
+    if event == "merge_group":
+        if not isinstance(payload, dict):
+            raise OperationError("GitHub merge_group event payload is missing")
+        return GitHubCandidateHeads(
+            event="merge_group",
+            candidate_revision=_github_revision(payload.get("head_sha"), "merge_group.head_sha"),
+            target_revision=_github_revision(payload.get("base_sha"), "merge_group.base_sha"),
+        )
+
+    raise OperationError(f"unsupported GitHub gated-candidate event: {event!r}")
+
+
+def verify_github_candidate_heads(
+    payload: object,
+    event: str,
+    *,
+    candidate_revision: str | None,
+    target_revision: str | None,
+) -> GitHubCandidateHeads:
+    """Fail closed unless a GitHub event names the exact candidate and target heads."""
+
+    heads = github_candidate_heads(payload, event)
+    expected_candidate = _github_revision(candidate_revision, "expected candidate head")
+    expected_target = _github_revision(target_revision, "expected target head")
+    if heads.candidate_revision != expected_candidate:
+        raise OperationError("GitHub event candidate head does not match the published candidate")
+    if heads.target_revision != expected_target:
+        raise OperationError("GitHub event target head does not match the current target head")
+    return heads
+
 
 @dataclass(frozen=True)
 class ChangeRequestSpec:

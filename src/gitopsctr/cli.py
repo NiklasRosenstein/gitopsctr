@@ -127,7 +127,7 @@ from gitopsctr.resources import (
     validate_desired_resource_graph,
 )
 from gitopsctr.schemas import encoded_schema, export_schemas, resource_schema_url, show_schema
-from gitopsctr.state import GitStateStore
+from gitopsctr.state import GatedCandidate, GitStateStore
 from gitopsctr.templates import (
     ArtifactReference as ArtifactReferenceExpression,
 )
@@ -505,6 +505,12 @@ def command_read_tree(args: argparse.Namespace) -> None:
 
 def publish_tree(ref: str, directory: Path, parent: str | None, message: str) -> str:
     return state_store().publish(ref, directory, parent, message).revision
+
+
+def verify_gated_candidate(candidate_revision: str | None, target_revision: str | None) -> GatedCandidate:
+    """Verify a change-gated candidate against the exact target head used to build it."""
+
+    return state_store().verify_gated_candidate(candidate_revision, target_revision)
 
 
 def command_publish_tree(args: argparse.Namespace) -> None:
@@ -4708,6 +4714,7 @@ def publish_change_candidate(
             target_revision,
             commit_message,
         )
+    verify_gated_candidate(candidate_revision, target_revision)
     outcome = ensure_change_request(
         ChangeRequestSpec(
             head=candidate_ref,
