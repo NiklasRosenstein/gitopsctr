@@ -110,6 +110,96 @@ def test_failed_teardown_survives_restart_and_retries_from_durable_intent(tmp_pa
     assert not cli.unit_document_path(desired_state, "application").exists()
 
 
+def test_evidence_publication_crash_is_restart_safe_without_repeating_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    desired_state = tmp_path / "desired-state"
+    unit_path = desired_state / "units/application.json"
+    unit_path.parent.mkdir(parents=True)
+    unit_path.write_text(json.dumps(_terraform_unit("application", "d1-application")))
+    unit = cli.load_desired_unit(unit_path, "application")
+    intent = cli.UnitDeletionIntent.from_unit(unit, unit_path, desired_state)
+    cli.write_deletion_intent(desired_state, intent)
+    cli.write_desired_transition_blocks(desired_state, {"application": cli.deletion_intent_reason(intent)})
+    observed_state = tmp_path / "observed-state"
+    observed_state.mkdir()
+    desired_revision = "c" * 40
+
+    def observed_tree(ref: str, output: Path):
+        source = desired_state if ref == "deploy/dev" else observed_state
+        shutil.copytree(source, output)
+        return desired_revision if ref == "deploy/dev" else None
+
+    def materialize_revision(revision: str, output: Path):
+        if revision in {"c" * 40, "d" * 40}:
+            shutil.copytree(desired_state, output)
+        else:
+            output.mkdir(parents=True)
+
+    def publish_tree(ref: str, directory: Path, _parent: str | None, _message: str):
+        nonlocal desired_revision
+        target = desired_state if ref == "deploy/dev" else observed_state
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(directory, target)
+        if ref == "deploy/dev":
+            desired_revision = "d" * 40
+        return "d" * 40
+
+    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(cli, "observed_tree", observed_tree)
+    monkeypatch.setattr(cli, "fetch_ref", lambda _ref: desired_revision)
+    monkeypatch.setattr(cli, "materialize_revision", materialize_revision)
+    monkeypatch.setattr(cli, "publish_tree", publish_tree)
+    monkeypatch.setattr(cli, "validate_effect_lease_head", lambda _ref, *_args: desired_revision)
+    monkeypatch.setattr(
+        cli,
+        "rebase_effect_completion",
+        lambda _ref, acquisition, _unit_name, _uid, _root: acquisition,
+    )
+
+    class NoopHeartbeat:
+        def __init__(self, acquisition: cli.EffectLeaseAcquisition):
+            self.acquisition = acquisition
+
+        def stop(self) -> cli.EffectLeaseAcquisition:
+            return self.acquisition
+
+    monkeypatch.setattr(
+        cli, "start_effect_lease_heartbeat", lambda _ref, acquisition, **_kwargs: NoopHeartbeat(acquisition)
+    )
+
+    teardown_calls = []
+
+    def teardown(_driver, context):
+        teardown_calls.append(context)
+        return TeardownResult(details={"destroyed": True})
+
+    monkeypatch.setattr(type(cli.UNIT_DRIVERS["terraform"]), "teardown", teardown)
+    original_publish_desired_change = cli.publish_desired_change
+    monkeypatch.setattr(
+        cli,
+        "publish_desired_change",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("controller crashed after evidence")),
+    )
+
+    with pytest.raises(RuntimeError, match="controller crashed after evidence"):
+        cli.command_finalize(_finalize_args())
+
+    assert len(teardown_calls) == 1
+    assert cli.load_teardown_evidence(observed_state, "application", intent.uid, intent.deletion_generation) is not None
+    assert cli.load_desired_effect_leases(desired_state)["application"].uid == intent.uid
+
+    # A fresh controller resumes from the durable evidence and removes the
+    # lease and deletion intent without invoking the external driver again.
+    monkeypatch.setattr(cli, "publish_desired_change", original_publish_desired_change)
+    assert cli.command_finalize(_finalize_args()) is True
+    assert len(teardown_calls) == 1
+    assert cli.load_desired_deletion_intents(desired_state) == {}
+    assert cli.load_desired_effect_leases(desired_state) == {}
+    assert not cli.unit_document_path(desired_state, "application").exists()
+
+
 def test_stale_delete_request_cannot_target_recreated_same_name(tmp_path: Path, monkeypatch):
     source = tmp_path / "source"
     current = tmp_path / "current"

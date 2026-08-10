@@ -3620,6 +3620,7 @@ def acquire_effect_lease(
     *,
     ttl_seconds: int = EFFECT_LEASE_TTL_SECONDS,
     precondition: Callable[[Path], None] | None = None,
+    resume_existing: bool = False,
 ) -> EffectLeaseAcquisition:
     if ttl_seconds < 1:
         raise OperationError("effect lease TTL must be positive")
@@ -3646,6 +3647,18 @@ def acquire_effect_lease(
             leases = load_desired_effect_leases(current)
             existing = leases.get(unit_name)
             if existing is not None:
+                if resume_existing:
+                    if existing.uid != uid:
+                        raise EffectLeaseUnavailable(
+                            f"effect lease for {unit_name!r} is fenced to a different Unit UID"
+                        )
+                    if existing.snapshot is None or effect_lease_snapshot(current, unit_name, uid) != existing.snapshot:
+                        raise EffectLeaseUnavailable(
+                            f"effect lease for {unit_name!r} no longer fences the same Unit snapshot"
+                        )
+                    if precondition is not None:
+                        precondition(current)
+                    return EffectLeaseAcquisition(lease=existing, revision=current_revision)
                 raise EffectLeaseUnavailable(
                     f"effect lease for {unit_name!r} is held by {existing.owner}; explicit UID/token recovery is required"
                 )
@@ -7601,6 +7614,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                 args.unit,
                 intent.uid,
                 precondition=assert_no_active_teardown_dependents,
+                resume_existing=existing_evidence is not None,
             )
         except EffectLeaseUnavailable as exc:
             log_status("WAIT", f"{style_unit(args.unit)}: {exc}")
