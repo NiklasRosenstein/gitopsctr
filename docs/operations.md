@@ -22,6 +22,19 @@ gitopsctr dependencies --environment dev --unit application
 gitopsctr validate
 ```
 
+Check that the GitHub branch protects the candidate-freshness status check:
+
+```console
+uv run python tools/verify_github_policy.py \
+  --repository NiklasRosenstein/gitopsctr \
+  --branch main \
+  --required-check "CI / Verify gated candidate freshness"
+```
+
+The command performs a read-only `gh api` request and emits stable JSON. It exits non-zero when the branch is not
+protected, the policy is invalid, the API fails, or the required check is absent. The check name must match the GitHub
+status context exactly.
+
 `show receipt --artifact NAME` prints one typed artifact and `--artifacts` prints all artifacts. Add `--json` or
 `--yaml` to the `show` commands to override the Project's preferred output format.
 
@@ -83,25 +96,33 @@ the Environment's change gate controls direct publication versus a reviewed cand
 
 For CI orchestration, see the [GitHub Action](github-action.md).
 
-## Recover orphaned preview Stacks
+## CI-driven preview cleanup
 
-The repository-owned `.github/workflows/recover-orphaned-preview-stacks.yml`
-runs hourly and can also be started manually. Configure these repository variables:
+Forge identity is provenance only. `gitopsctr` does not decide whether a pull
+request or merge request is eligible, and normal desired-state operations do not
+call GitHub or GitLab.
 
-- `GITOPSCTR_RECOVERY_ENABLED` — set to `true` to enable scheduled recovery.
-- `PREVIEW_ENVIRONMENT` — required for scheduled recovery; its value is the environment name.
-- `PREVIEW_REQUIRED_LABEL` — optional pull-request label required for preview eligibility.
+Trusted PR CI may create, update, delete, and finalize a preview Stack with the
+normal CLI primitives. A scheduled CI job may enumerate preview refs or
+resources by lineage, consult the forge for missed events, and request cleanup.
+Cleanup still uses UID-/revision-fenced Stack finalization.
 
-Set them with `gh variable set GITOPSCTR_RECOVERY_ENABLED --body true`,
-`gh variable set PREVIEW_ENVIRONMENT --body dev` and, when needed, `gh variable
-set PREVIEW_REQUIRED_LABEL --body preview`. A manual run may override the
-environment and label with its inputs. Manual runs default to `dry_run: true`;
-set it to `false` only for an intentional cleanup run. Scheduled runs perform
-real recovery after the enable variable is set.
+The existing `recover-orphaned-preview-stacks.yml` workflow is a transitional
+forge-aware reference. Do not treat it as the core product contract; replace or
+retire it when external CI orchestration is established.
 
-The workflow checks out the trusted default branch and does not execute pull-request
-code or configuration. It uses the repository `GITHUB_TOKEN` as `GH_TOKEN` with
-`contents: write` and `pull-requests: write`: cleanup may publish Git state and
-create a change-gated cleanup pull request, but it cannot access unrelated
-repository permissions. Protect the repository and restrict workflow changes
-because this token can publish cleanup changes.
+## Verify GitHub merge policy
+
+After configuring branch protection or a merge queue, run the read-only verifier:
+
+```console
+python tools/verify_github_policy.py \
+  --repository OWNER/REPOSITORY \
+  --branch main \
+  --required-check 'CI / Verify gated candidate freshness'
+```
+
+It prints versioned JSON and returns non-zero if the branch is unprotected, the
+GitHub API fails, the policy is malformed, or the candidate-freshness check is
+not required. It verifies branch protection only; it does not inspect or change
+GitHub rulesets or merge-queue settings.

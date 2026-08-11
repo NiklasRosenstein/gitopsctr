@@ -181,6 +181,8 @@ pre-publication orphan-pin cleanup safeguards. The current increment adds CAS-fe
 read-only GitLab.com eligibility adapter uses `glab`; the repository still does not publish preview manifests or own
 ApplicationSet resources, and forge-side required checks/merge queues remain deployment configuration. CI now runs for
 GitHub `merge_group` requests and verifies the exact candidate/base commit shape.
+This forge-aware recovery implementation is retained as transitional code while the external-CI boundary is adopted;
+it is not the target lifecycle contract.
 
 Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 548 tests,
 lint, typecheck, schema freshness, strict docs, actionlint, formatting, and diff checks.
@@ -236,16 +238,32 @@ and emits one versioned JSON report with per-environment results. It continues a
 so the report identifies all failures. Focused coverage includes multiple environments, custom refs, duplicate refs,
 and partial failures. Out-of-band desired refs still require explicit inventory before legacy removal.
 
-### 8.4 Opt-in GitHub orphan-Stack recovery workflow — complete as a reference workflow
+### 8.4 Opt-in GitHub orphan-Stack recovery workflow — superseded direction
 
 Commit `eccc338` adds `.github/workflows/recover-orphaned-preview-stacks.yml` and documents its repository variables.
 Scheduled recovery is disabled unless `GITOPSCTR_RECOVERY_ENABLED=true` and `PREVIEW_ENVIRONMENT` are set. Manual
 runs default to dry-run and can override the environment, label, and dry-run mode. The workflow checks out the trusted
 default branch and grants only Git contents and pull-request write access needed for cleanup and change-gated requests.
 Deployment-owned alerts, token policy, environment coverage, and self-hosted GitLab scheduling remain open.
+The later boundary decision below means this forge-aware workflow is not the target core product behavior.
 
 ### 8.5 Forge policy verification — external prerequisite confirmed
 
 A read-only GitHub API check on 2026-08-11 returned `404 Branch not protected` for `main`. Repository CI verifies
 candidate freshness, but the result is not authoritative until branch protection or a merge queue requires that check.
 No GitHub settings were changed because this requires deployment-owner authority.
+
+### 8.6 Read-only forge policy verifier — repository support complete
+
+Added `tools/verify_github_policy.py`. It performs a read-only GitHub API request, checks the exact required status
+context, encodes branch names safely, and fails closed on API errors or malformed policy data. It emits versioned JSON
+for automation. The live branch remains unprotected; deployment owners must configure and re-run this check after
+branch protection, rulesets, or merge-queue policy is set.
+
+### 8.7 Forge provenance boundary — new direction recorded
+
+Forge identity is provenance, not lifecycle authority. PR CI may imperatively create and delete preview Stacks with
+normal `gitopsctr` CLI primitives. Scheduled CI may enumerate preview refs or resources by lineage, consult GitHub or
+GitLab, and request cleanup for missed events. `advance-desired`, reconciliation, and finalization remain forge-
+independent. The forge-aware recovery command, adapters, and repository workflow are now follow-up rework or removal,
+not completion criteria for the core lifecycle.
