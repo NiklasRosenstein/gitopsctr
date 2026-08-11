@@ -10,6 +10,7 @@ import argparse
 import fcntl
 import glob as globlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -20,7 +21,7 @@ import sys
 import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import cache
@@ -289,6 +290,11 @@ STATUS_ROLES = {
     "ERROR": "error",
     "INVALID": "error",
     "READY": "focus",
+    "CHANGED": "focus",
+    "UP TO DATE": "success",
+    "ADDED": "success",
+    "UPDATED": "success",
+    "UNCHANGED": "muted",
     "RUN": "focus",
     "NEXT": "focus",
     "PROMOTE": "focus",
@@ -352,13 +358,13 @@ def style_units(unit_names: Sequence[str], stream: TextIO | None = None) -> str:
 
 
 def status_role(status: str, message: str) -> str:
-    if status.upper() == "RESULT":
+    if status.upper() in {"RESULT", "RECONCILE", "PLAN"}:
         result = message.split(":", 1)[0].strip().upper()
-        if result == "FAILED":
+        if result.startswith("FAILED"):
             return "error"
         if result == "DRIFT":
             return "warning"
-        if result in {"CLEAN", "VALID"}:
+        if result in {"CLEAN", "VALID"} or result.startswith("SUCCEEDED"):
             return "success"
     return STATUS_ROLES.get(status.upper(), "label")
 
@@ -373,6 +379,23 @@ def log_status(status: str, message: str) -> None:
     padding = " " * (max(8 - len(status), 0) + 1)
     rendered_status = style_text(status, status_role(status, message))
     print(f"    {rendered_status}{padding}{message}", file=sys.stderr, flush=True)
+
+
+def log_reconcile_outcome(
+    status: str,
+    reason: str,
+    action: str,
+    effects: Sequence[tuple[str, str]],
+) -> None:
+    """Render the at-a-glance result of reconciling one unit."""
+
+    log_status(status, reason)
+    log_status("ACTION", action)
+    if effects:
+        for effect_status, message in effects:
+            log_status(effect_status, message)
+    else:
+        log_status("EFFECTS", "None")
 
 
 def short_revision(revision: str | None) -> str:
@@ -1132,6 +1155,8 @@ def load_artifact_document(
     unit: UnitResource[Any],
     receipt: ReceiptResource[Any],
     artifact_name: str,
+    *,
+    require_current_producer: bool = True,
 ) -> tuple[dict[str, Any], str]:
     driver_name = receipt.driver_name
     artifact_kind = UNIT_DRIVERS[driver_name].artifact_outputs.get(artifact_name)
@@ -1169,6 +1194,8 @@ def load_artifact_document(
         f"persisted {driver_name} artifact {artifact_name}",
     )
     document = artifact_api.dump(typed_resource)
+    if not require_current_producer:
+        return document, digest
     producer = document.get("producer")
     metadata = document.get("metadata")
     source = getattr(unit.spec, "source", None)
@@ -2450,6 +2477,7 @@ class BuildDesiredResult:
     blocked: Mapping[str, str]
     cleanup_inputs: Mapping[str, DesiredCleanupInput] = field(default_factory=dict)
     blocked_transitions: Mapping[str, str] = field(default_factory=dict)
+    refreshes: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -4817,6 +4845,7 @@ def build_desired_candidate(
     incarnation_tombstones = load_desired_unit_incarnation_tombstones(current_desired)
     blocked: dict[str, str] = {}
     cleanup_inputs: dict[str, DesiredCleanupInput] = {}
+    refreshes: dict[str, str] = {}
 
     def adopt_existing_incarnation(unit: UnitResource[Any]) -> UnitIncarnationTombstone | None:
         """Durably fence a canonical pre-record Unit without changing its UID."""
@@ -4972,6 +5001,7 @@ def build_desired_candidate(
         )
         prepared[unit_name] = (specification, source_resolution.source)
         if source_resolution.refresh_reason is not None:
+            refreshes[unit_name] = source_resolution.refresh_reason
             if verbose:
                 log_status("REFRESH", f"{style_unit(unit_name)}: {source_resolution.refresh_reason}")
             continue
@@ -5220,6 +5250,7 @@ def build_desired_candidate(
         blocked=blocked,
         cleanup_inputs=cleanup_inputs,
         blocked_transitions=blocked_transitions,
+        refreshes=refreshes,
     )
 
 
@@ -8546,9 +8577,48 @@ def write_reconcile_outputs(changed: bool, desired_revision: str = "") -> None:
             stream.write(f"desired_revision={desired_revision}\n")
 
 
+def reconciliation_artifact_effects(
+    observed: Path,
+    unit: UnitResource[Any],
+    previous_receipt: ReceiptResource[Any] | None,
+    artifacts: Mapping[str, JsonObject],
+) -> list[tuple[str, str]]:
+    """Describe artifact changes using the typed artifact documents, not incidental serialization."""
+
+    previous_names = set(previous_receipt.status.artifacts or {}) if previous_receipt is not None else set()
+    effects: list[tuple[str, str]] = []
+    for name in sorted(artifacts):
+        if name not in previous_names or previous_receipt is None:
+            effects.append(("ADDED", f"Artifact {style_unit(name)}"))
+            continue
+        previous_document, _digest = load_artifact_document(
+            observed,
+            unit,
+            previous_receipt,
+            name,
+            require_current_producer=False,
+        )
+        artifact_api = require_artifact_api(unit.driver.artifact_outputs[name])
+        current_resource = parse_artifact_document(
+            artifact_api,
+            artifacts[name],
+            f"{unit.driver_name} artifact {name}",
+        )
+        current_document = artifact_api.dump(current_resource)
+        status = "UNCHANGED" if previous_document == current_document else "UPDATED"
+        effects.append((status, f"Artifact {style_unit(name)}"))
+    return effects
+
+
 def _command_reconcile(args: argparse.Namespace) -> bool:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
         raise OperationError(f"invalid unit name: {args.unit!r}")
+    verbose = getattr(args, "verbose", False)
+
+    def detail(status: str, message: str) -> None:
+        if verbose:
+            log_status(status, message)
+
     configured_environment = load_environment(REPOSITORY_ROOT, args.environment)
     promoted_environment = configured_environment.get("promotion") is not None
     if args.advance:
@@ -8563,9 +8633,12 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         source_revision = None
     if args.require_source_ref and source_revision is None:
         raise OperationError("--require-source-ref requires --source-revision")
-    log_heading(f"Reconcile {style_unit(args.unit)}")
-    log_status("START", f"environment {style_environment(args.environment)}")
-    log_status("MODE", "plan" if args.plan else "apply")
+    if verbose:
+        log_heading(f"Reconcile {style_unit(args.unit)}")
+        log_status("START", f"environment {style_environment(args.environment)}")
+        log_status("MODE", "plan" if args.plan else "apply")
+    else:
+        log_heading(f"{style_unit(args.unit)} · {style_environment(args.environment)}")
     report = Path(args.report).resolve() if args.report else None
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
@@ -8574,8 +8647,16 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         if not args.plan and args.require_source_ref:
             required_head = fetch_ref(args.require_source_ref)
             if required_head != source_revision:
-                log_status("SKIP", f"source revision is superseded by {args.require_source_ref}")
-                log_status("DONE", f"{style_unit(args.unit)}: no changes")
+                if verbose:
+                    log_status("SKIP", f"source revision is superseded by {args.require_source_ref}")
+                    log_status("DONE", f"{style_unit(args.unit)}: no changes")
+                else:
+                    log_reconcile_outcome(
+                        "SKIP",
+                        f"Source revision is superseded by {args.require_source_ref}",
+                        "No reconciliation performed",
+                        [],
+                    )
                 write_reconcile_outputs(False)
                 return False
         warn_if_source_revision_excludes_changes(source_revision)
@@ -8592,25 +8673,41 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         )
         if args.plan or (args.advance and not args.desired_revision):
             require_environment_unit(ref_source_root, args.environment, args.unit)
-        log_status("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
-        pre_advance = not args.plan and args.advance and not args.desired_revision
-        pre_advanced_revision = ""
-        if pre_advance:
-            advanced, changed = advance_desired(
+        detail("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
+
+        def advance_for_reconcile() -> tuple[str | None, bool]:
+            arguments = (
                 args.environment,
                 source_revision,
                 desired_ref,
                 observed_ref,
                 args.require_source_ref,
             )
+            if verbose:
+                return advance_desired(*arguments)
+            with redirect_stderr(io.StringIO()):
+                return advance_desired(*arguments)
+
+        pre_advance = not args.plan and args.advance and not args.desired_revision
+        pre_advanced_revision = ""
+        if pre_advance:
+            advanced, changed = advance_for_reconcile()
             if advanced is None:
-                log_status("DONE", f"{style_unit(args.unit)}: source revision is no longer eligible")
+                if verbose:
+                    log_status("DONE", f"{style_unit(args.unit)}: source revision is no longer eligible")
+                else:
+                    log_reconcile_outcome(
+                        "SKIP",
+                        "Source revision is no longer eligible",
+                        "No reconciliation performed",
+                        [],
+                    )
                 write_reconcile_outputs(False)
                 return False
             desired_revision = advanced
             if changed:
                 pre_advanced_revision = advanced
-            log_status("PIN", f"reconcile advanced desired state at {describe_revision(advanced)}")
+            detail("PIN", f"reconcile advanced desired state at {describe_revision(advanced)}")
         observed_revision = observed_tree(observed_ref, observed)
         if args.plan and candidate_source_root is not None:
             assert source_revision is not None
@@ -8625,8 +8722,12 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 observed_revision,
                 desired,
                 dry=True,
+                verbose=verbose,
                 source_revision_operation="plan",
             )
+            if not verbose:
+                for unit_name, reason in sorted(candidate_result.refreshes.items()):
+                    log_status("REFRESH", f"{style_unit(unit_name)}: {reason}")
             if args.unit in candidate_result.blocked:
                 log_status("WAIT", candidate_result.blocked[args.unit])
                 log_status("DONE", f"{style_unit(args.unit)}: no changes")
@@ -8637,8 +8738,8 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             desired_revision = resolve_ref(desired_ref, args.desired_revision)
         if candidate_source_root is None:
             materialize_revision(desired_revision, desired)
-        log_status("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(desired_revision)}")
-        log_status(
+        detail("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(desired_revision)}")
+        detail(
             "OBSERVED",
             f"{style_branch(observed_ref)} at {describe_revision(observed_revision)}"
             if observed_revision
@@ -8679,12 +8780,12 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             return False
         driver_name, source = require_unit(unit, args.unit)
         validate_unit_materialization(desired, args.unit, unit)
-        log_status("DRIVER", driver_name)
+        detail("DRIVER", driver_name)
         if source is not None:
             assert source.revision is not None
-            log_status("SOURCE", f"{describe_revision(source.revision)} ({source.path})")
+            detail("SOURCE", f"{describe_revision(source.revision)} ({source.path})")
         else:
-            log_status("SOURCE", "none (source-less unit)")
+            detail("SOURCE", "none (source-less unit)")
         if unit_contains_reference(unit):
             raise OperationError(f"{args.unit} desired state is not fully materialized")
         if not unit_requires_reconciliation(unit):
@@ -8696,22 +8797,17 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         def advance_if_requested() -> str:
             if not args.advance:
                 return ""
-            advanced, changed = advance_desired(
-                args.environment,
-                source_revision,
-                desired_ref,
-                observed_ref,
-                args.require_source_ref,
-            )
+            advanced, changed = advance_for_reconcile()
             if changed and advanced:
                 return advanced
             if advanced:
-                log_status("KEEP", f"{style_branch(desired_ref)} did not change after observation")
+                detail("KEEP", f"{style_branch(desired_ref)} did not change after observation")
             return ""
 
         unit_blob = file_blob(unit_path)
         receipt_path = unit_document_path(observed, args.unit)
         previous_receipt = load_receipt(receipt_path, args.unit) if receipt_path.is_file() else None
+        receipt_is_current = False
         if receipt_path.is_file():
             assert previous_receipt is not None
             receipt = previous_receipt
@@ -8720,14 +8816,44 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             if receipt_is_current:
                 validate_receipt_artifacts(observed, unit, receipt)
             if not getattr(args, "reapply", False) and skip_clean_unit and receipt_is_current:
-                log_status("KEEP", "observation already matches desired state")
+                detail("KEEP", "observation already matches desired state")
                 if args.plan:
                     advanced_revision = ""
                 elif pre_advance:
                     advanced_revision = pre_advanced_revision
                 else:
                     advanced_revision = advance_if_requested()
-                log_status("DONE", f"{style_unit(args.unit)}: clean")
+                if verbose:
+                    log_status("DONE", f"{style_unit(args.unit)}: clean")
+                else:
+                    effects = []
+                    if advanced_revision:
+                        effects.append(
+                            (
+                                "UPDATED",
+                                f"Desired state {style_branch(desired_ref)} to {describe_revision(advanced_revision)}",
+                            )
+                        )
+                    log_reconcile_outcome(
+                        "UP TO DATE",
+                        "Observation matches desired state",
+                        "No reconciliation needed",
+                        effects,
+                    )
+                    displayed_desired_revision = advanced_revision or desired_revision
+                    log_status(
+                        "DESIRED",
+                        f"{style_branch(desired_ref)} at {describe_revision(displayed_desired_revision)}",
+                    )
+                    log_status(
+                        "OBSERVED",
+                        f"{style_branch(observed_ref)} at {describe_revision(observed_revision)}",
+                    )
+                    log_status("DRIVER", driver_name)
+                    if source is not None:
+                        log_status("SOURCE", f"{describe_revision(source.revision)} ({source.path})")
+                    else:
+                        log_status("SOURCE", "none (source-less unit)")
                 write_reconcile_outputs(False, advanced_revision)
                 return False
 
@@ -8774,7 +8900,42 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                     )
                 raise
 
-        log_status("RUN", f"execute {driver_name} {'planning' if args.plan else 'reconciliation'}")
+        def log_compact_failure() -> None:
+            if verbose:
+                return
+            log_status("PLAN" if args.plan else "RECONCILE", "FAILED")
+            log_status(
+                "UNCHANGED",
+                f"Observation {style_branch(observed_ref)} at {describe_revision(observed_revision)}",
+            )
+            log_status(
+                "UNCHANGED",
+                f"Desired state {style_branch(desired_ref)} at {describe_revision(desired_revision)}",
+            )
+            if not args.plan:
+                log_status("WARN", "Driver effects may have occurred; no observation was published")
+
+        if verbose:
+            log_status("RUN", f"execute {driver_name} {'planning' if args.plan else 'reconciliation'}")
+        else:
+            if args.plan:
+                reason = (
+                    "Plan requested for the current desired state"
+                    if receipt_is_current
+                    else ("No observation exists" if previous_receipt is None else "Desired inputs changed")
+                )
+                log_status("CHANGED", reason)
+                log_status("ACTION", f"Run {driver_name} planning")
+            else:
+                reason = (
+                    "Reapply requested"
+                    if getattr(args, "reapply", False)
+                    else "No observation exists"
+                    if previous_receipt is None
+                    else "Desired inputs changed since the last observation"
+                )
+                log_status("CHANGED", reason)
+                log_status("ACTION", f"Run {driver_name} reconciliation")
         heartbeat: EffectLeaseHeartbeat | None = None
         driver_started = False
         if lease_acquisition is not None:
@@ -8811,8 +8972,12 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 planned = planner.plan(PlanningContext(**execution))
                 if planned is not None:
                     raise DriverError(f"{driver_name} planning returned a value; planning evidence belongs in reports")
-                log_status("PLAN", f"{driver_name} planning succeeded")
-                log_status("DONE", f"{style_unit(args.unit)}: no remote changes")
+                if verbose:
+                    log_status("PLAN", f"{driver_name} planning succeeded")
+                    log_status("DONE", f"{style_unit(args.unit)}: no remote changes")
+                else:
+                    log_status("PLAN", "SUCCEEDED")
+                    log_status("EFFECTS", "None; planning does not change remote state")
                 write_reconcile_outputs(False)
                 return False
             assert plugin is not None
@@ -8838,6 +9003,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                         f"{style_unit(args.unit)}: pre-effect lease release failed; explicit recovery remains: "
                         f"{release_exc}",
                     )
+            log_compact_failure()
             raise
         if heartbeat is not None:
             try:
@@ -8864,6 +9030,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 return False
             desired_revision = lease_acquisition.revision
         if not isinstance(output, ReconciliationOutput):
+            log_compact_failure()
             raise DriverError(f"{driver_name} reconciliation did not return ReconciliationOutput")
         receipt = ReceiptResource(
             gvk=unit.gvk,
@@ -8883,19 +9050,36 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 result=output.result,
             ),
         )
-        revision = publish_observation_cas(
-            observed_ref,
-            args.unit,
-            receipt,
-            unit,
-            output.artifacts,
-            desired_revision,
-            desired_ref=desired_ref,
-            expected_uid=unit.metadata.uid,
-            lease_token=lease_acquisition.lease.token if lease_acquisition is not None else None,
-            lease_snapshot=lease_acquisition.lease.snapshot if lease_acquisition is not None else None,
-        )
-        log_status(
+        try:
+            revision = publish_observation_cas(
+                observed_ref,
+                args.unit,
+                receipt,
+                unit,
+                output.artifacts,
+                desired_revision,
+                desired_ref=desired_ref,
+                expected_uid=unit.metadata.uid,
+                lease_token=lease_acquisition.lease.token if lease_acquisition is not None else None,
+                lease_snapshot=lease_acquisition.lease.snapshot if lease_acquisition is not None else None,
+            )
+        except BaseException:
+            log_compact_failure()
+            raise
+        try:
+            artifact_effects = reconciliation_artifact_effects(
+                observed,
+                unit,
+                previous_receipt,
+                output.artifacts,
+            )
+        except Exception:
+            previous_artifacts = set(previous_receipt.status.artifacts or {}) if previous_receipt is not None else set()
+            artifact_effects = [
+                ("UPDATED" if name in previous_artifacts else "ADDED", f"Artifact {style_unit(name)}")
+                for name in sorted(output.artifacts)
+            ]
+        detail(
             "OBSERVE",
             f"receipt published to {style_branch(observed_ref)} at {describe_revision(revision)}",
         )
@@ -8905,11 +9089,43 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             except OperationError as exc:
                 log_status("WAIT", f"{style_unit(args.unit)}: effect lease release pending expiry: {exc}")
                 write_reconcile_outputs(True, pre_advanced_revision)
-                log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully; desired advance deferred")
+                if verbose:
+                    log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully; desired advance deferred")
+                else:
+                    log_status("RECONCILE", "SUCCEEDED; desired advance deferred")
+                    observation_status = "UPDATED" if revision != observed_revision else "UNCHANGED"
+                    log_status(
+                        observation_status,
+                        f"Observation {style_branch(observed_ref)} "
+                        f"{describe_revision(observed_revision)} → {describe_revision(revision)}",
+                    )
+                    for effect_status, message in artifact_effects:
+                        log_status(effect_status, message)
                 return True
         advanced_revision = advance_if_requested() or pre_advanced_revision
         write_reconcile_outputs(True, advanced_revision)
-        log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully")
+        if verbose:
+            log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully")
+        else:
+            log_status("RECONCILE", "SUCCEEDED")
+            observation_status = "UPDATED" if revision != observed_revision else "UNCHANGED"
+            log_status(
+                observation_status,
+                f"Observation {style_branch(observed_ref)} "
+                f"{describe_revision(observed_revision)} → {describe_revision(revision)}",
+            )
+            for effect_status, message in artifact_effects:
+                log_status(effect_status, message)
+            if advanced_revision:
+                log_status(
+                    "UPDATED",
+                    f"Desired state {style_branch(desired_ref)} to {describe_revision(advanced_revision)}",
+                )
+            else:
+                log_status(
+                    "UNCHANGED",
+                    f"Desired state {style_branch(desired_ref)} at {describe_revision(desired_revision)}",
+                )
         return True
 
 
@@ -9284,6 +9500,7 @@ def command_converge(args: argparse.Namespace) -> None:
                         advance=False,
                         require_source_ref=None,
                         reapply=False,
+                        verbose=args.verbose,
                     )
                 )
                 after_observed = fetch_ref(observed_ref)
@@ -10132,6 +10349,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--reapply",
         action="store_true",
         help="run the driver even when a clean receipt already exists",
+    )
+    reconcile.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show desired-state resolution and reconciliation internals",
     )
     reconcile.set_defaults(handler=command_reconcile)
 

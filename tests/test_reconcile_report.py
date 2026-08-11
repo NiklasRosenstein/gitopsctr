@@ -71,8 +71,61 @@ def test_reconcile_parser_exposes_plan_without_a_dry_alias():
 
     args = parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--plan"])
     assert args.plan is True
+    assert args.verbose is False
+    verbose_args = parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--verbose"])
+    assert verbose_args.verbose is True
     with pytest.raises(SystemExit):
         parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--dry"])
+
+
+def test_reconciliation_artifact_effects_distinguish_added_updated_and_unchanged(monkeypatch, tmp_path):
+    previous = SimpleNamespace(
+        status=SimpleNamespace(
+            artifacts={"same": object(), "updated": object()},
+        )
+    )
+    driver = SimpleNamespace(
+        driver_name="example",
+        artifact_outputs={"added": object(), "same": object(), "updated": object()},
+    )
+    unit = SimpleNamespace(driver=driver, driver_name="example")
+    previous_documents = {
+        "same": {"value": "same"},
+        "updated": {"value": "before"},
+    }
+
+    monkeypatch.setattr(
+        deploy_release,
+        "load_artifact_document",
+        lambda _observed, _unit, _receipt, name, **_kwargs: (previous_documents[name], "sha256:previous"),
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "require_artifact_api",
+        lambda _kind: SimpleNamespace(dump=lambda document: document),
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "parse_artifact_document",
+        lambda _api, document, _description: document,
+    )
+
+    effects = deploy_release.reconciliation_artifact_effects(
+        tmp_path,
+        unit,
+        previous,
+        {
+            "added": {"value": "new"},
+            "same": {"value": "same"},
+            "updated": {"value": "after"},
+        },
+    )
+
+    assert effects == [
+        ("ADDED", "Artifact added"),
+        ("UNCHANGED", "Artifact same"),
+        ("UPDATED", "Artifact updated"),
+    ]
 
 
 def test_dry_plan_uses_artifact_fallback_when_observation_is_unavailable(tmp_path):
@@ -495,7 +548,7 @@ def test_reconcile_legacy_unit_without_advance_blocks_before_effect(monkeypatch,
     assert "run advance-desired" in capsys.readouterr().err
 
 
-def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monkeypatch):
+def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monkeypatch, capsys):
     report = tmp_path / "report"
     calls = []
 
@@ -559,6 +612,10 @@ def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monke
     materializations = 0
     with pytest.raises(deploy_release.OperationError, match="does not support planning"):
         deploy_release.command_reconcile(args)
+    output = capsys.readouterr().err
+    assert "PLAN     SUCCEEDED" in output
+    assert "PLAN     FAILED" in output
+    assert "UNCHANGED Observation observed/dev at bbbbbbbbbbbb" in output
 
 
 @pytest.mark.parametrize("plan_action", [None, "refresh"])
@@ -671,10 +728,11 @@ def test_planned_reconcile_applies_plan_source_policy(tmp_path, monkeypatch, cap
         "REFRESH  aws-application: retained source aaaaaaaaaaaa is unavailable; use bbbbbbbbbbbb "
         "in the dry candidate only"
     ) in output
-    assert "PLAN     terraform planning succeeded" in output
+    assert "PLAN     SUCCEEDED" in output
+    assert "EFFECTS  None; planning does not change remote state" in output
 
 
-def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_path, monkeypatch):
+def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_path, monkeypatch, capsys):
     advances = []
     outputs = []
 
@@ -747,9 +805,15 @@ def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_p
     assert advances[0][1] == deploy_release.git("rev-parse", "HEAD^{commit}").stdout.strip()
     assert advances[0][2:] == ("deploy/dev", "observed/dev", None)
     assert outputs == [(False, "d" * 40)]
+    output = capsys.readouterr().err
+    assert "==> application-images · dev" in output
+    assert "UP TO DATE Observation matches desired state" in output
+    assert "ACTION   No reconciliation needed" in output
+    assert "UPDATED  Desired state deploy/dev to dddddddddddd" in output
+    assert "Advance desired state" not in output
 
 
-def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, monkeypatch):
+def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, monkeypatch, capsys):
     events = []
     advance_results = iter([("d" * 40, True), ("d" * 40, False)])
 
@@ -842,6 +906,13 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
     ]
     assert events[0][1] == ("dev", "a" * 40, "deploy/dev", "observed/dev", None)
     assert events[2] == ("driver", "e" * 40)
+    output = capsys.readouterr().err
+    assert "==> aws-application · dev" in output
+    assert "CHANGED  No observation exists" in output
+    assert "ACTION   Run terraform reconciliation" in output
+    assert "RECONCILE SUCCEEDED" in output
+    assert "UPDATED  Observation observed/dev bbbbbbbbbbbb → ffffffffffff" in output
+    assert "UPDATED  Desired state deploy/dev to dddddddddddd" in output
 
 
 def test_superseded_source_stops_before_reconciliation(monkeypatch):
