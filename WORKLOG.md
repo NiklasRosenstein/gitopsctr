@@ -311,3 +311,19 @@ tests. Schemas were regenerated.
 The acceptance suite now covers moving remote refs, fixed remote commits, source-fetch/ref/path failures, promoted
 artifact lineage failures, ambiguous imports, reconcile from desired state, and dev-to-staging-to-production artifact
 promotion. Remaining work is limited to legacy desired-resource retirement and deployment-owned forge policy.
+
+### 8.12 Multi-environment preview story — complete for the current implementation
+
+Luna High added `update-direct-stack`. It uses a Stack UID fence, an expected desired-head fence, concrete template
+parameters, and a request identity. It preserves the direct Stack UID and generated Unit UIDs. The controller supports
+image-first convergence: a direct update may retain a downstream Unit until its producer artifact is observed; a later
+update resolves the downstream Unit.
+
+The temporary-repository acceptance test now proves the complete flow: dev source projection from one StackTemplate,
+promotion to staging with only the deploy Unit and exact artifact lineage, independent direct preview instantiation,
+dev-only R2 advancement, independent preview R2 update, and UID-fenced preview deletion with reverse cleanup.
+The Docker/Terraform demo mirrors this flow with real image builds, Terraform deployment, independent preview images,
+and final cleanup. Its command is `mise run demo-preview-acceptance`.
+
+The observed artifact receipt blob contract now accepts both the current Git blob ID and the historical SHA-256 form.
+This keeps older observed documents readable while matching the repository's Git-backed identity implementation.

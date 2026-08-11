@@ -7,7 +7,7 @@
 > setup remain external or pending. Field names, document layouts, and command names are examples unless marked
 > **Settled**.
 
-Last updated: 2026-08-11
+Last updated: 2026-08-12
 
 This document records the design decisions that should guide implementation. It complements the current
 [concepts](docs/concepts.md), [resource model](docs/documents.md), and [receipt contract](docs/apis/receipt.md); those
@@ -26,16 +26,16 @@ this repository.
 | Change-gated candidate freshness | **Local and CI verifier implemented** | `88ae0b9` rejects stale, rebased, multi-commit, merge, root, and missing-head candidates before review creation. CI now verifies the exact GitHub pull-request and merge-queue event head and target; required check and branch-protection policy remain forge configuration. |
 | StackTemplate/Stack contracts and deterministic parameter expansion | **Implemented** | Commits `eb0bcb9` and `84d7ddb`; direct desired Stack provenance is typed and schema-published. |
 | Generated Stack resource graphs with UID-fenced ownership | **Implemented projection and closure** | `b441941` and `d071c1e` project source-authored/direct Stack-owned Units and retain a UID-fenced closure through deletion. |
-| Direct Stack instantiation | **Implemented with durable incarnation fencing** | `84d7ddb` adds replay-fenced `instantiate-stack` and exact template provenance; `a18c23f` and `f12329a` add desired-head and durable Stack tombstone fencing. A request ledger for richer replay history remains optional follow-up. |
+| Direct Stack instantiation and update | **Implemented with durable incarnation fencing** | `84d7ddb` adds replay-fenced `instantiate-stack` and exact template provenance; `a18c23f` and `f12329a` add desired-head and durable Stack tombstone fencing. `update-direct-stack` now applies UID- and desired-head-fenced source updates, preserves Stack and child Unit UIDs, and supports image-first convergence. A request ledger for richer replay history remains optional follow-up. |
 | Direct and source-tracked Stack deletion/finalization | **Implemented core lifecycle** | `d071c1e` adds source-absence intents, direct UID/generation-fenced requests, child obligations, and root finalization after owned Units. |
 | Controller-owned source pins | **Lifecycle and claims implemented** | `5d3a5a0` provides fenced refs and the current implementation adds CAS-fenced `gitopsctr/pin-claims/stacks/...` records. Direct Stack deletion and finalization retain UID-/revision-fenced pins and claims; orphan enumeration and reaping remain external CI responsibilities. |
 | Forge provenance and recovery boundary | **Core boundary implemented; forge orchestration remains external** | Direct Stack provenance, source pins, claims, UID-fenced deletion, and finalization are core lifecycle primitives. PR/MR identity does not own desired resources. Forge CI may enumerate refs/resources, consult the forge, and invoke normal `gitopsctr` CLI primitives; the core has no forge eligibility or orphan-recovery command. |
 | Stack dependency ordering | **Convergence, multi-instance isolation, and external-driver acceptance implemented** | `3b25f04` includes Stack-generated and desired-only Stack Units in convergence/status and preserves explicit cross-kind Stack edges during teardown; the current increment scopes generated names as `<stack>--<template-unit>`. The temporary-repository inventory harness and Docker/Terraform demo exercise dependency-safe external deployment and reverse teardown. |
 | Argo integration and external publication | **Boundary and Argo absence observation implemented; external publication remains deployment-owned** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. Argo-backed Kubernetes Units now wait for Application absence during teardown, and the Kubernetes/Argo acceptance job proves external delivery and observation. This repository still does not publish preview manifests or own ApplicationSet resources. |
-| End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. The read-only compatibility audit covers one explicit ref or all Project-configured environments. Forge policy configuration and complete legacy migration remain open. |
+| End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and the complete temporary-repository multi-environment Stack story are implemented. The read-only compatibility audit covers one explicit ref or all Project-configured environments. Forge policy configuration and complete legacy migration remain open. |
 
-The repository verification suite passes (`565` tests), including concurrency, recovery, incarnation, evidence,
-direct-root, and candidate-freshness checks. The suite does not prove deployment-owned forge policy, external
+The repository verification suite includes the multi-environment Stack story, including promotion lineage, independent
+direct-preview updates, source isolation, and UID-fenced cleanup. It does not prove deployment-owned forge policy, external
 publication, or legacy migration.
 The current checkout has no `deployment/environments` path, so `audit-desired-compatibility --all` reports
 `unavailable-environments-path`; a deployment-owned supported-ref inventory is still required before legacy retirement.
@@ -62,8 +62,9 @@ The following contract is now implemented and schema-published:
 - `fromEnvironment` is only a Unit-template value expression. It reads the target Environment value during desired
   resolution. It is not a StackTemplate source or lifecycle reference.
 
-The new acceptance tests cover all three Stack source variants, selected projection, exact source pinning, and
-reconcile from desired state. They use temporary repositories and deterministic Unit drivers.
+The acceptance tests cover all three Stack source variants, selected projection, exact source pinning, reconcile from
+desired state, and the complete dev/staging/direct-preview flow. They use temporary repositories and deterministic Unit
+drivers. The Docker/Terraform demo covers the same flow against real external effects.
 
 Remaining implementation work:
 
@@ -275,8 +276,16 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
   continuously follow later template changes in the first implementation.
 - The temporary-repository acceptance flow now invokes `instantiate-stack` with a source-tracked StackTemplate and no
   source Stack. It verifies direct management, exact template provenance, generated ownership, and replay idempotence.
-- A source-tracked Stack is a concrete source resource. Whether it may also track or promote changes from a
-  StackTemplate remains **Open**.
+- `update-direct-stack` applies a new pinned source revision to an existing direct Stack under its UID and desired-head
+  fences. It preserves the Stack and generated Unit UIDs. If a downstream artifact is not yet observed, it records a
+  transition block and the caller repeats the update after the producer converges.
+- A source-tracked Stack is a concrete source resource. It may select a source-tracked StackTemplate, or copy a pinned
+  StackTemplate projection and artifact lineage through promotion. A direct Stack update uses an explicit source
+  revision and does not follow a moving ref during reconcile.
+- If an update cannot resolve a downstream input, the desired candidate may retain the last resolved downstream Unit
+  and record a transition block. After the upstream artifact is observed, the caller repeats the update with a new
+  request identity to resolve the downstream Unit. This is expected image-first convergence, not a partial ownership
+  transition.
 - StackTemplate dependency declarations are validated and retained in the projected graph. `3b25f04` integrates them
   into generic convergence/status and reverse teardown ordering. Generated Unit names are Stack-scoped in desired
   state, and intra-template receipt/artifact/promotion references are rewritten to the same concrete names. Restart
@@ -284,7 +293,7 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
 - Secrets are references to an external secret mechanism, not plaintext Stack parameters committed to Git.
 
 The implementation currently uses `deployment/environments/<environment>/stack-templates/` and `stacks/` for authored
-resources, `stack-templates/` and `stacks/` in desired state, and the `instantiate-stack`,
+resources, `stack-templates/` and `stacks/` in desired state, and the `instantiate-stack`, `update-direct-stack`,
 `request-delete-direct-stack`, and `finalize-stack` commands. These names are **Settled for this increment**; future
 API compatibility review may still revise them before production.
 
@@ -391,7 +400,30 @@ file may remain. Out-of-band demo cleanup is only a final safety net.
 - Any controller source pin remains through teardown and is released only after successful finalization.
 - Repeated deletion is inert; recreating the name receives a new UID and cannot reuse old receipts.
 
-### C. Unit lifecycle hardening
+### C. One template across dev, staging, and preview
+
+The temporary-repository acceptance test covers this complete flow:
+
+1. Commit one `StackTemplate` with an image Unit and a deploy Unit. The dev source Stack selects both Units.
+2. Advance dev at revision R1. Assert the StackTemplate and Stack source records contain the full commit, resource path,
+   and digest; assert both generated Units have the Stack UID as owner and both receipts are observed.
+3. Promote dev to staging. Assert staging selects only the deploy Unit, resolves the image from the promoted artifact,
+   and records the source Stack UID, source Unit UID, desired revision, observed revision, receipt blob, and artifact
+   digest. Assert staging reconciles successfully.
+4. Instantiate a separate direct `preview` Stack from the same template. Assert the Stack is not source-authored,
+   receives a new UID, and creates only the image Unit until its artifact is observed. Repeat the direct update at R1 and
+   assert that the deploy Unit then resolves to the preview image, not the dev image.
+5. Change the source to R2 and advance only dev. Assert dev changes its image source and artifact while staging and
+   preview desired and observed refs remain unchanged.
+6. Update preview independently to R2 with the same Stack UID and new request identities. Converge the image first,
+   resolve the deploy Unit after the artifact is observed, and assert the preview deployment uses its own R2 artifact.
+7. Request preview deletion with the Stack UID, retain the root and owned closure through restart, finalize deploy then
+   image then Stack, and assert the external inventory is empty and the desired closure is removed.
+
+The real Docker/Terraform demo mirrors this flow. Run it with `mise run demo-preview-acceptance`; it requires Docker,
+Terraform, Git, and curl. The temporary-repository test does not require those external tools.
+
+### D. Unit lifecycle hardening
 
 The harness covers the implemented Unit lifecycle path:
 
@@ -478,6 +510,9 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
   by the demo acceptance flow.
 - [x] Add temporary-repository acceptance for direct Stack instantiation from a source-tracked StackTemplate, with
   replay idempotence and exact template provenance.
+- [x] Add `update-direct-stack` with UID and desired-head fencing, child UID preservation, and image-first convergence.
+- [x] Add temporary-repository acceptance for dev source projection, staging promotion, independent preview updates,
+  source isolation across R2, and UID-fenced preview cleanup.
 - [x] Add instance-scoped generated Unit naming and acceptance coverage for two concurrent Stacks from one template.
 - [x] Extend Docker/Terraform acceptance to add a source Stack, observe its generated Terraform Unit, remove the
   Stack, and finalize the Unit and Stack against the real Docker inventory.
@@ -496,6 +531,7 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
   explicit operation, but reconcile never follows a moving source.
 - [x] Define and implement promotion source copying for the resolved Stack source and projection, including explicit
   artifact imports, UID/receipt/GVK/digest lineage, carried evidence, and staging-to-production acceptance.
+- [x] Add the real Docker/Terraform demo for the complete dev/staging/direct-preview R1/R2 story and reverse cleanup.
 - [ ] Configure and verify required forge freshness checks or merge-queue/branch-protection enforcement at merge time;
   repository CI now verifies GitHub `pull_request` and `merge_group` heads, but required-check policy remains external.
 - [ ] Remove legacy implicit-root compatibility after the documented migration condition is met.
@@ -505,7 +541,7 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
 ## Open decisions
 
 - Exact API fields, resource locations, CLI names, and Stack-local naming/collision rules.
-- Direct Stack template-selection fields, latest-refresh semantics, and promotion inputs.
+- Direct Stack request-ledger history, latest-refresh convenience semantics, and richer promotion inputs.
 - Receipt generation/spec digest format and cleanup-evidence layout on the observed ref.
 - Whether direct Argo CD Application management is supported alongside the preferred ApplicationSet integration.
 - External CI garbage-collection boundary, lineage enumeration, and forge adapters.
