@@ -305,8 +305,9 @@ Acceptance coverage checks all three source variants, exact commit/path/digest r
 promotion source copying from the promotion desired tree, and reconcile after source removal. `fromEnvironment` is
 supported as a Unit-template value lookup only.
 
-Verification: focused preview and contract tests pass; full suite passes with 548 tests. Schemas were regenerated.
+Verification: focused preview, remote-source, artifact-lineage, and contract tests pass; full suite passes with 565
+tests. Schemas were regenerated.
 
-Remaining work: materialize explicit promoted artifact imports from pinned source desired/observed refs, validate source
-UID/receipt/GVK/digest lineage, carry imports through staging-to-production promotion, and add remote-ref movement and
-failure-case acceptance coverage.
+The acceptance suite now covers moving remote refs, fixed remote commits, source-fetch/ref/path failures, promoted
+artifact lineage failures, ambiguous imports, reconcile from desired state, and dev-to-staging-to-production artifact
+promotion. Remaining work is limited to legacy desired-resource retirement and deployment-owned forge policy.

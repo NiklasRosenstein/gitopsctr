@@ -34,7 +34,7 @@ this repository.
 | Argo integration and external publication | **Boundary and Argo absence observation implemented; external publication remains deployment-owned** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. Argo-backed Kubernetes Units now wait for Application absence during teardown, and the Kubernetes/Argo acceptance job proves external delivery and observation. This repository still does not publish preview manifests or own ApplicationSet resources. |
 | End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. The read-only compatibility audit covers one explicit ref or all Project-configured environments. Forge policy configuration and complete legacy migration remain open. |
 
-The repository verification suite passes (`548` tests), including concurrency, recovery, incarnation, evidence,
+The repository verification suite passes (`565` tests), including concurrency, recovery, incarnation, evidence,
 direct-root, and candidate-freshness checks. The suite does not prove deployment-owned forge policy, external
 publication, or legacy migration.
 The current checkout has no `deployment/environments` path, so `audit-desired-compatibility --all` reports
@@ -56,8 +56,9 @@ The following contract is now implemented and schema-published:
 - `fromResource` resolves the current same-environment desired catalog entry. Its UID is the reference fence.
 - `fromGit` resolves a local project path or a validated external Git URL during advancement. Mutable refs are
   normalized and resolved to a commit. Reconcile uses the desired projection and does not reread Git.
-- `fromPromotion` copies the pinned source Stack projection and exact source record. The current implementation
-  supports projection copying and Unit subset selection. Artifact import materialization is still open.
+- `fromPromotion` copies the pinned source Stack projection and exact source record. Unit subset selection and
+  promoted artifact imports are supported. Desired state records artifact lineage and can carry an imported artifact
+  from staging to production without projecting the producer Unit.
 - `fromEnvironment` is only a Unit-template value expression. It reads the target Environment value during desired
   resolution. It is not a StackTemplate source or lifecycle reference.
 
@@ -66,10 +67,6 @@ reconcile from desired state. They use temporary repositories and deterministic 
 
 Remaining implementation work:
 
-- Resolve `fromArtifact` for an omitted producer through explicit `artifactImports` and a pinned promotion observed
-  revision. Persist import evidence separately from local dependency fingerprints and carry it through promotion.
-- Add full remote-ref movement and first-hop/staging-to-production artifact acceptance, including stale UID, receipt,
-  GVK, digest, and import ambiguity failures.
 - Keep legacy desired-resource compatibility until every supported desired ref has been audited.
 
 ## Problem and scope
@@ -497,8 +494,8 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
 - [x] Define and implement Stack template selection with `template.name`, `fromResource`, `fromGit`,
   `fromPromotion`, optional `units`, and exact desired-state source pins. A future refresh command may add a new
   explicit operation, but reconcile never follows a moving source.
-- [x] Define and implement promotion source copying for the resolved Stack source and projection. Full artifact
-  import validation and promotion-context materialization remain open work below.
+- [x] Define and implement promotion source copying for the resolved Stack source and projection, including explicit
+  artifact imports, UID/receipt/GVK/digest lineage, carried evidence, and staging-to-production acceptance.
 - [ ] Configure and verify required forge freshness checks or merge-queue/branch-protection enforcement at merge time;
   repository CI now verifies GitHub `pull_request` and `merge_group` heads, but required-check policy remains external.
 - [ ] Remove legacy implicit-root compatibility after the documented migration condition is met.
