@@ -40,6 +40,8 @@ The repository verification suite currently passes (`539` tests), including the 
 incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
 not sufficient, for the remaining preview-environment milestones because external forge orchestration,
 forge policy configuration, deployment-owned publication, and legacy migration are still open.
+The current checkout has no `deployment/environments` path, so `audit-desired-compatibility --all` reports
+`unavailable-environments-path`; a deployment-owned supported-ref inventory is still required before legacy retirement.
 
 ## Problem and scope
 

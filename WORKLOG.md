@@ -237,6 +237,9 @@ audit for every ref.
 and emits one versioned JSON report with per-environment results. It continues after one ref is missing or unavailable,
 so the report identifies all failures. Focused coverage includes multiple environments, custom refs, duplicate refs,
 and partial failures. Out-of-band desired refs still require explicit inventory before legacy removal.
+The current checkout has no `deployment/environments` directory; a live `audit-desired-compatibility --all` run on
+2026-08-11 returned `unavailable-environments-path`. This is an external inventory prerequisite, not a clean legacy
+audit.
 
 ### 8.4 Opt-in GitHub orphan-Stack recovery workflow — superseded direction
 
