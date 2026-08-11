@@ -14,7 +14,7 @@ import os
 import shlex
 import subprocess
 import tempfile
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,13 @@ from gitopsctr.formats import (
 )
 
 ROOT = Path.cwd().resolve()
+
+
+@dataclass(frozen=True)
+class EnvironmentMigrationRefs:
+    environment: str
+    desired: str
+    observed: str
 
 
 def git(*args: str, check: bool = True, input_text: str | None = None, env: dict[str, str] | None = None) -> str:
@@ -108,6 +115,17 @@ def write_yaml(path: Path, document: dict[str, Any]) -> None:
 
 
 def write_project(tree: Path, project_name: str) -> None:
+    configured = [tree / filename for filename in PROJECT_CONFIG_NAMES if (tree / filename).is_file()]
+    if configured:
+        if len(configured) > 1:
+            raise RuntimeError("multiple Project configuration files exist")
+        try:
+            project = load_project_config(tree)
+        except Exception as exc:
+            raise RuntimeError(f"existing Project configuration is invalid: {configured[0]}") from exc
+        if project.name != project_name:
+            raise RuntimeError(f"existing Project configuration names project {project.name!r}, not {project_name!r}")
+        return
     for filename in PROJECT_CONFIG_NAMES:
         path = tree / filename
         if path.exists():
@@ -137,7 +155,8 @@ def write_project(tree: Path, project_name: str) -> None:
 
 
 def convert_environment(tree: Path, environment_name: str) -> None:
-    root = tree / "deployment" / "environments" / environment_name
+    project = load_project_config(tree)
+    root = tree.joinpath(*project.environments_path.parts, environment_name)
     paths = document_candidates(root, "environment")
     if len(paths) != 1:
         raise RuntimeError(f"expected one environment document for {environment_name}")
@@ -154,8 +173,11 @@ def convert_desired(tree: Path, source_revision: str) -> None:
     for path in sorted(path for path in units.glob("*") if path.suffix in {".json", ".yaml", ".yml"}):
         unit = cli.parse_desired_unit_document(load_document(path), path.stem)
         source = getattr(unit.spec, "source", None)
-        if source is not None and isinstance(source.revision, str):
+        if source is not None:
             unit = unit.with_spec(replace(unit.spec, source=replace(source, revision=source_revision)))
+            source = getattr(unit.spec, "source", None)
+        if unit.is_legacy_compatibility:
+            unit = unit.with_metadata(cli.source_tracked_metadata_for_resource(unit, source, source_revision))
         write_yaml(units / f"{path.stem}.yaml", cli.serialize_unit_document(unit, profile="desired"))
     promotion_paths = document_candidates(tree, "promotion")
     if promotion_paths:
@@ -170,6 +192,7 @@ def rewrite_promotion_lineage(
     tree: Path,
     desired_heads: dict[str, tuple[str, str]],
     observed_heads: dict[str, tuple[str, str]],
+    desired_refs: dict[str, str],
 ) -> None:
     paths = document_candidates(tree, "promotion")
     if not paths:
@@ -182,7 +205,8 @@ def rewrite_promotion_lineage(
     desired = desired_heads.get(source_environment)
     observed = observed_heads.get(source_environment)
     if desired is None:
-        raise RuntimeError(f"promotion source deploy/{source_environment} has not been migrated")
+        ref = desired_refs.get(source_environment, source_environment)
+        raise RuntimeError(f"promotion source {ref} has not been migrated")
     updated_source = {**source, "desiredRevision": desired[1]}
     updated_source["observedRevision"] = observed[1] if observed is not None else None
     write_yaml(
@@ -214,6 +238,44 @@ def local_refs(prefix: str) -> list[tuple[str, str]]:
                 raise RuntimeError(f"unexpected ref listing: {line}")
             refs.append((parts[0], parts[1]))
     return refs
+
+
+def local_ref_revision(ref: str) -> str | None:
+    full_ref = ref if ref.startswith("refs/") else f"refs/heads/{ref}"
+    revision = git("rev-parse", "--verify", "--quiet", full_ref, check=False)
+    return revision or None
+
+
+def heads_ref(ref: str) -> str:
+    return ref if ref.startswith("refs/heads/") else f"refs/heads/{ref}"
+
+
+def environment_names(tree: Path) -> list[str]:
+    project = load_project_config(tree)
+    root = tree.joinpath(*project.environments_path.parts)
+    return sorted(path.name for path in root.glob("*") if path.is_dir())
+
+
+def migration_ref_inventory(tree: Path) -> tuple[EnvironmentMigrationRefs, ...]:
+    """Resolve every environment ref from the migrated Project configuration.
+
+    A legacy tree without a Project is given an explicit generated Project by
+    ``write_project`` before this function runs.  That generated configuration
+    records the historical deploy/observed mapping instead of hiding it in
+    ref discovery.
+    """
+
+    inventory: list[EnvironmentMigrationRefs] = []
+    seen: dict[str, str] = {}
+    for environment in environment_names(tree):
+        desired, observed = cli.deployment_refs(tree, environment)
+        for ref, role in ((desired, "desired"), (observed, "observed")):
+            owner = seen.get(ref)
+            if owner is not None:
+                raise RuntimeError(f"{ref!r} is configured for multiple environment refs ({owner}, {environment})")
+            seen[ref] = f"{environment} {role}"
+        inventory.append(EnvironmentMigrationRefs(environment, desired, observed))
+    return tuple(inventory)
 
 
 def update_ref(ref: str, new: str, old: str) -> None:
@@ -253,40 +315,53 @@ def migrate(*, project_name: str, apply: bool, push: bool) -> dict[str, str]:
         raise RuntimeError("--push requires --apply")
 
     source_ref = f"refs/heads/{branch}"
-    desired_refs = [ref for ref, _revision in local_refs("deploy/")]
-    observed_refs = [ref for ref, _revision in local_refs("observed/")]
     remote: str | None = None
-    if push:
-        remotes = git("remote").splitlines()
-        if not remotes:
-            raise RuntimeError("--push requires a Git remote")
-        remote = remotes[0]
-        validate_remote_refs(remote, [source_ref, *desired_refs, *observed_refs])
-
     old_source = git("rev-parse", source_ref)
     results: dict[str, str] = {}
+    old_refs: dict[str, str] = {source_ref: old_source}
     with tempfile.TemporaryDirectory(prefix="gitopsctr-migration-") as temporary:
         root = Path(temporary)
         source_tree = root / "source"
         materialize(old_source, source_tree)
-        for environment_root in sorted((source_tree / "deployment" / "environments").glob("*")):
-            if environment_root.is_dir():
-                convert_environment(source_tree, environment_root.name)
         write_project(source_tree, project_name)
+        for environment in environment_names(source_tree):
+            convert_environment(source_tree, environment)
         new_source = commit_tree(source_tree, old_source, "Migrate deployment documents to YAML resources")
         results[branch] = new_source
+        refs = migration_ref_inventory(source_tree)
+
+        if push:
+            remotes = git("remote").splitlines()
+            if not remotes:
+                raise RuntimeError("--push requires a Git remote")
+            remote = remotes[0]
+            configured_refs = {
+                heads_ref(ref)
+                for item in refs
+                for ref in (item.desired, item.observed)
+                if local_ref_revision(ref) is not None
+            }
+            validate_remote_refs(remote, [source_ref, *sorted(configured_refs)])
 
         desired_heads: dict[str, tuple[str, str]] = {}
         desired_trees: dict[str, Path] = {}
-        for ref, old in local_refs("deploy/"):
-            environment = ref.removeprefix("refs/heads/deploy/")
+        desired_ref_by_environment = {item.environment: item.desired for item in refs}
+        for item in refs:
+            old = local_ref_revision(item.desired)
+            if old is None:
+                continue
+            desired_ref = heads_ref(item.desired)
+            if desired_ref == source_ref:
+                raise RuntimeError(f"source branch {branch!r} is also the desired ref for {item.environment}")
+            environment = item.environment
             desired_tree = root / f"desired-{environment}"
             materialize(old, desired_tree)
             convert_desired(desired_tree, new_source)
             new = commit_tree(desired_tree, old, f"Migrate desired {environment} documents to YAML resources")
             desired_heads[environment] = (old, new)
             desired_trees[environment] = desired_tree
-            results[ref] = new
+            results[desired_ref] = new
+            old_refs[desired_ref] = old
 
         # Rewrite promotion references after every desired head is known. This
         # keeps source desired revisions from pointing at pre-migration commits.
@@ -294,18 +369,23 @@ def migrate(*, project_name: str, apply: bool, push: bool) -> dict[str, str]:
             tree = desired_trees[environment]
             if not document_candidates(tree, "promotion"):
                 continue
-            rewrite_promotion_lineage(tree, desired_heads, {})
+            rewrite_promotion_lineage(tree, desired_heads, {}, desired_ref_by_environment)
             new = commit_tree(tree, current, f"Migrate {environment} promotion lineage")
             desired_heads[environment] = (old, new)
-            results[f"refs/heads/deploy/{environment}"] = new
+            desired_ref = heads_ref(desired_ref_by_environment[environment])
+            results[desired_ref] = new
 
         observed_heads: dict[str, tuple[str, str]] = {}
         observed_trees: dict[str, Path] = {}
-        for ref, old in local_refs("observed/"):
-            environment = ref.removeprefix("refs/heads/observed/")
+        for item in refs:
+            old = local_ref_revision(item.observed)
+            if old is None:
+                continue
+            observed_ref = heads_ref(item.observed)
+            environment = item.environment
             desired = desired_heads.get(environment)
             if desired is None:
-                raise RuntimeError(f"observed/{environment} has no matching deploy/{environment} ref")
+                raise RuntimeError(f"{item.observed} has no matching desired ref {item.desired}")
             observed_tree = root / f"observed-{environment}"
             desired_tree = root / f"desired-{environment}"
             materialize(old, observed_tree)
@@ -313,7 +393,8 @@ def migrate(*, project_name: str, apply: bool, push: bool) -> dict[str, str]:
             new = commit_tree(observed_tree, old, f"Migrate observed {environment} receipts to YAML resources")
             observed_heads[environment] = (old, new)
             observed_trees[environment] = observed_tree
-            results[ref] = new
+            results[observed_ref] = new
+            old_refs[observed_ref] = old
 
         # Add observed promotion lineage now that observation heads exist, then
         # refresh receipts once more so their desired revision matches the
@@ -322,10 +403,11 @@ def migrate(*, project_name: str, apply: bool, push: bool) -> dict[str, str]:
             tree = desired_trees[environment]
             if not document_candidates(tree, "promotion"):
                 continue
-            rewrite_promotion_lineage(tree, desired_heads, observed_heads)
+            rewrite_promotion_lineage(tree, desired_heads, observed_heads, desired_ref_by_environment)
             new = commit_tree(tree, current, f"Migrate {environment} observed promotion lineage")
             desired_heads[environment] = (old, new)
-            results[f"refs/heads/deploy/{environment}"] = new
+            desired_ref = heads_ref(desired_ref_by_environment[environment])
+            results[desired_ref] = new
         for environment, (old, current) in list(observed_heads.items()):
             tree = observed_trees[environment]
             desired = desired_heads.get(environment)
@@ -334,13 +416,13 @@ def migrate(*, project_name: str, apply: bool, push: bool) -> dict[str, str]:
             convert_observed(tree, desired[1], desired_trees[environment])
             new = commit_tree(tree, current, f"Migrate observed {environment} desired lineage")
             observed_heads[environment] = (old, new)
-            results[f"refs/heads/observed/{environment}"] = new
+            results[heads_ref(next(item.observed for item in refs if item.environment == environment))] = new
 
     if apply:
         update_ref(source_ref, results[branch], old_source)
-        for ref, old in (*[(f"refs/heads/deploy/{env}", old) for env, (old, _new) in desired_heads.items()],):
-            update_ref(ref, results[ref], old)
-        for ref, old in local_refs("observed/"):
+        for ref, old in old_refs.items():
+            if ref == source_ref:
+                continue
             update_ref(ref, results[ref], old)
         # update-ref moves the checked-out branch without updating its index or
         # working tree. The precondition above guarantees this cannot overwrite

@@ -36,7 +36,7 @@ implementation.
 | Argo integration and external publication | **Boundary and Argo absence observation implemented; external publication remains deployment-owned** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. Argo-backed Kubernetes Units now wait for Application absence during teardown, and the Kubernetes/Argo acceptance job proves external delivery and observation. This repository still does not publish preview manifests or own ApplicationSet resources. |
 | End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. Forge policy configuration and legacy migration completion remain open. |
 
-The repository verification suite currently passes (`549` tests), including the landed concurrency, recovery,
+The repository verification suite currently passes (`550` tests), including the landed concurrency, recovery,
 incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
 not sufficient, for the remaining preview-environment milestones because forge policy configuration,
 Stack-specific external acceptance, and legacy migration are still open.
@@ -294,6 +294,8 @@ Existing desired Units have no explicit UID or lifecycle authority. They are tem
 source-tracked roots:
 
 - New desired-state writers MUST NOT emit the legacy shape.
+- `tools/migrate_documents.py` converts known legacy desired refs to canonical YAML desired Units with deterministic
+  source-tracked identity and follows the Project's configured desired and observed refs.
 - Missing metadata MUST NOT be interpreted as direct management or an owner reference.
 - A legacy root is adopted only while comparing it with an authoritative source snapshot. Adoption durably assigns
   explicit identity and management metadata; authoritative source absence begins normal finalization while retaining
@@ -426,6 +428,8 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
 - [ ] Configure and verify required forge freshness checks or merge-queue/branch-protection enforcement at merge time;
   repository CI now verifies GitHub `pull_request` and `merge_group` heads, but required-check policy remains external.
 - [ ] Remove legacy implicit-root compatibility after the documented migration condition is met.
+  The document migration tool now handles known source and configured desired refs; live retirement still requires an
+  explicit supported-ref inventory and a clean compatibility audit.
 
 ## Open decisions
 
@@ -452,3 +456,4 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
 | 2026-08-11 | Run repository CI for GitHub `merge_group` requests; required checks and merge-queue policy remain forge configuration. |
 | 2026-08-11 | Validate Stack cleanup with the real Docker/Terraform drivers: add a source Stack, converge its generated Unit, remove it, and finalize the Unit before the Stack root. |
 | 2026-08-11 | Resolve a permanently unparseable cleanup root only with an exact UID, explicit external-cleanup confirmation, and a durable Unit incarnation tombstone; parseable roots must use driver-backed recovery. |
+| 2026-08-11 | Make document migration canonicalize legacy desired Units and resolve refs from the Project configuration; compatibility retirement still requires a complete supported-ref inventory and clean audit. |

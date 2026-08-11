@@ -115,3 +115,9 @@ When migrating legacy documents, supply the required project identity:
 ```console
 python tools/migrate_documents.py --project-name my-project --apply
 ```
+
+The migration preserves an existing Project configuration. It uses that
+configuration to find desired and observed refs and writes canonical
+source-tracked metadata for legacy desired Units. It does not retire the
+runtime legacy reader; verify every supported desired ref before removing that
+compatibility path.

@@ -204,10 +204,18 @@ tombstone before publishing the resolution.
 
 Commit `8bb059e` closes the remaining pre-publication recovery gap. If teardown evidence is published but finalization
 publication fails, a fresh controller run reuses the matching durable effect lease and evidence, removes the deletion
-intent, and does not invoke the external driver a second time. Focused acceptance coverage now has five tests; the
-full repository verification is pending for this increment.
+intent, and does not invoke the external driver a second time. Focused acceptance coverage now has five tests. The
+full repository verification passes with 550 tests, lint, typecheck, schema freshness, strict docs, actionlint,
+formatting, and diff checks.
 
 ### 8. Remove legacy compatibility after migration condition — pending
 
 Legacy desired-resource compatibility remains intentionally enabled. It can be removed only after every supported
 desired ref has explicit lifecycle metadata and the migration/adoption diagnostics are no longer needed.
+
+### 8.1 Migration tooling hardening — complete for known refs
+
+The document migration tool now assigns deterministic source-tracked metadata to legacy desired Units, updates their
+source revision to the migrated source commit, preserves existing Project ref configuration, and migrates configured
+desired and observed refs instead of assuming `deploy/*` and `observed/*`. Live compatibility retirement remains open
+until deployments provide a complete supported-ref inventory and pass a clean audit.

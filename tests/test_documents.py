@@ -344,6 +344,115 @@ def test_migration_script_converts_a_source_branch_in_one_forward_commit(tmp_pat
     assert (units_root / "infrastructure.yaml").exists()
 
 
+def test_migration_script_canonicalizes_legacy_desired_units_and_uses_configured_refs(tmp_path: Path):
+    project = {
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "Project",
+        "metadata": {"name": "test-project"},
+        "spec": {
+            "writeFormat": "yaml",
+            "environmentsPath": "config/environments",
+            "environmentDefaults": {
+                "refs": {
+                    "desired": "release/{environment}",
+                    "observed": "state/{environment}",
+                    "candidate": "changes/{environment}/{id}",
+                }
+            },
+        },
+    }
+    environment_root = tmp_path / "config/environments/dev"
+    units_root = environment_root / "units"
+    units_root.mkdir(parents=True)
+    (tmp_path / "gitopsctr.yaml").write_text(yaml.safe_dump(project, sort_keys=False))
+    (environment_root / "environment.json").write_text(json.dumps({"schema": 1, "name": "dev"}))
+    (units_root / "application.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "name": "application",
+                "driver": "terraform",
+                "source": {"path": "infrastructure"},
+                "terraform": {
+                    "backend": {"key": "example/dev.tfstate"},
+                    "variables": {"environment": "dev"},
+                    "observeOutputs": [],
+                    "checks": [],
+                },
+            }
+        )
+    )
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "legacy source"], cwd=tmp_path, check=True, capture_output=True)
+
+    subprocess.run(["git", "branch", "release/dev"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "checkout", "release/dev"], cwd=tmp_path, check=True, capture_output=True)
+    desired_units = tmp_path / "units"
+    desired_units.mkdir()
+    desired_units.joinpath("application.json").write_text(
+        json.dumps(
+            {
+                "name": "application",
+                "driver": "terraform",
+                "source": {
+                    "path": "infrastructure",
+                    "revision": "a" * 40,
+                    "inputHash": "sha256:inputs",
+                    "driverVersion": cli.DRIVER_VERSIONS["terraform"],
+                },
+                "terraform": {
+                    "backend": {"key": "example/dev.tfstate"},
+                    "variables": {"environment": "dev"},
+                    "observeOutputs": [],
+                    "checks": [],
+                },
+            }
+        )
+    )
+    subprocess.run(["git", "add", "units/application.json"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "legacy desired"], cwd=tmp_path, check=True, capture_output=True)
+    old_desired = subprocess.run(
+        ["git", "rev-parse", "release/dev"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path, check=True, capture_output=True)
+
+    script = Path(__file__).parents[1] / "tools/migrate_documents.py"
+    subprocess.run(
+        [sys.executable, str(script), "--project-name", "test-project", "--apply"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    new_desired = subprocess.run(
+        ["git", "rev-parse", "release/dev"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    source_revision = subprocess.run(
+        ["git", "rev-parse", "main"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert new_desired != old_desired
+    migrated = yaml.safe_load(
+        subprocess.run(
+            ["git", "show", "release/dev:units/application.yaml"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    assert migrated["apiVersion"] == "unit.gitopsctr.io/v1"
+    assert migrated["kind"] == "Terraform"
+    assert migrated["metadata"]["uid"].startswith("d1-")
+    assert migrated["metadata"]["lifecycle"] == {"management": {"mode": "sourceTracked"}}
+    assert migrated["spec"]["source"]["revision"] == source_revision
+    with pytest.raises(subprocess.CalledProcessError):
+        subprocess.run(["git", "show", "release/dev:units/application.json"], cwd=tmp_path, check=True)
+
+
 def test_migration_script_rejects_stale_local_refs_before_applying(tmp_path: Path):
     repository = tmp_path / "repository"
     remote = tmp_path / "remote.git"
