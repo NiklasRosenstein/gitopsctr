@@ -13,10 +13,15 @@ on:
         description: Optional pull-request label required for preview eligibility
         required: false
         type: string
+      dry_run:
+        description: Preview recovery only; defaults to true for manual runs
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
-  pull-requests: read
+  pull-requests: write
 
 concurrency:
   group: recover-orphaned-preview-stacks
@@ -24,9 +29,8 @@ concurrency:
 
 jobs:
   recover:
-    # A missing repository variable disables unattended cleanup. Manual runs can
-    # still supply an environment input for an explicit operator action.
-    if: github.event_name == 'workflow_dispatch' || vars.PREVIEW_ENVIRONMENT != ''
+    # Scheduled cleanup is opt-in. Manual runs can supply an environment input.
+    if: github.event_name == 'workflow_dispatch' || (vars.GITOPSCTR_RECOVERY_ENABLED == 'true' && vars.PREVIEW_ENVIRONMENT != '')
     runs-on: ubuntu-latest
     env:
       PREVIEW_ENVIRONMENT: ${{ vars.PREVIEW_ENVIRONMENT }}
@@ -49,6 +53,7 @@ jobs:
         env:
           WORKFLOW_ENVIRONMENT: ${{ inputs.environment }}
           WORKFLOW_REQUIRED_LABEL: ${{ inputs.required_label }}
+          WORKFLOW_DRY_RUN: ${{ inputs.dry_run }}
         shell: bash
         run: |
           set -euo pipefail
@@ -64,4 +69,17 @@ jobs:
           if [[ -n "$required_label" ]]; then
             command+=(--required-label "$required_label")
           fi
+          dry_run="${WORKFLOW_DRY_RUN:-}"
+          if [[ -z "$dry_run" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+              dry_run=true
+            else
+              dry_run=false
+            fi
+          fi
+          case "$dry_run" in
+            true) command+=(--dry) ;;
+            false) ;;
+            *) echo "dry_run must be true or false" >&2; exit 1 ;;
+          esac
           "${command[@]}"

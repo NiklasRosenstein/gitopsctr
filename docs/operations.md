@@ -88,16 +88,20 @@ For CI orchestration, see the [GitHub Action](github-action.md).
 The repository-owned `.github/workflows/recover-orphaned-preview-stacks.yml`
 runs hourly and can also be started manually. Configure these repository variables:
 
+- `GITOPSCTR_RECOVERY_ENABLED` — set to `true` to enable scheduled recovery.
 - `PREVIEW_ENVIRONMENT` — required for scheduled recovery; its value is the environment name.
 - `PREVIEW_REQUIRED_LABEL` — optional pull-request label required for preview eligibility.
 
-Set them with `gh variable set PREVIEW_ENVIRONMENT --body dev` and, when needed,
-`gh variable set PREVIEW_REQUIRED_LABEL --body preview`. A manual run may override
-both values with its `environment` and `required_label` inputs.
+Set them with `gh variable set GITOPSCTR_RECOVERY_ENABLED --body true`,
+`gh variable set PREVIEW_ENVIRONMENT --body dev` and, when needed, `gh variable
+set PREVIEW_REQUIRED_LABEL --body preview`. A manual run may override the
+environment and label with its inputs. Manual runs default to `dry_run: true`;
+set it to `false` only for an intentional cleanup run. Scheduled runs perform
+real recovery after the enable variable is set.
 
 The workflow checks out the trusted default branch and does not execute pull-request
-code or configuration. It uses the repository `GITHUB_TOKEN` as `GH_TOKEN` with only
-`contents: write` and `pull-requests: read`: cleanup may publish Git state and read
-pull-request eligibility, but it cannot write pull requests or access unrelated
-repository permissions. Protect the repository and restrict workflow changes because
-this token can publish cleanup changes.
+code or configuration. It uses the repository `GITHUB_TOKEN` as `GH_TOKEN` with
+`contents: write` and `pull-requests: write`: cleanup may publish Git state and
+create a change-gated cleanup pull request, but it cannot access unrelated
+repository permissions. Protect the repository and restrict workflow changes
+because this token can publish cleanup changes.

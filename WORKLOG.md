@@ -235,3 +235,11 @@ audit for every ref.
 and emits one versioned JSON report with per-environment results. It continues after one ref is missing or unavailable,
 so the report identifies all failures. Focused coverage includes multiple environments, custom refs, duplicate refs,
 and partial failures. Out-of-band desired refs still require explicit inventory before legacy removal.
+
+### 8.4 Opt-in GitHub orphan-Stack recovery workflow — complete as a reference workflow
+
+Commit `eccc338` adds `.github/workflows/recover-orphaned-preview-stacks.yml` and documents its repository variables.
+Scheduled recovery is disabled unless `GITOPSCTR_RECOVERY_ENABLED=true` and `PREVIEW_ENVIRONMENT` are set. Manual
+runs default to dry-run and can override the environment, label, and dry-run mode. The workflow checks out the trusted
+default branch and grants only Git contents and pull-request write access needed for cleanup and change-gated requests.
+Deployment-owned alerts, token policy, environment coverage, and self-hosted GitLab scheduling remain open.
