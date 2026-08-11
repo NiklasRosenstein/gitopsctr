@@ -14,33 +14,7 @@ import pytest
 
 from gitopsctr import cli
 from gitopsctr.errors import OperationError
-from tests.test_stack_projection import _project
-
-
-def _git(root: Path, *args: str, check: bool = True) -> str:
-    result = subprocess.run(
-        (
-            "git",
-            "-c",
-            "user.name=test",
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "commit.gpgSign=false",
-            *args,
-        ),
-        cwd=root,
-        check=check,
-        text=True,
-        capture_output=True,
-    )
-    return result.stdout.strip()
-
-
-def _commit(root: Path, message: str) -> str:
-    _git(root, "add", "--all")
-    _git(root, "commit", "-m", message)
-    return _git(root, "rev-parse", "HEAD")
+from tests.stack_support import commit, git, project_repository
 
 
 class GitDaemon:
@@ -71,7 +45,7 @@ class GitDaemon:
             stderr=subprocess.DEVNULL,
         )
         for _ in range(100):
-            if _git(self.base, "ls-remote", self.url, check=False):
+            if git(self.base, "ls-remote", self.url, check=False):
                 return
             time.sleep(0.01)
         raise AssertionError(f"git daemon did not start: {self.url}")
@@ -86,8 +60,8 @@ class GitDaemon:
 @contextmanager
 def _git_daemon(base: Path, repository: Path) -> Iterator[GitDaemon]:
     daemon = GitDaemon(base, repository)
-    daemon.start()
     try:
+        daemon.start()
         yield daemon
     finally:
         daemon.stop()
@@ -97,9 +71,9 @@ def _remote_repository(tmp_path: Path, *, include_template: bool = True) -> tupl
     remote = tmp_path / "stack-templates.git"
     working = tmp_path / "stack-templates-working"
     working.mkdir()
-    _git(tmp_path, "init", "--bare", str(remote))
-    _git(working, "init", "-b", "main")
-    _git(working, "remote", "add", "origin", str(remote))
+    git(tmp_path, "init", "--bare", str(remote))
+    git(working, "init", "-b", "main")
+    git(working, "remote", "add", "origin", str(remote))
     (working / "gitopsctr.yaml").write_text(
         json.dumps(
             {
@@ -114,9 +88,9 @@ def _remote_repository(tmp_path: Path, *, include_template: bool = True) -> tupl
     templates.mkdir(parents=True)
     if include_template:
         (templates / "application.json").write_text(json.dumps(_template("A")))
-    revision_a = _commit(working, "template A")
-    _git(working, "push", "-u", "origin", "main")
-    _git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
+    revision_a = commit(working, "template A")
+    git(working, "push", "-u", "origin", "main")
+    git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
     return remote, working, revision_a
 
 
@@ -142,14 +116,14 @@ def _template(marker: str) -> dict[str, object]:
 
 def _target_repository(tmp_path: Path, source: dict[str, object]) -> tuple[Path, str]:
     target = tmp_path / "target"
-    environment = _project(target)
+    environment = project_repository(target)
     (environment / "stacks").mkdir()
     (environment / "stacks/application.json").write_text(json.dumps(source))
-    _git(target, "init", "-b", "main")
+    git(target, "init", "-b", "main")
     origin = tmp_path / "target-origin.git"
-    _git(tmp_path, "init", "--bare", str(origin))
-    _git(target, "remote", "add", "origin", str(origin))
-    revision = _commit(target, "Stack source")
+    git(tmp_path, "init", "--bare", str(origin))
+    git(target, "remote", "add", "origin", str(origin))
+    revision = commit(target, "Stack source")
     return target, revision
 
 
@@ -194,8 +168,8 @@ def test_remote_ref_pins_commit_and_reconcile_ignores_moved_main(tmp_path: Path,
         assert resolved_source.fromGit.commit == revision_a
 
         (working / "deployment/stack-templates/application.json").write_text(json.dumps(_template("B")))
-        revision_b = _commit(working, "template B")
-        _git(working, "push", "origin", "main")
+        revision_b = commit(working, "template B")
+        git(working, "push", "origin", "main")
         daemon.stop()
         specifications, _ = cli.load_convergence_specifications(
             target, "dev", current, target_revision, tmp_path / "reconcile"
@@ -220,14 +194,17 @@ def test_fixed_remote_commit_stays_pinned_after_main_moves(tmp_path: Path, monke
         desired_a, changed_a = _advance(target, target_revision, monkeypatch)
         assert changed_a
         (working / "deployment/stack-templates/application.json").write_text(json.dumps(_template("B")))
-        revision_b = _commit(working, "template B")
-        _git(working, "push", "origin", "main")
+        revision_b = commit(working, "template B")
+        git(working, "push", "origin", "main")
         desired_b, changed_b = _advance(target, target_revision, monkeypatch)
+        desired_c, changed_c = _advance(target, target_revision, monkeypatch)
+        assert not changed_c
+        assert desired_c == desired_b
 
     assert revision_b != revision_a
-    assert changed_b or desired_b == desired_a
+    assert changed_b
     materialized_b = tmp_path / "current-b"
-    cli.materialize_revision(desired_b, materialized_b)
+    cli.materialize_revision(desired_c, materialized_b)
     resolved_source = _stack(materialized_b).spec.resolvedSource
     assert resolved_source is not None
     assert resolved_source.fromGit.commit == revision_a
@@ -237,21 +214,29 @@ def test_fixed_remote_commit_stays_pinned_after_main_moves(tmp_path: Path, monke
     assert specifications["application--deploy"].spec.terraform.variables["marker"] == "A"
 
 
-@pytest.mark.parametrize("failure", ["fetch", "ref", "path", "invalid-source"])
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    (
+        ("fetch", "could not fetch"),
+        ("ref", "does not exist"),
+        ("path", "expected exactly one StackTemplate"),
+        ("invalid-source", "invalid authored Stack"),
+    ),
+)
 def test_remote_source_failures_do_not_publish_desired_revision(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, expected: str
 ):
     if failure == "fetch":
         source = _stack_source("git://127.0.0.1:1/missing.git")
         target, target_revision = _target_repository(tmp_path, source)
         monkeypatch.setattr(cli, "REPOSITORY_ROOT", target)
-        with pytest.raises(OperationError):
+        with pytest.raises(OperationError, match=expected):
             cli.advance_desired("dev", target_revision, verbose=False, summarize=False)
     elif failure == "invalid-source":
         source = _stack_source("https://user:password@example.invalid/repository.git")
         target, target_revision = _target_repository(tmp_path, source)
         monkeypatch.setattr(cli, "REPOSITORY_ROOT", target)
-        with pytest.raises(OperationError):
+        with pytest.raises(OperationError, match=expected):
             cli.advance_desired("dev", target_revision, verbose=False, summarize=False)
     else:
         remote, _, _ = _remote_repository(tmp_path, include_template=failure != "path")
@@ -259,6 +244,6 @@ def test_remote_source_failures_do_not_publish_desired_revision(
             source = _stack_source(daemon.url, ref="missing" if failure == "ref" else "main")
             target, target_revision = _target_repository(tmp_path, source)
             monkeypatch.setattr(cli, "REPOSITORY_ROOT", target)
-            with pytest.raises(OperationError):
+            with pytest.raises(OperationError, match=expected):
                 cli.advance_desired("dev", target_revision, verbose=False, summarize=False)
     assert cli.fetch_ref("gitopsctr/desired/dev") is None

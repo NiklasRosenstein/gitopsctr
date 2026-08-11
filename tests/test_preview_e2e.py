@@ -4,30 +4,11 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 from pathlib import Path
 
 from gitopsctr import cli
-from gitopsctr.resources import ResourceMetadata
 from gitopsctr.state import GitStateStore
-from tests.test_stack_projection import _project, _write_stack_source
-
-
-def _git(root: Path, *args: str) -> str:
-    result = subprocess.run(
-        ("git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", *args),
-        cwd=root,
-        check=True,
-        text=True,
-        capture_output=True,
-    )
-    return result.stdout.strip()
-
-
-def _commit(root: Path, message: str) -> str:
-    _git(root, "add", "--all")
-    _git(root, "commit", "-m", message)
-    return _git(root, "rev-parse", "HEAD")
+from tests.stack_support import commit, git, project_repository, write_projected_units, write_stack_source
 
 
 class Inventory:
@@ -62,31 +43,29 @@ class Inventory:
 def _source_repository(tmp_path: Path) -> tuple[Path, Path, str]:
     remote = tmp_path / "origin.git"
     source = tmp_path / "source"
-    _git(tmp_path, "init", "--bare", str(remote))
-    environment = _project(source)
-    _git(source, "init", "-b", "main")
-    _git(source, "remote", "add", "origin", str(remote))
-    _write_stack_source(environment)
+    git(tmp_path, "init", "--bare", str(remote))
+    environment = project_repository(source)
+    git(source, "init", "-b", "main")
+    git(source, "remote", "add", "origin", str(remote))
+    write_stack_source(environment)
     template_path = environment / "stack-templates/preview.json"
     template = json.loads(template_path.read_text())
-    template["spec"]["resources"] = [
-        {
+    template["spec"]["unitTemplates"] = {
+        "preview-db": {
             "apiVersion": "unit.gitopsctr.io/v1",
             "kind": "Terraform",
-            "name": "preview-db",
             "spec": {"source": {"path": "."}},
         },
-        {
+        "preview-app": {
             "apiVersion": "unit.gitopsctr.io/v1",
             "kind": "Terraform",
-            "name": "preview-app",
             "dependsOn": ["preview-db"],
             "spec": {"source": {"path": "."}},
         },
-    ]
+    }
     template_path.write_text(json.dumps(template))
-    source_revision = _commit(source, "add preview Stack")
-    _git(source, "push", "-u", "origin", "main")
+    source_revision = commit(source, "add preview Stack")
+    git(source, "push", "-u", "origin", "main")
     return source, environment, source_revision
 
 
@@ -94,24 +73,9 @@ def _template_only_repository(tmp_path: Path) -> tuple[Path, Path, str]:
     source, environment, source_revision = _source_repository(tmp_path)
     for path in (environment / "stacks").glob("web.*"):
         path.unlink()
-    source_revision = _commit(source, "remove source Stack")
-    _git(source, "push", "origin", "main")
+    source_revision = commit(source, "remove source Stack")
+    git(source, "push", "origin", "main")
     return source, environment, source_revision
-
-
-def _write_generated_units(root: Path, projection: cli.StackProjection, source_root: Path) -> None:
-    for name, unit in projection.generated_units.items():
-        cli.write_desired_candidate_unit(
-            root / "units" / f"{name}.json",
-            unit.with_metadata(
-                ResourceMetadata(
-                    name=name,
-                    uid=f"d1-{name}",
-                    lifecycle=cli.DesiredLifecycle(owner=projection.owners[name]),
-                )
-            ),
-            source_root,
-        )
 
 
 def test_direct_stack_instantiation_from_template_only_source_is_replay_safe(tmp_path: Path, monkeypatch):
@@ -120,7 +84,7 @@ def test_direct_stack_instantiation_from_template_only_source_is_replay_safe(tmp
     initial = tmp_path / "initial"
     projection = cli.project_stack_resources(source, "dev", source_revision, initial, source)
     assert projection.generated_units == {}
-    source_head = _git(source, "rev-parse", "HEAD")
+    source_head = git(source, "rev-parse", "HEAD")
     desired = store.publish("deploy/dev", initial, None, "publish template-only desired state")
 
     monkeypatch.setattr(cli, "REPOSITORY_ROOT", source)
@@ -176,7 +140,7 @@ def test_direct_stack_instantiation_from_template_only_source_is_replay_safe(tmp
     assert unit.metadata.lifecycle.owner is not None
     assert unit.metadata.lifecycle.owner.uid == stack.metadata.uid
     assert not list((environment / "stacks").glob("web.*"))
-    assert _git(source, "rev-parse", "HEAD") == source_head
+    assert git(source, "rev-parse", "HEAD") == source_head
 
     assert cli.command_instantiate_stack(args) is False
     assert store.fetch("deploy/dev").revision == instantiated_revision
@@ -187,7 +151,7 @@ def test_stack_lifecycle_survives_git_restart_and_tears_down_in_reverse_order(tm
     store = GitStateStore(source)
     initial = tmp_path / "initial"
     projection = cli.project_stack_resources(source, "dev", source_revision, initial, source)
-    _write_generated_units(initial, projection, source)
+    write_projected_units(initial, projection, source)
     resources = cli.load_desired_resource_graph(initial)
     units = {
         resource.name: resource
@@ -208,7 +172,7 @@ def test_stack_lifecycle_survives_git_restart_and_tears_down_in_reverse_order(tm
     assert initial_stack.metadata.uid is not None
 
     (environment / "stacks/web.json").unlink()
-    source_revision_without_stack = _commit(source, "remove preview Stack")
+    source_revision_without_stack = commit(source, "remove preview Stack")
     current = tmp_path / "current"
     store.materialize(desired.revision, current)
     candidate = tmp_path / "candidate"
@@ -259,7 +223,7 @@ def test_stack_lifecycle_survives_git_restart_and_tears_down_in_reverse_order(tm
             }
         )
     )
-    recreated_revision = _commit(source, "recreate preview Stack")
+    recreated_revision = commit(source, "recreate preview Stack")
     recreated = tmp_path / "recreated"
     recreated_projection = cli.project_stack_resources(source, "dev", recreated_revision, recreated, source, finalized)
     recreated_stack = cli.RESOURCE_CATALOG.parse_stack(

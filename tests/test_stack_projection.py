@@ -19,76 +19,13 @@ from gitopsctr.contracts import (
 from gitopsctr.errors import OperationError
 from gitopsctr.resources import ResourceMetadata, StackResource, validate_desired_resource_graph
 from gitopsctr.state import ControllerPin, ControllerPinClaim
-
-
-def _project(root: Path) -> Path:
-    root.mkdir(parents=True)
-    root.joinpath("gitopsctr.yaml").write_text(
-        json.dumps(
-            {
-                "apiVersion": "gitopsctr.io/v1",
-                "kind": "Project",
-                "metadata": {"name": "test"},
-                "spec": {},
-            }
-        )
-    )
-    environment = root / "deployment/environments/dev"
-    environment.mkdir(parents=True)
-    (environment / "environment.json").write_text(
-        json.dumps(
-            {
-                "apiVersion": "gitopsctr.io/v1",
-                "kind": "Environment",
-                "metadata": {"name": "dev"},
-                "spec": {},
-            }
-        )
-    )
-    return environment
-
-
-def _write_stack_source(environment: Path) -> None:
-    templates = environment / "stack-templates"
-    stacks = environment / "stacks"
-    templates.mkdir()
-    stacks.mkdir()
-    (templates / "preview.json").write_text(
-        json.dumps(
-            {
-                "apiVersion": "gitopsctr.io/v1",
-                "kind": "StackTemplate",
-                "metadata": {"name": "preview"},
-                "spec": {
-                    "parameters": [{"name": "source-path", "type": "string"}],
-                    "resources": [
-                        {
-                            "apiVersion": "unit.gitopsctr.io/v1",
-                            "kind": "Terraform",
-                            "name": "preview-app",
-                            "spec": {"source": {"path": {"fromParameter": {"name": "source-path"}}}},
-                        }
-                    ],
-                },
-            }
-        )
-    )
-    (stacks / "web.json").write_text(
-        json.dumps(
-            {
-                "apiVersion": "gitopsctr.io/v1",
-                "kind": "Stack",
-                "metadata": {"name": "web"},
-                "spec": {"template": "preview", "parameters": {"source-path": "."}},
-            }
-        )
-    )
+from tests.stack_support import project_repository, write_projected_units, write_stack_source
 
 
 def test_stack_projection_is_deterministic_and_templates_are_inert(tmp_path: Path):
     source = tmp_path / "source"
-    environment = _project(source)
-    _write_stack_source(environment)
+    environment = project_repository(source)
+    write_stack_source(environment)
 
     first = cli.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate-a", source)
     second = cli.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate-b", source)
@@ -102,8 +39,8 @@ def test_stack_projection_is_deterministic_and_templates_are_inert(tmp_path: Pat
 
 def test_existing_stack_root_uids_are_preserved_across_source_revisions(tmp_path: Path):
     source = tmp_path / "source"
-    environment = _project(source)
-    _write_stack_source(environment)
+    environment = project_repository(source)
+    write_stack_source(environment)
     initial = tmp_path / "initial"
     cli.project_stack_resources(source, "dev", "a" * 40, initial, source)
     current = tmp_path / "current"
@@ -134,8 +71,8 @@ def test_existing_stack_root_uids_are_preserved_across_source_revisions(tmp_path
 
 def test_recreated_source_stack_does_not_reuse_finalized_uid(tmp_path: Path):
     source = tmp_path / "source"
-    environment = _project(source)
-    _write_stack_source(environment)
+    environment = project_repository(source)
+    write_stack_source(environment)
     initial = tmp_path / "initial"
     cli.project_stack_resources(source, "dev", "a" * 40, initial, source)
     old_path = next((initial / "stacks").glob("web.*"))
@@ -165,10 +102,15 @@ def test_recreated_source_stack_does_not_reuse_finalized_uid(tmp_path: Path):
 
 def test_source_absent_stack_root_is_retained_for_owned_unit_cleanup(tmp_path: Path):
     source = tmp_path / "source"
-    environment = _project(source)
-    _write_stack_source(environment)
+    environment = project_repository(source)
+    write_stack_source(environment)
     initial = tmp_path / "initial"
     cli.project_stack_resources(source, "dev", "a" * 40, initial, source)
+    initial_stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(next((initial / "stacks").glob("web.*"))),
+        profile="desired",
+        expected_name="web",
+    )
     current = tmp_path / "current"
     shutil.copytree(initial, current)
 
@@ -177,42 +119,33 @@ def test_source_absent_stack_root_is_retained_for_owned_unit_cleanup(tmp_path: P
     projection = cli.project_stack_resources(source, "dev", "b" * 40, next_candidate, source, current)
 
     assert not projection.generated_units
-    assert list((next_candidate / "stacks").glob("web.*"))
+    retained_stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(next((next_candidate / "stacks").glob("web.*"))),
+        profile="desired",
+        expected_name="web",
+    )
+    assert retained_stack.metadata.uid == initial_stack.metadata.uid
     assert list((next_candidate / "stack-templates").glob("preview.*"))
 
 
 def test_expanded_stack_dependencies_are_retained_and_validated(tmp_path: Path):
     source = tmp_path / "source"
-    environment = _project(source)
-    _write_stack_source(environment)
+    environment = project_repository(source)
+    write_stack_source(environment)
     template_path = environment / "stack-templates/preview.json"
     template = json.loads(template_path.read_text())
-    template["spec"]["resources"].append(
-        {
-            "apiVersion": "unit.gitopsctr.io/v1",
-            "kind": "Terraform",
-            "name": "preview-db",
-            "spec": {"source": {"path": "."}},
-        }
-    )
-    template["spec"]["resources"][0]["dependsOn"] = ["preview-db"]
+    template["spec"]["unitTemplates"]["preview-db"] = {
+        "apiVersion": "unit.gitopsctr.io/v1",
+        "kind": "Terraform",
+        "spec": {"source": {"path": "."}},
+    }
+    template["spec"]["unitTemplates"]["preview-app"]["dependsOn"] = ["preview-db"]
     template_path.write_text(json.dumps(template))
 
     candidate = tmp_path / "candidate"
     projection = cli.project_stack_resources(source, "dev", "a" * 40, candidate, source)
     assert projection.dependencies["web--preview-app"] == ("web--preview-db",)
-    for name, unit in projection.generated_units.items():
-        cli.write_desired_candidate_unit(
-            candidate / "units" / f"{name}.json",
-            unit.with_metadata(
-                ResourceMetadata(
-                    name=name,
-                    uid=f"d1-generated-{name}",
-                    lifecycle=DesiredLifecycle(owner=projection.owners[name]),
-                )
-            ),
-            source,
-        )
+    write_projected_units(candidate, projection, source, uid_prefix="d1-generated-")
     cli.load_desired_resource_graph(candidate)
     current_desired = tmp_path / "empty-desired"
     current_desired.mkdir()
@@ -236,8 +169,8 @@ def test_expanded_stack_dependencies_are_retained_and_validated(tmp_path: Path):
 
 def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path: Path):
     source = tmp_path / "source"
-    environment = _project(source)
-    _write_stack_source(environment)
+    environment = project_repository(source)
+    write_stack_source(environment)
     candidate = tmp_path / "candidate"
     projection = cli.project_stack_resources(source, "dev", "a" * 40, candidate, source)
     owner = projection.owners["web--preview-app"]
@@ -282,8 +215,8 @@ def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path:
 
 def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
     source = tmp_path / "source"
-    environment = _project(source)
-    _write_stack_source(environment)
+    environment = project_repository(source)
+    write_stack_source(environment)
     authored_stack = cli.RESOURCE_CATALOG.parse_stack(
         cli.RESOURCE_CATALOG.load_document(environment / "stacks/web.json"),
         profile="authored",
@@ -345,7 +278,7 @@ def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
 
 def test_stack_rejects_missing_template_during_projection(tmp_path: Path):
     source = tmp_path / "source"
-    environment = _project(source)
+    environment = project_repository(source)
     stacks = environment / "stacks"
     stacks.mkdir()
     (stacks / "web.json").write_text(
@@ -365,8 +298,8 @@ def test_stack_rejects_missing_template_during_projection(tmp_path: Path):
 
 def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Path, monkeypatch):
     source = tmp_path / "source"
-    environment = _project(source)
-    _write_stack_source(environment)
+    environment = project_repository(source)
+    write_stack_source(environment)
     (environment / "stacks/web.json").unlink()
     current = tmp_path / "current"
     current.mkdir()

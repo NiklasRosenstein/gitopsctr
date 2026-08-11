@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -248,19 +248,19 @@ def _advance_import_fixture(fixture: ImportFixture, output: Path):
 
 
 @pytest.mark.parametrize(
-    "failure",
-    (
-        "stack-uid",
-        "unit-owner-uid",
-        "missing-unit",
-        "stale-receipt",
-        "wrong-gvk",
-        "wrong-digest",
-        "missing-artifact",
-        "unmatched-import",
-    ),
+    ("failure", "expected"),
+    {
+        "stack-uid": "invalid Stack owner fence",
+        "unit-owner-uid": "invalid Stack owner fence",
+        "missing-unit": "promoted source Unit is unavailable",
+        "stale-receipt": "promoted artifact receipt is stale",
+        "wrong-gvk": "was expected",
+        "wrong-digest": "does not match its digest",
+        "missing-artifact": "artifact files do not match",
+        "unmatched-import": "imports an artifact from unknown Unit template",
+    }.items(),
 )
-def test_promoted_artifact_import_rejects_invalid_lineage(tmp_path: Path, monkeypatch, failure: str):
+def test_promoted_artifact_import_rejects_invalid_lineage(tmp_path: Path, monkeypatch, failure: str, expected: str):
     fixture = _setup_import_fixture(tmp_path, monkeypatch)
     if failure == "stack-uid":
         path = cli.document_candidates(fixture.desired / "stacks", "application")[0]
@@ -275,7 +275,10 @@ def test_promoted_artifact_import_rejects_invalid_lineage(tmp_path: Path, monkey
     elif failure == "missing-unit":
         cli.unit_document_path(fixture.desired, "application--image").unlink()
     elif failure == "stale-receipt":
-        cli.unit_document_path(fixture.observed, "application--image").unlink()
+        path = cli.unit_document_path(fixture.observed, "application--image")
+        document = cli.RESOURCE_CATALOG.load_document(path)
+        document["spec"]["desired"]["unitBlob"] = "stale-unit-blob"
+        path.write_text(json.dumps(document))
     elif failure in {"wrong-gvk", "wrong-digest"}:
         path = cli.unit_document_path(fixture.observed, "application--image")
         document = cli.RESOURCE_CATALOG.load_document(path)
@@ -291,86 +294,25 @@ def test_promoted_artifact_import_rejects_invalid_lineage(tmp_path: Path, monkey
         document["spec"]["artifactImports"][0]["unit"] = "missing"
         path.write_text(json.dumps(document))
 
+    candidate = tmp_path / "failed-candidate"
     try:
-        result = _advance_import_fixture(fixture, tmp_path / "failed-candidate")
-    except (cli.ReferenceUnavailable, cli.OperationError):
-        return
-    assert result.blocked
-    assert not cli.document_candidates(tmp_path / "failed-candidate/units", "application--deploy")
+        result = _advance_import_fixture(fixture, candidate)
+    except (cli.ReferenceUnavailable, cli.OperationError) as error:
+        assert expected in str(error)
+    else:
+        assert result.blocked
+        assert expected in " ".join(str(reason) for reason in result.blocked.values())
+    finally:
+        assert not cli.document_candidates(candidate / "units", "application--deploy")
 
 
 def test_promoted_artifact_import_records_lineage_and_reconciles_from_desired(
     tmp_path: Path,
     monkeypatch,
 ):
-    source = tmp_path / "source"
-    _repository(source)
-    _write_stack(
-        source,
-        "dev",
-        {
-            "apiVersion": "gitopsctr.io/v1",
-            "kind": "Stack",
-            "metadata": {"name": "application"},
-            "spec": {"template": "application"},
-        },
-    )
-    _write_stack(
-        source,
-        "staging",
-        {
-            "apiVersion": "gitopsctr.io/v1",
-            "kind": "Stack",
-            "metadata": {"name": "application"},
-            "spec": {
-                "template": {"name": "application", "source": {"fromPromotion": {"stack": "application"}}},
-                "units": ["deploy"],
-                "artifactImports": [
-                    {
-                        "unit": "image",
-                        "name": "containers",
-                        "apiVersion": "artifact.gitopsctr.io/v1",
-                        "kind": "ContainerImages",
-                        "fromPromotion": {"stack": "application"},
-                    }
-                ],
-            },
-        },
-    )
-    source_revision = "a" * 40
-    dev_desired = tmp_path / "dev-desired"
-    dev_projection = cli.project_stack_resources(source, "dev", source_revision, dev_desired, source)
-    observed = tmp_path / "dev-observed"
-    monkeypatch.setattr(cli, "REPOSITORY_ROOT", source)
-    monkeypatch.setattr(cli, "file_blob", lambda path: hashlib.sha256(path.read_bytes()).hexdigest())
-    _write_source_observation(source, dev_desired, observed, dev_projection, source_revision)
-
-    promotion = cli.PromotionContext(
-        source_environment="dev",
-        desired_ref="deploy/dev",
-        desired_revision=source_revision,
-        observed_ref="observed/dev",
-        observed_revision="d" * 40,
-        specification_revision=source_revision,
-        desired_root=dev_desired,
-        observed_root=observed,
-    )
+    fixture = _setup_import_fixture(tmp_path, monkeypatch)
     staging = tmp_path / "staging-desired"
-    current = tmp_path / "empty-current"
-    current.mkdir()
-    staging_observed = tmp_path / "staging-observed"
-    staging_observed.mkdir()
-    result = cli.build_desired_candidate(
-        "staging",
-        source,
-        "e" * 40,
-        current,
-        staging_observed,
-        None,
-        staging,
-        promotion=promotion,
-        verbose=False,
-    )
+    result = _advance_import_fixture(fixture, staging)
 
     assert result.blocked == {}
     deploy = cli.load_desired_unit(cli.unit_document_path(staging, "application--deploy"), "application--deploy")
@@ -388,12 +330,12 @@ def test_promoted_artifact_import_records_lineage_and_reconciles_from_desired(
     evidence = stack.spec.resolvedArtifactImports["image/containers"]
     assert evidence.sourceStack == "application"
     assert evidence.sourceUnit == "application--image"
-    assert evidence.sourceDesiredRevision == source_revision
+    assert evidence.sourceDesiredRevision == fixture.promotion.desired_revision
     assert evidence.sourceObservedRevision == "d" * 40
     assert evidence.targetStackUid == stack.metadata.uid
 
     specifications, _ = cli.load_convergence_specifications(
-        source, "staging", staging, "f" * 40, tmp_path / "staging-reconcile"
+        fixture.source, "staging", staging, "f" * 40, tmp_path / "staging-reconcile"
     )
     assert specifications["application--deploy"].spec.terraform.variables["image"].endswith("c" * 64)
 
@@ -401,7 +343,16 @@ def test_promoted_artifact_import_records_lineage_and_reconciles_from_desired(
 def test_promoted_artifact_import_chains_from_staging_to_production(tmp_path: Path, monkeypatch):
     fixture = _setup_import_fixture(tmp_path, monkeypatch)
     staging = tmp_path / "staging-desired"
-    _advance_import_fixture(fixture, staging)
+    staging_result = _advance_import_fixture(fixture, staging)
+    assert staging_result.blocked == {}
+    staging_stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(cli.document_candidates(staging / "stacks", "application")[0]),
+        profile="desired",
+        expected_name="application",
+    )
+    assert isinstance(staging_stack.spec, cli.DesiredStackSpec)
+    assert staging_stack.spec.resolvedArtifactImports is not None
+    staging_evidence = staging_stack.spec.resolvedArtifactImports["image/containers"]
 
     _write_stack(
         fixture.source,
@@ -464,8 +415,7 @@ def test_promoted_artifact_import_chains_from_staging_to_production(tmp_path: Pa
     assert isinstance(stack.spec, cli.DesiredStackSpec)
     assert stack.spec.resolvedArtifactImports is not None
     evidence = stack.spec.resolvedArtifactImports["image/containers"]
-    assert evidence.sourceDesiredRevision == "a" * 40
-    assert evidence.targetStackUid == stack.metadata.uid
+    assert evidence == replace(staging_evidence, targetStackUid=stack.metadata.uid)
 
 
 def test_promoted_artifact_import_rejects_ambiguous_imports(tmp_path: Path):

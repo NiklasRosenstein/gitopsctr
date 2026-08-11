@@ -13,10 +13,11 @@ import pytest
 
 from gitopsctr import cli
 from gitopsctr.errors import OperationError
-from gitopsctr.resources import ResourceMetadata
 from gitopsctr.state import ControllerPin, ControllerPinClaim
-from tests.test_stack_deletion import _args, _fake_git, _stack_tree
-from tests.test_stack_projection import _project, _write_stack_source
+from tests.stack_deletion_support import deletion_args as _args
+from tests.stack_deletion_support import fake_git as _fake_git
+from tests.stack_deletion_support import stack_tree as _stack_tree
+from tests.stack_support import project_repository, write_projected_units, write_stack_source
 
 
 def _write_project_template(root: Path, environment_name: str, stack: dict[str, object]) -> Path:
@@ -70,22 +71,9 @@ def _write_project_template(root: Path, environment_name: str, stack: dict[str, 
     return environment
 
 
-def _write_project_units(root: Path, projection: cli.StackProjection, source_root: Path) -> None:
-    for name, unit in projection.generated_units.items():
-        cli.write_desired_candidate_unit(
-            root / "units" / f"{name}.json",
-            unit.with_metadata(
-                ResourceMetadata(
-                    name=name, uid=f"d1-{name}", lifecycle=cli.DesiredLifecycle(owner=projection.owners[name])
-                )
-            ),
-            source_root,
-        )
-
-
 def test_stack_source_variants_pin_and_reconcile_from_desired_projection(tmp_path: Path):
     source = tmp_path / "source"
-    _project(source)
+    project_repository(source)
     _write_project_template(
         source,
         "dev",
@@ -116,7 +104,7 @@ def test_stack_source_variants_pin_and_reconcile_from_desired_projection(tmp_pat
         == hashlib.sha256((source / "deployment/stack-templates/application.json").read_bytes()).hexdigest()
     )
     assert stack.spec.resolvedProjection is not None
-    _write_project_units(desired, projection, source)
+    write_projected_units(desired, projection, source)
     (source / "deployment/stack-templates/application.json").unlink()
     specifications, dependencies = cli.load_convergence_specifications(
         source, "dev", desired, "b" * 40, tmp_path / "reconcile-projection"
@@ -127,7 +115,7 @@ def test_stack_source_variants_pin_and_reconcile_from_desired_projection(tmp_pat
 
 def test_from_git_stack_source_does_not_create_catalog_or_read_source_during_reconcile(tmp_path: Path):
     source = tmp_path / "source"
-    _project(source)
+    project_repository(source)
     external = source / "external"
     external.mkdir()
     (external / "gitopsctr.yaml").write_text(
@@ -180,7 +168,7 @@ def test_from_git_stack_source_does_not_create_catalog_or_read_source_during_rec
     assert stack.spec.resolvedSource is not None
     assert stack.spec.resolvedSource.fromGit.ref == "refs/heads/main"
     assert stack.spec.resolvedSource.fromGit.resourcePath == "deployment/stack-templates/application.json"
-    _write_project_units(desired, projection, source)
+    write_projected_units(desired, projection, source)
     shutil.rmtree(external)
     specifications, _ = cli.load_convergence_specifications(
         source, "dev", desired, "d" * 40, tmp_path / "reconcile-projection"
@@ -190,7 +178,7 @@ def test_from_git_stack_source_does_not_create_catalog_or_read_source_during_rec
 
 def test_from_promotion_copies_exact_source_and_projects_subset(tmp_path: Path):
     source = tmp_path / "source"
-    _project(source)
+    project_repository(source)
     _write_project_template(
         source,
         "dev",
@@ -203,7 +191,7 @@ def test_from_promotion_copies_exact_source_and_projects_subset(tmp_path: Path):
     )
     dev_desired = tmp_path / "dev-desired"
     dev_projection = cli.project_stack_resources(source, "dev", "e" * 40, dev_desired, source)
-    _write_project_units(dev_desired, dev_projection, source)
+    write_projected_units(dev_desired, dev_projection, source)
     _write_project_template(
         source,
         "staging",
@@ -251,8 +239,8 @@ def test_from_promotion_copies_exact_source_and_projects_subset(tmp_path: Path):
 
 def test_source_tracked_stack_cleanup_is_durable_across_restart(tmp_path: Path):
     source = tmp_path / "source"
-    environment = _project(source)
-    _write_stack_source(environment)
+    environment = project_repository(source)
+    write_stack_source(environment)
     initial = tmp_path / "initial"
     projection = cli.project_stack_resources(source, "dev", "a" * 40, initial, source)
     initial_stack = cli.RESOURCE_CATALOG.parse_stack(
@@ -261,18 +249,7 @@ def test_source_tracked_stack_cleanup_is_durable_across_restart(tmp_path: Path):
         expected_name="web",
     )
 
-    for name, unit in projection.generated_units.items():
-        cli.write_desired_candidate_unit(
-            initial / "units" / f"{name}.json",
-            unit.with_metadata(
-                ResourceMetadata(
-                    name=name,
-                    uid=f"d1-{name}",
-                    lifecycle=cli.DesiredLifecycle(owner=projection.owners[name]),
-                )
-            ),
-            source,
-        )
+    write_projected_units(initial, projection, source)
     cli.load_desired_resource_graph(initial)
 
     (environment / "stacks/web.json").unlink()
@@ -315,13 +292,18 @@ def test_source_tracked_stack_cleanup_is_durable_across_restart(tmp_path: Path):
     second_intent = cli.load_desired_stack_deletion_intents(restarted)["web"]
     assert second.blocked == {}
     assert second_intent == first_intent
+    retained_unit = cli.load_desired_unit(restarted / "units/web--preview-app.json", "web--preview-app")
+    assert retained_unit.metadata.uid == "d1-web--preview-app"
+    assert retained_unit.metadata.lifecycle is not None
+    assert retained_unit.metadata.lifecycle.owner is not None
+    assert retained_unit.metadata.lifecycle.owner.uid == initial_stack.metadata.uid
     assert cli.load_desired_resource_graph(restarted)
 
 
 def test_two_stacks_from_one_template_have_independent_generated_units(tmp_path: Path):
     source = tmp_path / "source"
-    environment = _project(source)
-    _write_stack_source(environment)
+    environment = project_repository(source)
+    write_stack_source(environment)
     (environment / "stacks/api.json").write_text(
         json.dumps(
             {
@@ -338,18 +320,7 @@ def test_two_stacks_from_one_template_have_independent_generated_units(tmp_path:
     assert sorted(projection.generated_units) == ["api--preview-app", "web--preview-app"]
     assert projection.owners["api--preview-app"].name == "api"
     assert projection.owners["web--preview-app"].name == "web"
-    for name, unit in projection.generated_units.items():
-        cli.write_desired_candidate_unit(
-            candidate / "units" / f"{name}.json",
-            unit.with_metadata(
-                ResourceMetadata(
-                    name=name,
-                    uid=f"d1-{name}",
-                    lifecycle=cli.DesiredLifecycle(owner=projection.owners[name]),
-                )
-            ),
-            source,
-        )
+    write_projected_units(candidate, projection, source)
 
     graph = cli.load_desired_resource_graph(candidate)
     assert ("unit.gitopsctr.io/v1", "Terraform", "api--preview-app") in graph
@@ -433,19 +404,16 @@ def test_direct_stack_finalization_retries_after_injected_publication_failure(tm
 
 def test_dependencies_cli_preserves_explicit_stack_order_after_restart(tmp_path: Path, monkeypatch, capsys):
     source = tmp_path / "source"
-    environment = _project(source)
-    _write_stack_source(environment)
+    environment = project_repository(source)
+    write_stack_source(environment)
     template_path = environment / "stack-templates/preview.json"
     template = json.loads(template_path.read_text())
-    template["spec"]["resources"].append(
-        {
-            "apiVersion": "unit.gitopsctr.io/v1",
-            "kind": "Terraform",
-            "name": "preview-db",
-            "spec": {"source": {"path": "."}},
-        }
-    )
-    template["spec"]["resources"][0]["dependsOn"] = ["preview-db"]
+    template["spec"]["unitTemplates"]["preview-db"] = {
+        "apiVersion": "unit.gitopsctr.io/v1",
+        "kind": "Terraform",
+        "spec": {"source": {"path": "."}},
+    }
+    template["spec"]["unitTemplates"]["preview-app"]["dependsOn"] = ["preview-db"]
     template_path.write_text(json.dumps(template))
 
     source_revision = "a" * 40

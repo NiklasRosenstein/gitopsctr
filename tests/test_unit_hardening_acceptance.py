@@ -13,8 +13,8 @@ import pytest
 from gitopsctr import cli
 from gitopsctr.driver import DriverError, TeardownResult
 from gitopsctr.errors import OperationError
+from tests.stack_support import project_repository
 from tests.test_finalization import _finalize_args, _terraform_unit
-from tests.test_stack_projection import _project
 
 
 def _stub_effect_lease(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -204,7 +204,7 @@ def test_stale_delete_request_cannot_target_recreated_same_name(tmp_path: Path, 
     source = tmp_path / "source"
     current = tmp_path / "current"
     observed = tmp_path / "observed"
-    environment = _project(source)
+    environment = project_repository(source)
     source_unit_path = environment / "units/application.json"
     source_unit_path.parent.mkdir(parents=True)
     source_unit_path.write_text(
