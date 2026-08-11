@@ -65,7 +65,9 @@ outside preview workflows.
 - **Deferred:** Packaging the source or Terraform module as an OCI bundle. The first implementation pins a
   controller-owned Git ref.
 - **Deferred:** Automatically deleting empty Terraform state objects or backend keys after successful destroy.
-- **Deferred:** Continuous tracking or promotion of one Stack from a changing StackTemplate.
+- **Deferred:** Template-selection policy for direct Stacks. A future contract may pin a revision or select a named
+  trusted ref for an explicit latest refresh. It may also accept that selection through promotion. It MUST record the
+  resolved template revision in Stack provenance and MUST NOT bind a live Stack to a moving ref.
 - **Deferred:** Cross-ref ownership, multiple controlling owners, and a separate lifecycle database.
 - **Non-goal:** Forge eligibility, expiry, and orphan detection inside `gitopsctr`. CI workflows or webhooks may
   consult the forge, enumerate preview lineage, and request operations through the normal CLI. A scheduled CI job
@@ -242,6 +244,8 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
 - **Implemented in `84d7ddb` and `d071c1e`:** A direct Stack retains a cleanup-capable snapshot and pins its exact
   template revision. The pin remains through teardown and is released only after successful finalization. It does not
   continuously follow later template changes in the first implementation.
+- The temporary-repository acceptance flow now invokes `instantiate-stack` with a source-tracked StackTemplate and no
+  source Stack. It verifies direct management, exact template provenance, generated ownership, and replay idempotence.
 - A source-tracked Stack is a concrete source resource. Whether it may also track or promote changes from a
   StackTemplate remains **Open**.
 - StackTemplate dependency declarations are validated and retained in the projected graph. `3b25f04` integrates them
@@ -348,8 +352,8 @@ file may remain. Out-of-band demo cleanup is only a final safety net.
 ### B. Direct Stack from a source-tracked StackTemplate
 
 - Project a source-tracked StackTemplate and prove that it creates no Units or external effects by itself.
-- Submit a direct instantiation with explicit parameters. Replaying the same request identity MUST yield one Stack
-  lifecycle, not a duplicate.
+- Submit a direct instantiation with explicit parameters while no Stack is source-tracked. Replaying the same request
+  identity MUST yield one Stack lifecycle, not a duplicate.
 - Assert direct management, pinned template provenance, Stack-owned Units, and an unchanged source ref.
 - Reconcile and observe external inventory.
 - Request UID-fenced deletion, checkpoint deletion intent, restart, and finalize in reverse dependency order.
@@ -443,6 +447,8 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
 - [x] Add a real temporary-repository Stack harness with a deterministic external inventory, restart recovery, UID
   retention, reverse teardown, and same-name recreation assertions; Docker/Terraform driver-backed cleanup is covered
   by the demo acceptance flow.
+- [x] Add temporary-repository acceptance for direct Stack instantiation from a source-tracked StackTemplate, with
+  replay idempotence and exact template provenance.
 - [x] Add instance-scoped generated Unit naming and acceptance coverage for two concurrent Stacks from one template.
 - [x] Extend Docker/Terraform acceptance to add a source Stack, observe its generated Terraform Unit, remove the
   Stack, and finalize the Unit and Stack against the real Docker inventory.
@@ -456,6 +462,11 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
   ruleset, and merge-queue configuration remains deployment-owned.
 - [x] Add a read-only compatibility audit for one desired ref and an aggregate mode for all Project-configured
   environments; keep legacy retirement pending until out-of-band refs are inventoried and every audit is clean.
+- [ ] Define direct Stack template selection for a pinned revision and an explicit latest-refresh policy. Record the
+  resolved revision in provenance, retain one revision per Stack incarnation, and make refresh create a new fenced
+  incarnation after the old one is finalized.
+- [ ] Define how promotion supplies template selection. Validate the selected revision or trusted ref from the
+  promotion source; do not treat a moving ref or forge identity as lifecycle authority.
 - [ ] Configure and verify required forge freshness checks or merge-queue/branch-protection enforcement at merge time;
   repository CI now verifies GitHub `pull_request` and `merge_group` heads, but required-check policy remains external.
 - [ ] Remove legacy implicit-root compatibility after the documented migration condition is met.
@@ -465,7 +476,7 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
 ## Open decisions
 
 - Exact API fields, resource locations, CLI names, and Stack-local naming/collision rules.
-- Stack and StackTemplate promotion or continuous-tracking semantics.
+- Direct Stack template-selection fields, latest-refresh semantics, and promotion inputs.
 - Receipt generation/spec digest format and cleanup-evidence layout on the observed ref.
 - Whether direct Argo CD Application management is supported alongside the preferred ApplicationSet integration.
 - External CI garbage-collection boundary, lineage enumeration, and forge adapters.
@@ -488,5 +499,6 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
 | 2026-08-11 | Validate Stack cleanup with the real Docker/Terraform drivers: add a source Stack, converge its generated Unit, remove it, and finalize the Unit before the Stack root. |
 | 2026-08-11 | Resolve a permanently unparseable cleanup root only with an exact UID, explicit external-cleanup confirmation, and a durable Unit incarnation tombstone; parseable roots must use driver-backed recovery. |
 | 2026-08-11 | Make document migration canonicalize legacy desired Units and resolve refs from the Project configuration; compatibility retirement still requires a complete supported-ref inventory and clean audit. |
+| 2026-08-11 | Add acceptance for direct Stack instantiation from a source-tracked StackTemplate. Keep template selection and latest-refresh semantics as explicit follow-up work. |
 | 2026-08-11 | Read-only GitHub API verification reports `main` is not branch protected; required freshness checks and merge-queue enforcement remain an external prerequisite. |
 | 2026-08-11 | Treat forge identity as provenance only. PR CI may imperatively use `gitopsctr` lifecycle primitives; scheduled CI handles missed forge events by enumerating lineage and consulting the forge outside core lifecycle logic. |

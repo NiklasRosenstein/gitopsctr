@@ -286,3 +286,10 @@ Parameterized tests cover direct, gated, and temporary-failure paths.
 Sol High found two more defects. Cleanup checked the claim after releasing the pin. A caller-supplied candidate ref was
 also reused for post-merge cleanup. Cleanup now checks the claim first, uses a separate deterministic cleanup ref, and
 tests matching and mismatched claims and explicit candidate-ref retries.
+
+### 8.10 Direct Stack instantiation acceptance — complete for pinned templates
+
+The temporary-repository acceptance flow now starts with a source-tracked `StackTemplate` and no source `Stack`.
+It invokes `instantiate-stack`, verifies direct Stack ownership and exact template provenance, and replays the same
+request identity. The replay does not publish a second desired revision. Template selection by pinned revision or
+explicit latest refresh, including promotion input, remains open design work.

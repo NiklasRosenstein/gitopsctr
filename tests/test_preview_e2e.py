@@ -90,6 +90,15 @@ def _source_repository(tmp_path: Path) -> tuple[Path, Path, str]:
     return source, environment, source_revision
 
 
+def _template_only_repository(tmp_path: Path) -> tuple[Path, Path, str]:
+    source, environment, source_revision = _source_repository(tmp_path)
+    for path in (environment / "stacks").glob("web.*"):
+        path.unlink()
+    source_revision = _commit(source, "remove source Stack")
+    _git(source, "push", "origin", "main")
+    return source, environment, source_revision
+
+
 def _write_generated_units(root: Path, projection: cli.StackProjection, source_root: Path) -> None:
     for name, unit in projection.generated_units.items():
         cli.write_desired_candidate_unit(
@@ -103,6 +112,74 @@ def _write_generated_units(root: Path, projection: cli.StackProjection, source_r
             ),
             source_root,
         )
+
+
+def test_direct_stack_instantiation_from_template_only_source_is_replay_safe(tmp_path: Path, monkeypatch):
+    source, environment, source_revision = _template_only_repository(tmp_path)
+    store = GitStateStore(source)
+    initial = tmp_path / "initial"
+    projection = cli.project_stack_resources(source, "dev", source_revision, initial, source)
+    assert projection.generated_units == {}
+    source_head = _git(source, "rev-parse", "HEAD")
+    desired = store.publish("deploy/dev", initial, None, "publish template-only desired state")
+
+    monkeypatch.setattr(cli, "REPOSITORY_ROOT", source)
+    args = cli.build_parser().parse_args(
+        [
+            "instantiate-stack",
+            "--environment",
+            "dev",
+            "--stack",
+            "web",
+            "--template",
+            "preview",
+            "--source-revision",
+            source_revision,
+            "--parameters",
+            '{"source-path":"."}',
+            "--request-id",
+            "github:example/application#123",
+            "--desired-ref",
+            "deploy/dev",
+            "--observed-ref",
+            "observed/dev",
+        ]
+    )
+
+    assert cli.command_instantiate_stack(args) is True
+    instantiated_revision = store.fetch("deploy/dev").revision
+    assert instantiated_revision is not None
+    assert instantiated_revision != desired.revision
+
+    instantiated = tmp_path / "instantiated"
+    store.materialize(instantiated_revision, instantiated)
+    stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(next((instantiated / "stacks").glob("web.*"))),
+        profile="desired",
+        expected_name="web",
+    )
+    assert stack.metadata.lifecycle is not None
+    assert stack.metadata.lifecycle.management is not None
+    assert stack.metadata.lifecycle.management.mode == "direct"
+    assert isinstance(stack.spec, cli.DesiredStackSpec)
+    assert stack.spec.provenance is not None
+    assert stack.spec.provenance.templateRevision == source_revision
+    assert stack.spec.provenance.templatePath.endswith("stack-templates/preview.json")
+    template = cli.RESOURCE_CATALOG.parse_stack_template(
+        cli.RESOURCE_CATALOG.load_document(next((instantiated / "stack-templates").glob("preview.*"))),
+        profile="desired",
+        expected_name="preview",
+    )
+    assert template.metadata.uid is not None
+    unit = cli.load_desired_unit(next((instantiated / "units").glob("web--preview-app.*")), "web--preview-app")
+    assert unit.metadata.lifecycle is not None
+    assert unit.metadata.lifecycle.owner is not None
+    assert unit.metadata.lifecycle.owner.uid == stack.metadata.uid
+    assert not list((environment / "stacks").glob("web.*"))
+    assert _git(source, "rev-parse", "HEAD") == source_head
+
+    assert cli.command_instantiate_stack(args) is False
+    assert store.fetch("deploy/dev").revision == instantiated_revision
 
 
 def test_stack_lifecycle_survives_git_restart_and_tears_down_in_reverse_order(tmp_path: Path):
