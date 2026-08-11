@@ -100,6 +100,12 @@
           },
           "type": "object"
         },
+        "stackTemplatesPath": {
+          "description": "Repository-relative directory containing authored StackTemplates.",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$",
+          "type": "string"
+        },
         "writeFormat": {
           "enum": [
             "yaml",

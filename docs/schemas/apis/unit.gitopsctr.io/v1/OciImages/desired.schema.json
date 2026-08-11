@@ -28,6 +28,7 @@
             "not": {
               "enum": [
                 "fromArtifact",
+                "fromEnvironment",
                 "fromPromotion",
                 "fromReceipt"
               ]
@@ -182,6 +183,7 @@
                 "not": {
                   "enum": [
                     "fromArtifact",
+                    "fromEnvironment",
                     "fromPromotion",
                     "fromReceipt"
                   ]
@@ -301,6 +303,23 @@
               "additionalProperties": false,
               "properties": {
                 "artifacts": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "importedArtifacts": {
                   "anyOf": [
                     {
                       "additionalProperties": {

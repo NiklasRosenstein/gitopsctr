@@ -60,16 +60,19 @@ def reference_fingerprints(*resolutions: TemplateResolution) -> ResolvedInputs |
     promotions: dict[str, str] = {}
     receipts: dict[str, str] = {}
     artifacts: dict[str, str] = {}
+    imported_artifacts: dict[str, str] = {}
     for resolution in resolutions:
         promotions.update(resolution.promotions)
         receipts.update(resolution.receipts)
         artifacts.update(resolution.artifacts)
-    if not (promotions or receipts or artifacts):
+        imported_artifacts.update(resolution.imported_artifacts)
+    if not (promotions or receipts or artifacts or imported_artifacts):
         return None
     return ResolvedInputs(
         promotions=promotions or None,
         receipts=receipts or None,
         artifacts=artifacts or None,
+        importedArtifacts=imported_artifacts or None,
     )
 
 

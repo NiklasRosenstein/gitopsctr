@@ -16,7 +16,13 @@ from mashumaro.mixins.dict import DataClassDictMixin
 from mashumaro.types import SerializableType
 
 from gitopsctr.api import GVK
-from gitopsctr.document import REFERENCE_KEYS, JsonObject, JsonScalar, JsonValue, require_json_value
+from gitopsctr.document import REFERENCE_KEYS as DOCUMENT_REFERENCE_KEYS
+from gitopsctr.document import JsonObject, JsonScalar, JsonValue, require_json_value
+
+# ``fromEnvironment`` is a value lookup, not a source or lifecycle reference.
+# Keep it in this module's expression language without changing the lower-level
+# document contract used by resolved JSON values.
+REFERENCE_KEYS = frozenset((*DOCUMENT_REFERENCE_KEYS, "fromEnvironment"))
 
 type ResourceName = Annotated[str, Pattern("^[a-z0-9][a-z0-9-]*$")]
 type JsonPointer = Annotated[str, Pattern("^(?:$|/(?:[^~]|~[01])*)$")]
@@ -135,6 +141,21 @@ class PromotionReference(TemplateModel):
 
 
 @dataclass(frozen=True, kw_only=True)
+class EnvironmentReferenceTarget(TemplateModel):
+    pointer: JsonPointer = ""
+
+    def __post_init__(self) -> None:
+        _validate_pointer(self.pointer)
+
+
+@dataclass(frozen=True, kw_only=True)
+class EnvironmentReference(TemplateModel):
+    """Read a value from the Environment resource in the target context."""
+
+    fromEnvironment: EnvironmentReferenceTarget
+
+
+@dataclass(frozen=True, kw_only=True)
 class ParameterReferenceTarget(TemplateModel):
     name: ResourceName
 
@@ -150,13 +171,15 @@ class ParameterReference(TemplateModel):
     fromParameter: ParameterReferenceTarget
 
 
-type ReferenceExpression = ReceiptReference | ArtifactReference | PromotionReference
+type ReferenceExpression = ReceiptReference | ArtifactReference | PromotionReference | EnvironmentReference
 type ParameterExpression = ParameterReference
 FixedT = TypeVar("FixedT")
 # Mashumaro does not yet expand a PEP 695 generic alias while generating JSON Schema.
 AuthoredValue: TypeAlias = FixedT | ReferenceExpression  # noqa: UP040
 type TemplateValue = (
-    ReceiptReference
+    ParameterReference
+    | EnvironmentReference
+    | ReceiptReference
     | ArtifactReference
     | PromotionReference
     | JsonScalar
@@ -165,7 +188,11 @@ type TemplateValue = (
 )
 
 type ParameterTemplateValue = (
-    ParameterReference | JsonScalar | list[ParameterTemplateValue] | dict[str, ParameterTemplateValue]
+    ParameterReference
+    | ReferenceExpression
+    | JsonScalar
+    | list[ParameterTemplateValue]
+    | dict[str, ParameterTemplateValue]
 )
 
 
@@ -252,6 +279,10 @@ def _parse_reference(value: dict[str, object], pointer: str) -> ReferenceExpress
     if not isinstance(target, dict) or not all(isinstance(name, str) for name in target):
         raise TemplateError(f"{_child_pointer(pointer, key)}: invalid {key} reference")
     try:
+        if key == "fromEnvironment":
+            parsed = EnvironmentReferenceTarget.from_dict(target)
+            _validate_pointer(parsed.pointer)
+            return EnvironmentReference(fromEnvironment=parsed)
         if key == "fromReceipt":
             if "unit" not in target:
                 raise TemplateError("fromReceipt requires unit")
@@ -326,6 +357,8 @@ def parse_template_value(value: object, pointer: str = "") -> TemplateValue:
         if not all(isinstance(name, str) for name in value):
             raise TemplateError("template object keys must be strings")
         candidate = cast(dict[str, object], value)
+        if "fromParameter" in candidate:
+            return _parse_parameter_reference(candidate, pointer)
         if REFERENCE_KEYS.intersection(candidate):
             return _parse_reference(candidate, pointer)
         return {name: parse_template_value(item, _child_pointer(pointer, name)) for name, item in candidate.items()}
@@ -387,11 +420,18 @@ def dump_template_value(value: TemplateValue) -> JsonValue:
         if has_dry_fallback(value.fromPromotion):
             target["dryFallback"] = value.fromPromotion.dryFallback.value
         return {"fromPromotion": target}
+    if isinstance(value, EnvironmentReference):
+        target: JsonObject = {}
+        if value.fromEnvironment.pointer:
+            target["pointer"] = value.fromEnvironment.pointer
+        return {"fromEnvironment": target}
+    if isinstance(value, ParameterReference):
+        return {"fromParameter": {"name": value.fromParameter.name}}
     if isinstance(value, list):
         return [dump_template_value(item) for item in value]
     if isinstance(value, dict):
         return {name: dump_template_value(item) for name, item in value.items()}
-    return value
+    return cast(JsonValue, value)
 
 
 def dump_parameter_value(value: ParameterTemplateValue) -> JsonValue:
@@ -403,15 +443,17 @@ def dump_parameter_value(value: ParameterTemplateValue) -> JsonValue:
         return [dump_parameter_value(item) for item in value]
     if isinstance(value, dict):
         return {name: dump_parameter_value(item) for name, item in value.items()}
-    return value
+    return cast(JsonValue, value)
 
 
-def resolve_parameter_value(value: ParameterTemplateValue, parameters: Mapping[str, JsonValue]) -> JsonValue:
-    """Resolve a parameter expression tree into a detached JSON value."""
+def resolve_parameter_value(
+    value: ParameterTemplateValue, parameters: Mapping[str, JsonValue]
+) -> ParameterTemplateValue:
+    """Resolve parameters and preserve other runtime references for later resolution."""
 
     if isinstance(value, ParameterReference):
         try:
-            return deepcopy(parameters[value.fromParameter.name])
+            return cast(ParameterTemplateValue, deepcopy(parameters[value.fromParameter.name]))
         except KeyError as exc:
             raise TemplateError(f"missing parameter: {value.fromParameter.name}") from exc
     if isinstance(value, list):

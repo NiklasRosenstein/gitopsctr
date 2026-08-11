@@ -239,6 +239,23 @@
                   ],
                   "default": null
                 },
+                "importedArtifacts": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
                 "promotions": {
                   "anyOf": [
                     {

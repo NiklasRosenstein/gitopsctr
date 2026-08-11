@@ -53,6 +53,12 @@ PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
                     "pattern": r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+$",
                     "description": "Repository-relative directory containing authored environments.",
                 },
+                "stackTemplatesPath": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+$",
+                    "description": "Repository-relative directory containing authored StackTemplates.",
+                },
                 "environmentDefaults": {
                     "type": "object",
                     "properties": {
@@ -176,6 +182,7 @@ class Project:
     name: str
     write_format: DocumentFormat = DocumentFormat.YAML
     environments_path: PurePosixPath = PurePosixPath("deployment/environments")
+    stack_templates_path: PurePosixPath = PurePosixPath("deployment/stack-templates")
     environment_defaults: EnvironmentDefaults = EnvironmentDefaults()
     source_revision_policy: SourceRevisionPolicy = SourceRevisionPolicy()
 
@@ -214,6 +221,11 @@ def validate_project_document(value: object, path: Path) -> Project:
     environments_path = PurePosixPath(cast(str, specification.get("environmentsPath", "deployment/environments")))
     if environments_path.is_absolute() or ".." in environments_path.parts:
         raise DocumentFormatError(f"invalid project config {path}: environmentsPath must stay inside the source tree")
+    stack_templates_path = PurePosixPath(
+        cast(str, specification.get("stackTemplatesPath", "deployment/stack-templates"))
+    )
+    if stack_templates_path.is_absolute() or ".." in stack_templates_path.parts:
+        raise DocumentFormatError(f"invalid project config {path}: stackTemplatesPath must stay inside the source tree")
     environment_defaults_document = cast(dict[str, Any], specification.get("environmentDefaults", {}))
     refs_document = cast(dict[str, Any], environment_defaults_document.get("refs", {}))
     source_revision_policy_document = cast(dict[str, Any], specification.get("sourceRevisionPolicy", {}))
@@ -221,6 +233,7 @@ def validate_project_document(value: object, path: Path) -> Project:
         name=project_name,
         write_format=DocumentFormat.JSON if selected == "json" else DocumentFormat.YAML,
         environments_path=environments_path,
+        stack_templates_path=stack_templates_path,
         environment_defaults=EnvironmentDefaults(
             refs=EnvironmentRefTemplates(
                 desired=cast(str, refs_document.get("desired", DEFAULT_DESIRED_REF_TEMPLATE)),

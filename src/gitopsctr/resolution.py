@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 from gitopsctr.document import JsonValue
 from gitopsctr.errors import OperationError, ReferenceUnavailable
 from gitopsctr.templates import (
     ArtifactReference,
     ArtifactReferenceTarget,
+    EnvironmentReference,
     PromotionReference,
     ReceiptReference,
     ReceiptReferenceTarget,
@@ -25,6 +27,7 @@ from gitopsctr.templates import (
 class FingerprintedValue:
     value: JsonValue
     fingerprint: str
+    imported: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,7 @@ class ResolutionContext:
     receipt: Callable[[ReceiptReferenceTarget], FingerprintedValue]
     artifact: Callable[[ArtifactReferenceTarget], FingerprintedValue]
     promotion: Callable[[PromotionReferenceSelection], FingerprintedValue]
+    environment: Callable[[str], FingerprintedValue] | None = None
     unit: str | None = None
     dry: bool = False
 
@@ -51,12 +55,14 @@ class TemplateResolution:
     promotions: dict[str, str]
     receipts: dict[str, str]
     artifacts: dict[str, str]
+    imported_artifacts: dict[str, str]
 
 
 def resolve_template(value: object, context: ResolutionContext, pointer: str = "") -> TemplateResolution:
     promotions: dict[str, str] = {}
     receipts: dict[str, str] = {}
     artifacts: dict[str, str] = {}
+    imported_artifacts: dict[str, str] = {}
     try:
         expression = parse_template_value(value, pointer)
     except TemplateError as exc:
@@ -85,6 +91,11 @@ def resolve_template(value: object, context: ResolutionContext, pointer: str = "
                 raise
             promotions[f"{selection.unit}#{selection.pointer}"] = resolved.fingerprint
             return resolved.value
+        if isinstance(candidate, EnvironmentReference):
+            if context.environment is None:
+                raise OperationError(f"{location or '/'}: fromEnvironment is unavailable in this context")
+            resolved = context.environment(candidate.fromEnvironment.pointer)
+            return resolved.value
         if isinstance(candidate, ReceiptReference):
             try:
                 resolved = context.receipt(candidate.fromReceipt)
@@ -101,8 +112,12 @@ def resolve_template(value: object, context: ResolutionContext, pointer: str = "
                 if context.dry and has_dry_fallback(candidate.fromArtifact):
                     return resolve(parse_template_value(candidate.fromArtifact.dryFallback.value, location), location)
                 raise
-            artifacts[f"{candidate.fromArtifact.unit}/{candidate.fromArtifact.name}"] = resolved.fingerprint
+            key = f"{candidate.fromArtifact.unit}/{candidate.fromArtifact.name}"
+            if resolved.imported:
+                imported_artifacts[key] = resolved.fingerprint
+            else:
+                artifacts[key] = resolved.fingerprint
             return resolved.value
-        return candidate
+        return cast(JsonValue, candidate)
 
-    return TemplateResolution(resolve(expression, pointer), promotions, receipts, artifacts)
+    return TemplateResolution(resolve(expression, pointer), promotions, receipts, artifacts, imported_artifacts)
