@@ -224,6 +224,14 @@ until deployments provide a complete supported-ref inventory and pass a clean au
 
 The read-only `audit-desired-compatibility` command now materializes one exact desired ref and emits versioned JSON.
 It reports legacy or partial Units, invalid resource graphs, ambiguous cleanup state, unverified deletion identities,
-and opaque cleanup roots. It returns non-zero when findings exist. Three focused tests cover clean canonical state,
-legacy state, and unsafe cleanup state. Full verification remains at 553 tests. Live legacy retirement still needs a
-complete supported-ref inventory and a clean audit for every ref.
+and opaque cleanup roots. It returns non-zero when findings exist. Focused tests cover clean canonical state, legacy
+state, and unsafe cleanup state. Live legacy retirement still needs a complete supported-ref inventory and a clean
+audit for every ref.
+
+### 8.3 Aggregate desired compatibility audit — complete for Project-configured refs
+
+`audit-desired-compatibility --all` now discovers environments from
+`Project.spec.environmentsPath`, resolves each configured desired ref, audits each ref once, reports duplicate refs,
+and emits one versioned JSON report with per-environment results. It continues after one ref is missing or unavailable,
+so the report identifies all failures. Focused coverage includes multiple environments, custom refs, duplicate refs,
+and partial failures. Out-of-band desired refs still require explicit inventory before legacy removal.

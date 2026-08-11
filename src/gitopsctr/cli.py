@@ -228,6 +228,14 @@ class CompatibilityFinding(TypedDict):
     message: str
 
 
+class CompatibilityAuditResult(TypedDict):
+    environment: str
+    ref: str | None
+    revision: str | None
+    clean: bool
+    findings: list[CompatibilityFinding]
+
+
 class UnitStatusSnapshot(TypedDict):
     unit: str
     status: str
@@ -8055,16 +8063,11 @@ def _audit_desired_compatibility(root: Path) -> list[CompatibilityFinding]:
     return sorted(findings, key=lambda finding: (finding["path"], finding["code"], finding["unit"]))
 
 
-def command_audit_desired_compatibility(args: argparse.Namespace) -> None:
-    """Audit one desired ref without publishing or invoking a driver."""
-
-    _resource_name(args.environment, "environment name")
-    if not isinstance(args.desired_ref, str) or not args.desired_ref:
-        raise OperationError("audit-desired-compatibility requires --desired-ref")
+def _audit_desired_compatibility_ref(desired_ref: str) -> tuple[str | None, list[CompatibilityFinding]]:
     with tempfile.TemporaryDirectory() as temporary_directory:
         desired = Path(temporary_directory) / "desired"
         try:
-            revision = observed_tree(args.desired_ref, desired)
+            revision = observed_tree(desired_ref, desired)
         except Exception:
             revision = None
             findings = [
@@ -8087,6 +8090,145 @@ def command_audit_desired_compatibility(args: argparse.Namespace) -> None:
                 ]
             else:
                 findings = _audit_desired_compatibility(desired)
+    return revision, findings
+
+
+def _compatibility_audit_result(
+    environment: str,
+    desired_ref: str | None,
+) -> CompatibilityAuditResult:
+    if desired_ref is None:
+        findings = [
+            _compatibility_finding(
+                "unavailable-ref",
+                "",
+                "",
+                "environment desired ref cannot be resolved",
+            )
+        ]
+        return {
+            "environment": environment,
+            "ref": None,
+            "revision": None,
+            "clean": False,
+            "findings": findings,
+        }
+    revision, findings = _audit_desired_compatibility_ref(desired_ref)
+    return {
+        "environment": environment,
+        "ref": desired_ref,
+        "revision": revision,
+        "clean": not findings,
+        "findings": findings,
+    }
+
+
+def _aggregate_compatibility_report() -> dict[str, Any]:
+    top_level_findings: list[CompatibilityFinding] = []
+    try:
+        project = load_project_config(REPOSITORY_ROOT)
+    except Exception:
+        project = None
+        top_level_findings.append(
+            _compatibility_finding(
+                "unavailable-project",
+                "",
+                "",
+                "Project configuration cannot be read",
+            )
+        )
+
+    if project is None:
+        environments: list[str] = []
+    else:
+        environments_root = REPOSITORY_ROOT.joinpath(*project.environments_path.parts)
+        if not environments_root.is_dir():
+            top_level_findings.append(
+                _compatibility_finding(
+                    "unavailable-environments-path",
+                    project.environments_path.as_posix(),
+                    "",
+                    "Project environmentsPath does not exist",
+                )
+            )
+            environments = []
+        else:
+            environments = sorted(path.name for path in environments_root.iterdir() if path.is_dir())
+
+    resolved: list[tuple[str, str | None]] = []
+    for environment in environments:
+        try:
+            desired_ref, _observed_ref = deployment_refs(REPOSITORY_ROOT, environment)
+        except Exception:
+            desired_ref = None
+        resolved.append((environment, desired_ref))
+
+    by_ref: dict[str, list[str]] = {}
+    for environment, desired_ref in resolved:
+        if desired_ref is not None:
+            by_ref.setdefault(desired_ref, []).append(environment)
+
+    cache: dict[str, tuple[str | None, list[CompatibilityFinding]]] = {}
+    results: list[CompatibilityAuditResult] = []
+    for environment, desired_ref in resolved:
+        if desired_ref is None:
+            result = _compatibility_audit_result(environment, None)
+        else:
+            if desired_ref not in cache:
+                cache[desired_ref] = _audit_desired_compatibility_ref(desired_ref)
+            revision, findings = cache[desired_ref]
+            result = cast(
+                CompatibilityAuditResult,
+                {
+                    "environment": environment,
+                    "ref": desired_ref,
+                    "revision": revision,
+                    "clean": not findings,
+                    "findings": list(findings),
+                },
+            )
+            owners = by_ref[desired_ref]
+            if len(owners) > 1:
+                result["findings"].append(
+                    _compatibility_finding(
+                        "duplicate-desired-ref",
+                        "",
+                        "",
+                        "desired ref is configured for multiple environments: " + ", ".join(owners),
+                    )
+                )
+                result["findings"].sort(key=lambda finding: (finding["path"], finding["code"], finding["unit"]))
+                result["clean"] = False
+        results.append(result)
+
+    clean = not top_level_findings and all(result["clean"] for result in results)
+    return {
+        "schema": 1,
+        "mode": "all",
+        "clean": clean,
+        "environments": results,
+        "findings": sorted(top_level_findings, key=lambda finding: (finding["path"], finding["code"])),
+    }
+
+
+def command_audit_desired_compatibility(args: argparse.Namespace) -> None:
+    """Audit desired refs without publishing or invoking a driver."""
+
+    if getattr(args, "all", False):
+        if args.environment or args.desired_ref:
+            raise OperationError("--all cannot be combined with --environment or --desired-ref")
+        result = _aggregate_compatibility_report()
+        print(json.dumps(result, indent=2, sort_keys=True))
+        if not result["clean"]:
+            raise OperationError("aggregate desired compatibility audit found unsafe state")
+        return
+
+    if not isinstance(args.environment, str) or not args.environment:
+        raise OperationError("audit-desired-compatibility requires --all or --environment with --desired-ref")
+    _resource_name(args.environment, "environment name")
+    if not isinstance(args.desired_ref, str) or not args.desired_ref:
+        raise OperationError("audit-desired-compatibility requires --desired-ref")
+    revision, findings = _audit_desired_compatibility_ref(args.desired_ref)
 
     result = {
         "schema": 1,
@@ -10185,10 +10327,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit_compatibility = commands.add_parser(
         "audit-desired-compatibility",
-        help="audit one desired ref before retiring legacy compatibility",
+        help="audit one or all desired refs before retiring legacy compatibility",
     )
-    audit_compatibility.add_argument("--environment", required=True)
-    audit_compatibility.add_argument("--desired-ref", required=True)
+    audit_compatibility.add_argument("--environment")
+    audit_compatibility.add_argument("--desired-ref")
+    audit_compatibility.add_argument(
+        "--all",
+        action="store_true",
+        help="audit every environment configured by Project.environmentsPath",
+    )
     audit_compatibility.set_defaults(handler=command_audit_desired_compatibility)
 
     status = commands.add_parser(

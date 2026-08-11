@@ -32,14 +32,14 @@ implementation.
 | Direct and source-tracked Stack deletion/finalization | **Implemented core lifecycle** | `d071c1e` adds source-absence intents, direct UID/generation-fenced requests, child obligations, and root finalization after owned Units. |
 | Controller-owned source pins | **Lifecycle and claim recovery implemented** | `5d3a5a0` provides fenced refs; `36a529b` recovers present direct Stacks, and `57dd132` handles finalized tombstone and proven pre-publication cleanup. The current implementation adds CAS-fenced `gitopsctr/pin-claims/stacks/...` records, candidate ownership checks, and safe reaping; unclaimed legacy pins are retained. |
 | Forge eligibility/expiry/orphan recovery | **GitHub and GitLab eligibility implemented; merge enforcement remains external** | `36a529b` implements fail-closed GitHub eligibility, expiry, pin comparison, and UID-fenced cleanup requests for present roots. The read-only `glab` adapter and CAS-fenced orphan recovery are now implemented. Authoritative merge-time enforcement remains deployment configuration. |
-| Stack dependency ordering | **Convergence and multi-instance isolation implemented** | `3b25f04` includes Stack-generated and desired-only Stack Units in convergence/status and preserves explicit cross-kind Stack edges during teardown; the current increment scopes generated names as `<stack>--<template-unit>`. External-driver acceptance remains. |
+| Stack dependency ordering | **Convergence, multi-instance isolation, and external-driver acceptance implemented** | `3b25f04` includes Stack-generated and desired-only Stack Units in convergence/status and preserves explicit cross-kind Stack edges during teardown; the current increment scopes generated names as `<stack>--<template-unit>`. The temporary-repository inventory harness and Docker/Terraform demo exercise dependency-safe external deployment and reverse teardown. |
 | Argo integration and external publication | **Boundary and Argo absence observation implemented; external publication remains deployment-owned** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. Argo-backed Kubernetes Units now wait for Application absence during teardown, and the Kubernetes/Argo acceptance job proves external delivery and observation. This repository still does not publish preview manifests or own ApplicationSet resources. |
-| End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. The read-only compatibility audit now reports unsafe state for one explicit desired ref. Forge policy configuration and complete legacy migration remain open. |
+| End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. The read-only compatibility audit covers one explicit ref or all Project-configured environments. Forge policy configuration and complete legacy migration remain open. |
 
-The repository verification suite currently passes (`553` tests), including the landed concurrency, recovery,
+The repository verification suite currently passes (`557` tests), including the landed concurrency, recovery,
 incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
 not sufficient, for the remaining preview-environment milestones because forge policy configuration,
-Stack-specific external acceptance, and legacy migration are still open.
+deployment-owned publication, and legacy migration are still open.
 
 ## Problem and scope
 
@@ -229,7 +229,7 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
 - StackTemplate dependency declarations are validated and retained in the projected graph. `3b25f04` integrates them
   into generic convergence/status and reverse teardown ordering. Generated Unit names are Stack-scoped in desired
   state, and intra-template receipt/artifact/promotion references are rewritten to the same concrete names. Restart
-  and external-driver acceptance are still to be added.
+  and external-driver acceptance are covered by the temporary-repository inventory harness and Docker/Terraform demo.
 - Secrets are references to an external secret mechanism, not plaintext Stack parameters committed to Git.
 
 The implementation currently uses `deployment/environments/<environment>/stack-templates/` and `stacks/` for authored
@@ -304,12 +304,14 @@ source-tracked roots:
   reader and this exception are then removed. The read-only
   `audit-desired-compatibility --environment ... --desired-ref ...` command emits
   versioned JSON and returns non-zero while one ref has legacy, partial,
-  unparseable, ambiguous, opaque, or unverified cleanup state. A complete
+  unparseable, ambiguous, opaque, or unverified cleanup state. The `--all` mode
+  inventories Project-configured environments, resolves their desired refs,
+  detects duplicate refs, and reports per-environment results. A complete
   supported-ref inventory and clean audit are still required before removal.
 
 ## Acceptance contract
 
-The planned fast acceptance harness will use a real temporary Git repository and a deterministic external inventory
+The fast acceptance harness uses a real temporary Git repository and a deterministic external inventory
 driver that rejects dependency-unsafe deletion. A smaller integration against the existing Docker/Terraform demo will
 prove that real Terraform destroy removes the managed container; `terraform state list` is empty although the state
 file may remain. Out-of-band demo cleanup is only a final safety net.
@@ -416,7 +418,7 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
 - [x] Add direct Stack deletion requests with UID/generation fencing.
 - [x] Generalize two-phase finalization and teardown ordering from Units to Stack-owned closures.
 - [x] Integrate explicit StackTemplate dependencies, including cross-kind edges, into generic convergence/status and
-  reverse teardown ordering; external-driver acceptance remains a separate item.
+  reverse teardown ordering; external-driver acceptance is covered by the inventory harness and Docker/Terraform demo.
 - [x] Add focused Stack lifecycle, restart/recovery, and dependency-ordering acceptance coverage in
   `tests/test_preview_acceptance.py`; real Docker/Terraform, Kubernetes, and Argo acceptance jobs are present.
 - [x] Add a real temporary-repository Stack harness with a deterministic external inventory, restart recovery, UID
@@ -429,6 +431,8 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
   preview manifest publication and provider-specific setup remain deployment-owned.
 - [x] Add GitHub and GitLab.com eligibility, expiry handling, present-root recovery, and CAS-fenced candidate-aware
   orphan-pin recovery; GitLab setup and deployment scheduling remain follow-up work.
+- [x] Add a read-only compatibility audit for one desired ref and an aggregate mode for all Project-configured
+  environments; keep legacy retirement pending until out-of-band refs are inventoried and every audit is clean.
 - [ ] Configure and verify required forge freshness checks or merge-queue/branch-protection enforcement at merge time;
   repository CI now verifies GitHub `pull_request` and `merge_group` heads, but required-check policy remains external.
 - [ ] Remove legacy implicit-root compatibility after the documented migration condition is met.

@@ -156,8 +156,16 @@ gitopsctr audit-desired-compatibility \
   --desired-ref deploy/dev
 ```
 
+For all environments configured by the Project, use the aggregate report:
+
+```console
+gitopsctr audit-desired-compatibility --all
+```
+
 The command is read-only. It always prints versioned JSON. A clean ref has
 `"clean": true` and no findings. Legacy or partial Units, invalid resource
 graphs, ambiguous cleanup state, unverified deletion identities, and opaque
 cleanup roots produce findings and a non-zero exit status. Run it for every
-supported desired ref before removing compatibility handling.
+supported desired ref, or use `--all` to audit the complete Project-configured
+inventory, before removing compatibility handling. Duplicate desired refs and
+unavailable environment configuration also fail the aggregate audit.
