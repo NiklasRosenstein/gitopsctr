@@ -6886,6 +6886,28 @@ def _stack_intent_for_resource(
     )
 
 
+def _release_stack_controller_pin(intent: StackDeletionIntent) -> None:
+    """Release a finalized Stack pin and its claim under both identity fences."""
+
+    pin = intent.controller_pin
+    if pin is None:
+        return
+    store = state_store()
+    store.release_controller_pin(pin.name, pin.revision)
+    read_claim = getattr(store, "read_controller_pin_claim", None)
+    delete_claim = getattr(store, "delete_controller_pin_claim", None)
+    if read_claim is None:
+        return
+    claim = read_claim(pin.name)
+    if claim is None:
+        return
+    if claim.pin_name != pin.name or claim.uid != intent.uid or claim.pin_revision != pin.revision:
+        raise OperationError(f"Stack {intent.stack_name}: controller pin claim fence does not match the Stack")
+    if delete_claim is None or claim.revision is None:
+        raise OperationError(f"Stack {intent.stack_name}: controller pin claim cannot be released safely")
+    delete_claim(claim.ref.removeprefix("gitopsctr/pin-claims/"), claim.revision)
+
+
 def _command_request_delete_direct_stack(args: argparse.Namespace) -> bool:
     _resource_name(args.environment, "environment name")
     _resource_name(args.stack, "Stack name")
@@ -7018,43 +7040,64 @@ def _command_finalize_stack(args: argparse.Namespace) -> bool:
         if intent.deletion_generation != args.deletion_generation:
             raise OperationError(f"stale Stack deletion generation fence for {args.stack!r}")
         stack_path = _current_desired_stack_paths(current, "Stack").get(args.stack)
-        if stack_path is None:
-            return False
-        if file_blob(stack_path) != intent.cleanup_identity.blob:
-            raise OperationError(f"retained Stack cleanup root changed for {args.stack!r}")
-        resources = load_desired_resource_graph(current)
-        child_intents = load_desired_deletion_intents(current)
-        active_children = [
-            resource.name
-            for resource in resources.values()
-            if isinstance(resource, UnitResource)
-            and resource.metadata.lifecycle is not None
-            and resource.metadata.lifecycle.owner is not None
-            and resource.metadata.lifecycle.owner.kind == "Stack"
-            and resource.metadata.lifecycle.owner.name == args.stack
-            and resource.metadata.lifecycle.owner.uid == args.uid
-        ]
-        active_children.extend(
-            identity.unit_name
-            for identity in intent.owned_unit_closure
-            if identity.unit_name in child_intents and identity.unit_name not in active_children
-        )
-        if active_children:
-            raise OperationError("active owned Units must be finalized first: " + ", ".join(sorted(active_children)))
         candidate = temporary / "candidate"
-        shutil.copytree(current, candidate)
-        write_stack_incarnation_tombstone(
-            candidate,
-            StackIncarnationTombstone(stack_name=args.stack, uid=intent.uid),
-        )
-        for path in document_candidates(candidate / "stacks", args.stack):
-            path.unlink()
-        for path in document_candidates(candidate / DESIRED_STACK_DELETION_INTENTS_PATH, args.stack):
-            path.unlink()
-        blocks = load_desired_transition_blocks(candidate)
-        blocks.pop(args.stack, None)
-        write_desired_transition_blocks(candidate, blocks)
-        load_desired_resource_graph(candidate)
+        if stack_path is None:
+            tombstone = load_desired_stack_incarnation_tombstones(current).get(args.stack)
+            if tombstone is None or tombstone.uid != args.uid:
+                return False
+            child_intents = load_desired_deletion_intents(current)
+            active_children = sorted(
+                identity.unit_name for identity in intent.owned_unit_closure if identity.unit_name in child_intents
+            )
+            if active_children:
+                raise OperationError("active owned Units must be finalized first: " + ", ".join(active_children))
+            if not args.dry:
+                _release_stack_controller_pin(intent)
+            shutil.copytree(current, candidate)
+            for path in document_candidates(candidate / DESIRED_STACK_DELETION_INTENTS_PATH, args.stack):
+                path.unlink()
+            blocks = load_desired_transition_blocks(candidate)
+            blocks.pop(args.stack, None)
+            write_desired_transition_blocks(candidate, blocks)
+            load_desired_resource_graph(candidate)
+        else:
+            if file_blob(stack_path) != intent.cleanup_identity.blob:
+                raise OperationError(f"retained Stack cleanup root changed for {args.stack!r}")
+            resources = load_desired_resource_graph(current)
+            child_intents = load_desired_deletion_intents(current)
+            active_children = [
+                resource.name
+                for resource in resources.values()
+                if isinstance(resource, UnitResource)
+                and resource.metadata.lifecycle is not None
+                and resource.metadata.lifecycle.owner is not None
+                and resource.metadata.lifecycle.owner.kind == "Stack"
+                and resource.metadata.lifecycle.owner.name == args.stack
+                and resource.metadata.lifecycle.owner.uid == args.uid
+            ]
+            active_children.extend(
+                identity.unit_name
+                for identity in intent.owned_unit_closure
+                if identity.unit_name in child_intents and identity.unit_name not in active_children
+            )
+            if active_children:
+                raise OperationError(
+                    "active owned Units must be finalized first: " + ", ".join(sorted(active_children))
+                )
+            shutil.copytree(current, candidate)
+            write_stack_incarnation_tombstone(
+                candidate,
+                StackIncarnationTombstone(stack_name=args.stack, uid=intent.uid),
+            )
+            for path in document_candidates(candidate / "stacks", args.stack):
+                path.unlink()
+            if intent.controller_pin is None:
+                for path in document_candidates(candidate / DESIRED_STACK_DELETION_INTENTS_PATH, args.stack):
+                    path.unlink()
+            blocks = load_desired_transition_blocks(candidate)
+            blocks.pop(args.stack, None)
+            write_desired_transition_blocks(candidate, blocks)
+            load_desired_resource_graph(candidate)
         candidate_id = candidate_identifier(
             "finalize-stack",
             args.environment,
@@ -7085,20 +7128,50 @@ def _command_finalize_stack(args: argparse.Namespace) -> bool:
         )
         if args.dry:
             return False
-        if outcome is None and intent.controller_pin is not None:
-            store = state_store()
-            try:
-                store.release_controller_pin(intent.controller_pin.name, intent.controller_pin.revision)
-                read_claim = getattr(store, "read_controller_pin_claim", None)
-                delete_claim = getattr(store, "delete_controller_pin_claim", None)
-                if read_claim is not None and delete_claim is not None:
-                    claim = read_claim(intent.controller_pin.name)
-                    if claim is not None and claim.revision is not None:
-                        delete_claim(intent.controller_pin.name, claim.revision)
-            except OperationError as exc:
-                log_status(
-                    "WAIT", f"Stack {args.stack}: desired state finalized; source pin release needs retry: {exc}"
-                )
+        if outcome is None and intent.controller_pin is not None and stack_path is not None:
+            _release_stack_controller_pin(intent)
+            cleanup_candidate = temporary / "cleanup-candidate"
+            shutil.copytree(candidate, cleanup_candidate)
+            for path in document_candidates(cleanup_candidate / DESIRED_STACK_DELETION_INTENTS_PATH, args.stack):
+                path.unlink()
+            cleanup_blocks = load_desired_transition_blocks(cleanup_candidate)
+            cleanup_blocks.pop(args.stack, None)
+            write_desired_transition_blocks(cleanup_candidate, cleanup_blocks)
+            load_desired_resource_graph(cleanup_candidate)
+            cleanup_id = candidate_identifier(
+                "finalize-stack",
+                args.environment,
+                cleanup_candidate,
+                desired_ref,
+                revision,
+                {
+                    "stack": args.stack,
+                    "uid": args.uid,
+                    "deletionGeneration": args.deletion_generation,
+                    "phase": "pin-cleanup",
+                },
+            )
+            cleanup_ref = resolve_candidate_ref(
+                REPOSITORY_ROOT,
+                args.environment,
+                "finalize-stack",
+                cleanup_id,
+                args.candidate_ref,
+            )
+            revision, outcome = publish_desired_change(
+                args.environment,
+                cleanup_candidate,
+                desired_ref,
+                revision,
+                cleanup_ref,
+                f"Finalize direct Stack {args.stack} pin cleanup",
+                f"Finalize direct Stack {args.stack}",
+                f"Remove the completed deletion intent for directly managed Stack `{args.stack}`.",
+                False,
+                candidate,
+                request_change=False,
+            )
+            candidate_ref = cleanup_ref
         print(revision)
         write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
         return True

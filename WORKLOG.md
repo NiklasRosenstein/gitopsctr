@@ -270,5 +270,13 @@ normal `gitopsctr` CLI primitives. Scheduled CI may enumerate preview refs or re
 GitLab, and request cleanup for missed events. `advance-desired`, reconciliation, and finalization remain forge-
 independent. The core no longer contains preview eligibility/orphan-recovery adapters or the repository recovery
 workflow; lifecycle candidate publication delegates change-request creation to the calling CI workflow.
-Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 539 tests,
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 541 tests,
 lint, typecheck, schema freshness, strict docs, actionlint, and formatting.
+
+### 8.8 Durable Stack pin cleanup — complete
+
+Sol High found that change-gated Stack finalization could remove the Stack root while leaking its controller pin and
+claim. Direct finalization could also report success after a transient release failure. The fix retains the deletion
+intent until target finalization, releases the pin and claim with UID-/revision fences, and leaves the intent for a
+retry on any release failure. Direct publication performs a second cleanup transition; gated publication cleans up on
+the retry after the candidate is applied. Parameterized tests cover direct, gated, and transient-failure paths.

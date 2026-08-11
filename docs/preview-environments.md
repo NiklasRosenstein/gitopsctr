@@ -45,7 +45,9 @@ gitopsctr instantiate-stack \
 Instantiation creates a CAS-fenced controller claim and pins the exact template
 revision on a controller-owned ref. The pin remains available while the Stack
 and its Units are being torn down and is released only after successful
-`finalize-stack` publication. Recovery retains unclaimed legacy pins.
+target finalization. A gated finalization retains a cleanup intent until the
+candidate is applied; a later `finalize-stack` retry releases the pin and claim
+under their UID-/revision fences. Unclaimed legacy pins remain retained.
 
 When a pull request closes, loses its required label, or expires, trusted CI may
 request deletion immediately with `request-delete-direct-stack`. A scheduled CI

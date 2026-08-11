@@ -145,6 +145,9 @@ Deletion is monotonic for one UID and follows a durable finalization protocol:
 4. Only after every teardown obligation succeeds may a later atomic desired transition remove the root and completed
    children. Active observations and materialized payloads are eventually removed from current state; Git history
    remains the audit trail.
+5. A Stack finalization that removes a pinned root retains its deletion intent until the target transition is applied
+   and the controller pin and claim are released under their UID-/revision fences. A later retry performs this cleanup;
+   a pin or claim release failure MUST retain the intent and MUST NOT report cleanup complete.
 
 With Git as the lifecycle authority, teardown therefore has at least a durable deleting transition followed by a
 later absent transition. Tests MUST assert this ordering, not an exact commit count; progress may add commits.
@@ -174,8 +177,9 @@ whole-document blob identity immediately or through a compatibility period is **
 The current implementation covers source-tracked and explicitly direct Unit deletion intents, retained cleanup inputs,
 owned-child obligations, UID-/generation-fenced teardown evidence, effect leases, and Terraform destroy. Direct Unit
 roots retain their identity and cleanup inputs until explicit finalization; source absence never reclassifies a root as
-direct or source-tracked. Core Stack finalization and source-pin recovery are implemented; forge-aware eligibility,
-enforcement, and acceptance work remain external or pending. The remaining Unit correctness work is listed in
+direct or source-tracked. Core Stack finalization and UID-/revision-fenced source-pin retention and release are
+implemented; forge-aware eligibility, enforcement, and acceptance work remain external or pending. The remaining Unit
+correctness work is listed in
 [Unit lifecycle hardening](#unit-lifecycle-hardening).
 
 ## Unit lifecycle hardening
@@ -419,9 +423,9 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
   parseable-transition, legacy-safety, parseable-opaque-recovery, terminal evidence, and direct-Unit lifecycle items
   are complete in `118429d`, `22d7814`, `816a8a4`, `26982bf`, and `f9cc2ac`.
 - [x] Add controller-owned source-pin creation, retention, and UID-/revision-fenced release for direct Stacks.
-- [x] Complete candidate-aware orphan-pin ownership/recovery with CAS-fenced controller claim refs; finalized-tombstone
-  release and proven pre-publication failure cleanup remain compatible. Unclaimed legacy pins are retained for operator
-  resolution.
+- [x] Add CAS-fenced controller claim refs and retain direct Stack pins through gated or failed finalization; release
+  pins and claims only after target finalization under UID-/revision fences. Unclaimed legacy pins remain retained for
+  operator resolution; forge-aware orphan enumeration remains external.
 - [x] Add the remaining Unit hardening acceptance scenarios and recovery cases, including restart after destroy
   failure, stale same-name deletion fencing, and operator resolution of an unparseable root; the local candidate
   freshness check is now also enforced by the GitHub CI job.

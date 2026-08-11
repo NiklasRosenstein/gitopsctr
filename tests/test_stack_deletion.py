@@ -166,7 +166,16 @@ def test_request_delete_direct_stack_retains_children_and_creates_fenced_intents
         cli.command_finalize_stack(_args())
 
 
-def test_finalize_stack_removes_root_and_releases_pin_after_children(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize(
+    ("gated", "release_fails"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_finalize_stack_retains_pin_cleanup_until_target_finalization(
+    tmp_path: Path,
+    monkeypatch,
+    gated: bool,
+    release_fails: bool,
+):
     current = tmp_path / "current"
     _stack_tree(current)
     monkeypatch.setattr(cli, "git", _fake_git)
@@ -197,8 +206,22 @@ def test_finalize_stack_removes_root_and_releases_pin_after_children(tmp_path: P
 
     published: list[Path] = []
     released: list[tuple[str, str]] = []
+    pin_available = True
+    release_failure_pending = release_fails
+
+    def release_pin(name: str, revision: str) -> bool:
+        nonlocal pin_available, release_failure_pending
+        if release_failure_pending:
+            release_failure_pending = False
+            raise OperationError("temporary pin release failure")
+        if not pin_available:
+            return False
+        pin_available = False
+        released.append((name, revision))
+        return True
+
     store = SimpleNamespace(
-        release_controller_pin=lambda name, revision: released.append((name, revision)) or True,
+        release_controller_pin=release_pin,
     )
     monkeypatch.setattr(cli, "REPOSITORY_ROOT", tmp_path)
     monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
@@ -211,15 +234,39 @@ def test_finalize_stack_removes_root_and_releases_pin_after_children(tmp_path: P
     monkeypatch.setattr(cli, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
 
     def publish(_environment, candidate, *_args, **_kwargs):
-        snapshot = tmp_path / "published"
+        snapshot = tmp_path / f"published-{len(published)}"
         shutil.copytree(candidate, snapshot)
         published.append(snapshot)
-        return "e" * 40, None
+        if not gated:
+            return "e" * 40, None
+        return (
+            "e" * 40,
+            cli.ManualChangeRequest(
+                reason="delegated",
+                head="candidate/dev",
+                base="deploy/dev",
+                title="Finalize direct Stack preview",
+                body="Finalize direct Stack preview.",
+                remote_url=None,
+            ),
+        )
 
     monkeypatch.setattr(cli, "publish_desired_change", publish)
-    assert cli.command_finalize_stack(_args()) is True
+    if release_fails:
+        with pytest.raises(OperationError, match="temporary pin release failure"):
+            cli.command_finalize_stack(_args())
+    else:
+        assert cli.command_finalize_stack(_args()) is True
     assert not list((published[0] / "stacks").glob("preview.*"))
-    assert cli.load_desired_stack_deletion_intents(published[0]) == {}
+    assert cli.load_desired_stack_deletion_intents(published[0])["preview"].uid == "d1-stack-direct"
     assert list((published[0] / "stack-templates").glob("preview.*"))
     assert cli.load_desired_stack_incarnation_tombstones(published[0])["preview"].uid == "d1-stack-direct"
+    assert released == ([] if gated or release_fails else [("stacks/dev/preview/d1-stack-direct", "a" * 40)])
+
+    # A gated candidate is now considered finalized only after it is merged. The
+    # second invocation models the post-merge cleanup publication and must be
+    # able to release the retained pin even though the Stack root is gone.
+    monkeypatch.setattr(cli, "materialize_revision", lambda _revision, output: shutil.copytree(published[0], output))
+    assert cli.command_finalize_stack(_args()) is True
+    assert cli.load_desired_stack_deletion_intents(published[1]) == {}
     assert released == [("stacks/dev/preview/d1-stack-direct", "a" * 40)]
