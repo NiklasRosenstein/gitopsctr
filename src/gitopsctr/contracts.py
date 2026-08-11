@@ -739,7 +739,9 @@ class ResolvedArtifactImport(StrictModel):
     sourceUnitUid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
     sourceDesiredRevision: Annotated[str, Pattern(r"^[0-9a-f]{40}$")]
     sourceObservedRevision: Annotated[str, Pattern(r"^[0-9a-f]{40}$")]
-    receiptUnitBlob: Annotated[str, Pattern(r"^[0-9a-f]{64}$")]
+    # Git-backed receipts use the repository blob ID. Keep accepting the
+    # historical SHA-256 form used by older observed documents.
+    receiptUnitBlob: Annotated[str, Pattern(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")]
     artifactName: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
     apiVersion: Annotated[str, Pattern(r"^[^/]+/[^/]+$")]
     kind: Annotated[str, Pattern(r"^[A-Z][A-Za-z0-9]*$")]

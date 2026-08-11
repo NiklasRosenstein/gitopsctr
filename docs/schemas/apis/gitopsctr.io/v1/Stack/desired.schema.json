@@ -357,7 +357,7 @@
                     "type": "string"
                   },
                   "receiptUnitBlob": {
-                    "pattern": "^[0-9a-f]{64}$",
+                    "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
                     "type": "string"
                   },
                   "sourceDesiredRevision": {

@@ -262,6 +262,19 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
             raise ValueError(f"Stack {stack.name!r} references missing StackTemplate {template_name!r} in this ref")
         assert isinstance(template.spec, StackTemplateSpec)
         expanded = scope_stack_template_resources(stack.name, template.spec.expand(stack.spec.parameters))
+        if (
+            lifecycle.management.mode == "direct"
+            and isinstance(stack.spec, DesiredStackSpec)
+            and stack.spec.resolvedProjection is not None
+        ):
+            projected_units = stack.spec.resolvedProjection.get("units")
+            if isinstance(projected_units, dict):
+                projected_names = set(projected_units)
+                expanded = tuple(
+                    resource
+                    for resource in expanded
+                    if resource.name.removeprefix(f"{stack.name}--") in projected_names
+                )
         expanded_by_name = {resource.name: resource for resource in expanded}
         for generated in expanded:
             generated_key = (generated.apiVersion, generated.kind, generated.name)

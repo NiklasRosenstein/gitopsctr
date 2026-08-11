@@ -706,7 +706,9 @@ def write_desired_candidate_unit(path: Path, unit: UnitResource[Any], project_ro
     return write_document(path, serialize_unit_document(unit, profile="desired"), format=selected)
 
 
-def load_desired_resource_graph(root: Path) -> dict[tuple[str, str, str], UnitResource[Any] | StackResource]:
+def load_desired_resource_graph(
+    root: Path, *, validate: bool = True
+) -> dict[tuple[str, str, str], UnitResource[Any] | StackResource]:
     """Load and validate every desired resource in one desired ref before effects."""
 
     resources: dict[tuple[str, str, str], UnitResource[Any] | StackResource] = {}
@@ -731,6 +733,8 @@ def load_desired_resource_graph(root: Path) -> dict[tuple[str, str, str], UnitRe
             if key in resources:
                 raise OperationError(f"duplicate desired resource identity: {key!r}")
             resources[key] = resource
+    if not validate:
+        return resources
     try:
         validate_desired_resource_graph(resources)
     except ValueError as exc:
@@ -777,6 +781,37 @@ def load_desired_resource_graph(root: Path) -> dict[tuple[str, str, str], UnitRe
                 }
                 closure_names = {identity.unit_name for identity in stack_intent.owned_unit_closure}
                 if missing_units and missing_units <= closure_names and unit_name in missing_units:
+                    return resources
+            transition_blocks = load_desired_transition_blocks(root)
+            if (
+                transition_blocks.get(unit_name)
+                and isinstance(stack_resource, StackResource)
+                and isinstance(stack_resource.spec, DesiredStackSpec)
+                and stack_resource.spec.resolvedProjection is not None
+                and stack_resource.metadata.lifecycle is not None
+                and stack_resource.metadata.lifecycle.management is not None
+                and stack_resource.metadata.lifecycle.owner is None
+                and unit_name not in _current_desired_unit_paths(root)
+            ):
+                projected_units = stack_resource.spec.resolvedProjection.get("units")
+                if isinstance(projected_units, dict) and unit_name.removeprefix(f"{stack_name}--") in projected_units:
+                    validation_projection = dict(projected_units)
+                    for blocked_name in transition_blocks:
+                        logical_name = blocked_name.removeprefix(f"{stack_name}--")
+                        if (
+                            blocked_name.startswith(f"{stack_name}--")
+                            and not unit_document_path(root, blocked_name).is_file()
+                        ):
+                            validation_projection.pop(logical_name, None)
+                    validation_resources = dict(resources)
+                    validation_resources[stack_key] = replace(
+                        stack_resource,
+                        spec=replace(
+                            stack_resource.spec,
+                            resolvedProjection=JsonObjectValue({"units": validation_projection}),
+                        ),
+                    )
+                    validate_desired_resource_graph(validation_resources)
                     return resources
         raise OperationError(f"invalid desired resource graph: {exc}") from exc
     return resources
@@ -1452,6 +1487,21 @@ def resolve_template(
                         None,
                     )
                 if chained is not None:
+                    if (
+                        chained.artifactName != reference.name
+                        or chained.apiVersion != reference.apiVersion
+                        or chained.kind != reference.kind
+                    ):
+                        raise ReferenceUnavailable("promoted artifact evidence does not match the requested artifact")
+                    artifact_kind = API_KINDS.get(reference.gvk)
+                    if artifact_kind is None:
+                        raise ReferenceUnavailable("promoted chained artifact API is not installed")
+                    artifact_api = require_artifact_api(artifact_kind)
+                    parse_artifact_document(
+                        artifact_api,
+                        cast(JsonObject, chained.artifactDocument),
+                        f"promoted chained artifact {reference.name}",
+                    )
                     if target_stack_uid is None:
                         raise ReferenceUnavailable("promoted artifact target has no Stack UID")
                     chained = replace(chained, targetStackUid=target_stack_uid)
@@ -1762,6 +1812,7 @@ def candidate_identifier(
         "request-delete-direct-unit",
         "request-delete-direct-stack",
         "instantiate-stack",
+        "update-direct-stack",
         "resolve-opaque-unit",
     ],
     environment_name: str,
@@ -1797,6 +1848,7 @@ def resolve_candidate_ref(
         "request-delete-direct-unit",
         "request-delete-direct-stack",
         "instantiate-stack",
+        "update-direct-stack",
         "resolve-opaque-unit",
     ],
     candidate_id: str,
@@ -5154,6 +5206,7 @@ def build_desired_candidate(
     verbose: bool = True,
     source_revision_policy: SourceRevisionPolicy | None = None,
     source_revision_operation: Literal["advance", "plan"] = "advance",
+    preserve_stack_owned_metadata: bool = False,
 ) -> BuildDesiredResult:
     if verbose:
         log_heading(f"Resolve desired state for {style_environment(environment_name)}")
@@ -5490,17 +5543,25 @@ def build_desired_candidate(
             previous = load_desired_unit(previous_unit, unit_name) if previous_unit.is_file() else None
             previous_incarnation = incarnation_tombstones.get(unit_name) if previous is None else None
             owner = stack_projection.owners.get(unit_name)
-            resolved = resolved.with_metadata(
-                _stack_owned_metadata(unit_name, owner)
-                if owner is not None
-                else desired_metadata_for_candidate(
-                    authored,
-                    previous,
-                    resolved_source,
-                    source_revision,
-                    previous_incarnation.uid if previous_incarnation is not None else None,
+            if owner is not None and preserve_stack_owned_metadata and previous is not None:
+                previous_lifecycle = previous.metadata.lifecycle
+                previous_owner = previous_lifecycle.owner if previous_lifecycle is not None else None
+                if previous_owner is not None and previous_owner.kind == "Stack" and previous_owner.name == owner.name:
+                    resolved = resolved.with_metadata(previous.metadata)
+                else:
+                    resolved = resolved.with_metadata(_stack_owned_metadata(unit_name, owner))
+            else:
+                resolved = resolved.with_metadata(
+                    _stack_owned_metadata(unit_name, owner)
+                    if owner is not None
+                    else desired_metadata_for_candidate(
+                        authored,
+                        previous,
+                        resolved_source,
+                        source_revision,
+                        previous_incarnation.uid if previous_incarnation is not None else None,
+                    )
                 )
-            )
             candidate_unit = write_desired_candidate_unit(candidate_units / f"{unit_name}.json", resolved, source_root)
             previous_inputs = getattr(previous.spec, "resolvedInputs", None) if previous is not None else None
             previous_receipts = previous_inputs.receipts if previous_inputs is not None else None
@@ -5558,11 +5619,20 @@ def build_desired_candidate(
         next_driver = prepared[unit_name][0].driver_name
         if previous_driver == next_driver:
             previous_resource = load_desired_unit(previous, unit_name)
-            retained = previous_resource.with_metadata(
-                desired_metadata_for_candidate(
+            previous_lifecycle = previous_resource.metadata.lifecycle
+            previous_owner = previous_lifecycle.owner if previous_lifecycle is not None else None
+            stack_owner = stack_projection.owners.get(unit_name)
+            retained_metadata = (
+                previous_resource.metadata
+                if stack_owner is not None
+                and previous_owner is not None
+                and previous_owner.kind == "Stack"
+                and previous_owner.name == stack_owner.name
+                else desired_metadata_for_candidate(
                     prepared[unit_name][0], previous_resource, prepared[unit_name][1], source_revision
                 )
             )
+            retained = previous_resource.with_metadata(retained_metadata)
             write_desired_candidate_unit(candidate_units / previous.name, retained, source_root)
             copy_unit_materialization(current_desired, candidate, unit_name, previous_resource)
             resolution = "retain previous desired state"
@@ -5572,6 +5642,7 @@ def build_desired_candidate(
             resolution = "omit until its inputs are available"
         if verbose:
             log_status("WAIT", f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}")
+        blocked_transitions[unit_name] = unavailable[unit_name]
         blocked[unit_name] = unavailable[unit_name]
 
     for stack_name, _fingerprints in imported_artifact_fingerprints.items():
@@ -5663,12 +5734,17 @@ def build_desired_candidate(
             )
             if verbose:
                 log_status("WAIT", f"{style_unit(unit_name)}: {deletion_reason}")
+    # Publish transition blocks before validating the graph. A Stack with an
+    # unavailable downstream input may intentionally omit that generated Unit
+    # until the upstream artifact becomes observed.
+    write_desired_transition_blocks(candidate, blocked_transitions)
+
     # A source-absent parent makes its owned/dependent closure deletion obligations
     # explicit as well, even when a child still appears in the source snapshot.
     closure_changed = True
     while closure_changed:
         closure_changed = False
-        resources = load_desired_resource_graph(candidate)
+        resources = load_desired_resource_graph(candidate, validate=not preserve_stack_owned_metadata)
         for parent_name, parent_intent in tuple(deletion_intents.items()):
             parent_key = (
                 parent_intent.retained_api_version,
@@ -7072,6 +7148,70 @@ def _stack_pin_claim(
     )
 
 
+def _controller_pin_revision(pin_name: str) -> str | None:
+    """Read one controller pin without changing the local repository."""
+
+    ref = f"refs/heads/gitopsctr/pins/{pin_name}"
+    result = state_store().git("ls-remote", "--exit-code", "--refs", "origin", ref, check=False)
+    if result.returncode == 2:
+        return None
+    if result.returncode != 0:
+        raise OperationError(result.stderr.strip() or f"could not inspect controller pin {pin_name!r}")
+    lines = result.stdout.splitlines()
+    if len(lines) != 1 or len(lines[0].split()) != 2:
+        raise OperationError(f"controller pin {pin_name!r} inspection returned an invalid result")
+    revision, actual_ref = lines[0].split()
+    if actual_ref != ref or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise OperationError(f"controller pin {pin_name!r} inspection returned an invalid identity")
+    return revision
+
+
+def _replace_controller_pin(pin_name: str, expected_revision: str, revision: str) -> ControllerPin:
+    """Advance a Stack source pin with an exact remote-head fence.
+
+    GitStateStore intentionally exposes create/release operations only. A Stack
+    update needs the equivalent of a CAS replacement so an old cleanup source
+    can never be silently replaced by a concurrent actor.
+    """
+
+    store = state_store()
+    if expected_revision == revision:
+        actual = _controller_pin_revision(pin_name)
+        if actual is None:
+            store.create_controller_pin(pin_name, revision)
+        elif actual != revision:
+            raise OperationError(
+                f"controller pin {pin_name!r} changed before update: expected {expected_revision}, found {actual}"
+            )
+        return ControllerPin(pin_name, f"refs/heads/gitopsctr/pins/{pin_name}", revision)
+    replace_pin = getattr(store, "replace_controller_pin", None)
+    if callable(replace_pin):
+        return cast(ControllerPin, replace_pin(pin_name, expected_revision, revision))
+    ref = f"refs/heads/gitopsctr/pins/{pin_name}"
+    actual = _controller_pin_revision(pin_name)
+    if actual != expected_revision:
+        raise OperationError(
+            f"controller pin {pin_name!r} changed before update: expected {expected_revision}, found {actual}"
+        )
+    pushed = store.git(
+        "push",
+        f"--force-with-lease={ref}:{expected_revision}",
+        "origin",
+        f"{revision}:{ref}",
+        check=False,
+    )
+    actual = _controller_pin_revision(pin_name)
+    if actual != revision:
+        raise OperationError(pushed.stderr.strip() or f"controller pin {pin_name!r} changed during update")
+    return ControllerPin(pin_name, ref, revision)
+
+
+def _restore_controller_pin(pin_name: str, expected_revision: str, revision: str) -> None:
+    """Best-effort rollback for a pin changed before failed candidate publication."""
+
+    _replace_controller_pin(pin_name, expected_revision, revision)
+
+
 def _parse_stack_parameters(raw: str) -> JsonObjectValue:
     try:
         value = json.loads(raw)
@@ -7081,6 +7221,14 @@ def _parse_stack_parameters(raw: str) -> JsonObjectValue:
     if not isinstance(validated, dict):
         raise OperationError("--parameters must contain a JSON object")
     return JsonObjectValue(validated)
+
+
+def _parameter_values(value: object) -> list[object]:
+    if isinstance(value, dict):
+        return [value, *[item for child in value.values() for item in _parameter_values(child)]]
+    if isinstance(value, list):
+        return [item for child in value for item in _parameter_values(child)]
+    return [value]
 
 
 def _command_instantiate_stack(args: argparse.Namespace) -> bool:
@@ -7183,6 +7331,7 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
             observed_revision,
             candidate,
             dry=args.dry,
+            preserve_stack_owned_metadata=True,
         )
         # The desired head is part of the incarnation identity. Retries against
         # the same head remain replay-idempotent, while a same-name request
@@ -7201,6 +7350,23 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
             uid=direct_uid,
             lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
         )
+        # Keep the complete logical projection, including Units that are not
+        # yet materialized because an input is still unavailable.  The desired
+        # graph uses this record to distinguish a blocked generated Unit from
+        # an invalid Stack expansion.
+        resolved_projection = JsonObjectValue(
+            {
+                "units": {
+                    resource.name: {
+                        "apiVersion": resource.apiVersion,
+                        "kind": resource.kind,
+                        "spec": cast(JsonObjectValue, dump_template_value(cast(TemplateValue, resource.spec))),
+                        "dependsOn": list(resource.dependsOn),
+                    }
+                    for resource in template.spec.expand(parameters)
+                }
+            }
+        )
         direct_spec = DesiredStackSpec(
             template=StackTemplateReference(name=args.template),
             parameters=parameters,
@@ -7213,6 +7379,7 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
                     digest=template_provenance.templateDigest,
                 )
             ),
+            resolvedProjection=resolved_projection,
         )
         direct_stack = StackResource(GVK(CORE_API_VERSION, "Stack"), direct_metadata, direct_spec)
         stack_path = _current_desired_stack_paths(candidate, "Stack").get(args.stack)
@@ -7228,13 +7395,24 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
         for resource in expanded:
             unit_path = unit_document_path(candidate, resource.name)
             if not unit_path.is_file():
+                if load_desired_transition_blocks(candidate).get(resource.name):
+                    continue
                 raise OperationError(f"generated Unit {resource.name!r} is unresolved in the desired candidate")
             unit = load_desired_unit(unit_path, resource.name)
             if unit_contains_reference(unit):
                 raise OperationError(f"generated Unit {resource.name!r} is unresolved in the desired candidate")
+            previous_path = unit_document_path(current, resource.name)
+            previous_unit = load_desired_unit(previous_path, resource.name) if previous_path.is_file() else None
+            owned_metadata = _stack_owned_metadata(resource.name, owner)
+            if previous_unit is not None and previous_unit.metadata.uid is not None:
+                owned_metadata = ResourceMetadata(
+                    name=resource.name,
+                    uid=previous_unit.metadata.uid,
+                    lifecycle=owned_metadata.lifecycle,
+                )
             write_desired_candidate_unit(
                 unit_path,
-                unit.with_metadata(_stack_owned_metadata(resource.name, owner)),
+                unit.with_metadata(owned_metadata),
                 REPOSITORY_ROOT,
             )
         load_desired_resource_graph(candidate)
@@ -7350,6 +7528,446 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
 def command_instantiate_stack(args: argparse.Namespace) -> bool:
     with unit_effect_lock(args.environment, f"stack-{getattr(args, 'stack', '<invalid>')}"):
         return _command_instantiate_stack(args)
+
+
+def _direct_stack_update_replay_matches(
+    stack: StackResource,
+    uid: str,
+    template: str,
+    source_revision: str,
+    parameters: JsonObjectValue,
+    request_id: str,
+) -> bool:
+    lifecycle = stack.metadata.lifecycle
+    if (
+        stack.metadata.uid != uid
+        or lifecycle is None
+        or lifecycle.owner is not None
+        or lifecycle.management is None
+        or lifecycle.management.mode != "direct"
+        or not isinstance(stack.spec, DesiredStackSpec)
+        or stack.spec.provenance is None
+    ):
+        return False
+    stack_template = stack.spec.template
+    stack_template_name = stack_template.name if isinstance(stack_template, StackTemplateReference) else stack_template
+    return (
+        stack_template_name == template
+        and stack.spec.parameters == parameters
+        and stack.spec.provenance.templateRevision == source_revision
+        and stack.spec.provenance.requestIdentity == request_id
+    )
+
+
+def _repair_direct_stack_update_fences(
+    args: argparse.Namespace,
+    source_revision: str,
+    desired_ref: str,
+    desired_revision: str,
+) -> None:
+    """Repair pin and claim state after a published update was interrupted."""
+
+    pin_name = _stack_pin_name(args.environment, args.stack, args.uid)
+    store = state_store()
+    actual_pin = _controller_pin_revision(pin_name)
+    if actual_pin is None:
+        store.create_controller_pin(pin_name, source_revision)
+    elif actual_pin != source_revision:
+        _replace_controller_pin(pin_name, actual_pin, source_revision)
+    read_claim = getattr(store, "read_controller_pin_claim", None)
+    update_claim = getattr(store, "update_controller_pin_claim", None)
+    if not callable(read_claim) or not callable(update_claim):
+        return
+    claim = read_claim(pin_name)
+    if claim is None:
+        create_claim = getattr(store, "create_controller_pin_claim", None)
+        if callable(create_claim):
+            create_claim(
+                _stack_pin_claim(
+                    args.environment,
+                    args.stack,
+                    args.uid,
+                    source_revision,
+                    desired_ref,
+                    desired_revision,
+                    desired_ref,
+                    state="active",
+                    candidate_revision=desired_revision,
+                )
+            )
+        return
+    if claim.revision is None:
+        return
+    if claim.pin_revision == source_revision and claim.state == "active" and claim.target_revision == desired_revision:
+        return
+    update_claim(
+        replace(
+            claim,
+            pin_revision=source_revision,
+            target_ref=desired_ref,
+            target_revision=desired_revision,
+            state="active",
+        ),
+        claim.revision,
+    )
+
+
+def _command_update_direct_stack(args: argparse.Namespace) -> bool:
+    _resource_name(args.environment, "environment name")
+    _resource_name(args.stack, "Stack name")
+    _resource_name(args.template, "StackTemplate name")
+    if not isinstance(args.uid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args.uid):
+        raise OperationError("update-direct-stack requires a valid --uid")
+    if not isinstance(args.desired_revision, str) or not re.fullmatch(r"[0-9a-f]{40}", args.desired_revision):
+        raise OperationError("update-direct-stack requires an exact full --desired-revision")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/#!-]{0,127}", args.request_id):
+        raise OperationError("--request-id has an invalid format")
+    parameters = _parse_stack_parameters(args.parameters)
+    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
+    current_revision = fetch_ref(desired_ref)
+    if current_revision is None:
+        raise OperationError(f"desired ref {desired_ref!r} has no state")
+
+    source_revision_result = git("rev-parse", f"{args.source_revision}^{{commit}}", check=False)
+    if source_revision_result.returncode != 0:
+        raise OperationError(f"source revision {args.source_revision!r} is not a valid Git commit")
+    source_revision = source_revision_result.stdout.strip()
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary = Path(temporary_directory)
+        current = temporary / "current"
+        observed = temporary / "observed"
+        source = temporary / "source"
+        synthetic_source = temporary / "synthetic-source"
+        build_current = temporary / "build-current"
+        candidate = temporary / "candidate"
+        materialize_revision(current_revision, current)
+
+        stack_path = _current_desired_stack_paths(current, "Stack").get(args.stack)
+        if stack_path is None:
+            raise OperationError(f"desired Stack {args.stack!r} is not present")
+        existing = RESOURCE_CATALOG.parse_stack(
+            RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name=args.stack
+        )
+        lifecycle = existing.metadata.lifecycle
+        if lifecycle is None or lifecycle.owner is not None or lifecycle.management is None:
+            raise OperationError(f"desired Stack {args.stack!r} is not a root resource")
+        if lifecycle.management.mode != "direct":
+            raise OperationError(f"desired Stack {args.stack!r} is source-tracked, not directly managed")
+        if existing.metadata.uid != args.uid:
+            raise OperationError(f"stale desired Stack UID fence for {args.stack!r}")
+        if not isinstance(existing.spec, DesiredStackSpec) or existing.spec.provenance is None:
+            raise OperationError(f"desired Stack {args.stack!r} is missing direct instantiation provenance")
+        existing_template = existing.spec.template
+        existing_template_name = (
+            existing_template.name if isinstance(existing_template, StackTemplateReference) else existing_template
+        )
+        if existing_template_name != args.template:
+            raise OperationError("direct Stack update cannot change the StackTemplate identity")
+        if load_desired_stack_deletion_intents(current).get(args.stack) is not None:
+            raise OperationError(f"desired Stack {args.stack!r} has an active deletion intent")
+
+        if current_revision != args.desired_revision:
+            if _direct_stack_update_replay_matches(
+                existing, args.uid, args.template, source_revision, parameters, args.request_id
+            ):
+                _repair_direct_stack_update_fences(args, source_revision, desired_ref, current_revision)
+                return False
+            raise OperationError(
+                f"stale desired Stack head for {args.stack!r}: expected {args.desired_revision}, found {current_revision}"
+            )
+        if existing.spec.provenance.requestIdentity == args.request_id:
+            if _direct_stack_update_replay_matches(
+                existing, args.uid, args.template, source_revision, parameters, args.request_id
+            ):
+                _repair_direct_stack_update_fences(args, source_revision, desired_ref, current_revision)
+                return False
+            raise OperationError(f"Stack {args.stack!r} already uses request identity {args.request_id!r}")
+
+        materialize_revision(source_revision, source)
+        template_root = source.joinpath(*load_project_config(source).stack_templates_path.parts)
+        if not template_root.is_dir():
+            template_root = project_environment_root(source, args.environment) / "stack-templates"
+        template_paths = document_candidates(template_root, args.template)
+        if len(template_paths) != 1:
+            raise OperationError(f"expected exactly one StackTemplate document for {args.template!r}")
+        template_path = template_paths[0]
+        template = RESOURCE_CATALOG.parse_stack_template(
+            RESOURCE_CATALOG.load_document(template_path), profile="authored", expected_name=args.template
+        )
+        if not isinstance(template.spec, StackTemplateSpec):
+            raise OperationError(f"StackTemplate {args.template!r} has an invalid specification")
+        if any(
+            isinstance(value, dict)
+            and any(
+                key in value
+                for key in ("fromParameter", "fromReceipt", "fromArtifact", "fromPromotion", "fromEnvironment")
+            )
+            for value in _parameter_values(parameters)
+        ):
+            raise OperationError("update-direct-stack requires concrete parameters without template references")
+        try:
+            expanded_template = template.spec.expand(parameters)
+        except (TemplateError, TypeError, ValueError) as exc:
+            raise OperationError(f"StackTemplate parameters are unsafe: {exc}") from exc
+        selected_names = set(existing.spec.units or (resource.name for resource in expanded_template))
+        known_names = {resource.name for resource in expanded_template}
+        unknown = sorted(selected_names - known_names)
+        if unknown:
+            raise OperationError(f"Stack {args.stack!r} selects unknown Unit templates: {', '.join(unknown)}")
+        for resource in expanded_template:
+            if resource.name in selected_names:
+                omitted = sorted(set(resource.dependsOn) - selected_names)
+                if omitted:
+                    raise OperationError(
+                        f"Stack {args.stack!r} selects {resource.name!r} but omits dependencies: {', '.join(omitted)}"
+                    )
+        expanded = scope_stack_template_resources(
+            args.stack,
+            tuple(resource for resource in expanded_template if resource.name in selected_names),
+        )
+
+        shutil.copytree(source, synthetic_source)
+        synthetic_environment = project_environment_root(synthetic_source, args.environment)
+        source_stacks = _document_paths(synthetic_environment / "stacks")
+        if args.stack in source_stacks:
+            raise OperationError(f"Stack {args.stack!r} is source-authored; direct update would collide")
+        project = load_project_config(synthetic_source)
+        synthetic_stack_path = synthetic_environment / "stacks" / f"{args.stack}{project.write_format.suffix}"
+        synthetic_spec: dict[str, Any] = {"template": args.template, "parameters": dict(parameters)}
+        if existing.spec.units is not None:
+            synthetic_spec["units"] = list(existing.spec.units)
+        if existing.spec.artifactImports:
+            synthetic_spec["artifactImports"] = [item.to_dict() for item in existing.spec.artifactImports]
+        write_document(
+            synthetic_stack_path,
+            {
+                "apiVersion": CORE_API_VERSION,
+                "kind": "Stack",
+                "metadata": {"name": args.stack},
+                "spec": synthetic_spec,
+            },
+            format=project.write_format,
+        )
+
+        # Let the normal desired builder resolve every generated Unit, but hide
+        # the direct root while it projects the synthetic source Stack. The
+        # direct root and UID-owned closure are restored below.
+        shutil.copytree(current, build_current)
+        for path in document_candidates(build_current / "stacks", args.stack):
+            path.unlink()
+        observed_revision = observed_tree(observed_ref, observed)
+        build_desired_candidate(
+            args.environment,
+            synthetic_source,
+            source_revision,
+            build_current,
+            observed,
+            observed_revision,
+            candidate,
+            dry=args.dry,
+            verbose=False,
+            preserve_stack_owned_metadata=True,
+        )
+        candidate_stack_path = _current_desired_stack_paths(candidate, "Stack").get(args.stack)
+        if candidate_stack_path is None:
+            raise OperationError(f"updated Stack {args.stack!r} was not projected into desired state")
+        projected = RESOURCE_CATALOG.parse_stack(
+            RESOURCE_CATALOG.load_document(candidate_stack_path), profile="desired", expected_name=args.stack
+        )
+        if not isinstance(projected.spec, DesiredStackSpec) or projected.spec.resolvedProjection is None:
+            raise OperationError(f"updated Stack {args.stack!r} has no generated Unit projection")
+        template_provenance = StackInstantiationProvenance(
+            templateRevision=source_revision,
+            templatePath=template_path.relative_to(source).as_posix(),
+            templateDigest=hashlib.sha256(template_path.read_bytes()).hexdigest(),
+            requestIdentity=args.request_id,
+        )
+        direct_stack = StackResource(
+            GVK(CORE_API_VERSION, "Stack"),
+            ResourceMetadata(
+                name=args.stack,
+                uid=args.uid,
+                lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
+            ),
+            DesiredStackSpec(
+                template=StackTemplateReference(name=args.template),
+                parameters=parameters,
+                units=existing.spec.units,
+                artifactImports=existing.spec.artifactImports,
+                provenance=template_provenance,
+                resolvedSource=ResolvedStackTemplateSource(
+                    fromGit=ResolvedGitSource(
+                        path=".",
+                        commit=source_revision,
+                        resourcePath=template_path.relative_to(source).as_posix(),
+                        digest=template_provenance.templateDigest,
+                    )
+                ),
+                resolvedProjection=projected.spec.resolvedProjection,
+                resolvedArtifactImports=projected.spec.resolvedArtifactImports,
+            ),
+        )
+        _write_desired_stack_resource(candidate_stack_path, direct_stack, REPOSITORY_ROOT)
+        owner = DesiredOwnerReference(
+            apiVersion=CORE_API_VERSION,
+            kind="Stack",
+            name=args.stack,
+            uid=args.uid,
+        )
+        projected_unit_names = {resource.name for resource in expanded}
+        transition_blocks = load_desired_transition_blocks(candidate)
+        for previous_name, previous_path in _current_desired_unit_paths(current).items():
+            previous_unit = load_desired_unit(previous_path, previous_name)
+            previous_owner = previous_unit.metadata.lifecycle.owner if previous_unit.metadata.lifecycle else None
+            if (
+                previous_owner is None
+                or previous_owner.kind != "Stack"
+                or previous_owner.name != args.stack
+                or previous_owner.uid != args.uid
+                or previous_name in projected_unit_names
+            ):
+                continue
+            retained_path = unit_document_path(candidate, previous_name)
+            intent = UnitDeletionIntent.from_unit(previous_unit, retained_path, candidate)
+            write_deletion_intent(candidate, intent)
+            transition_blocks[previous_name] = deletion_intent_reason(intent)
+        write_desired_transition_blocks(candidate, transition_blocks)
+        for resource in expanded:
+            unit_path = unit_document_path(candidate, resource.name)
+            if not unit_path.is_file():
+                if load_desired_transition_blocks(candidate).get(resource.name):
+                    continue
+                raise OperationError(f"generated Unit {resource.name!r} is unresolved in the desired candidate")
+            unit = load_desired_unit(unit_path, resource.name)
+            if unit_contains_reference(unit):
+                raise OperationError(f"generated Unit {resource.name!r} is unresolved in the desired candidate")
+            previous_path = unit_document_path(current, resource.name)
+            previous_unit = load_desired_unit(previous_path, resource.name) if previous_path.is_file() else None
+            owned_metadata = _stack_owned_metadata(resource.name, owner)
+            if previous_unit is not None and previous_unit.metadata.uid is not None:
+                if previous_unit.gvk != unit.gvk or previous_unit.driver_name != unit.driver_name:
+                    raise OperationError(
+                        f"direct Stack update changes the GVK or driver of generated Unit {resource.name!r}; "
+                        "delete and recreate the Stack"
+                    )
+                owned_metadata = ResourceMetadata(
+                    name=resource.name,
+                    uid=previous_unit.metadata.uid,
+                    lifecycle=owned_metadata.lifecycle,
+                )
+            write_desired_candidate_unit(
+                unit_path,
+                unit.with_metadata(owned_metadata),
+                REPOSITORY_ROOT,
+            )
+        load_desired_resource_graph(candidate)
+        candidate_id = candidate_identifier(
+            "update-direct-stack",
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            {
+                "stack": args.stack,
+                "uid": args.uid,
+                "template": args.template,
+                "requestIdentity": args.request_id,
+                "templateRevision": source_revision,
+                "parameters": parameters,
+            },
+        )
+        candidate_ref = resolve_candidate_ref(
+            REPOSITORY_ROOT,
+            args.environment,
+            "update-direct-stack",
+            candidate_id,
+            args.candidate_ref,
+        )
+        if candidate_ref in {desired_ref, observed_ref}:
+            raise OperationError("direct Stack update candidate ref conflicts with deployment state")
+
+        old_source_revision = existing.spec.provenance.templateRevision
+        pin_name = _stack_pin_name(args.environment, args.stack, args.uid)
+        store = state_store()
+        existing_claim = None
+        read_claim = getattr(store, "read_controller_pin_claim", None)
+        if callable(read_claim):
+            existing_claim = read_claim(pin_name)
+            if existing_claim is not None and (
+                existing_claim.uid != args.uid
+                or existing_claim.pin_revision != old_source_revision
+                or existing_claim.pin_name != pin_name
+            ):
+                raise OperationError(f"Stack {args.stack!r} has a conflicting source-pin claim")
+        try:
+            revision, outcome = publish_desired_change(
+                args.environment,
+                candidate,
+                desired_ref,
+                current_revision,
+                candidate_ref,
+                f"Update direct Stack {args.stack}",
+                f"Update direct Stack {args.stack}",
+                f"Update UID-fenced direct Stack `{args.stack}` from StackTemplate `{args.template}`.",
+                args.dry,
+                current,
+                request_change=False,
+            )
+        except OperationError:
+            raise
+        if args.dry:
+            return False
+        pin_revision = old_source_revision
+        if outcome is None:
+            if hasattr(store, "git"):
+                _replace_controller_pin(pin_name, old_source_revision, source_revision)
+            else:
+                create_pin = getattr(store, "create_controller_pin", None)
+                if not callable(create_pin):
+                    raise OperationError(f"Stack {args.stack!r} source pin cannot be updated safely")
+                create_pin(pin_name, source_revision)
+            pin_revision = source_revision
+        update_claim = getattr(store, "update_controller_pin_claim", None)
+        if existing_claim is not None and callable(update_claim) and existing_claim.revision is not None:
+            update_claim(
+                _stack_pin_claim(
+                    args.environment,
+                    args.stack,
+                    args.uid,
+                    pin_revision,
+                    desired_ref,
+                    current_revision,
+                    candidate_ref,
+                    state="active" if outcome is None else "preparing",
+                    candidate_revision=revision,
+                ),
+                existing_claim.revision,
+            )
+        elif existing_claim is None:
+            create_claim = getattr(store, "create_controller_pin_claim", None)
+            if callable(create_claim):
+                create_claim(
+                    _stack_pin_claim(
+                        args.environment,
+                        args.stack,
+                        args.uid,
+                        pin_revision,
+                        desired_ref,
+                        current_revision,
+                        candidate_ref,
+                        state="active" if outcome is None else "preparing",
+                        candidate_revision=revision,
+                    )
+                )
+        print(revision)
+        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
+        return True
+
+
+def command_update_direct_stack(args: argparse.Namespace) -> bool:
+    with unit_effect_lock(args.environment, f"stack-{getattr(args, 'stack', '<invalid>')}"):
+        return _command_update_direct_stack(args)
 
 
 def _stack_intent_for_resource(
@@ -10367,7 +10985,15 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
         ("Schemas", ("schemas",)),
         (
             "Deployment",
-            ("advance-desired", "instantiate-stack", "promote", "rollback", "recover-effect-lease", "resolve-desired"),
+            (
+                "advance-desired",
+                "instantiate-stack",
+                "update-direct-stack",
+                "promote",
+                "rollback",
+                "recover-effect-lease",
+                "resolve-desired",
+            ),
         ),
         (
             "Recovery",
@@ -10543,6 +11169,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     instantiate_stack.add_argument("--dry", action="store_true")
     instantiate_stack.set_defaults(handler=command_instantiate_stack)
+
+    update_direct_stack = commands.add_parser(
+        "update-direct-stack",
+        help="update an existing directly managed Stack from a trusted StackTemplate revision",
+    )
+    update_direct_stack.add_argument("--environment", required=True)
+    update_direct_stack.add_argument("--stack", required=True)
+    update_direct_stack.add_argument("--uid", required=True, help="exact current direct Stack UID fence")
+    update_direct_stack.add_argument(
+        "--desired-revision",
+        required=True,
+        help="exact current desired-state head used to fence this update",
+    )
+    update_direct_stack.add_argument("--template", required=True)
+    update_direct_stack.add_argument("--source-revision", required=True, help="trusted full Git revision or ref")
+    update_direct_stack.add_argument("--parameters", required=True, help="concrete Stack parameters as a JSON object")
+    update_direct_stack.add_argument("--request-id", required=True, help="stable replay identity for this update")
+    update_direct_stack.add_argument("--desired-ref", help="override the environment's desired ref")
+    update_direct_stack.add_argument("--observed-ref", help="override the environment's observed ref")
+    update_direct_stack.add_argument(
+        "--candidate-ref",
+        help="exact candidate ref override when the environment uses a pull-request change gate",
+    )
+    update_direct_stack.add_argument("--dry", action="store_true")
+    update_direct_stack.set_defaults(handler=command_update_direct_stack)
 
     promote = commands.add_parser(
         "promote",
