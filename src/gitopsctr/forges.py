@@ -1,7 +1,9 @@
-"""Create or find forge-hosted review requests for deployment changes.
+"""Create or find forge-hosted review requests and verify forge CI candidates.
 
 The deployment controller publishes candidate refs before calling this module. This module never
-updates a target ref: it only opens (or finds) the change request that reviews candidate changes.
+updates a target ref: it only opens (or finds) the change request that reviews candidate changes,
+or validates exact candidate heads supplied by CI. Forge state and preview eligibility are outside
+the lifecycle core.
 """
 
 from __future__ import annotations
@@ -18,7 +20,6 @@ from urllib.parse import urlsplit
 from gitopsctr.errors import OperationError
 
 GitHubCandidateEventName = Literal["pull_request", "merge_group"]
-PreviewEligibilityStatus = Literal["eligible", "ineligible", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -28,107 +29,6 @@ class GitHubCandidateHeads:
     event: GitHubCandidateEventName
     candidate_revision: str
     target_revision: str
-
-
-@dataclass(frozen=True)
-class PreviewEligibility:
-    """Forge eligibility used by preview garbage collection."""
-
-    status: PreviewEligibilityStatus
-    reason: str
-
-
-def github_preview_eligibility(payload: object, required_label: str | None = None) -> PreviewEligibility:
-    """Interpret a trusted GitHub pull-request payload as an eligibility decision.
-
-    Closed or merged requests are always ineligible. When configured, a required
-    label must be present on an open request. Malformed or incomplete payloads
-    remain ``unknown`` so cleanup fails closed.
-    """
-
-    if not isinstance(payload, dict):
-        return PreviewEligibility("unknown", "GitHub pull-request payload is missing")
-    state = payload.get("state")
-    if not isinstance(state, str):
-        return PreviewEligibility("unknown", "GitHub pull-request payload has no state")
-    normalized_state = state.upper()
-    if normalized_state in {"CLOSED", "MERGED"} or payload.get("mergedAt") is not None:
-        return PreviewEligibility("ineligible", "pull request is closed or merged")
-    if normalized_state != "OPEN":
-        return PreviewEligibility("unknown", f"unsupported GitHub pull-request state {state!r}")
-    if required_label is None:
-        return PreviewEligibility("eligible", "pull request is open")
-    labels = payload.get("labels")
-    if not isinstance(labels, list):
-        return PreviewEligibility("unknown", "GitHub pull-request payload has no labels")
-    names = {item.get("name") for item in labels if isinstance(item, dict) and isinstance(item.get("name"), str)}
-    if required_label not in names:
-        return PreviewEligibility("ineligible", f"required label {required_label!r} is absent")
-    return PreviewEligibility("eligible", f"required label {required_label!r} is present")
-
-
-def gitlab_preview_eligibility(payload: object, required_label: str | None = None) -> PreviewEligibility:
-    """Interpret a trusted GitLab merge-request payload fail-closed."""
-
-    if not isinstance(payload, dict):
-        return PreviewEligibility("unknown", "GitLab merge-request payload is missing")
-    state = payload.get("state") or payload.get("state_label")
-    if not isinstance(state, str):
-        return PreviewEligibility("unknown", "GitLab merge-request payload has no state")
-    normalized_state = state.upper()
-    if normalized_state in {"CLOSED", "MERGED"} or payload.get("merged_at") is not None:
-        return PreviewEligibility("ineligible", "merge request is closed or merged")
-    if normalized_state not in {"OPEN", "OPENED"}:
-        return PreviewEligibility("unknown", f"unsupported GitLab merge-request state {state!r}")
-    if required_label is None:
-        return PreviewEligibility("eligible", "merge request is open")
-    labels = payload.get("labels")
-    if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
-        return PreviewEligibility("unknown", "GitLab merge-request payload has no labels")
-    if required_label not in labels:
-        return PreviewEligibility("ineligible", f"required label {required_label!r} is absent")
-    return PreviewEligibility("eligible", f"required label {required_label!r} is present")
-
-
-def github_pull_request_identity(identity: str) -> tuple[str, int] | None:
-    """Parse a forge-stable GitHub pull-request identity.
-
-    Supported forms are a canonical pull-request URL and
-    ``github:owner/repository#number``. Opaque identities deliberately return
-    ``None`` rather than guessing a repository or number.
-    """
-
-    value = identity.strip()
-    if value.startswith("github:"):
-        match = re.fullmatch(r"github:([^/]+/[^#]+)#([1-9][0-9]*)", value)
-        if match:
-            return match.group(1), int(match.group(2))
-        return None
-    parsed = urlsplit(value)
-    if parsed.hostname not in {"github.com", "www.github.com"}:
-        return None
-    match = re.fullmatch(r"/([^/]+/[^/]+)/pull/([1-9][0-9]*)/?", parsed.path)
-    if match is None:
-        return None
-    return match.group(1), int(match.group(2))
-
-
-def gitlab_merge_request_identity(identity: str) -> tuple[str, int] | None:
-    """Parse a forge-stable GitLab merge-request identity."""
-
-    value = identity.strip()
-    if value.startswith("gitlab:"):
-        match = re.fullmatch(r"gitlab:(.+)!([1-9][0-9]*)", value)
-        if match and "/" in match.group(1):
-            return match.group(1), int(match.group(2))
-        return None
-    parsed = urlsplit(value)
-    if parsed.hostname not in {"gitlab.com", "www.gitlab.com"}:
-        return None
-    match = re.fullmatch(r"/(.+)/-/merge_requests/([1-9][0-9]*)/?", parsed.path)
-    if match is None or "/" not in match.group(1):
-        return None
-    return match.group(1), int(match.group(2))
 
 
 def _github_revision(value: object, field: str) -> str:
@@ -249,10 +149,6 @@ class CommandRunner(Protocol):
 
 class ChangeRequestAdapter(Protocol):
     def ensure_change_request(self, spec: ChangeRequestSpec) -> ChangeRequestOutcome: ...
-
-
-class PreviewEligibilityAdapter(Protocol):
-    def preview_eligibility(self, request_identity: str, required_label: str | None = None) -> PreviewEligibility: ...
 
 
 def run_command(command: Sequence[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -430,102 +326,6 @@ class GitHubChangeRequestAdapter:
         except OSError as exc:
             detail = str(exc).strip() or exc.__class__.__name__
             return self._manual(spec, f"GitHub CLI is unavailable: {detail}")
-
-
-@dataclass(frozen=True)
-class GitHubPreviewEligibilityAdapter:
-    """Read pull-request eligibility without mutating forge state."""
-
-    remote_url: str
-    runner: CommandRunner = run_command
-    cwd: Path | None = None
-
-    def preview_eligibility(self, request_identity: str, required_label: str | None = None) -> PreviewEligibility:
-        parsed = github_pull_request_identity(request_identity)
-        if parsed is None:
-            return PreviewEligibility("unknown", "request identity is not a supported GitHub pull request")
-        repository, number = parsed
-        result = self.runner(
-            (
-                "gh",
-                "pr",
-                "view",
-                str(number),
-                "--repo",
-                repository,
-                "--json",
-                "state,mergedAt,labels",
-            ),
-            cwd=self.cwd,
-        )
-        if result.returncode != 0:
-            return PreviewEligibility("unknown", _process_error(result, "GitHub CLI could not inspect pull request"))
-        try:
-            payload = json.loads(result.stdout)
-        except (json.JSONDecodeError, TypeError):
-            return PreviewEligibility("unknown", "GitHub CLI returned invalid pull-request data")
-        return github_preview_eligibility(payload, required_label)
-
-
-@dataclass(frozen=True)
-class GitLabPreviewEligibilityAdapter:
-    """Read merge-request eligibility through the GitLab CLI."""
-
-    remote_url: str
-    runner: CommandRunner = run_command
-    cwd: Path | None = None
-
-    def preview_eligibility(self, request_identity: str, required_label: str | None = None) -> PreviewEligibility:
-        parsed = gitlab_merge_request_identity(request_identity)
-        if parsed is None:
-            return PreviewEligibility("unknown", "request identity is not a supported GitLab merge request")
-        repository, number = parsed
-        result = self.runner(
-            ("glab", "mr", "view", str(number), "--repo", repository, "--output", "json"),
-            cwd=self.cwd,
-        )
-        if result.returncode != 0:
-            return PreviewEligibility("unknown", _process_error(result, "GitLab CLI could not inspect merge request"))
-        try:
-            payload = json.loads(result.stdout)
-        except (json.JSONDecodeError, TypeError):
-            return PreviewEligibility("unknown", "GitLab CLI returned invalid merge-request data")
-        return gitlab_preview_eligibility(payload, required_label)
-
-
-def preview_eligibility(
-    request_identity: str,
-    *,
-    required_label: str | None = None,
-    remote_url: str | None = None,
-    runner: CommandRunner = run_command,
-    cwd: Path | None = None,
-    adapter: PreviewEligibilityAdapter | None = None,
-) -> PreviewEligibility:
-    """Evaluate preview eligibility through a read-only forge adapter."""
-
-    if adapter is not None:
-        return adapter.preview_eligibility(request_identity, required_label)
-    if remote_url is None:
-        try:
-            result = runner(("git", "remote", "get-url", "origin"), cwd=cwd)
-        except OSError as exc:
-            return PreviewEligibility("unknown", f"Git is unavailable: {exc}")
-        if result.returncode != 0:
-            return PreviewEligibility("unknown", _process_error(result, "could not read Git remote"))
-        remote_url = result.stdout.strip()
-    location = detect_forge(remote_url)
-    if location is None:
-        return PreviewEligibility("unknown", f"no preview eligibility adapter is available for remote {remote_url!r}")
-    if location.forge == "github":
-        return GitHubPreviewEligibilityAdapter(remote_url, runner, cwd).preview_eligibility(
-            request_identity,
-            required_label,
-        )
-    return GitLabPreviewEligibilityAdapter(remote_url, runner, cwd).preview_eligibility(
-        request_identity,
-        required_label,
-    )
 
 
 def ensure_change_request(

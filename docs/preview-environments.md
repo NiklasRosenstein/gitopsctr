@@ -28,9 +28,9 @@ use one template in the same desired ref.
 ## Direct preview workflow
 
 The workflow must use a trusted source revision and a stable request identity.
-For GitHub, use `github:OWNER/REPOSITORY#NUMBER` or the canonical pull-request
-URL. Include an `expiresAt` Unix timestamp in the Stack parameters when the
-preview has a time limit:
+The identity is provenance only; it may be an opaque CI-generated value or a
+forge reference such as `github:OWNER/REPOSITORY#NUMBER`. Include an `expiresAt`
+Unix timestamp in the Stack parameters when the preview has a time limit:
 
 ```console
 gitopsctr instantiate-stack \
@@ -47,27 +47,14 @@ revision on a controller-owned ref. The pin remains available while the Stack
 and its Units are being torn down and is released only after successful
 `finalize-stack` publication. Recovery retains unclaimed legacy pins.
 
-When a pull request closes, loses its required label, or expires, a webhook may
-request deletion immediately. A scheduled job can recover missed events:
-
-```console
-gitopsctr recover-orphaned-stacks \
-  --environment dev \
-  --required-label preview
-```
-
-The recovery operation is fail-closed when forge state or claim evidence is
-unknown. It changes a claim to `reaping` with a revision fence, rechecks current
-and candidate ownership, then releases the pin and claim. It creates a normal
-UID-fenced Stack deletion intent for a present root; it never deletes external
-resources or releases a pin through an out-of-band path. The Unit finalization
-commands must complete the owned closure before the Stack root can be finalized.
-
-GitHub eligibility is read through `gh pr view`. GitLab.com eligibility is read
-through `glab mr view`. Both consider a request eligible only while it is open
-and, when configured, carries the required label. Self-hosted GitLab and
-deployment-specific merge-request creation still require an external adapter;
-the controller must not infer eligibility from an opaque request identity.
+When a pull request closes, loses its required label, or expires, trusted CI may
+request deletion immediately with `request-delete-direct-stack`. A scheduled CI
+job owned by the deployment may recover missed events by enumerating preview
+lineage, consulting the forge, and invoking the same UID-fenced deletion and
+finalization commands. The core CLI does not inspect forge state, decide
+eligibility, detect orphaned previews, or release pins through an out-of-band
+path. The Unit finalization commands must complete the owned closure before the
+Stack root can be finalized.
 
 ## Argo CD boundary
 
@@ -134,9 +121,8 @@ to the controller.
 - Pull-request-authored Terraform is arbitrary code; isolate it and scope its
   credentials explicitly.
 - Verify desired state and the UID before every deletion request. A stale UID
-  or unknown forge response must stop cleanup.
-- Re-run `recover-orphaned-stacks` after a transient forge or Git failure. It is
-  idempotent for the same Stack and request identity.
+  must stop cleanup; forge eligibility is the responsibility of the external CI
+  orchestrator.
 - Keep controller pin refs and desired deletion intents observable until the
   Stack closure is finalized; do not manually delete either as a cleanup
   shortcut.

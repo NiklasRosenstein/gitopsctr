@@ -260,10 +260,12 @@ context, encodes branch names safely, and fails closed on API errors or malforme
 for automation. The live branch remains unprotected; deployment owners must configure and re-run this check after
 branch protection, rulesets, or merge-queue policy is set.
 
-### 8.7 Forge provenance boundary — new direction recorded
+### 8.7 Forge provenance boundary — core alignment complete
 
 Forge identity is provenance, not lifecycle authority. PR CI may imperatively create and delete preview Stacks with
 normal `gitopsctr` CLI primitives. Scheduled CI may enumerate preview refs or resources by lineage, consult GitHub or
 GitLab, and request cleanup for missed events. `advance-desired`, reconciliation, and finalization remain forge-
-independent. The forge-aware recovery command, adapters, and repository workflow are now follow-up rework or removal,
-not completion criteria for the core lifecycle.
+independent. The core no longer contains preview eligibility/orphan-recovery adapters or the repository recovery
+workflow; lifecycle candidate publication delegates change-request creation to the calling CI workflow.
+Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 539 tests,
+lint, typecheck, schema freshness, strict docs, actionlint, and formatting.

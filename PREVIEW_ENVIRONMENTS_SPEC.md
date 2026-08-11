@@ -2,7 +2,7 @@
 
 > **Status:** Living implementation design. The lifecycle-aware desired-resource envelope, hardened Unit-specific
 > finalization slice, Stack/StackTemplate contracts, Stack projection, direct Stack instantiation, Stack deletion
-> lifecycle, Stack-owned convergence ordering, and controller-owned pin claim recovery are implemented, including
+> lifecycle, Stack-owned convergence ordering, and controller-owned source pins and claims are implemented, including
 > terminal teardown evidence, explicit direct-Unit deletion, and direct Stack source-pin creation/release.
 > Forge identity is provenance only. Forge-aware eligibility/recovery orchestration, merge enforcement, Argo manifest
 > publication, and deployment-owned setup remain external or pending. Field names, document layouts,
@@ -30,13 +30,13 @@ implementation.
 | Generated Stack resource graphs with UID-fenced ownership | **Implemented projection and closure** | `b441941` and `d071c1e` project source-authored/direct Stack-owned Units and retain a UID-fenced closure through deletion. |
 | Direct Stack instantiation | **Implemented with durable incarnation fencing** | `84d7ddb` adds replay-fenced `instantiate-stack` and exact template provenance; `a18c23f` and `f12329a` add desired-head and durable Stack tombstone fencing. A request ledger for richer replay history remains optional follow-up. |
 | Direct and source-tracked Stack deletion/finalization | **Implemented core lifecycle** | `d071c1e` adds source-absence intents, direct UID/generation-fenced requests, child obligations, and root finalization after owned Units. |
-| Controller-owned source pins | **Lifecycle and claim recovery implemented** | `5d3a5a0` provides fenced refs; `36a529b` recovers present direct Stacks, and `57dd132` handles finalized tombstone and proven pre-publication cleanup. The current implementation adds CAS-fenced `gitopsctr/pin-claims/stacks/...` records, candidate ownership checks, and safe reaping; unclaimed legacy pins are retained. |
-| Forge provenance and recovery boundary | **Lifecycle primitives implemented; forge orchestration remains external** | Direct Stack provenance, source pins, claims, UID-fenced deletion, and finalization are implemented. PR/MR identity does not own desired resources and `advance-desired` remains forge-independent. Forge CI may enumerate refs/resources, consult the forge, and invoke normal `gitopsctr` CLI primitives. The current forge-aware adapters, recovery command, and scheduled workflow require rework or retirement before they are treated as the product boundary. |
+| Controller-owned source pins | **Lifecycle and claims implemented** | `5d3a5a0` provides fenced refs and the current implementation adds CAS-fenced `gitopsctr/pin-claims/stacks/...` records. Direct Stack deletion and finalization retain UID-/revision-fenced pins and claims; orphan enumeration and reaping remain external CI responsibilities. |
+| Forge provenance and recovery boundary | **Core boundary implemented; forge orchestration remains external** | Direct Stack provenance, source pins, claims, UID-fenced deletion, and finalization are core lifecycle primitives. PR/MR identity does not own desired resources. Forge CI may enumerate refs/resources, consult the forge, and invoke normal `gitopsctr` CLI primitives; the core has no forge eligibility or orphan-recovery command. |
 | Stack dependency ordering | **Convergence, multi-instance isolation, and external-driver acceptance implemented** | `3b25f04` includes Stack-generated and desired-only Stack Units in convergence/status and preserves explicit cross-kind Stack edges during teardown; the current increment scopes generated names as `<stack>--<template-unit>`. The temporary-repository inventory harness and Docker/Terraform demo exercise dependency-safe external deployment and reverse teardown. |
 | Argo integration and external publication | **Boundary and Argo absence observation implemented; external publication remains deployment-owned** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. Argo-backed Kubernetes Units now wait for Application absence during teardown, and the Kubernetes/Argo acceptance job proves external delivery and observation. This repository still does not publish preview manifests or own ApplicationSet resources. |
 | End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. The read-only compatibility audit covers one explicit ref or all Project-configured environments. Forge policy configuration and complete legacy migration remain open. |
 
-The repository verification suite currently passes (`562` tests), including the landed concurrency, recovery,
+The repository verification suite currently passes (`539` tests), including the landed concurrency, recovery,
 incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
 not sufficient, for the remaining preview-environment milestones because external forge orchestration,
 forge policy configuration, deployment-owned publication, and legacy migration are still open.
@@ -445,10 +445,10 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
   Stack, and finalize the Unit and Stack against the real Docker inventory.
 - [x] Add Argo CD boundary examples, operations, security documentation, and external-delivery acceptance; native
   preview manifest publication and provider-specific setup remain deployment-owned.
-- [ ] Move forge eligibility, expiry, and orphan detection out of `gitopsctr`; retain forge provenance and lifecycle
-  primitives, and keep cleanup UID-/revision-fenced.
-- [ ] Replace or retire the forge-aware repository recovery workflow. Provide only an external-CI orchestration
-  example that enumerates preview lineage and invokes ordinary `gitopsctr` CLI operations.
+- [x] Move forge eligibility, expiry, and orphan detection out of `gitopsctr`; retain forge provenance and lifecycle
+  primitives, and keep cleanup UID-/revision-fenced. External CI owns eligibility and lineage enumeration.
+- [x] Retire the forge-aware repository recovery workflow and command. Deployment-owned scheduled CI may enumerate
+  preview lineage and invoke ordinary `gitopsctr` CLI operations.
 - [x] Add a read-only GitHub branch-policy verifier for the required candidate-freshness check; live branch protection,
   ruleset, and merge-queue configuration remains deployment-owned.
 - [x] Add a read-only compatibility audit for one desired ref and an aggregate mode for all Project-configured

@@ -65,6 +65,70 @@ def test_root_help_groups_commands_and_describes_each_command():
     assert "    reconcile           reconcile one deployment unit" in help_text
 
 
+def test_lifecycle_candidate_publication_delegates_change_request_to_ci(tmp_path, monkeypatch):
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(deploy_release, "load_desired_resource_graph", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(deploy_release, "validate_effect_leases_preserved", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(deploy_release, "change_gate", lambda *_args, **_kwargs: "pullRequest")
+    monkeypatch.setattr(
+        deploy_release,
+        "git",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(deploy_release, "publish_tree", lambda *_args, **_kwargs: "d" * 40)
+    monkeypatch.setattr(deploy_release, "verify_gated_candidate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        deploy_release,
+        "ensure_change_request",
+        lambda *_args, **_kwargs: pytest.fail("lifecycle publication must not call a forge adapter"),
+    )
+
+    revision, outcome = deploy_release.publish_desired_change(
+        "dev",
+        tmp_path / "candidate",
+        "deploy/dev",
+        "b" * 40,
+        "candidate/dev/0123456789ab",
+        "Finalize deletion",
+        "Finalize deletion",
+        "Finalize a UID-fenced deletion.",
+        False,
+        request_change=False,
+    )
+
+    assert revision == "d" * 40
+    assert isinstance(outcome, deploy_release.ManualChangeRequest)
+    assert "delegated" in outcome.reason
+
+
+def test_write_change_outputs_handles_delegated_change_request(tmp_path, monkeypatch):
+    output = tmp_path / "github-output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+
+    deploy_release.write_change_outputs(
+        "d" * 40,
+        "deploy/dev",
+        "candidate/dev/0123456789ab",
+        deploy_release.ManualChangeRequest(
+            reason="delegated",
+            head="candidate/dev/0123456789ab",
+            base="deploy/dev",
+            title="Delete preview",
+            body="Delete preview Stack.",
+            remote_url=None,
+        ),
+    )
+
+    assert output.read_text() == (
+        "change_revision=" + "d" * 40 + "\n"
+        "target_ref=deploy/dev\n"
+        "candidate_ref=candidate/dev/0123456789ab\n"
+        "change_status=manual\n"
+        "change_url=\n"
+    )
+
+
 def test_desired_resolution_logs_unit_and_observation_decision(tmp_path, monkeypatch, capsys):
     source = tmp_path / "source"
     current = tmp_path / "current"

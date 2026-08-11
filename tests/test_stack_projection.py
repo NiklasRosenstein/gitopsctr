@@ -401,7 +401,8 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
             unit = cli.RESOURCE_CATALOG.parse_unit(unit_document, profile="desired", expected_name=name)
             cli.write_desired_candidate_unit(candidate / "units" / f"{name}.json", unit, source_root)
 
-    def publish(_environment, candidate, *_args, **_kwargs):
+    def publish(_environment, candidate, *_args, **kwargs):
+        assert kwargs["request_change"] is False
         events.append("publish")
         snapshot = tmp_path / "published"
         shutil.copytree(candidate, snapshot)

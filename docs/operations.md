@@ -105,11 +105,9 @@ call GitHub or GitLab.
 Trusted PR CI may create, update, delete, and finalize a preview Stack with the
 normal CLI primitives. A scheduled CI job may enumerate preview refs or
 resources by lineage, consult the forge for missed events, and request cleanup.
-Cleanup still uses UID-/revision-fenced Stack finalization.
-
-The existing `recover-orphaned-preview-stacks.yml` workflow is a transitional
-forge-aware reference. Do not treat it as the core product contract; replace or
-retire it when external CI orchestration is established.
+Cleanup still uses UID-/revision-fenced Stack finalization. The deployment-owned
+scheduled job is responsible for lineage enumeration and forge API calls; this
+repository does not provide a forge-aware recovery command or watcher.
 
 ## Verify GitHub merge policy
 

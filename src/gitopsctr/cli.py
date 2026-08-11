@@ -80,7 +80,6 @@ from gitopsctr.forges import (
     ChangeRequestSpec,
     ManualChangeRequest,
     ensure_change_request,
-    preview_eligibility,
 )
 from gitopsctr.formats import (
     DEFAULT_CANDIDATE_REF_TEMPLATE,
@@ -134,7 +133,7 @@ from gitopsctr.resources import (
     validate_desired_resource_graph,
 )
 from gitopsctr.schemas import encoded_schema, export_schemas, resource_schema_url, show_schema
-from gitopsctr.state import ControllerPin, ControllerPinClaim, GatedCandidate, GitRefSnapshot, GitStateStore
+from gitopsctr.state import ControllerPin, ControllerPinClaim, GatedCandidate, GitStateStore
 from gitopsctr.templates import (
     ArtifactReference as ArtifactReferenceExpression,
 )
@@ -4532,6 +4531,7 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
                 f"Restore the UID-fenced opaque cleanup root for `{args.unit}`.",
                 False,
                 current,
+                request_change=False,
             )
             if outcome is not None:
                 log_status(
@@ -4635,6 +4635,7 @@ def command_resolve_opaque_unit(args: argparse.Namespace) -> bool:
             ),
             False,
             current,
+            request_change=False,
         )
         if outcome is not None:
             log_status(
@@ -5628,7 +5629,8 @@ def publish_change_candidate(
     body: str,
     current_root: Path | None = None,
     allow_removed_units: frozenset[str] = frozenset(),
-) -> tuple[str, ChangeRequestResult | ManualChangeRequest]:
+    request_change: bool = True,
+) -> tuple[str, ChangeRequestResult | ManualChangeRequest | None]:
     load_desired_resource_graph(candidate)
     validate_effect_leases_preserved(target_ref, target_revision, candidate, current_root, allow_removed_units)
     if git("check-ref-format", "--branch", candidate_ref, check=False).returncode != 0:
@@ -5660,6 +5662,17 @@ def publish_change_candidate(
             commit_message,
         )
     verify_gated_candidate(candidate_revision, target_revision)
+    if not request_change:
+        outcome = ManualChangeRequest(
+            reason="change-request creation is delegated to the calling CI workflow",
+            head=candidate_ref,
+            base=target_ref,
+            title=title,
+            body=body,
+            remote_url=None,
+        )
+        log_status("REVIEW", f"external change request required for {style_branch(candidate_ref)}")
+        return candidate_revision, outcome
     outcome = ensure_change_request(
         ChangeRequestSpec(
             head=candidate_ref,
@@ -5685,12 +5698,21 @@ def write_change_outputs(
     outcome: ChangeRequestResult | ManualChangeRequest | None = None,
 ) -> None:
     if output := os.environ.get("GITHUB_OUTPUT"):
+        if isinstance(outcome, ChangeRequestResult):
+            change_status = outcome.status
+            change_url = outcome.url
+        elif isinstance(outcome, ManualChangeRequest):
+            change_status = "manual"
+            change_url = ""
+        else:
+            change_status = "published"
+            change_url = ""
         with Path(output).open("a") as stream:
             stream.write(f"change_revision={revision}\n")
             stream.write(f"target_ref={target_ref}\n")
             stream.write(f"candidate_ref={candidate_ref}\n")
-            stream.write(f"change_status={outcome.status if outcome else 'published'}\n")
-            stream.write(f"change_url={outcome.url if isinstance(outcome, ChangeRequestResult) else ''}\n")
+            stream.write(f"change_status={change_status}\n")
+            stream.write(f"change_url={change_url}\n")
 
 
 def command_promote(args: argparse.Namespace) -> None:
@@ -5893,6 +5915,7 @@ def publish_desired_change(
     dry: bool,
     current_root: Path | None = None,
     allow_removed_units: frozenset[str] = frozenset(),
+    request_change: bool = True,
 ) -> tuple[str, ChangeRequestResult | ManualChangeRequest | None]:
     load_desired_resource_graph(candidate)
     validate_effect_leases_preserved(target_ref, target_revision, candidate, current_root, allow_removed_units)
@@ -5911,6 +5934,7 @@ def publish_desired_change(
             body,
             current_root,
             allow_removed_units,
+            request_change,
         )
         log_status(
             "CANDIDATE",
@@ -6486,6 +6510,7 @@ def _command_request_delete_direct_unit(args: argparse.Namespace) -> bool:
             f"Create a UID-fenced deletion intent for directly managed `{args.unit}`.",
             args.dry,
             current,
+            request_change=False,
         )
         if args.dry:
             return False
@@ -6540,161 +6565,6 @@ def _stack_pin_claim(
         candidate_revision=candidate_revision,
         state=state,
     )
-
-
-def _parse_stack_pin_name(environment: str, name: str) -> tuple[str, str] | None:
-    parts = name.split("/")
-    if len(parts) != 4 or parts[0] != "stacks" or parts[1] != environment:
-        return None
-    stack_name, uid = parts[2], parts[3]
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", stack_name):
-        return None
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", uid):
-        return None
-    return stack_name, uid
-
-
-_CANDIDATE_OPERATIONS = (
-    "promotion",
-    "rollback",
-    "finalize",
-    "finalize-stack",
-    "request-delete-direct-unit",
-    "request-delete-direct-stack",
-    "instantiate-stack",
-    "resolve-opaque-unit",
-)
-
-
-def _candidate_ref_pattern(environment: str) -> re.Pattern[str]:
-    """Compile the configured candidate ref template for published-ref lookup."""
-
-    template = candidate_ref_template(REPOSITORY_ROOT, environment)
-    token_pattern = re.compile(r"\{(environment|operation|id)\}")
-    pieces: list[str] = []
-    offset = 0
-    for match in token_pattern.finditer(template):
-        pieces.append(re.escape(template[offset : match.start()]))
-        token = match.group(1)
-        if token == "environment":
-            pieces.append(re.escape(environment))
-        elif token == "operation":
-            pieces.append("(?:" + "|".join(map(re.escape, _CANDIDATE_OPERATIONS)) + ")")
-        else:
-            pieces.append(r"[0-9a-f]{12}")
-        offset = match.end()
-    pieces.append(re.escape(template[offset:]))
-    return re.compile("^" + "".join(pieces) + "$")
-
-
-def _published_candidate_snapshots(
-    environment: str,
-    desired_ref: str,
-    observed_ref: str,
-    explicit_candidate_ref: str | None,
-    claimed_candidate_refs: Sequence[str] = (),
-) -> tuple[tuple[GitRefSnapshot, ...], bool]:
-    """Return candidate refs and whether the inventory is complete.
-
-    A complete inventory is required before an unknown pin can be released.
-    """
-
-    try:
-        pattern = _candidate_ref_pattern(environment)
-        remote_refs = state_store().list_remote_refs()
-    except (OperationError, re.error):
-        return (), False
-    snapshots = {
-        snapshot.ref: snapshot
-        for snapshot in remote_refs
-        if pattern.fullmatch(snapshot.ref) and snapshot.ref not in {desired_ref, observed_ref}
-    }
-    explicit_refs = set(claimed_candidate_refs)
-    if explicit_candidate_ref is not None:
-        explicit_refs.add(explicit_candidate_ref)
-    for candidate_ref in explicit_refs:
-        explicit = next((snapshot for snapshot in remote_refs if snapshot.ref == candidate_ref), None)
-        if explicit is not None and explicit.ref not in {desired_ref, observed_ref}:
-            snapshots[explicit.ref] = explicit
-    return tuple(sorted(snapshots.values(), key=lambda snapshot: snapshot.ref)), True
-
-
-def _candidate_owns_stack_pin(candidate: Path, pin: ControllerPin, stack_name: str, uid: str) -> bool:
-    """Return whether a published candidate carries this pin's Stack identity."""
-
-    stack_path = _current_desired_stack_paths(candidate, "Stack").get(stack_name)
-    if stack_path is not None:
-        stack = RESOURCE_CATALOG.parse_stack(
-            RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name=stack_name
-        )
-        if (
-            stack.metadata.uid == uid
-            and stack.metadata.lifecycle is not None
-            and stack.metadata.lifecycle.owner is None
-            and stack.metadata.lifecycle.management is not None
-            and stack.metadata.lifecycle.management.mode == "direct"
-            and isinstance(stack.spec, DesiredStackSpec)
-            and stack.spec.provenance is not None
-            and stack.spec.provenance.templateRevision == pin.revision
-        ):
-            return True
-
-    intent = load_desired_stack_deletion_intents(candidate).get(stack_name)
-    return (
-        intent is not None
-        and intent.uid == uid
-        and intent.controller_pin is not None
-        and intent.controller_pin.name == pin.name
-        and intent.controller_pin.revision == pin.revision
-    )
-
-
-def _candidate_owned_stack_pins(
-    environment: str,
-    desired_ref: str,
-    observed_ref: str,
-    explicit_candidate_ref: str | None,
-    pins: Sequence[ControllerPin],
-    claimed_candidate_refs: Sequence[str] = (),
-) -> tuple[set[str], bool]:
-    """Inspect published candidates and return owned pin names and certainty."""
-
-    snapshots, complete = _published_candidate_snapshots(
-        environment,
-        desired_ref,
-        observed_ref,
-        explicit_candidate_ref,
-        claimed_candidate_refs,
-    )
-    owned: set[str] = set()
-    unresolved = {
-        pin.name: (pin, parsed) for pin in pins if (parsed := _parse_stack_pin_name(environment, pin.name)) is not None
-    }
-    for snapshot in snapshots:
-        revision = fetch_ref(snapshot.ref)
-        if revision is None or revision != snapshot.revision:
-            complete = False
-            continue
-        try:
-            with tempfile.TemporaryDirectory() as temporary_directory:
-                candidate = Path(temporary_directory) / "candidate"
-                materialize_revision(revision, candidate)
-                for pin_name, (pin, parsed) in unresolved.items():
-                    if pin_name in owned:
-                        continue
-                    if _candidate_owns_stack_pin(candidate, pin, *parsed):
-                        owned.add(pin_name)
-        except (
-            DocumentFormatError,
-            KeyError,
-            OSError,
-            OperationError,
-            subprocess.SubprocessError,
-            TypeError,
-            ValueError,
-        ):
-            complete = False
-    return owned, complete
 
 
 def _parse_stack_parameters(raw: str) -> JsonObjectValue:
@@ -6909,6 +6779,7 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
                 f"Create a UID-fenced direct Stack `{args.stack}` from StackTemplate `{args.template}`.",
                 args.dry,
                 current,
+                request_change=False,
             )
         except OperationError:
             # A pin created for a candidate that was never published is not a
@@ -7015,237 +6886,6 @@ def _stack_intent_for_resource(
     )
 
 
-def direct_stack_expiry(stack: StackResource) -> int | None:
-    """Read the optional controller-recognized ``expiresAt`` Stack parameter."""
-
-    if not isinstance(stack.spec, DesiredStackSpec):
-        return None
-    value = stack.spec.parameters.get("expiresAt")
-    if value is None:
-        return None
-    if type(value) is not int or value < 1:
-        raise OperationError(f"direct Stack {stack.name!r} has an invalid expiresAt parameter")
-    return value
-
-
-def _command_recover_orphaned_stacks(args: argparse.Namespace) -> bool:
-    _resource_name(args.environment, "environment name")
-    desired_ref, _observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, None)
-    current_revision = fetch_ref(desired_ref)
-    if current_revision is None:
-        log_status("KEEP", f"{style_environment(args.environment)}: no desired state")
-        return False
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        current = Path(temporary_directory) / "current"
-        materialize_revision(current_revision, current)
-        resources = load_desired_resource_graph(current)
-        intents = load_desired_stack_deletion_intents(current)
-        store = state_store()
-        pins = {pin.name: pin for pin in store.list_controller_pins()}
-        claims_by_pin: dict[str, ControllerPinClaim] = {}
-        claims_complete = True
-        list_claims = getattr(store, "list_controller_pin_claims", None)
-        if list_claims is not None:
-            try:
-                claims_by_pin = {claim.pin_name: claim for claim in list_claims()}
-            except OperationError as exc:
-                claims_complete = False
-                log_status("WAIT", f"controller pin claims are unavailable; retaining source pins: {exc}")
-        tombstones = load_desired_stack_incarnation_tombstones(current)
-        direct_stacks = sorted(
-            (
-                resource
-                for resource in resources.values()
-                if isinstance(resource, StackResource)
-                and resource.gvk.kind == "Stack"
-                and resource.metadata.lifecycle is not None
-                and resource.metadata.lifecycle.owner is None
-                and resource.metadata.lifecycle.management is not None
-                and resource.metadata.lifecycle.management.mode == "direct"
-            ),
-            key=lambda resource: resource.name,
-        )
-        changed = False
-        now = effect_lease_now()
-        for stack in direct_stacks:
-            assert isinstance(stack.spec, DesiredStackSpec)
-            assert stack.metadata.uid is not None
-            intent = intents.get(stack.name)
-            if intent is not None:
-                log_status("WAIT", f"{stack.name}: deletion intent already active")
-                continue
-            if stack.spec.provenance is None:
-                raise OperationError(f"direct Stack {stack.name!r} is missing instantiation provenance")
-            pin_name = _stack_pin_name(args.environment, stack.name, stack.metadata.uid)
-            pin = pins.get(pin_name)
-            if args.dry:
-                if pin is None:
-                    log_status("WAIT", f"{stack.name}: source pin is not present; recovery would create it")
-                    continue
-            else:
-                if pin is not None and pin.revision != stack.spec.provenance.templateRevision:
-                    raise OperationError(
-                        f"source pin for Stack {stack.name!r} is fenced at {pin.revision}, "
-                        f"not template revision {stack.spec.provenance.templateRevision}"
-                    )
-                if pin is None:
-                    store.create_controller_pin(pin_name, stack.spec.provenance.templateRevision)
-
-            expiry = direct_stack_expiry(stack)
-            if expiry is not None and expiry <= now:
-                reason = f"expiresAt {expiry} has passed"
-            else:
-                eligibility = preview_eligibility(
-                    stack.spec.provenance.requestIdentity,
-                    required_label=args.required_label,
-                    cwd=REPOSITORY_ROOT,
-                )
-                reason = eligibility.reason
-                if eligibility.status == "unknown":
-                    log_status("WAIT", f"{stack.name}: forge eligibility unknown; {reason}")
-                    continue
-                if eligibility.status == "eligible":
-                    log_status("KEEP", f"{stack.name}: preview remains eligible; {reason}")
-                    continue
-
-            log_status("REQUEST", f"{stack.name}: preview is ineligible; {reason}")
-            changed = (
-                _command_request_delete_direct_stack(
-                    argparse.Namespace(
-                        environment=args.environment,
-                        stack=stack.name,
-                        uid=stack.metadata.uid,
-                        desired_ref=args.desired_ref,
-                        candidate_ref=args.candidate_ref,
-                        dry=args.dry,
-                    )
-                )
-                or changed
-            )
-        direct_uids = {(stack.name, stack.metadata.uid) for stack in direct_stacks if stack.metadata.uid is not None}
-        unresolved_pins = tuple(
-            pin
-            for pin in pins.values()
-            if (parsed := _parse_stack_pin_name(args.environment, pin.name)) is not None
-            and parsed not in direct_uids
-            and (tombstones.get(parsed[0]) is None or tombstones[parsed[0]].uid != parsed[1])
-        )
-        if unresolved_pins:
-            candidate_owned_pins, candidate_inventory_complete = _candidate_owned_stack_pins(
-                args.environment,
-                desired_ref,
-                _observed_ref,
-                args.candidate_ref,
-                unresolved_pins,
-                tuple(claim.candidate_ref for claim in claims_by_pin.values()),
-            )
-        else:
-            candidate_owned_pins, candidate_inventory_complete = set(), True
-        for pin in pins.values():
-            parsed = _parse_stack_pin_name(args.environment, pin.name)
-            if parsed is None:
-                log_status("WAIT", f"controller pin {pin.name}: identity is not recoverable")
-                continue
-            stack_name, uid = parsed
-            if (stack_name, uid) in direct_uids:
-                continue
-            tombstone = tombstones.get(stack_name)
-            if tombstone is not None and tombstone.uid == uid:
-                log_status("RELEASE", f"{stack_name}: finalized Stack tombstone confirms pin is no longer needed")
-                if not args.dry:
-                    store.release_controller_pin(pin.name, pin.revision)
-                    claim = claims_by_pin.get(pin.name)
-                    delete_claim = getattr(store, "delete_controller_pin_claim", None)
-                    if claim is not None and claim.revision is not None and delete_claim is not None:
-                        delete_claim(claim.ref.removeprefix("gitopsctr/pin-claims/"), claim.revision)
-                changed = True
-                continue
-            if pin.name in candidate_owned_pins:
-                log_status("WAIT", f"{stack_name}: published candidate still owns the Stack pin")
-                continue
-            claim = claims_by_pin.get(pin.name)
-            if not claims_complete:
-                log_status("WAIT", f"{stack_name}: pin claim ownership is unknown; retaining source pin")
-                continue
-            if claim is None:
-                log_status("WAIT", f"{stack_name}: pin has no controller claim; retaining source pin")
-                continue
-            if claim.pin_revision != pin.revision or claim.uid != uid or claim.stack_name != stack_name:
-                log_status("WAIT", f"{stack_name}: pin claim does not match the source pin; retaining source")
-                continue
-            if not candidate_inventory_complete:
-                log_status("WAIT", f"{stack_name}: candidate ownership is unknown; retaining source pin")
-                continue
-            update_claim = getattr(store, "update_controller_pin_claim", None)
-            delete_claim = getattr(store, "delete_controller_pin_claim", None)
-            if update_claim is None or delete_claim is None or claim.revision is None:
-                log_status("WAIT", f"{stack_name}: pin claim CAS is unavailable; retaining source pin")
-                continue
-            try:
-                target_revision = fetch_ref(claim.target_ref)
-                candidate_revision = fetch_ref(claim.candidate_ref)
-            except OperationError as exc:
-                log_status("WAIT", f"{stack_name}: claim fence cannot be checked; retaining source pin: {exc}")
-                continue
-            if target_revision != claim.target_revision:
-                log_status("WAIT", f"{stack_name}: claim target changed; retaining source pin")
-                continue
-            if claim.candidate_revision is None:
-                if candidate_revision is not None:
-                    log_status("WAIT", f"{stack_name}: candidate appeared before publication was confirmed")
-                    continue
-            elif candidate_revision is not None and candidate_revision != claim.candidate_revision:
-                log_status("WAIT", f"{stack_name}: candidate changed; retaining source pin")
-                continue
-            if claim.state != "reaping":
-                if args.dry:
-                    log_status("WAIT", f"{stack_name}: recovery would claim the orphan pin for reaping")
-                    continue
-                try:
-                    claim = update_claim(
-                        _stack_pin_claim(
-                            args.environment,
-                            stack_name,
-                            uid,
-                            pin.revision,
-                            claim.target_ref,
-                            claim.target_revision,
-                            claim.candidate_ref,
-                            state="reaping",
-                            candidate_revision=claim.candidate_revision,
-                        ),
-                        claim.revision,
-                    )
-                except OperationError as exc:
-                    log_status("WAIT", f"{stack_name}: pin claim changed during recovery; {exc}")
-                    continue
-            refreshed_owned, refreshed_complete = _candidate_owned_stack_pins(
-                args.environment,
-                desired_ref,
-                _observed_ref,
-                args.candidate_ref,
-                (pin,),
-                (claim.candidate_ref,),
-            )
-            if pin.name in refreshed_owned or not refreshed_complete:
-                log_status("WAIT", f"{stack_name}: candidate ownership changed during recovery; retaining source pin")
-                continue
-            log_status("RELEASE", f"{stack_name}: no published candidate owns the orphan pin")
-            if not args.dry:
-                store.release_controller_pin(pin.name, pin.revision)
-                if claim.revision is not None:
-                    delete_claim(claim.ref.removeprefix("gitopsctr/pin-claims/"), claim.revision)
-            changed = True
-        if not direct_stacks and not pins:
-            log_status("KEEP", f"{style_environment(args.environment)}: no direct Stack roots or controller pins")
-        return changed
-
-
-def command_recover_orphaned_stacks(args: argparse.Namespace) -> bool:
-    with unit_effect_lock(args.environment, "stack-garbage-collector"):
-        return _command_recover_orphaned_stacks(args)
-
-
 def _command_request_delete_direct_stack(args: argparse.Namespace) -> bool:
     _resource_name(args.environment, "environment name")
     _resource_name(args.stack, "Stack name")
@@ -7341,6 +6981,7 @@ def _command_request_delete_direct_stack(args: argparse.Namespace) -> bool:
             f"Create a UID-fenced deletion intent for directly managed Stack `{args.stack}`.",
             args.dry,
             current,
+            request_change=False,
         )
         if args.dry:
             return False
@@ -7440,6 +7081,7 @@ def _command_finalize_stack(args: argparse.Namespace) -> bool:
             f"Remove the finalized direct Stack `{args.stack}` after its owned Units are absent.",
             args.dry,
             current,
+            request_change=False,
         )
         if args.dry:
             return False
@@ -7830,6 +7472,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                     False,
                     current,
                     frozenset({args.unit}),
+                    request_change=False,
                 )
                 break
             except (EffectLeaseUnavailable, subprocess.CalledProcessError) as exc:
@@ -9951,7 +9594,6 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
             (
                 "recover-opaque-unit",
                 "resolve-opaque-unit",
-                "recover-orphaned-stacks",
                 "request-delete-direct-unit",
                 "request-delete-direct-stack",
                 "finalize",
@@ -10224,23 +9866,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resolve_opaque.add_argument("--dry", action="store_true")
     resolve_opaque.set_defaults(handler=command_resolve_opaque_unit)
-
-    recover_stacks = commands.add_parser(
-        "recover-orphaned-stacks",
-        help="request cleanup for direct Stacks whose preview is expired or forge-ineligible",
-    )
-    recover_stacks.add_argument("--environment", required=True)
-    recover_stacks.add_argument(
-        "--required-label",
-        help="GitHub pull-request label required for preview eligibility",
-    )
-    recover_stacks.add_argument("--desired-ref", help="override the environment's desired ref")
-    recover_stacks.add_argument(
-        "--candidate-ref",
-        help="exact candidate ref override when the environment uses a pull-request change gate",
-    )
-    recover_stacks.add_argument("--dry", action="store_true")
-    recover_stacks.set_defaults(handler=command_recover_orphaned_stacks)
 
     request_delete_direct = commands.add_parser(
         "request-delete-direct-unit",
