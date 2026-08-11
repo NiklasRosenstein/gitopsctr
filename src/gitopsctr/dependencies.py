@@ -95,12 +95,11 @@ def _unit_dependencies(
     unit_name: str,
     additional_dependencies: Mapping[str, Sequence[str]] | None = None,
 ) -> frozenset[str]:
-    """Return observation and controller-provided dependency edges for one Unit.
+    """Return observation and controller dependency edges for one Unit.
 
-    StackTemplate edges are supplied separately because they live in the desired
-    Stack graph rather than in a driver-owned Unit spec. Keeping them as an
-    explicit input prevents authored Unit documents from acquiring controller
-    metadata while allowing the same ordering algorithms to cover both forms.
+    StackTemplate edges live in the desired Stack graph, not in the Unit spec.
+    Pass them as a separate input. This keeps controller metadata out of
+    authored Unit documents and lets one ordering algorithm handle both forms.
     """
 
     dependencies = set(observation_reference_units(_authored_document(specifications[unit_name])))

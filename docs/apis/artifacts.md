@@ -11,7 +11,7 @@ The current bundled artifact kinds are:
 | `ContainerImages` | `OciImages` | `containers` | [Container images](container-images.md) |
 | `FrontendBundle` | `ViteOciBundle` | `frontend` | [Frontend bundle](frontend-bundle.md) |
 
-Plugins can register additional `artifact.gitopsctr.io` kinds. The table describes the bundled set, not an exhaustive
+Plugins can register additional `artifact.gitopsctr.io` kinds. The table describes the bundled set, not a complete
 ecosystem.
 
 ## How `fromArtifact` resolves

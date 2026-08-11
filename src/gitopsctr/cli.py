@@ -1,6 +1,7 @@
-"""Resolve deployment state and run registered reconciliation drivers.
+"""Resolve deployment state and run registered drivers.
 
-Desired and observed JSON remain the contract; GitHub Actions and local callers use the same CLI.
+Desired and observed documents are the contract. Local callers and GitHub
+Actions use the same CLI.
 """
 
 from __future__ import annotations
@@ -2800,7 +2801,7 @@ class StackIncarnationTombstone:
 
 
 class EffectLeaseUnavailable(OperationError):
-    """The desired Git state currently grants the effect lease to another runner."""
+    """The desired Git state grants the effect lease to another runner."""
 
 
 @dataclass(frozen=True)
@@ -6673,7 +6674,7 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
         )
         # The desired head is part of the incarnation identity. Retries against
         # the same head remain replay-idempotent, while a same-name request
-        # after a finalized root has a new desired head and therefore cannot
+        # after a finalized root has a new desired head and cannot
         # reuse the old UID or its teardown evidence.
         previous_tombstone = load_desired_stack_incarnation_tombstones(current).get(args.stack)
         direct_uid = _direct_stack_uid(
@@ -6887,7 +6888,7 @@ def _stack_intent_for_resource(
 
 
 def _release_stack_controller_pin(intent: StackDeletionIntent) -> None:
-    """Release a finalized Stack pin and its claim under both identity fences."""
+    """Release a finalized Stack pin and claim under both identity fences."""
 
     pin = intent.controller_pin
     if pin is None:

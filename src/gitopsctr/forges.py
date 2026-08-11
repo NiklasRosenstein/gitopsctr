@@ -1,8 +1,8 @@
-"""Create or find forge-hosted review requests and verify forge CI candidates.
+"""Create or find forge review requests and verify CI candidates.
 
-The deployment controller publishes candidate refs before calling this module. This module never
-updates a target ref: it only opens (or finds) the change request that reviews candidate changes,
-or validates exact candidate heads supplied by CI. Forge state and preview eligibility are outside
+The controller publishes candidate refs before it calls this module. This
+module does not update target refs. It creates or finds review requests and
+checks candidate heads from CI. Forge state and preview eligibility are outside
 the lifecycle core.
 """
 
@@ -24,7 +24,7 @@ GitHubCandidateEventName = Literal["pull_request", "merge_group"]
 
 @dataclass(frozen=True)
 class GitHubCandidateHeads:
-    """Head data extracted from a GitHub gated-candidate event."""
+    """Candidate and target heads from a GitHub event."""
 
     event: GitHubCandidateEventName
     candidate_revision: str
@@ -38,11 +38,10 @@ def _github_revision(value: object, field: str) -> str:
 
 
 def github_candidate_heads(payload: object, event: str) -> GitHubCandidateHeads:
-    """Extract exact candidate and target heads from supported GitHub event payloads.
+    """Extract candidate and target heads from a supported GitHub event.
 
-    This validates only forge-provided identity data.  It does not claim that GitHub
-    branch protection or merge rules are configured; callers must still run the local
-    commit-graph verifier before accepting the candidate.
+    This validates forge identity data only. It does not check branch protection
+    or merge rules. Callers must run the local commit-graph verifier.
     """
 
     if event == "pull_request":
@@ -94,7 +93,7 @@ def verify_github_candidate_heads(
 
 @dataclass(frozen=True)
 class ChangeRequestSpec:
-    """All forge-neutral information needed to request a reviewed ref change."""
+    """Forge-neutral data for a reviewed ref change."""
 
     head: str
     base: str
@@ -112,7 +111,7 @@ class ChangeRequestResult:
 
 @dataclass(frozen=True)
 class ManualChangeRequest:
-    """Exact instructions for creating a change request outside the controller."""
+    """Instructions for creating a change request outside the controller."""
 
     reason: str
     head: str

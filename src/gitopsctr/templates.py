@@ -316,7 +316,7 @@ def _parse_parameter_reference(value: dict[str, object], pointer: str) -> Parame
 
 
 def parse_template_value(value: object, pointer: str = "") -> TemplateValue:
-    """Parse untrusted JSON into an exhaustive authored-value expression tree."""
+    """Parse untrusted JSON into a complete authored-value expression tree."""
 
     if value is None or isinstance(value, (bool, int, float, str)):
         return value

@@ -25,4 +25,4 @@ Image keys correspond to the names configured by the producing unit. Consumers n
 pointer such as `/images/application/uri`.
 
 See the [OCI images unit](../drivers/oci-images.md), the [artifact lookup](artifacts.md#how-fromartifact-resolves), and
-the exhaustive [ContainerImages schema](../schemas/apis/artifact.gitopsctr.io/v1/ContainerImages.schema.json).
+the complete [ContainerImages schema](../schemas/apis/artifact.gitopsctr.io/v1/ContainerImages.schema.json).

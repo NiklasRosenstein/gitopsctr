@@ -23,9 +23,9 @@ promoted_image:
   fromPromotion: {}
 ```
 
-Receipt and artifact evidence is usable only while its receipt matches the producer's current desired unit. Artifact
-identity, declared type, descriptor, media type, and digest are checked before the value is read. If required evidence
-is unavailable or stale, the consumer waits.
+Receipt and artifact evidence is valid only while its receipt matches the producer's current desired unit. Before a
+value is read, the controller checks artifact identity, type, descriptor, media type, and digest. If required evidence
+is missing or stale, the consumer waits.
 
 See [Receipt lookup](apis/receipt.md#how-fromreceipt-resolves) and
 [Artifact lookup](apis/artifacts.md#how-fromartifact-resolves) for the exact files, freshness checks, and pointer scope.
@@ -42,9 +42,8 @@ overridden independently:
 | `fromPromotion: {pointer: /inputs/release}` | Target unit name | `/inputs/release` |
 | `fromPromotion: {unit: release, pointer: /inputs/release}` | `release` | `/inputs/release` |
 
-An inferred pointer requires source and target units to have the same `apiVersion` and `kind`. Cross-kind references
-must specify `pointer`. An explicitly authored `pointer: ""` selects the source unit's whole public `spec`; resource
-metadata and internal driver identity are never exposed.
+An inferred pointer requires matching `apiVersion` and `kind` values. A cross-kind reference must specify `pointer`.
+`pointer: ""` selects the source unit's public `spec`. Resource metadata and driver identity are never exposed.
 
 Once a promotion is active, a missing source unit, mismatched inferred kind, or unresolved pointer is an error rather
 than a waiting condition. Successful promotion inputs are fingerprinted as `<source-unit>#<effective-pointer>`, so
@@ -66,9 +65,9 @@ image:
     dryFallback: registry.invalid/application@sha256:0000000000000000000000000000000000000000000000000000000000000000
 ```
 
-The fallback is considered only during dry resolution, including `reconcile --plan` and `advance-desired --dry`, and
-only when the reference is unavailable. Normal advancement and reconciliation never use it. Invalid expressions,
-type errors, and broken active promotions remain fatal and cannot be hidden by a fallback.
+The fallback is used only during dry resolution, including `reconcile --plan` and `advance-desired --dry`, and only
+when the reference is unavailable. Normal advancement and reconciliation never use it. Invalid expressions, type
+errors, and broken active promotions remain fatal. A fallback cannot hide them.
 
 Fallback values use the same recursive template language as their containing field. They may be scalar, structured,
 explicitly `null`, or another reference:

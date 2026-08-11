@@ -34,9 +34,9 @@ field-by-field:
 | 3 | Expanded `Project.spec.environmentDefaults.refs` template |
 | 4 | Built-in `gitopsctr/desired/<environment>` or `gitopsctr/observed/<environment>` convention |
 
-Project templates substitute the literal `{environment}` placeholder. Environment-level desired and observed refs are
-literal; the candidate ref remains a template because each proposal may have its own `{id}`. The final desired and
-observed refs must be non-empty and different. See
+Project templates replace the literal `{environment}` placeholder. Environment-level desired and observed refs are
+literal. The candidate ref stays a template because each proposal can have its own `{id}`. Desired and observed refs
+must be non-empty and different. See
 [Project configuration](../project-configuration.md#environment-ref-defaults).
 
 ### Candidate refs
@@ -51,8 +51,8 @@ environment; an operation-specific `--candidate-ref` exact override has highest 
 | `{id}` | Deterministic proposal identifier; optional |
 | `{operation}` | `promotion` or `rollback`; optional |
 
-Omitting `{id}` creates one candidate slot for each expanded template. An identical retry reuses that branch and pull
-request; a different proposal fails until the occupied branch is removed, rather than rewriting reviewed content.
+Without `{id}`, all proposals use one candidate branch. An identical retry reuses that branch and pull request. A
+different proposal fails while the branch exists. It cannot replace reviewed content.
 
 ## Promotion and change gates
 
@@ -64,4 +64,4 @@ request; a different proposal fails until the occupied branch is removed, rather
   materialized evidence even if no observed ref exists.
 
 Use [`gitopsctr create environment`](../operations.md) for a minimal resource. The
-[Environment schema](../schemas/apis/gitopsctr.io/v1/Environment.schema.json) is the exhaustive field reference.
+[Environment schema](../schemas/apis/gitopsctr.io/v1/Environment.schema.json) is the complete field reference.

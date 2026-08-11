@@ -82,7 +82,7 @@ class ResourceMetadata(StrictModel):
 
     @classmethod
     def source_tracked_from_provenance(cls, name: str, provenance: str) -> ResourceMetadata:
-        """Create a source-tracked identity stable for one desired proposal."""
+        """Create a source-tracked identity for one desired proposal."""
 
         digest = hashlib.sha256(f"gitopsctr/desired-uid/v1\0{provenance}".encode()).hexdigest()[:32]
         return cls(

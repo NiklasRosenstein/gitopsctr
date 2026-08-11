@@ -219,7 +219,7 @@ desired ref has explicit lifecycle metadata and the migration/adoption diagnosti
 
 The document migration tool now assigns deterministic source-tracked metadata to legacy desired Units, updates their
 source revision to the migrated source commit, preserves existing Project ref configuration, and migrates configured
-desired and observed refs instead of assuming `deploy/*` and `observed/*`. Live compatibility retirement remains open
+desired and observed refs from configuration. Live compatibility retirement remains open
 until deployments provide a complete supported-ref inventory and pass a clean audit.
 
 ### 8.2 Desired compatibility audit — complete for one explicit ref
@@ -263,27 +263,26 @@ context, encodes branch names safely, and fails closed on API errors or malforme
 for automation. The live branch remains unprotected; deployment owners must configure and re-run this check after
 branch protection, rulesets, or merge-queue policy is set.
 
-### 8.7 Forge provenance boundary — core alignment complete
+### 8.7 Forge provenance boundary — complete
 
-Forge identity is provenance, not lifecycle authority. PR CI may imperatively create and delete preview Stacks with
-normal `gitopsctr` CLI primitives. Scheduled CI may enumerate preview refs or resources by lineage, consult GitHub or
-GitLab, and request cleanup for missed events. `advance-desired`, reconciliation, and finalization remain forge-
-independent. The core no longer contains preview eligibility/orphan-recovery adapters or the repository recovery
-workflow; lifecycle candidate publication delegates change-request creation to the calling CI workflow.
+Forge identity is provenance, not lifecycle authority. PR CI may create and delete preview Stacks with normal
+`gitopsctr` commands. Scheduled CI may find preview refs or resources by lineage, check GitHub or GitLab, and request
+cleanup for missed events. `advance-desired`, reconciliation, and finalization do not call a forge. The core no longer
+contains preview eligibility, orphan recovery, or the repository recovery workflow. Candidate publication leaves change
+request creation to the calling CI workflow.
 Verification: `GIT_CONFIG_GLOBAL=/dev/null UV_CACHE_DIR=/tmp/gitopsctr-uv-cache mise run check` passed with 541 tests,
 lint, typecheck, schema freshness, strict docs, actionlint, and formatting.
 
 ### 8.8 Durable Stack pin cleanup — complete
 
-Sol High found that change-gated Stack finalization could remove the Stack root while leaking its controller pin and
-claim. Direct finalization could also report success after a transient release failure. The fix retains the deletion
-intent until target finalization, releases the pin and claim with UID-/revision fences, and leaves the intent for a
-retry on any release failure. Direct publication performs a second cleanup transition; gated publication cleans up on
-the retry after the candidate is applied. Parameterized tests cover direct, gated, and transient-failure paths.
+Sol High found that gated Stack finalization could remove the Stack root and leak its pin and claim. Direct finalization
+could also report success after a temporary release failure. The fix keeps the deletion intent until target
+finalization, releases the pin and claim with UID and revision fences, and keeps the intent for a retry after failure.
+Direct publication uses a second cleanup transition. Gated publication cleans up after the candidate is applied.
+Parameterized tests cover direct, gated, and temporary-failure paths.
 
 ### 8.9 Fenced Stack cleanup retries — complete
 
-Sol High found two follow-up defects: cleanup validated a controller claim after releasing its pin, and a caller-supplied
-candidate ref was reused for the post-merge cleanup proposal. Cleanup now validates the claim before changing either
-ref, uses a separate deterministic cleanup candidate ref, and tests matching and mismatched claims plus explicit
-candidate-ref retry behavior.
+Sol High found two more defects. Cleanup checked the claim after releasing the pin. A caller-supplied candidate ref was
+also reused for post-merge cleanup. Cleanup now checks the claim first, uses a separate deterministic cleanup ref, and
+tests matching and mismatched claims and explicit candidate-ref retries.

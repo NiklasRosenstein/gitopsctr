@@ -26,5 +26,5 @@ bundle:
 frontend deployment driver. A consumer selects the URI with `/bundle/uri`.
 
 See the [Vite OCI bundle unit](../drivers/vite-oci-bundle.md), the
-[artifact lookup](artifacts.md#how-fromartifact-resolves), and the exhaustive
+[artifact lookup](artifacts.md#how-fromartifact-resolves), and the complete
 [FrontendBundle schema](../schemas/apis/artifact.gitopsctr.io/v1/FrontendBundle.schema.json).

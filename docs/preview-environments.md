@@ -100,16 +100,15 @@ spec:
           - CreateNamespace=true
 ```
 
-The exact ref/path templating is deployment-specific; the important boundary
-is that the ApplicationSet and gitopsctr use the same eligibility decision.
+The ref and path templates depend on the deployment. The ApplicationSet and
+gitopsctr must use the same eligibility decision.
 `CreateNamespace=true` does not by itself establish cleanup ownership, so a
 dedicated Namespace manifest should be included when namespace deletion is
 part of the preview contract.
 
-The Argo-backed Kubernetes Unit waits for the Application to be absent before
-reporting teardown complete. The Kubernetes/Argo acceptance job proves the
-external delivery and observation path, but this repository does not publish
-preview manifests or own ApplicationSet resources.
+The Argo-backed Kubernetes Unit waits until the Application is absent. The
+Kubernetes/Argo acceptance job checks external delivery and observation. This
+repository does not publish preview manifests or own ApplicationSet resources.
 External effects not represented by Kubernetes resources must use Unit teardown,
 such as Terraform destroy or a `PostDelete` hook whose completion is observable
 to the controller.

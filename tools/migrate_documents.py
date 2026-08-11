@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""One-shot migration from the original JSON documents to YAML resources.
+"""Migrate legacy JSON documents to YAML resources.
 
-The script operates on local branches, creates ordinary forward commits, and
-never rewrites existing history.  Run it from a clean checkout of the source
-branch; pass ``--apply`` to update refs (the default is a preview).
+The script creates forward commits on local branches. It never rewrites
+history. Run it from a clean source checkout. Use ``--apply`` to update refs;
+without it, the script only previews the changes.
 """
 
 from __future__ import annotations
@@ -257,12 +257,11 @@ def environment_names(tree: Path) -> list[str]:
 
 
 def migration_ref_inventory(tree: Path) -> tuple[EnvironmentMigrationRefs, ...]:
-    """Resolve every environment ref from the migrated Project configuration.
+    """Resolve each environment ref from the Project configuration.
 
-    A legacy tree without a Project is given an explicit generated Project by
-    ``write_project`` before this function runs.  That generated configuration
-    records the historical deploy/observed mapping instead of hiding it in
-    ref discovery.
+    A legacy tree without a Project gets a generated Project from
+    ``write_project``. The generated configuration records the historical
+    deploy/observed mapping.
     """
 
     inventory: list[EnvironmentMigrationRefs] = []
@@ -283,7 +282,7 @@ def update_ref(ref: str, new: str, old: str) -> None:
 
 
 def validate_remote_refs(remote: str, refs: list[str]) -> None:
-    """Fetch and ensure migrating each existing ref would remain a fast-forward push."""
+    """Check that each existing ref can be updated with a fast-forward push."""
     git("fetch", "--prune", remote)
     stale: list[str] = []
     for ref in refs:

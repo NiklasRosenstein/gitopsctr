@@ -1,7 +1,7 @@
-"""Unit driver contracts and entry-point discovery.
+"""Unit driver contracts and entry-point loading.
 
-A unit is a resource instance; a :class:`UnitDriver` implements the resource
-kind and advertises the capabilities it supports.
+A unit is a resource instance. A :class:`UnitDriver` implements its kind and
+declares its capabilities.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ class ReconciliationOutput[ResultT: StrictModel]:
 
 @dataclass(frozen=True)
 class UnitResolutionContext:
-    """Controller-owned facts and the intentionally open template boundary."""
+    """Controller facts and the template resolver."""
 
     source: DesiredSource | None
     resolve_template: Callable[[object, str], TemplateResolution]
@@ -210,7 +210,7 @@ class VerificationContext[DesiredT: StrictModel]:
 
 
 class MaterializationCapability[ResolvedT: StrictModel, DesiredT: StrictModel](ABC):
-    """Produce immutable files while desired state is advanced."""
+    """Produce immutable files while desired state advances."""
 
     @abstractmethod
     def materialize(self, context: MaterializationContext[ResolvedT]) -> MaterializationResult:
@@ -230,7 +230,7 @@ class MaterializationCapability[ResolvedT: StrictModel, DesiredT: StrictModel](A
 
 
 class PlanningCapability[DesiredT: StrictModel](ABC):
-    """Perform speculative, non-publishing work for a deployment unit."""
+    """Plan a unit without publishing or changing external state."""
 
     @abstractmethod
     def plan(self, context: PlanningContext[DesiredT]) -> None:
@@ -238,7 +238,7 @@ class PlanningCapability[DesiredT: StrictModel](ABC):
 
 
 class TeardownCapability[DesiredT: StrictModel](ABC):
-    """Remove external state for a retained desired unit."""
+    """Remove external state for a retained unit."""
 
     @abstractmethod
     def teardown(self, context: TeardownContext[DesiredT]) -> TeardownResult | None:
@@ -246,7 +246,7 @@ class TeardownCapability[DesiredT: StrictModel](ABC):
 
 
 class ReconciliationCapability[DesiredT: StrictModel, ResultT: StrictModel](ABC):
-    """Converge external state for a fully materialized unit."""
+    """Converge external state for a materialized unit."""
 
     def reconciliation_required(self, unit: DesiredT) -> bool:
         return True
@@ -271,7 +271,7 @@ class VerificationResult:
 
 
 class VerificationCapability[DesiredT: StrictModel](ABC):
-    """Compare external state with desired state without writing a receipt."""
+    """Compare external state with desired state without a receipt."""
 
     def verification_supported(self, unit: DesiredT) -> bool:
         return True

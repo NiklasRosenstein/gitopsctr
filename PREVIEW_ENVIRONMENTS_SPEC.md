@@ -1,13 +1,11 @@
-# Stacks and preview environments — living implementation spec
+# Stacks and preview environments — implementation spec
 
-> **Status:** Living implementation design. The lifecycle-aware desired-resource envelope, hardened Unit-specific
-> finalization slice, Stack/StackTemplate contracts, Stack projection, direct Stack instantiation, Stack deletion
-> lifecycle, Stack-owned convergence ordering, and controller-owned source pins and claims are implemented, including
-> terminal teardown evidence, explicit direct-Unit deletion, and direct Stack source-pin creation/release.
-> Forge identity is provenance only. Forge-aware eligibility/recovery orchestration, merge enforcement, Argo manifest
-> publication, and deployment-owned setup remain external or pending. Field names, document layouts,
-> and command names are illustrative unless
-> explicitly marked **Settled**.
+> **Status:** Core lifecycle work is implemented. This includes the desired-resource envelope, Unit finalization,
+> Stack and StackTemplate contracts, Stack projection, direct Stack instantiation and deletion, dependency ordering,
+> teardown evidence, direct Unit deletion, and controller-owned source pins and claims.
+> Forge identity is provenance only. Forge eligibility, merge enforcement, Argo manifest publication, and deployment
+> setup remain external or pending. Field names, document layouts, and command names are examples unless marked
+> **Settled**.
 
 Last updated: 2026-08-11
 
@@ -18,8 +16,8 @@ already landed.
 
 ## Current implementation status
 
-The current branch now has the Unit and core Stack lifecycle foundations, rather than an end-to-end preview-environment
-implementation.
+The current branch implements the Unit and core Stack lifecycles. External forge and deployment setup is not part of
+this repository.
 
 | Area | Status | Reconciliation |
 | --- | --- | --- |
@@ -36,10 +34,9 @@ implementation.
 | Argo integration and external publication | **Boundary and Argo absence observation implemented; external publication remains deployment-owned** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. Argo-backed Kubernetes Units now wait for Application absence during teardown, and the Kubernetes/Argo acceptance job proves external delivery and observation. This repository still does not publish preview manifests or own ApplicationSet resources. |
 | End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. The read-only compatibility audit covers one explicit ref or all Project-configured environments. Forge policy configuration and complete legacy migration remain open. |
 
-The repository verification suite currently passes (`543` tests), including the landed concurrency, recovery,
-incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
-not sufficient, for the remaining preview-environment milestones because external forge orchestration,
-forge policy configuration, deployment-owned publication, and legacy migration are still open.
+The repository verification suite passes (`543` tests), including concurrency, recovery, incarnation, evidence,
+direct-root, and candidate-freshness checks. The suite does not prove deployment-owned forge policy, external
+publication, or legacy migration.
 The current checkout has no `deployment/environments` path, so `audit-desired-compatibility --all` reports
 `unavailable-environments-path`; a deployment-owned supported-ref inventory is still required before legacy retirement.
 
@@ -149,7 +146,7 @@ Deletion is monotonic for one UID and follows a durable finalization protocol:
    and the controller pin and claim are released under their UID-/revision fences. A later retry performs this cleanup;
    a pin or claim release failure MUST retain the intent and MUST NOT report cleanup complete.
 
-With Git as the lifecycle authority, teardown therefore has at least a durable deleting transition followed by a
+With Git as the lifecycle authority, teardown has at least a durable deleting transition followed by a
 later absent transition. Tests MUST assert this ordering, not an exact commit count; progress may add commits.
 
 Once deletion starts, the same UID cannot be revived. If external orchestration or source state requests the resource
@@ -290,15 +287,15 @@ gitopsctr publishes per-preview manifests to a controller-owned ref/path. Recomm
 
 The external Stack workflow and ApplicationSet MUST use the same eligibility gate. Closing a pull request makes it
 ineligible; label removal does the same when a required preview label is configured. Expiry of an otherwise open pull
-request must first remove that label or otherwise make the generator stop matching. If it cannot, finalization blocks
-instead of deleting the manifests underneath a live Application.
+request must first remove that label or otherwise make the generator stop matching. If it cannot, finalization blocks.
+It must not delete manifests under a live Application.
 
 Argo CD then removes the generated Application and cascades its managed resources. gitopsctr waits for the Application
 and workloads to be absent before finalizing the Stack and removing its preview manifests. `PostDelete` hooks may
 handle external effects that are not represented by Kubernetes resources.
 
-Creating one temporary Argo CD Application directly instead of using an ApplicationSet remains an **Open** alternative
-for deployments that cannot use the pull-request generator.
+Creating one temporary Argo CD Application is an **Open** alternative for deployments that cannot use the pull-request
+generator.
 
 ### Trust boundary — Settled
 
@@ -436,7 +433,7 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
 - [x] Add generated Stack resource graphs with UID-fenced controlling ownership.
 - [x] Add direct Stack instantiation with request and revision fencing.
 - [x] Add durable Stack incarnation tombstones; finalized Stack UIDs are carried through desired-state candidates,
-  rollback, and source/direct recreation. A richer request ledger is optional follow-up rather than lifecycle authority.
+  rollback, and source/direct recreation. A richer request ledger is optional. It is not lifecycle authority.
 - [x] Add direct Stack deletion requests with UID/generation fencing.
 - [x] Generalize two-phase finalization and teardown ordering from Units to Stack-owned closures.
 - [x] Integrate explicit StackTemplate dependencies, including cross-kind edges, into generic convergence/status and

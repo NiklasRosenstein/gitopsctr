@@ -1,8 +1,7 @@
 # Project configuration
 
-Every GitOpsCTR source tree contains a `Project` resource. It identifies the
-project, locates authored environments, and selects the preferred format for generated documents. It can also define
-default desired, observed, and candidate ref templates for every environment.
+Every GitOpsCTR source tree contains a `Project` resource. It names the project, locates authored environments, and
+selects the format for generated documents. It can also define desired, observed, and candidate ref templates.
 
 Create it from the root of an existing Git working tree:
 
@@ -43,8 +42,8 @@ or `json`:
 | `json` | `*.json` |
 
 Readers accept `.yaml`, `.yml`, and `.json` regardless of this setting. An
-existing representation wins, so changing `writeFormat` does not silently
-create a second copy of a logical document.
+existing representation wins. Changing `writeFormat` does not create a second
+copy of a document.
 
 `spec.environmentsPath` is relative to the source-tree root and defaults to
 `deployment/environments`. Environment `dev` is read from
@@ -84,9 +83,10 @@ refreshed or rejected for each operation. It defaults to:
 | `whenUnavailableDuringAdvance` | `refresh` | `advance-desired`, including `advance-desired --dry`, replaces the retained revision with the candidate revision. `error` leaves desired state unchanged. |
 | `whenUnavailableDuringPlan` | `error` | `reconcile --plan` fails before invoking the driver. `refresh` uses a refreshed source only in the dry candidate. |
 
-The history check uses `git merge-base --is-ancestor`. A dangling commit that can still be resolved locally is therefore
-unavailable under `outside-candidate-history`. Source-less units are not affected. When planning fails because of this
-policy, run `advance-desired` from a durable source revision before planning.
+The history check uses `git merge-base --is-ancestor`. Under
+`outside-candidate-history`, a local but unreachable commit is unavailable.
+Source-less units are not affected. If planning fails, run `advance-desired`
+from a durable source revision first.
 
 Create an environment in that configured location with:
 

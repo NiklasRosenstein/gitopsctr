@@ -1,7 +1,7 @@
 # Concepts
 
-gitopsctr separates authored intent, resolved desired state, and observed evidence. Git records each transition, while
-unit drivers perform the external work.
+gitopsctr separates authored intent, desired state, and observed evidence. Git
+records each transition. Unit drivers perform external work.
 
 ```mermaid
 flowchart LR

@@ -1,4 +1,4 @@
-"""Explicitly rooted Git-backed desired and observed state storage."""
+"""Git-backed desired and observed state storage."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ PinClaimState = Literal["preparing", "active", "reaping"]
 
 @dataclass(frozen=True)
 class ControllerPinClaim:
-    """A CAS-fenced lifecycle claim for one controller-owned Stack pin."""
+    """A CAS-fenced claim for one controller-owned Stack pin."""
 
     environment: str
     stack_name: str
@@ -202,12 +202,10 @@ class GitStateStore:
         return GitRefSnapshot(ref, resolved)
 
     def create_controller_pin(self, name: str, revision: str) -> ControllerPin:
-        """Create or retain a named pin without changing an existing revision.
+        """Create a named pin or return the existing pin.
 
-        ``revision`` may be any locally resolvable commit expression, but the
-        returned pin always contains its canonical object ID.  The remote pin
-        is created with an ordinary push, so a concurrent creator cannot
-        replace a pin with a different revision.
+        Resolve ``revision`` locally. The returned pin contains its object ID.
+        A concurrent creator cannot replace the pin with another revision.
         """
 
         pin_ref = self._controller_pin_ref(name)
@@ -238,11 +236,9 @@ class GitStateStore:
         return ControllerPin(name, pin_ref, resolved_revision)
 
     def release_controller_pin(self, name: str, expected_revision: str) -> bool:
-        """Release a pin only when its current remote revision matches exactly.
+        """Release a pin only when its remote revision matches.
 
-        Missing pins are already released and return ``False``.  A mismatched
-        pin is never modified.  The delete uses the normal Git push protocol
-        and is verified afterward; no force-push option is used.
+        A missing pin is an idempotent no-op. A mismatched pin is not modified.
         """
 
         pin_ref = self._controller_pin_ref(name)
@@ -469,11 +465,11 @@ class GitStateStore:
                 tar.extractall(output, filter="data")
 
     def verify_gated_candidate(self, candidate_revision: str | None, target_revision: str | None) -> GatedCandidate:
-        """Verify the fail-closed commit shape required by a change-gated candidate.
+        """Verify the commit shape required by a gated candidate.
 
-        A valid candidate is exactly one commit whose only parent is the current target
-        head.  Checking both the parent list and the revision range rejects roots,
-        stale candidates, rebases, multi-commit proposals, and merge commits.
+        A valid candidate is one commit whose only parent is the current target
+        head. The parent and revision checks reject roots, stale candidates,
+        rebases, multi-commit proposals, and merge commits.
         """
 
         if not candidate_revision:
