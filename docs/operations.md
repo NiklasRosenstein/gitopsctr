@@ -82,3 +82,22 @@ Repeat `--unit` for a targeted rollback; omit it for the full desired tree. `--d
 the Environment's change gate controls direct publication versus a reviewed candidate.
 
 For CI orchestration, see the [GitHub Action](github-action.md).
+
+## Recover orphaned preview Stacks
+
+The repository-owned `.github/workflows/recover-orphaned-preview-stacks.yml`
+runs hourly and can also be started manually. Configure these repository variables:
+
+- `PREVIEW_ENVIRONMENT` — required for scheduled recovery; its value is the environment name.
+- `PREVIEW_REQUIRED_LABEL` — optional pull-request label required for preview eligibility.
+
+Set them with `gh variable set PREVIEW_ENVIRONMENT --body dev` and, when needed,
+`gh variable set PREVIEW_REQUIRED_LABEL --body preview`. A manual run may override
+both values with its `environment` and `required_label` inputs.
+
+The workflow checks out the trusted default branch and does not execute pull-request
+code or configuration. It uses the repository `GITHUB_TOKEN` as `GH_TOKEN` with only
+`contents: write` and `pull-requests: read`: cleanup may publish Git state and read
+pull-request eligibility, but it cannot write pull requests or access unrelated
+repository permissions. Protect the repository and restrict workflow changes because
+this token can publish cleanup changes.
