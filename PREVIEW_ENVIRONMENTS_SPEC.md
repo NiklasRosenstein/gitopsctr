@@ -23,7 +23,7 @@ implementation.
 
 | Area | Status | Reconciliation |
 | --- | --- | --- |
-| Desired Unit identity, lifecycle authority, ownership, legacy retention, rollback, and schema profiles | **Implemented for Unit** | Keep the generic semantic model; extend it to Stack and StackTemplate later. |
+| Desired resource identity, lifecycle authority, ownership, legacy retention, rollback, and schema profiles | **Implemented for Unit, Stack, and StackTemplate** | The generic semantic model now covers the current resource families; future resource families may reuse it. |
 | Unit deletion intent, owned-child obligations, UID/generation fencing, observed teardown evidence, effect leases, and Terraform destroy | **Implemented for Unit** | Commits `118429d`, `22d7814`, `816a8a4`, `26982bf`, `f9cc2ac`, and `8bb059e` close lease, incarnation, transition, dependency, legacy-safety, opaque-recovery, evidence-contract, direct-root, and post-evidence recovery defects; explicit operator resolution now covers permanently unparseable roots. Forge enforcement remains external. |
 | Change-gated candidate freshness | **Local and CI verifier implemented** | `88ae0b9` rejects stale, rebased, multi-commit, merge, root, and missing-head candidates before review creation. CI now verifies the exact GitHub pull-request and merge-queue event head and target; required check and branch-protection policy remain forge configuration. |
 | StackTemplate/Stack contracts and deterministic parameter expansion | **Implemented** | Commits `eb0bcb9` and `84d7ddb`; direct desired Stack provenance is typed and schema-published. |
@@ -36,7 +36,7 @@ implementation.
 | Argo integration and external publication | **Boundary and Argo absence observation implemented; external publication remains deployment-owned** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. Argo-backed Kubernetes Units now wait for Application absence during teardown, and the Kubernetes/Argo acceptance job proves external delivery and observation. This repository still does not publish preview manifests or own ApplicationSet resources. |
 | End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. The read-only compatibility audit covers one explicit ref or all Project-configured environments. Forge policy configuration and complete legacy migration remain open. |
 
-The repository verification suite currently passes (`539` tests), including the landed concurrency, recovery,
+The repository verification suite currently passes (`543` tests), including the landed concurrency, recovery,
 incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
 not sufficient, for the remaining preview-environment milestones because external forge orchestration,
 forge policy configuration, deployment-owned publication, and legacy migration are still open.
@@ -132,7 +132,7 @@ Keep this representation unless a later resource family needs materially differe
 - A repository-owned example workflow may document this pattern, but a forge-aware recovery command is not part of
   the core product contract.
 
-### Finalization — Settled; Unit slice implemented with hardening required
+### Finalization — Settled; Unit and Stack lifecycle implemented
 
 Deletion is monotonic for one UID and follows a durable finalization protocol:
 
@@ -155,7 +155,7 @@ later absent transition. Tests MUST assert this ordering, not an exact commit co
 Once deletion starts, the same UID cannot be revived. If external orchestration or source state requests the resource
 again, a new lifecycle uses a new UID after the old lifecycle finalizes.
 
-### Driver teardown — Proposed; Unit capability implemented
+### Driver teardown — Settled for Unit; reused by Stack-owned Units
 
 Teardown is an independent Unit-driver capability, parallel to planning, reconciliation, and verification. It
 receives the retained desired Unit, its pinned source, a relevance-fenced prior receipt when one exists, the resource
@@ -229,7 +229,7 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
   same-name recreation, GVK/driver replacement, resolved receipt/artifact dependencies, concurrent dependent
   insertion, legacy application, opaque-root recovery, and teardown evidence round trips.
 
-## Stack resolution — Proposed; core lifecycle implemented
+## Stack resolution — Settled for this increment; core lifecycle implemented
 
 - **Implemented in `eb0bcb9` and `b441941`:** A StackTemplate declares typed parameters and a template for API resources plus their
   dependency relationships. Parameter values are validated strictly, recursively expanded, and cannot contain
@@ -363,7 +363,7 @@ file may remain. Out-of-band demo cleanup is only a final safety net.
 
 ### C. Unit lifecycle hardening
 
-Before declaring the Unit implementation milestone complete, the harness MUST cover the already-landed Unit path:
+The harness covers the implemented Unit lifecycle path:
 
 - Complete finalization and prove the effect lease is removed or completed, including direct publication and
   pull-request/change-request publication paths.
@@ -482,7 +482,7 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
 | 2026-08-10 | Desired-resource ownership is generic, desired-only, same-ref, and UID-fenced. |
 | 2026-08-10 | Use a controller-owned Git source pin first; defer OCI source bundles. |
 | 2026-08-10 | Cleanup is two-phase finalization; Terraform destroy success is sufficient and backend state files may remain. |
-| 2026-08-10 | Pull request close, merge, label removal, and expiry all make a preview ineligible and request cleanup. |
+| 2026-08-10 | Pull request close, merge, label removal, and expiry make a preview ineligible; this policy is now applied by external CI, not by core lifecycle code. |
 | 2026-08-10 | Scope generated Unit names to the concrete Stack as `<stack>--<template-unit>` (hash-bounded at 63 characters), and rewrite intra-template observation/artifact/promotion references to those names. |
 | 2026-08-10 | Keep an explicit `management.mode` discriminator for root authority; empty marker objects add no needed semantics for the current contract. |
 | 2026-08-10 | Unit lifecycle implementation is a foundation milestone, not completion of the end-to-end Stack/preview feature. Lease, incarnation, dependency, compatibility, opaque-root, evidence, and source-pin hardening remain tracked work. |

@@ -280,3 +280,10 @@ claim. Direct finalization could also report success after a transient release f
 intent until target finalization, releases the pin and claim with UID-/revision fences, and leaves the intent for a
 retry on any release failure. Direct publication performs a second cleanup transition; gated publication cleans up on
 the retry after the candidate is applied. Parameterized tests cover direct, gated, and transient-failure paths.
+
+### 8.9 Fenced Stack cleanup retries — complete
+
+Sol High found two follow-up defects: cleanup validated a controller claim after releasing its pin, and a caller-supplied
+candidate ref was reused for the post-merge cleanup proposal. Cleanup now validates the claim before changing either
+ref, uses a separate deterministic cleanup candidate ref, and tests matching and mismatched claims plus explicit
+candidate-ref retry behavior.

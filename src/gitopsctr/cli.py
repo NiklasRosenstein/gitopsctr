@@ -6893,19 +6893,19 @@ def _release_stack_controller_pin(intent: StackDeletionIntent) -> None:
     if pin is None:
         return
     store = state_store()
-    store.release_controller_pin(pin.name, pin.revision)
     read_claim = getattr(store, "read_controller_pin_claim", None)
     delete_claim = getattr(store, "delete_controller_pin_claim", None)
-    if read_claim is None:
-        return
-    claim = read_claim(pin.name)
-    if claim is None:
-        return
-    if claim.pin_name != pin.name or claim.uid != intent.uid or claim.pin_revision != pin.revision:
-        raise OperationError(f"Stack {intent.stack_name}: controller pin claim fence does not match the Stack")
-    if delete_claim is None or claim.revision is None:
-        raise OperationError(f"Stack {intent.stack_name}: controller pin claim cannot be released safely")
-    delete_claim(claim.ref.removeprefix("gitopsctr/pin-claims/"), claim.revision)
+    claim = read_claim(pin.name) if read_claim is not None else None
+    if claim is not None:
+        if claim.pin_name != pin.name or claim.uid != intent.uid or claim.pin_revision != pin.revision:
+            raise OperationError(f"Stack {intent.stack_name}: controller pin claim fence does not match the Stack")
+        if not callable(delete_claim) or claim.revision is None:
+            raise OperationError(f"Stack {intent.stack_name}: controller pin claim cannot be released safely")
+    store.release_controller_pin(pin.name, pin.revision)
+    if claim is not None:
+        cast(Callable[[str, str], object], delete_claim)(
+            claim.ref.removeprefix("gitopsctr/pin-claims/"), claim.revision
+        )
 
 
 def _command_request_delete_direct_stack(args: argparse.Namespace) -> bool:
@@ -7111,7 +7111,7 @@ def _command_finalize_stack(args: argparse.Namespace) -> bool:
             args.environment,
             "finalize-stack",
             candidate_id,
-            args.candidate_ref,
+            args.candidate_ref if stack_path is not None else None,
         )
         revision, outcome = publish_desired_change(
             args.environment,
@@ -7156,7 +7156,7 @@ def _command_finalize_stack(args: argparse.Namespace) -> bool:
                 args.environment,
                 "finalize-stack",
                 cleanup_id,
-                args.candidate_ref,
+                None,
             )
             revision, outcome = publish_desired_change(
                 args.environment,
