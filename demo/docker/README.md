@@ -54,6 +54,32 @@ removes the Stack, and finalizes the generated Unit and Stack. It always cleans 
 mise run demo-acceptance
 ```
 
+The multi-environment Stack acceptance is a separate flow. It creates dev, staging, and template-only preview in a
+second isolated repository, builds and publishes R1 and R2 to a private local registry, promotes only dev R1 to
+staging, instantiates a direct preview at R1, and checks the exact observed artifact digest against Docker's image and
+container inspection. It then proves that staging and preview stay on R1 during the dev-only R2 change, updates the
+direct preview to R2, and requests/finalizes its UID-fenced deletion:
+
+```console
+mise run demo-preview-acceptance
+```
+
+Prerequisites are Docker running locally plus the Mise-managed Python, Terraform, and project dependencies. The exact
+ports are registry `5003`, dev `18180`, staging `18181`, and preview `18182`; override the registry port with
+`GITOPSCTR_PREVIEW_REGISTRY_PORT` if needed. Cleanup is scoped to `.docker-preview-acceptance-state/`, the
+`gitopsctr-preview-acceptance-registry` container, and the three `gitopsctr-preview-*` containers.
+
+The flow uses the agreed explicit command, including the UID and desired-head fences:
+
+```console
+gitopsctr update-direct-stack --environment preview --stack preview --template application \
+  --uid STACK_UID --desired-revision DESIRED_REVISION --source-revision REVISION \
+  --parameters JSON --request-id demo:gitopsctr-preview#1
+```
+
+The acceptance reports a clear API mismatch if the selected controller build does not provide this command rather than
+silently replacing the update with a different operation. Do not use this command in the short `mise run demo`.
+
 The separate [`kubernetes`](../kubernetes/) demo builds an image, exports it to a selected kind or minikube cluster,
 renders a real Helm chart, and verifies the deployed application. See its README for commands and the
 [Kubernetes unit driver documentation](../../docs/drivers/kubernetes-manifests.md) for configuration and cleanup details.

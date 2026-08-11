@@ -66,6 +66,10 @@ run = "uv run python -m demo.docker.run clean"
 description = "Deploy, prove clean convergence, and clean the real local demo"
 run = "uv run python -m demo.docker.run acceptance"
 
+[tasks.demo-preview-acceptance]
+description = "Run the multi-environment Docker/Terraform Stack promotion acceptance"
+run = "uv run python -m demo.docker.run preview-acceptance"
+
 [tasks.kubernetes-demo]
 description = "Build and deploy the demo to an explicitly selected kind or minikube cluster"
 run = "uv run python -m demo.kubernetes.run run"

@@ -1,0 +1,65 @@
+# yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/StackTemplate/authored.schema.json
+apiVersion: gitopsctr.io/v1
+kind: StackTemplate
+metadata:
+  name: application
+spec:
+  parameters:
+    - name: container-name
+      type: string
+    - name: host-port
+      type: integer
+    - name: terraform-state
+      type: string
+    - name: image-repository
+      type: string
+  unitTemplates:
+    image:
+      apiVersion: unit.gitopsctr.io/v1
+      kind: OciImages
+      spec:
+        source:
+          path: acceptance
+          inputs: [Dockerfile, app.py]
+        build:
+          dockerfile: acceptance/Dockerfile
+          platform: __DOCKER_PLATFORM__
+        publish:
+          targets:
+            application:
+              type: registry
+              repository:
+                fromParameter:
+                  name: image-repository
+    deploy:
+      apiVersion: unit.gitopsctr.io/v1
+      kind: Terraform
+      dependsOn: [image]
+      spec:
+        source:
+          path: infrastructure
+          inputs: ["*.tf"]
+        terraform:
+          backend:
+            path:
+              fromParameter:
+                name: terraform-state
+          variables:
+            container_name:
+              fromParameter:
+                name: container-name
+            host_port:
+              fromParameter:
+                name: host-port
+            image:
+              fromArtifact:
+                unit: image
+                name: containers
+                apiVersion: artifact.gitopsctr.io/v1
+                kind: ContainerImages
+                pointer: /images/application/uri
+          observeOutputs: [container_id, url]
+          checks:
+            - type: http
+              urlOutput: url
+              path: /
