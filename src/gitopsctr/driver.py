@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from gitopsctr.api import GVK, ApiKind, api_kinds
 from gitopsctr.artifacts import ArtifactApi, require_artifact_api
 from gitopsctr.contracts import DesiredSource, MaterializationDocument, ResolvedInputs, StrictModel
-from gitopsctr.document import JsonObject, TypedDocumentContract
+from gitopsctr.document import JsonObject, JsonObjectValue, TypedDocumentContract
 from gitopsctr.execution import DriverExecution, default_driver_execution
 from gitopsctr.resolution import TemplateResolution
 
@@ -61,18 +61,23 @@ def reference_fingerprints(*resolutions: TemplateResolution) -> ResolvedInputs |
     receipts: dict[str, str] = {}
     artifacts: dict[str, str] = {}
     imported_artifacts: dict[str, str] = {}
+    imported_artifact_evidence: dict[str, JsonObjectValue] = {}
     for resolution in resolutions:
         promotions.update(resolution.promotions)
         receipts.update(resolution.receipts)
         artifacts.update(resolution.artifacts)
         imported_artifacts.update(resolution.imported_artifacts)
-    if not (promotions or receipts or artifacts or imported_artifacts):
+        imported_artifact_evidence.update(
+            {key: JsonObjectValue(value) for key, value in resolution.imported_artifact_evidence.items()}
+        )
+    if not (promotions or receipts or artifacts or imported_artifacts or imported_artifact_evidence):
         return None
     return ResolvedInputs(
         promotions=promotions or None,
         receipts=receipts or None,
         artifacts=artifacts or None,
         importedArtifacts=imported_artifacts or None,
+        importedArtifactEvidence=imported_artifact_evidence or None,
     )
 
 

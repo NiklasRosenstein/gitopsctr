@@ -402,7 +402,7 @@ class StackTemplateUnitTemplate(StrictModel):
 
     apiVersion: Annotated[str, Pattern(r"^[^/]+/[^/]+$")]
     kind: Annotated[str, Pattern(r"^[A-Z][A-Za-z0-9]*$")]
-    spec: ParameterTemplateObject
+    spec: TemplateObject
     dependsOn: list[Annotated[str, Pattern(DESIRED_UID_PATTERN)]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -499,7 +499,7 @@ class StackTemplateSpec(StrictModel):
                     apiVersion=template.apiVersion,
                     kind=template.kind,
                     name=name,
-                    spec=template.spec,
+                    spec=ParameterTemplateObject(cast(Any, template.spec)),
                     dependsOn=list(template.dependsOn),
                 )
                 for name, template in self.unitTemplates.items()
@@ -515,7 +515,7 @@ class StackTemplateSpec(StrictModel):
                     resource.name: StackTemplateUnitTemplate(
                         apiVersion=resource.apiVersion,
                         kind=resource.kind,
-                        spec=resource.spec,
+                        spec=TemplateObject(cast(Any, resource.spec)),
                         dependsOn=list(resource.dependsOn),
                     )
                     for resource in self.resources
@@ -730,6 +730,25 @@ class ArtifactImport(StrictModel):
 
 
 @dataclass(frozen=True, kw_only=True)
+class ResolvedArtifactImport(StrictModel):
+    """Immutable lineage evidence for one promoted artifact import."""
+
+    sourceStack: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    sourceStackUid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    sourceUnit: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    sourceUnitUid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    sourceDesiredRevision: Annotated[str, Pattern(r"^[0-9a-f]{40}$")]
+    sourceObservedRevision: Annotated[str, Pattern(r"^[0-9a-f]{40}$")]
+    receiptUnitBlob: Annotated[str, Pattern(r"^[0-9a-f]{64}$")]
+    artifactName: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    apiVersion: Annotated[str, Pattern(r"^[^/]+/[^/]+$")]
+    kind: Annotated[str, Pattern(r"^[A-Z][A-Za-z0-9]*$")]
+    artifactDigest: Annotated[str, Pattern(r"^[a-z0-9]+:[0-9a-f]{64}$")]
+    targetStackUid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    artifactDocument: JsonObjectValue
+
+
+@dataclass(frozen=True, kw_only=True)
 class StackSpec(StrictModel):
     """Source-authored Stack template selection and parameter values."""
 
@@ -784,7 +803,7 @@ class DesiredStackSpec(StrictModel):
     requestedSource: StackTemplateSource | None = None
     resolvedSource: ResolvedStackTemplateSource | None = None
     resolvedProjection: JsonObjectValue | None = None
-    resolvedArtifactImports: JsonObjectValue | None = None
+    resolvedArtifactImports: dict[str, ResolvedArtifactImport] | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.template, str):
@@ -1003,6 +1022,7 @@ class ResolvedInputs(StrictModel):
     receipts: dict[str, str] | None = None
     artifacts: dict[str, str] | None = None
     importedArtifacts: dict[str, str] | None = None
+    importedArtifactEvidence: dict[str, JsonObjectValue] | None = None
 
 
 @dataclass(frozen=True, kw_only=True)

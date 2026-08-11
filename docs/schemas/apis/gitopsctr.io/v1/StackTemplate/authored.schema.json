@@ -60,6 +60,208 @@
           "type": "object"
         }
       ]
+    },
+    "TemplateValue": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fromArtifact": {
+              "additionalProperties": false,
+              "properties": {
+                "apiVersion": {
+                  "pattern": "^[^/]+/[^/]+$",
+                  "type": "string"
+                },
+                "dryFallback": {
+                  "$ref": "#/$defs/TemplateValue",
+                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
+                },
+                "kind": {
+                  "pattern": "^[A-Z][A-Za-z0-9]*$",
+                  "type": "string"
+                },
+                "name": {
+                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "type": "string"
+                },
+                "pointer": {
+                  "default": "",
+                  "description": "JSON Pointer relative to the complete artifact resource; empty selects the whole resource.",
+                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                  "type": "string"
+                },
+                "unit": {
+                  "description": "Logical name of the unit that provides the referenced value.",
+                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "unit",
+                "name",
+                "apiVersion",
+                "kind"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "fromArtifact"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fromEnvironment": {
+              "additionalProperties": false,
+              "properties": {
+                "dryFallback": {
+                  "$ref": "#/$defs/TemplateValue",
+                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
+                },
+                "pointer": {
+                  "description": "JSON Pointer relative to the target Environment resource.",
+                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                  "type": "string"
+                },
+                "unit": {
+                  "description": "Logical name of the unit that provides the referenced value.",
+                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "type": "object"
+            }
+          },
+          "required": [
+            "fromEnvironment"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fromPromotion": {
+              "additionalProperties": false,
+              "properties": {
+                "dryFallback": {
+                  "$ref": "#/$defs/TemplateValue",
+                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
+                },
+                "pointer": {
+                  "description": "JSON Pointer relative to the promoted unit's public spec; omit it to use the containing field path, or set it to an empty string to select the whole spec.",
+                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                  "type": "string"
+                },
+                "unit": {
+                  "description": "Promoted source unit name; omit it to use the target unit name.",
+                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "type": "object"
+            }
+          },
+          "required": [
+            "fromPromotion"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fromReceipt": {
+              "additionalProperties": false,
+              "properties": {
+                "dryFallback": {
+                  "$ref": "#/$defs/TemplateValue",
+                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
+                },
+                "pointer": {
+                  "default": "",
+                  "description": "JSON Pointer relative to the producer's typed receipt result; empty selects the whole result.",
+                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                  "type": "string"
+                },
+                "unit": {
+                  "description": "Logical name of the unit that provides the referenced value.",
+                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "unit"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "fromReceipt"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fromParameter": {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "fromParameter"
+          ],
+          "type": "object"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/TemplateValue"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/TemplateValue"
+          },
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "fromArtifact",
+                "fromEnvironment",
+                "fromParameter",
+                "fromPromotion",
+                "fromReceipt"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      ]
     }
   },
   "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/StackTemplate/authored.schema.json",
@@ -202,7 +404,7 @@
                   },
                   "spec": {
                     "additionalProperties": {
-                      "$ref": "#/$defs/ParameterTemplateValue"
+                      "$ref": "#/$defs/TemplateValue"
                     },
                     "propertyNames": {
                       "not": {

@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
-from gitopsctr.document import JsonValue
+from gitopsctr.document import JsonObject, JsonValue
 from gitopsctr.errors import OperationError, ReferenceUnavailable
 from gitopsctr.templates import (
     ArtifactReference,
@@ -28,6 +28,7 @@ class FingerprintedValue:
     value: JsonValue
     fingerprint: str
     imported: bool = False
+    evidence: JsonObject | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,7 @@ class TemplateResolution:
     receipts: dict[str, str]
     artifacts: dict[str, str]
     imported_artifacts: dict[str, str]
+    imported_artifact_evidence: dict[str, JsonObject]
 
 
 def resolve_template(value: object, context: ResolutionContext, pointer: str = "") -> TemplateResolution:
@@ -63,6 +65,7 @@ def resolve_template(value: object, context: ResolutionContext, pointer: str = "
     receipts: dict[str, str] = {}
     artifacts: dict[str, str] = {}
     imported_artifacts: dict[str, str] = {}
+    imported_artifact_evidence: dict[str, JsonObject] = {}
     try:
         expression = parse_template_value(value, pointer)
     except TemplateError as exc:
@@ -115,9 +118,18 @@ def resolve_template(value: object, context: ResolutionContext, pointer: str = "
             key = f"{candidate.fromArtifact.unit}/{candidate.fromArtifact.name}"
             if resolved.imported:
                 imported_artifacts[key] = resolved.fingerprint
+                if resolved.evidence is not None:
+                    imported_artifact_evidence[key] = resolved.evidence
             else:
                 artifacts[key] = resolved.fingerprint
             return resolved.value
         return cast(JsonValue, candidate)
 
-    return TemplateResolution(resolve(expression, pointer), promotions, receipts, artifacts, imported_artifacts)
+    return TemplateResolution(
+        resolve(expression, pointer),
+        promotions,
+        receipts,
+        artifacts,
+        imported_artifacts,
+        imported_artifact_evidence,
+    )

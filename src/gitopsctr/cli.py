@@ -47,6 +47,7 @@ from gitopsctr.contracts import (
     LifecycleManagement,
     MaterializationDocument,
     ReceiptDesired,
+    ResolvedArtifactImport,
     ResolvedGitSource,
     ResolvedStackTemplateSource,
     StackInstantiationProvenance,
@@ -1356,6 +1357,7 @@ def resolve_template(
     dry: bool = False,
     environment_document: Mapping[str, Any] | None = None,
     artifact_imports: Sequence[ArtifactImport] = (),
+    target_stack_uid: str | None = None,
 ) -> TemplateResolution:
     def resolve_promotion(reference: PromotionReferenceSelection) -> FingerprintedValue:
         if promotion is None:
@@ -1410,17 +1412,18 @@ def resolve_template(
         validate_artifact_reference_target(reference)
         producer_path = unit_document_path(candidate, reference.unit)
         if not producer_path.is_file():
-            imported = next(
-                (
-                    item
-                    for item in artifact_imports
-                    if item.name == reference.name and item.apiVersion == reference.apiVersion
-                    if item.kind == reference.kind
-                    and (item.unit == reference.unit or reference.unit.endswith(f"--{item.unit}"))
-                ),
-                None,
-            )
-            if imported is None or promotion is None or promotion.observed_root is None:
+            matches = [
+                item
+                for item in artifact_imports
+                if item.name == reference.name
+                and item.apiVersion == reference.apiVersion
+                and item.kind == reference.kind
+                and (item.unit == reference.unit or reference.unit.endswith(f"--{item.unit}"))
+            ]
+            if len(matches) > 1:
+                raise OperationError(f"artifact import is ambiguous for producer {reference.unit}")
+            imported = matches[0] if matches else None
+            if imported is None or promotion is None:
                 raise ReferenceUnavailable(f"artifact producer is not selected: {reference.unit}")
             source_stack_path = document_candidates(promotion.desired_root / "stacks", imported.fromPromotion.stack)
             if len(source_stack_path) != 1:
@@ -1437,6 +1440,29 @@ def resolve_template(
             if not source_unit_path.is_file():
                 source_unit_path = unit_document_path(promotion.desired_root, reference.unit)
             if not source_unit_path.is_file():
+                chained = None
+                if isinstance(source_stack.spec, DesiredStackSpec) and source_stack.spec.resolvedArtifactImports:
+                    chained = next(
+                        (
+                            evidence
+                            for key, evidence in source_stack.spec.resolvedArtifactImports.items()
+                            if key == f"{imported.unit}/{imported.name}"
+                            or key.endswith(f"--{imported.unit}/{imported.name}")
+                        ),
+                        None,
+                    )
+                if chained is not None:
+                    if target_stack_uid is None:
+                        raise ReferenceUnavailable("promoted artifact target has no Stack UID")
+                    chained = replace(chained, targetStackUid=target_stack_uid)
+                    return FingerprintedValue(
+                        json_pointer(chained.artifactDocument, reference.pointer),
+                        chained.artifactDigest,
+                        imported=True,
+                        evidence=cast(JsonObject, chained.to_dict()),
+                    )
+                if promotion.observed_root is None:
+                    raise ReferenceUnavailable("promoted artifact observed state is unavailable")
                 raise ReferenceUnavailable(f"promoted source Unit is unavailable: {reference.unit}")
             source_unit = load_desired_unit(source_unit_path, source_unit_path.stem)
             source_lifecycle = source_unit.metadata.lifecycle
@@ -1444,6 +1470,8 @@ def resolve_template(
             source_uid = source_stack.metadata.uid
             if source_owner is None or source_uid is None or source_owner.uid != source_uid:
                 raise ReferenceUnavailable("promoted artifact producer has an invalid Stack owner fence")
+            if promotion.observed_root is None:
+                raise ReferenceUnavailable("promoted artifact observed state is unavailable")
             source_receipt = current_receipt(
                 promotion.observed_root, promotion.desired_root / "units", source_unit.name
             )
@@ -1452,7 +1480,38 @@ def resolve_template(
             document, digest = load_artifact_document(
                 promotion.observed_root, source_unit, source_receipt, reference.name
             )
-            return FingerprintedValue(json_pointer(document, reference.pointer), digest, imported=True)
+            if (
+                source_stack.metadata.uid is None
+                or source_unit.metadata.uid is None
+                or promotion.observed_revision is None
+            ):
+                raise ReferenceUnavailable("promoted artifact producer has no UID identity")
+            if target_stack_uid is None:
+                raise ReferenceUnavailable("promoted artifact target has no Stack UID")
+            evidence = cast(
+                JsonObject,
+                ResolvedArtifactImport(
+                    sourceStack=source_stack.name,
+                    sourceStackUid=source_stack.metadata.uid,
+                    sourceUnit=source_unit.name,
+                    sourceUnitUid=source_unit.metadata.uid,
+                    sourceDesiredRevision=promotion.desired_revision,
+                    sourceObservedRevision=promotion.observed_revision,
+                    receiptUnitBlob=source_receipt.spec.desired.unitBlob,
+                    artifactName=reference.name,
+                    apiVersion=reference.apiVersion,
+                    kind=reference.kind,
+                    artifactDigest=digest,
+                    targetStackUid=target_stack_uid,
+                    artifactDocument=JsonObjectValue(document),
+                ).to_dict(),
+            )
+            return FingerprintedValue(
+                json_pointer(document, reference.pointer),
+                digest,
+                imported=True,
+                evidence=evidence,
+            )
         receipt = current_receipt(observed, candidate / "units", reference.unit)
         if receipt is None:
             raise ReferenceUnavailable(f"receipt is stale: {reference.unit}")
@@ -2168,8 +2227,25 @@ def project_stack_resources(
         unknown = sorted(selected_names - known_names)
         if unknown:
             raise OperationError(f"Stack {name!r} selects unknown Unit templates: {', '.join(unknown)}")
+        promoted_imports: Mapping[str, ResolvedArtifactImport] = {}
+        if isinstance(template_ref.source, StackTemplateFromPromotion) and promotion is not None:
+            source_paths = document_candidates(
+                promotion.desired_root / "stacks", template_ref.source.fromPromotion.stack
+            )
+            if len(source_paths) == 1:
+                promoted_source_stack = RESOURCE_CATALOG.parse_stack(
+                    RESOURCE_CATALOG.load_document(source_paths[0]),
+                    profile="desired",
+                    expected_name=template_ref.source.fromPromotion.stack,
+                )
+                if isinstance(promoted_source_stack.spec, DesiredStackSpec):
+                    promoted_imports = promoted_source_stack.spec.resolvedArtifactImports or {}
         for imported in authored_stack.spec.artifactImports:
-            if imported.unit not in known_names:
+            has_promoted_evidence = any(
+                key == f"{imported.unit}/{imported.name}" or key.endswith(f"--{imported.unit}/{imported.name}")
+                for key in promoted_imports
+            )
+            if imported.unit not in known_names and not has_promoted_evidence:
                 raise OperationError(f"Stack {name!r} imports an artifact from unknown Unit template {imported.unit!r}")
             if imported.unit in selected_names:
                 raise OperationError(
@@ -5105,6 +5181,7 @@ def build_desired_candidate(
         promotion,
     )
     imported_artifact_fingerprints: dict[str, dict[str, str]] = {}
+    imported_artifact_evidence: dict[str, dict[str, ResolvedArtifactImport]] = {}
     # Direct Stacks are controller-owned roots, so they must survive source
     # advances just like direct Units. An active deletion intent is retained
     # with the same root until finalization removes it explicitly.
@@ -5139,8 +5216,12 @@ def build_desired_candidate(
         )
         if not is_direct and not is_source_tracked and stack_name not in stack_intents:
             continue
-        if stack_name in source_stack_paths:
+        if is_direct and stack_name in source_stack_paths:
             raise OperationError(f"source Stack {stack_name!r} collides with a directly managed desired Stack")
+        if is_source_tracked and stack_name in source_stack_paths:
+            # The current source-authored Stack was already projected above.
+            # Do not overwrite a refreshed source projection with its previous copy.
+            continue
         target = candidate / "stacks" / current_stack_path.name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(current_stack_path, target)
@@ -5368,12 +5449,14 @@ def build_desired_candidate(
         for unit_name in sorted(unresolved):
             authored, resolved_source = prepared[unit_name]
             unit_artifact_imports = stack_projection.artifact_imports.get(authored.name, ())
+            unit_owner = stack_projection.owners.get(authored.name)
+            target_stack_uid = unit_owner.uid if unit_owner is not None else None
             try:
                 resolution = authored.driver.resolve_unit(
                     authored.spec,
                     UnitResolutionContext(
                         source=resolved_source,
-                        resolve_template=lambda value, pointer, target_unit=authored.name, target_gvk=authored.gvk, artifact_imports=unit_artifact_imports: (
+                        resolve_template=lambda value, pointer, target_unit=authored.name, target_gvk=authored.gvk, artifact_imports=unit_artifact_imports, target_stack_uid=target_stack_uid: (
                             resolve_template(
                                 value,
                                 candidate,
@@ -5386,6 +5469,7 @@ def build_desired_candidate(
                                 dry=dry,
                                 environment_document=load_environment(source_root, environment_name),
                                 artifact_imports=artifact_imports,
+                                target_stack_uid=target_stack_uid,
                             )
                         ),
                     ),
@@ -5431,6 +5515,15 @@ def build_desired_candidate(
                 owner = stack_projection.owners.get(unit_name)
                 if owner is not None:
                     imported_artifact_fingerprints.setdefault(owner.name, {}).update(imported_artifacts)
+            if fingerprints is not None and fingerprints.importedArtifactEvidence:
+                owner = stack_projection.owners.get(unit_name)
+                if owner is not None:
+                    imported_artifact_evidence.setdefault(owner.name, {}).update(
+                        {
+                            key: ResolvedArtifactImport.from_dict(cast(dict[str, Any], evidence))
+                            for key, evidence in fingerprints.importedArtifactEvidence.items()
+                        }
+                    )
             if promotions:
                 promotion_resolution = (
                     "new promotion changes resolved inputs"
@@ -5481,7 +5574,7 @@ def build_desired_candidate(
             log_status("WAIT", f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}")
         blocked[unit_name] = unavailable[unit_name]
 
-    for stack_name, fingerprints in imported_artifact_fingerprints.items():
+    for stack_name, _fingerprints in imported_artifact_fingerprints.items():
         stack_path = next(
             iter(document_candidates(candidate / "stacks", stack_name)),
             None,
@@ -5497,7 +5590,7 @@ def build_desired_candidate(
             stack_resource,
             spec=replace(
                 stack_resource.spec,
-                resolvedArtifactImports=JsonObjectValue(dict(fingerprints)),
+                resolvedArtifactImports=imported_artifact_evidence.get(stack_name),
             ),
         )
         _write_desired_stack_resource(stack_path, stack_resource, source_root)

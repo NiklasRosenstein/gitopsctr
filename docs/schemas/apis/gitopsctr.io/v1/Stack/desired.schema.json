@@ -334,6 +334,82 @@
         "resolvedArtifactImports": {
           "anyOf": [
             {
+              "additionalProperties": {
+                "additionalProperties": false,
+                "properties": {
+                  "apiVersion": {
+                    "pattern": "^[^/]+/[^/]+$",
+                    "type": "string"
+                  },
+                  "artifactDigest": {
+                    "pattern": "^[a-z0-9]+:[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "artifactDocument": {
+                    "type": "object"
+                  },
+                  "artifactName": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "pattern": "^[A-Z][A-Za-z0-9]*$",
+                    "type": "string"
+                  },
+                  "receiptUnitBlob": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "sourceDesiredRevision": {
+                    "pattern": "^[0-9a-f]{40}$",
+                    "type": "string"
+                  },
+                  "sourceObservedRevision": {
+                    "pattern": "^[0-9a-f]{40}$",
+                    "type": "string"
+                  },
+                  "sourceStack": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  },
+                  "sourceStackUid": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  },
+                  "sourceUnit": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  },
+                  "sourceUnitUid": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  },
+                  "targetStackUid": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "sourceStack",
+                  "sourceStackUid",
+                  "sourceUnit",
+                  "sourceUnitUid",
+                  "sourceDesiredRevision",
+                  "sourceObservedRevision",
+                  "receiptUnitBlob",
+                  "artifactName",
+                  "apiVersion",
+                  "kind",
+                  "artifactDigest",
+                  "targetStackUid",
+                  "artifactDocument"
+                ],
+                "title": "ResolvedArtifactImport",
+                "type": "object"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
               "type": "object"
             },
             {

@@ -319,6 +319,23 @@
                   ],
                   "default": null
                 },
+                "importedArtifactEvidence": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": {
+                        "type": "object"
+                      },
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
                 "importedArtifacts": {
                   "anyOf": [
                     {
