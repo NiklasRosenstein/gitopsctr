@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from gitopsctr import cli
+from gitopsctr import controller
 from gitopsctr.errors import OperationError
 from tests.stack_support import commit, git, project_repository
 
@@ -143,14 +143,14 @@ def _stack_source(remote: str, *, ref: str | None = "main", commit: str | None =
 
 def _stack(root: Path):
     path = next((root / "stacks").glob("application.*"))
-    return cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(path), profile="desired", expected_name="application"
+    return controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(path), profile="desired", expected_name="application"
     )
 
 
 def _advance(root: Path, revision: str, monkeypatch: pytest.MonkeyPatch) -> tuple[str, bool]:
-    monkeypatch.setattr(cli, "REPOSITORY_ROOT", root)
-    desired, changed = cli.advance_desired("dev", revision, verbose=False, summarize=False)
+    monkeypatch.setattr(controller, "REPOSITORY_ROOT", root)
+    desired, changed = controller.advance_desired("dev", revision, verbose=False, summarize=False)
     assert desired is not None
     return desired, changed
 
@@ -162,7 +162,7 @@ def test_remote_ref_pins_commit_and_reconcile_ignores_moved_main(tmp_path: Path,
         desired_a, changed_a = _advance(target, target_revision, monkeypatch)
         assert changed_a
         current = tmp_path / "current"
-        cli.materialize_revision(desired_a, current)
+        controller.materialize_revision(desired_a, current)
         resolved_source = _stack(current).spec.resolvedSource
         assert resolved_source is not None
         assert resolved_source.fromGit.commit == revision_a
@@ -171,7 +171,7 @@ def test_remote_ref_pins_commit_and_reconcile_ignores_moved_main(tmp_path: Path,
         revision_b = commit(working, "template B")
         git(working, "push", "origin", "main")
         daemon.stop()
-        specifications, _ = cli.load_convergence_specifications(
+        specifications, _ = controller.load_convergence_specifications(
             target, "dev", current, target_revision, tmp_path / "reconcile"
         )
         assert specifications["application--deploy"].spec.terraform.variables["marker"] == "A"
@@ -181,7 +181,7 @@ def test_remote_ref_pins_commit_and_reconcile_ignores_moved_main(tmp_path: Path,
 
     assert desired_b != desired_a
     materialized_b = tmp_path / "current-b"
-    cli.materialize_revision(desired_b, materialized_b)
+    controller.materialize_revision(desired_b, materialized_b)
     resolved_source = _stack(materialized_b).spec.resolvedSource
     assert resolved_source is not None
     assert resolved_source.fromGit.commit == revision_b
@@ -204,11 +204,11 @@ def test_fixed_remote_commit_stays_pinned_after_main_moves(tmp_path: Path, monke
     assert revision_b != revision_a
     assert changed_b
     materialized_b = tmp_path / "current-b"
-    cli.materialize_revision(desired_c, materialized_b)
+    controller.materialize_revision(desired_c, materialized_b)
     resolved_source = _stack(materialized_b).spec.resolvedSource
     assert resolved_source is not None
     assert resolved_source.fromGit.commit == revision_a
-    specifications, _ = cli.load_convergence_specifications(
+    specifications, _ = controller.load_convergence_specifications(
         target, "dev", materialized_b, target_revision, tmp_path / "reconcile-fixed"
     )
     assert specifications["application--deploy"].spec.terraform.variables["marker"] == "A"
@@ -229,21 +229,21 @@ def test_remote_source_failures_do_not_publish_desired_revision(
     if failure == "fetch":
         source = _stack_source("git://127.0.0.1:1/missing.git")
         target, target_revision = _target_repository(tmp_path, source)
-        monkeypatch.setattr(cli, "REPOSITORY_ROOT", target)
+        monkeypatch.setattr(controller, "REPOSITORY_ROOT", target)
         with pytest.raises(OperationError, match=expected):
-            cli.advance_desired("dev", target_revision, verbose=False, summarize=False)
+            controller.advance_desired("dev", target_revision, verbose=False, summarize=False)
     elif failure == "invalid-source":
         source = _stack_source("https://user:password@example.invalid/repository.git")
         target, target_revision = _target_repository(tmp_path, source)
-        monkeypatch.setattr(cli, "REPOSITORY_ROOT", target)
+        monkeypatch.setattr(controller, "REPOSITORY_ROOT", target)
         with pytest.raises(OperationError, match=expected):
-            cli.advance_desired("dev", target_revision, verbose=False, summarize=False)
+            controller.advance_desired("dev", target_revision, verbose=False, summarize=False)
     else:
         remote, _, _ = _remote_repository(tmp_path, include_template=failure != "path")
         with _git_daemon(tmp_path, remote) as daemon:
             source = _stack_source(daemon.url, ref="missing" if failure == "ref" else "main")
             target, target_revision = _target_repository(tmp_path, source)
-            monkeypatch.setattr(cli, "REPOSITORY_ROOT", target)
+            monkeypatch.setattr(controller, "REPOSITORY_ROOT", target)
             with pytest.raises(OperationError, match=expected):
-                cli.advance_desired("dev", target_revision, verbose=False, summarize=False)
-    assert cli.fetch_ref("gitopsctr/desired/dev") is None
+                controller.advance_desired("dev", target_revision, verbose=False, summarize=False)
+    assert controller.fetch_ref("gitopsctr/desired/dev") is None

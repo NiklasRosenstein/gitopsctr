@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gitopsctr import cli as deploy_release
+from gitopsctr import controller as deploy_release
 from gitopsctr.contrib.drivers.terraform import AppliedTerraformModel, TerraformResultModel
 from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import ReconciliationOutput, VerificationContext, VerificationResult, VerificationStatus

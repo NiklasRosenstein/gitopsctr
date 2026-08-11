@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from gitopsctr import cli
+from gitopsctr import controller
 from gitopsctr.resources import ResourceMetadata
 
 
@@ -86,20 +86,20 @@ def write_stack_source(
 
 def write_projected_units(
     root: Path,
-    projection: cli.StackProjection,
+    projection: controller.StackProjection,
     source_root: Path,
     *,
     uid_prefix: str = "d1-",
 ) -> None:
     """Materialize projected Units with UID-fenced Stack ownership."""
     for name, unit in projection.generated_units.items():
-        cli.write_desired_candidate_unit(
+        controller.write_desired_candidate_unit(
             root / "units" / f"{name}.json",
             unit.with_metadata(
                 ResourceMetadata(
                     name=name,
                     uid=f"{uid_prefix}{name}",
-                    lifecycle=cli.DesiredLifecycle(owner=projection.owners[name]),
+                    lifecycle=controller.DesiredLifecycle(owner=projection.owners[name]),
                 )
             ),
             source_root,

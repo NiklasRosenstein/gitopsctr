@@ -11,7 +11,7 @@ import yaml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
-from gitopsctr import cli, schemas
+from gitopsctr import controller, schemas
 from gitopsctr.formats import DocumentFormat, DocumentFormatError, load_project_config, write_document
 
 
@@ -37,7 +37,7 @@ def test_yaml_is_the_default_and_project_config_can_select_json(tmp_path: Path):
     assert config.environment_defaults.refs.observed == "gitopsctr/observed/{environment}"
     assert config.environment_defaults.refs.candidate == "gitopsctr/candidates/{environment}/{id}"
     write_document(tmp_path / "configured.json", value, format=DocumentFormat.JSON)
-    assert cli.load_json(tmp_path / "configured.json") == value
+    assert controller.load_json(tmp_path / "configured.json") == value
 
 
 def test_yaml_uses_language_server_schema_directive_while_json_keeps_schema_property(tmp_path: Path):
@@ -190,8 +190,8 @@ spec:
     checks: []
 """
     )
-    assert cli.load_environment(tmp_path, "dev")["name"] == "dev"
-    assert list(cli.load_environment_specifications(tmp_path, "dev")) == ["infrastructure"]
+    assert controller.load_environment(tmp_path, "dev")["name"] == "dev"
+    assert list(controller.load_environment_specifications(tmp_path, "dev")) == ["infrastructure"]
 
 
 def test_new_yaml_resource_envelopes_are_loaded_as_typed_resources(tmp_path: Path):
@@ -225,8 +225,8 @@ spec:
 """
     )
 
-    environment = cli.load_environment(tmp_path, "dev")
-    specifications = cli.load_environment_specifications(tmp_path, "dev")
+    environment = controller.load_environment(tmp_path, "dev")
+    specifications = controller.load_environment_specifications(tmp_path, "dev")
 
     assert environment["name"] == "dev"
     assert specifications["infrastructure"].driver_name == "terraform"
@@ -258,8 +258,8 @@ def test_yaml_demo_documents_validate_against_published_resource_schemas():
 
 
 def test_receipt_result_cannot_override_envelope_identity():
-    with pytest.raises(cli.OperationError, match="Additional properties"):
-        cli.RESOURCE_CATALOG.parse_receipt(
+    with pytest.raises(controller.OperationError, match="Additional properties"):
+        controller.RESOURCE_CATALOG.parse_receipt(
             {
                 "apiVersion": "gitopsctr.io/v1",
                 "kind": "Receipt",
@@ -402,7 +402,7 @@ def test_migration_script_canonicalizes_legacy_desired_units_and_uses_configured
                     "path": "infrastructure",
                     "revision": "a" * 40,
                     "inputHash": "sha256:inputs",
-                    "driverVersion": cli.DRIVER_VERSIONS["terraform"],
+                    "driverVersion": controller.DRIVER_VERSIONS["terraform"],
                 },
                 "terraform": {
                     "backend": {"key": "example/dev.tfstate"},

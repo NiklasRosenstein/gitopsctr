@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from gitopsctr import cli as deploy_release
+from gitopsctr import controller as deploy_release
 from gitopsctr.contracts import DesiredSource, ResolvedInputs
 from gitopsctr.contrib.drivers.frontend_s3_cloudfront import FrontendDesiredUnit
 from gitopsctr.driver import UnitResolution

@@ -18,7 +18,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from gitopsctr import cli
+from gitopsctr import controller
 from gitopsctr.formats import (
     PROJECT_CONFIG_NAMES,
     DocumentFormat,
@@ -160,32 +160,32 @@ def convert_environment(tree: Path, environment_name: str) -> None:
     paths = document_candidates(root, "environment")
     if len(paths) != 1:
         raise RuntimeError(f"expected one environment document for {environment_name}")
-    environment = cli.normalize_environment_document(load_document(paths[0]), environment_name)
-    write_yaml(root / "environment.yaml", cli.serialize_environment_document(environment))
+    environment = controller.normalize_environment_document(load_document(paths[0]), environment_name)
+    write_yaml(root / "environment.yaml", controller.serialize_environment_document(environment))
     units = root / "units"
     for path in sorted(path for path in units.glob("*") if path.suffix in {".json", ".yaml", ".yml"}):
-        unit = cli.parse_authored_unit_document(load_document(path), path.stem)
-        write_yaml(units / f"{path.stem}.yaml", cli.serialize_unit_document(unit, profile="authored"))
+        unit = controller.parse_authored_unit_document(load_document(path), path.stem)
+        write_yaml(units / f"{path.stem}.yaml", controller.serialize_unit_document(unit, profile="authored"))
 
 
 def convert_desired(tree: Path, source_revision: str) -> None:
     units = tree / "units"
     for path in sorted(path for path in units.glob("*") if path.suffix in {".json", ".yaml", ".yml"}):
-        unit = cli.parse_desired_unit_document(load_document(path), path.stem)
+        unit = controller.parse_desired_unit_document(load_document(path), path.stem)
         source = getattr(unit.spec, "source", None)
         if source is not None:
             unit = unit.with_spec(replace(unit.spec, source=replace(source, revision=source_revision)))
             source = getattr(unit.spec, "source", None)
         if unit.is_legacy_compatibility:
-            unit = unit.with_metadata(cli.source_tracked_metadata_for_resource(unit, source, source_revision))
-        write_yaml(units / f"{path.stem}.yaml", cli.serialize_unit_document(unit, profile="desired"))
+            unit = unit.with_metadata(controller.source_tracked_metadata_for_resource(unit, source, source_revision))
+        write_yaml(units / f"{path.stem}.yaml", controller.serialize_unit_document(unit, profile="desired"))
     promotion_paths = document_candidates(tree, "promotion")
     if promotion_paths:
         if len(promotion_paths) > 1:
             raise RuntimeError("multiple promotion document formats exist")
-        promotion = cli.normalize_promotion_document(load_document(promotion_paths[0]))
+        promotion = controller.normalize_promotion_document(load_document(promotion_paths[0]))
         promotion = {**promotion, "specificationRevision": source_revision}
-        write_yaml(tree / "promotion.yaml", cli.serialize_promotion_document(promotion))
+        write_yaml(tree / "promotion.yaml", controller.serialize_promotion_document(promotion))
 
 
 def rewrite_promotion_lineage(
@@ -197,7 +197,7 @@ def rewrite_promotion_lineage(
     paths = document_candidates(tree, "promotion")
     if not paths:
         return
-    promotion = cli.normalize_promotion_document(load_document(paths[0]))
+    promotion = controller.normalize_promotion_document(load_document(paths[0]))
     source = promotion.get("source")
     if not isinstance(source, dict) or not isinstance(source.get("environment"), str):
         raise RuntimeError("promotion source is missing its environment")
@@ -211,21 +211,21 @@ def rewrite_promotion_lineage(
     updated_source["observedRevision"] = observed[1] if observed is not None else None
     write_yaml(
         tree / "promotion.yaml",
-        cli.serialize_promotion_document({**promotion, "source": updated_source}),
+        controller.serialize_promotion_document({**promotion, "source": updated_source}),
     )
 
 
 def convert_observed(tree: Path, desired_revision: str, desired_tree: Path) -> None:
     units = tree / "units"
     for path in sorted(path for path in units.glob("*") if path.suffix in {".json", ".yaml", ".yml"}):
-        receipt = cli.normalize_receipt_document(load_document(path), path.stem)
-        desired_path = cli.unit_document_path(desired_tree, path.stem)
+        receipt = controller.normalize_receipt_document(load_document(path), path.stem)
+        desired_path = controller.unit_document_path(desired_tree, path.stem)
         desired_blob = git("hash-object", str(desired_path))
         receipt = {
             **receipt,
             "desired": {**receipt.get("desired", {}), "revision": desired_revision, "unitBlob": desired_blob},
         }
-        write_yaml(units / f"{path.stem}.yaml", cli.serialize_receipt_document(receipt))
+        write_yaml(units / f"{path.stem}.yaml", controller.serialize_receipt_document(receipt))
 
 
 def local_refs(prefix: str) -> list[tuple[str, str]]:
@@ -267,7 +267,7 @@ def migration_ref_inventory(tree: Path) -> tuple[EnvironmentMigrationRefs, ...]:
     inventory: list[EnvironmentMigrationRefs] = []
     seen: dict[str, str] = {}
     for environment in environment_names(tree):
-        desired, observed = cli.deployment_refs(tree, environment)
+        desired, observed = controller.deployment_refs(tree, environment)
         for ref, role in ((desired, "desired"), (observed, "observed")):
             owner = seen.get(ref)
             if owner is not None:

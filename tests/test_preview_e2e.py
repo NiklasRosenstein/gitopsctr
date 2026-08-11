@@ -6,7 +6,7 @@ import json
 import shutil
 from pathlib import Path
 
-from gitopsctr import cli
+from gitopsctr import controller
 from gitopsctr.state import GitStateStore
 from tests.stack_support import commit, git, project_repository, write_projected_units, write_stack_source
 
@@ -82,13 +82,13 @@ def test_direct_stack_instantiation_from_template_only_source_is_replay_safe(tmp
     source, environment, source_revision = _template_only_repository(tmp_path)
     store = GitStateStore(source)
     initial = tmp_path / "initial"
-    projection = cli.project_stack_resources(source, "dev", source_revision, initial, source)
+    projection = controller.project_stack_resources(source, "dev", source_revision, initial, source)
     assert projection.generated_units == {}
     source_head = git(source, "rev-parse", "HEAD")
     desired = store.publish("deploy/dev", initial, None, "publish template-only desired state")
 
-    monkeypatch.setattr(cli, "REPOSITORY_ROOT", source)
-    args = cli.build_parser().parse_args(
+    monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
+    args = controller.build_parser().parse_args(
         [
             "instantiate-stack",
             "--environment",
@@ -110,39 +110,39 @@ def test_direct_stack_instantiation_from_template_only_source_is_replay_safe(tmp
         ]
     )
 
-    assert cli.command_instantiate_stack(args) is True
+    assert controller.command_instantiate_stack(args) is True
     instantiated_revision = store.fetch("deploy/dev").revision
     assert instantiated_revision is not None
     assert instantiated_revision != desired.revision
 
     instantiated = tmp_path / "instantiated"
     store.materialize(instantiated_revision, instantiated)
-    stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(next((instantiated / "stacks").glob("web.*"))),
+    stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((instantiated / "stacks").glob("web.*"))),
         profile="desired",
         expected_name="web",
     )
     assert stack.metadata.lifecycle is not None
     assert stack.metadata.lifecycle.management is not None
     assert stack.metadata.lifecycle.management.mode == "direct"
-    assert isinstance(stack.spec, cli.DesiredStackSpec)
+    assert isinstance(stack.spec, controller.DesiredStackSpec)
     assert stack.spec.provenance is not None
     assert stack.spec.provenance.templateRevision == source_revision
     assert stack.spec.provenance.templatePath.endswith("stack-templates/preview.json")
-    template = cli.RESOURCE_CATALOG.parse_stack_template(
-        cli.RESOURCE_CATALOG.load_document(next((instantiated / "stack-templates").glob("preview.*"))),
+    template = controller.RESOURCE_CATALOG.parse_stack_template(
+        controller.RESOURCE_CATALOG.load_document(next((instantiated / "stack-templates").glob("preview.*"))),
         profile="desired",
         expected_name="preview",
     )
     assert template.metadata.uid is not None
-    unit = cli.load_desired_unit(next((instantiated / "units").glob("web--preview-app.*")), "web--preview-app")
+    unit = controller.load_desired_unit(next((instantiated / "units").glob("web--preview-app.*")), "web--preview-app")
     assert unit.metadata.lifecycle is not None
     assert unit.metadata.lifecycle.owner is not None
     assert unit.metadata.lifecycle.owner.uid == stack.metadata.uid
     assert not list((environment / "stacks").glob("web.*"))
     assert git(source, "rev-parse", "HEAD") == source_head
 
-    assert cli.command_instantiate_stack(args) is False
+    assert controller.command_instantiate_stack(args) is False
     assert store.fetch("deploy/dev").revision == instantiated_revision
 
 
@@ -150,22 +150,22 @@ def test_stack_lifecycle_survives_git_restart_and_tears_down_in_reverse_order(tm
     source, environment, source_revision = _source_repository(tmp_path)
     store = GitStateStore(source)
     initial = tmp_path / "initial"
-    projection = cli.project_stack_resources(source, "dev", source_revision, initial, source)
+    projection = controller.project_stack_resources(source, "dev", source_revision, initial, source)
     write_projected_units(initial, projection, source)
-    resources = cli.load_desired_resource_graph(initial)
+    resources = controller.load_desired_resource_graph(initial)
     units = {
         resource.name: resource
         for (api_version, _kind, _name), resource in resources.items()
-        if api_version == cli.UNIT_API_VERSION
+        if api_version == controller.UNIT_API_VERSION
     }
-    order = cli.convergence_order(units, tuple(units), projection.dependencies)
+    order = controller.convergence_order(units, tuple(units), projection.dependencies)
     assert order == ("web--preview-db", "web--preview-app")
 
     inventory = Inventory(projection.dependencies)
     inventory.deploy(order)
     desired = store.publish("deploy/dev", initial, None, "publish initial Stack desired state")
-    initial_stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(next((initial / "stacks").glob("web.*"))),
+    initial_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((initial / "stacks").glob("web.*"))),
         profile="desired",
         expected_name="web",
     )
@@ -178,7 +178,7 @@ def test_stack_lifecycle_survives_git_restart_and_tears_down_in_reverse_order(tm
     candidate = tmp_path / "candidate"
     observed = tmp_path / "observed"
     observed.mkdir()
-    result = cli.build_desired_candidate(
+    result = controller.build_desired_candidate(
         "dev",
         source,
         source_revision_without_stack,
@@ -189,14 +189,14 @@ def test_stack_lifecycle_survives_git_restart_and_tears_down_in_reverse_order(tm
         verbose=False,
     )
     assert result.blocked == {}
-    intent = cli.load_desired_stack_deletion_intents(candidate)["web"]
+    intent = controller.load_desired_stack_deletion_intents(candidate)["web"]
     assert intent.uid == initial_stack.metadata.uid
     assert {item.unit_name for item in intent.owned_unit_closure} == set(order)
 
     deleted = store.publish("deploy/dev", candidate, desired.revision, "retain Stack deletion intent")
     restarted = tmp_path / "restarted"
     GitStateStore(source).materialize(deleted.revision, restarted)
-    assert cli.load_desired_stack_deletion_intents(restarted)["web"] == intent
+    assert controller.load_desired_stack_deletion_intents(restarted)["web"] == intent
 
     inventory.destroy(tuple(reversed(order)))
     assert inventory.active == set()
@@ -204,13 +204,13 @@ def test_stack_lifecycle_survives_git_restart_and_tears_down_in_reverse_order(tm
 
     finalized = tmp_path / "finalized"
     shutil.copytree(restarted, finalized)
-    cli.write_stack_incarnation_tombstone(
+    controller.write_stack_incarnation_tombstone(
         finalized,
-        cli.StackIncarnationTombstone(stack_name="web", uid=initial_stack.metadata.uid),
+        controller.StackIncarnationTombstone(stack_name="web", uid=initial_stack.metadata.uid),
     )
-    for path in cli.document_candidates(finalized / "stacks", "web"):
+    for path in controller.document_candidates(finalized / "stacks", "web"):
         path.unlink()
-    for path in cli.document_candidates(finalized / cli.DESIRED_STACK_DELETION_INTENTS_PATH, "web"):
+    for path in controller.document_candidates(finalized / controller.DESIRED_STACK_DELETION_INTENTS_PATH, "web"):
         path.unlink()
 
     (environment / "stacks/web.json").write_text(
@@ -225,9 +225,11 @@ def test_stack_lifecycle_survives_git_restart_and_tears_down_in_reverse_order(tm
     )
     recreated_revision = commit(source, "recreate preview Stack")
     recreated = tmp_path / "recreated"
-    recreated_projection = cli.project_stack_resources(source, "dev", recreated_revision, recreated, source, finalized)
-    recreated_stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(next((recreated / "stacks").glob("web.*"))),
+    recreated_projection = controller.project_stack_resources(
+        source, "dev", recreated_revision, recreated, source, finalized
+    )
+    recreated_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((recreated / "stacks").glob("web.*"))),
         profile="desired",
         expected_name="web",
     )

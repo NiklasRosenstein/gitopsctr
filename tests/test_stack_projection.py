@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gitopsctr import cli
+from gitopsctr import controller
 from gitopsctr.contracts import (
     DesiredLifecycle,
     DesiredOwnerReference,
@@ -27,8 +27,8 @@ def test_stack_projection_is_deterministic_and_templates_are_inert(tmp_path: Pat
     environment = project_repository(source)
     write_stack_source(environment)
 
-    first = cli.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate-a", source)
-    second = cli.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate-b", source)
+    first = controller.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate-a", source)
+    second = controller.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate-b", source)
 
     assert sorted(first.generated_units) == ["web--preview-app"]
     assert first.owners == second.owners
@@ -42,12 +42,12 @@ def test_existing_stack_root_uids_are_preserved_across_source_revisions(tmp_path
     environment = project_repository(source)
     write_stack_source(environment)
     initial = tmp_path / "initial"
-    cli.project_stack_resources(source, "dev", "a" * 40, initial, source)
+    controller.project_stack_resources(source, "dev", "a" * 40, initial, source)
     current = tmp_path / "current"
     shutil.copytree(initial, current)
 
     next_candidate = tmp_path / "next"
-    cli.project_stack_resources(source, "dev", "b" * 40, next_candidate, source, current)
+    controller.project_stack_resources(source, "dev", "b" * 40, next_candidate, source, current)
 
     for kind, directory in (("StackTemplate", "stack-templates"), ("Stack", "stacks")):
         old_path = next(
@@ -57,14 +57,22 @@ def test_existing_stack_root_uids_are_preserved_across_source_revisions(tmp_path
             path for path in (next_candidate / directory).glob("preview.*" if kind == "StackTemplate" else "web.*")
         )
         old = (
-            cli.RESOURCE_CATALOG.parse_stack_template(cli.RESOURCE_CATALOG.load_document(old_path), profile="desired")
+            controller.RESOURCE_CATALOG.parse_stack_template(
+                controller.RESOURCE_CATALOG.load_document(old_path), profile="desired"
+            )
             if kind == "StackTemplate"
-            else cli.RESOURCE_CATALOG.parse_stack(cli.RESOURCE_CATALOG.load_document(old_path), profile="desired")
+            else controller.RESOURCE_CATALOG.parse_stack(
+                controller.RESOURCE_CATALOG.load_document(old_path), profile="desired"
+            )
         )
         new = (
-            cli.RESOURCE_CATALOG.parse_stack_template(cli.RESOURCE_CATALOG.load_document(new_path), profile="desired")
+            controller.RESOURCE_CATALOG.parse_stack_template(
+                controller.RESOURCE_CATALOG.load_document(new_path), profile="desired"
+            )
             if kind == "StackTemplate"
-            else cli.RESOURCE_CATALOG.parse_stack(cli.RESOURCE_CATALOG.load_document(new_path), profile="desired")
+            else controller.RESOURCE_CATALOG.parse_stack(
+                controller.RESOURCE_CATALOG.load_document(new_path), profile="desired"
+            )
         )
         assert old.metadata.uid == new.metadata.uid
 
@@ -74,10 +82,10 @@ def test_recreated_source_stack_does_not_reuse_finalized_uid(tmp_path: Path):
     environment = project_repository(source)
     write_stack_source(environment)
     initial = tmp_path / "initial"
-    cli.project_stack_resources(source, "dev", "a" * 40, initial, source)
+    controller.project_stack_resources(source, "dev", "a" * 40, initial, source)
     old_path = next((initial / "stacks").glob("web.*"))
-    old_stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(old_path), profile="desired", expected_name="web"
+    old_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(old_path), profile="desired", expected_name="web"
     )
     assert old_stack.metadata.uid is not None
 
@@ -85,15 +93,15 @@ def test_recreated_source_stack_does_not_reuse_finalized_uid(tmp_path: Path):
     shutil.copytree(initial, current)
     for path in (current / "stacks").glob("web.*"):
         path.unlink()
-    cli.write_stack_incarnation_tombstone(
+    controller.write_stack_incarnation_tombstone(
         current,
-        cli.StackIncarnationTombstone(stack_name="web", uid=old_stack.metadata.uid),
+        controller.StackIncarnationTombstone(stack_name="web", uid=old_stack.metadata.uid),
     )
 
     candidate = tmp_path / "candidate"
-    cli.project_stack_resources(source, "dev", "a" * 40, candidate, source, current)
-    new_stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(next((candidate / "stacks").glob("web.*"))),
+    controller.project_stack_resources(source, "dev", "a" * 40, candidate, source, current)
+    new_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((candidate / "stacks").glob("web.*"))),
         profile="desired",
         expected_name="web",
     )
@@ -105,9 +113,9 @@ def test_source_absent_stack_root_is_retained_for_owned_unit_cleanup(tmp_path: P
     environment = project_repository(source)
     write_stack_source(environment)
     initial = tmp_path / "initial"
-    cli.project_stack_resources(source, "dev", "a" * 40, initial, source)
-    initial_stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(next((initial / "stacks").glob("web.*"))),
+    controller.project_stack_resources(source, "dev", "a" * 40, initial, source)
+    initial_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((initial / "stacks").glob("web.*"))),
         profile="desired",
         expected_name="web",
     )
@@ -116,11 +124,11 @@ def test_source_absent_stack_root_is_retained_for_owned_unit_cleanup(tmp_path: P
 
     (environment / "stacks/web.json").unlink()
     next_candidate = tmp_path / "next"
-    projection = cli.project_stack_resources(source, "dev", "b" * 40, next_candidate, source, current)
+    projection = controller.project_stack_resources(source, "dev", "b" * 40, next_candidate, source, current)
 
     assert not projection.generated_units
-    retained_stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(next((next_candidate / "stacks").glob("web.*"))),
+    retained_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((next_candidate / "stacks").glob("web.*"))),
         profile="desired",
         expected_name="web",
     )
@@ -143,28 +151,28 @@ def test_expanded_stack_dependencies_are_retained_and_validated(tmp_path: Path):
     template_path.write_text(json.dumps(template))
 
     candidate = tmp_path / "candidate"
-    projection = cli.project_stack_resources(source, "dev", "a" * 40, candidate, source)
+    projection = controller.project_stack_resources(source, "dev", "a" * 40, candidate, source)
     assert projection.dependencies["web--preview-app"] == ("web--preview-db",)
     write_projected_units(candidate, projection, source, uid_prefix="d1-generated-")
-    cli.load_desired_resource_graph(candidate)
+    controller.load_desired_resource_graph(candidate)
     current_desired = tmp_path / "empty-desired"
     current_desired.mkdir()
-    specifications, dependencies = cli.load_convergence_specifications(
+    specifications, dependencies = controller.load_convergence_specifications(
         source,
         "dev",
         current_desired,
         "a" * 40,
         tmp_path / "convergence-projection",
     )
-    selection = cli.convergence_scope(specifications, ["web--preview-app"], additional_dependencies=dependencies)
+    selection = controller.convergence_scope(specifications, ["web--preview-app"], additional_dependencies=dependencies)
     assert selection.scope == ("web--preview-app", "web--preview-db")
-    assert cli.convergence_order(specifications, selection.scope, dependencies) == (
+    assert controller.convergence_order(specifications, selection.scope, dependencies) == (
         "web--preview-db",
         "web--preview-app",
     )
     next(path for path in (candidate / "units").glob("web--preview-db.*")).unlink()
     with pytest.raises(OperationError, match="dependency 'web--preview-db' is absent"):
-        cli.load_desired_resource_graph(candidate)
+        controller.load_desired_resource_graph(candidate)
 
 
 def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path: Path):
@@ -172,7 +180,7 @@ def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path:
     environment = project_repository(source)
     write_stack_source(environment)
     candidate = tmp_path / "candidate"
-    projection = cli.project_stack_resources(source, "dev", "a" * 40, candidate, source)
+    projection = controller.project_stack_resources(source, "dev", "a" * 40, candidate, source)
     owner = projection.owners["web--preview-app"]
     unit = projection.generated_units["web--preview-app"].with_metadata(
         ResourceMetadata(
@@ -181,10 +189,10 @@ def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path:
             lifecycle=DesiredLifecycle(owner=owner),
         )
     )
-    cli.write_desired_candidate_unit(candidate / "units/web--preview-app.json", unit, source)
+    controller.write_desired_candidate_unit(candidate / "units/web--preview-app.json", unit, source)
 
-    graph = cli.load_desired_resource_graph(candidate)
-    assert cli.desired_unit_names(candidate) == ("web--preview-app",)
+    graph = controller.load_desired_resource_graph(candidate)
+    assert controller.desired_unit_names(candidate) == ("web--preview-app",)
     assert ("gitopsctr.io/v1", "StackTemplate", "preview") in graph
     assert ("gitopsctr.io/v1", "Stack", "web") in graph
     assert graph[("unit.gitopsctr.io/v1", "Terraform", "web--preview-app")].metadata.lifecycle is not None
@@ -217,16 +225,16 @@ def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
     source = tmp_path / "source"
     environment = project_repository(source)
     write_stack_source(environment)
-    authored_stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(environment / "stacks/web.json"),
+    authored_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(environment / "stacks/web.json"),
         profile="authored",
         expected_name="web",
     )
     desired = tmp_path / "desired"
-    projection = cli.project_stack_resources(source, "dev", "a" * 40, desired, source)
+    projection = controller.project_stack_resources(source, "dev", "a" * 40, desired, source)
     (environment / "stacks/web.json").unlink()
     stack = StackResource(
-        cli.GVK(cli.CORE_API_VERSION, "Stack"),
+        controller.GVK(controller.CORE_API_VERSION, "Stack"),
         ResourceMetadata(
             name="web",
             uid="d1-stack-web",
@@ -243,10 +251,10 @@ def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
             ),
         ),
     )
-    for path in cli.document_candidates(desired / "stacks", "web"):
+    for path in controller.document_candidates(desired / "stacks", "web"):
         path.unlink()
     (desired / "stacks/web.json").write_text(
-        json.dumps(cli.RESOURCE_CATALOG.serialize_stack_resource(stack, profile="desired"))
+        json.dumps(controller.RESOURCE_CATALOG.serialize_stack_resource(stack, profile="desired"))
     )
     unit = projection.generated_units["web--preview-app"].with_metadata(
         ResourceMetadata(
@@ -254,7 +262,7 @@ def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
             uid="d1-unit-preview-app",
             lifecycle=DesiredLifecycle(
                 owner=DesiredOwnerReference(
-                    apiVersion=cli.CORE_API_VERSION,
+                    apiVersion=controller.CORE_API_VERSION,
                     kind="Stack",
                     name="web",
                     uid="d1-stack-web",
@@ -262,9 +270,9 @@ def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
             ),
         )
     )
-    cli.write_desired_candidate_unit(desired / "units/web--preview-app.json", unit, source)
+    controller.write_desired_candidate_unit(desired / "units/web--preview-app.json", unit, source)
 
-    specifications, dependencies = cli.load_convergence_specifications(
+    specifications, dependencies = controller.load_convergence_specifications(
         source,
         "dev",
         desired,
@@ -293,7 +301,7 @@ def test_stack_rejects_missing_template_during_projection(tmp_path: Path):
     )
 
     with pytest.raises(OperationError, match="missing StackTemplate"):
-        cli.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate", source)
+        controller.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate", source)
 
 
 def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Path, monkeypatch):
@@ -311,7 +319,7 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
         shutil.copytree(source if revision == source_revision else current, output)
 
     def fake_build(_environment, source_root, revision, _current, _observed, _observed_revision, candidate, **_kwargs):
-        projection = cli.project_stack_resources(source_root, "dev", revision, candidate, source_root)
+        projection = controller.project_stack_resources(source_root, "dev", revision, candidate, source_root)
         for name in projection.generated_units:
             unit_document = {
                 "apiVersion": "unit.gitopsctr.io/v1",
@@ -326,13 +334,13 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
                         "path": ".",
                         "revision": source_revision,
                         "inputHash": "sha256:" + "0" * 64,
-                        "driverVersion": cli.DRIVER_VERSIONS["terraform"],
+                        "driverVersion": controller.DRIVER_VERSIONS["terraform"],
                     },
                     "terraform": {"backend": {}, "variables": {}, "observeOutputs": []},
                 },
             }
-            unit = cli.RESOURCE_CATALOG.parse_unit(unit_document, profile="desired", expected_name=name)
-            cli.write_desired_candidate_unit(candidate / "units" / f"{name}.json", unit, source_root)
+            unit = controller.RESOURCE_CATALOG.parse_unit(unit_document, profile="desired", expected_name=name)
+            controller.write_desired_candidate_unit(candidate / "units" / f"{name}.json", unit, source_root)
 
     def publish(_environment, candidate, *_args, **kwargs):
         assert kwargs["request_change"] is False
@@ -342,17 +350,17 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
         published.append(snapshot)
         return "c" * 40, None
 
-    monkeypatch.setattr(cli, "REPOSITORY_ROOT", source)
-    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
-    monkeypatch.setattr(cli, "fetch_ref", lambda ref: "b" * 40 if ref == "deploy/dev" else None)
-    monkeypatch.setattr(cli, "materialize_revision", materialize)
-    monkeypatch.setattr(cli, "observed_tree", lambda _ref, output: output.mkdir(parents=True) or None)
+    monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(controller, "fetch_ref", lambda ref: "b" * 40 if ref == "deploy/dev" else None)
+    monkeypatch.setattr(controller, "materialize_revision", materialize)
+    monkeypatch.setattr(controller, "observed_tree", lambda _ref, output: output.mkdir(parents=True) or None)
     monkeypatch.setattr(
-        cli, "git", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=source_revision + "\n")
+        controller, "git", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=source_revision + "\n")
     )
-    monkeypatch.setattr(cli, "build_desired_candidate", fake_build)
-    monkeypatch.setattr(cli, "publish_desired_change", publish)
-    monkeypatch.setattr(cli, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+    monkeypatch.setattr(controller, "build_desired_candidate", fake_build)
+    monkeypatch.setattr(controller, "publish_desired_change", publish)
+    monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
 
     def create_claim(claim: ControllerPinClaim) -> ControllerPinClaim:
         events.append("claim")
@@ -374,12 +382,12 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
         update_controller_pin_claim=update_claim,
     )
     monkeypatch.setattr(
-        cli,
+        controller,
         "state_store",
         lambda: store,
     )
 
-    args = cli.build_parser().parse_args(
+    args = controller.build_parser().parse_args(
         [
             "instantiate-stack",
             "--environment",
@@ -396,19 +404,19 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
             "pull-123",
         ]
     )
-    assert cli.command_instantiate_stack(args) is True
+    assert controller.command_instantiate_stack(args) is True
     assert events == ["claim", "pin", "publish", "activate"]
     candidate = published[0]
     stack_path = next((candidate / "stacks").glob("web.*"))
-    stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name="web"
+    stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name="web"
     )
     assert stack.metadata.lifecycle is not None
     assert stack.metadata.lifecycle.management is not None
     assert stack.metadata.lifecycle.management.mode == "direct"
-    assert isinstance(stack.spec, cli.DesiredStackSpec)
+    assert isinstance(stack.spec, controller.DesiredStackSpec)
     assert stack.spec.provenance is not None
-    unit = cli.load_desired_unit(next((candidate / "units").glob("web--preview-app.*")), "web--preview-app")
+    unit = controller.load_desired_unit(next((candidate / "units").glob("web--preview-app.*")), "web--preview-app")
     assert unit.metadata.lifecycle is not None
     assert unit.metadata.lifecycle.owner is not None
     assert unit.metadata.lifecycle.owner.uid == stack.metadata.uid

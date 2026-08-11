@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from gitopsctr import cli as deploy_release
+from gitopsctr import controller as deploy_release
 from gitopsctr.contracts import DesiredOwnerReference
 from gitopsctr.errors import OperationError
 

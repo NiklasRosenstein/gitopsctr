@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from gitopsctr import cli
+from gitopsctr import controller
 from gitopsctr.contracts import DesiredLifecycle, DesiredOwnerReference, LifecycleManagement
 from gitopsctr.errors import OperationError
 from gitopsctr.resources import ResourceMetadata, validate_desired_resource_graph
@@ -28,24 +28,24 @@ def legacy_desired(name: str, revision: str = "a" * 40) -> dict[str, object]:
             "path": ".",
             "revision": revision,
             "inputHash": "sha256:inputs",
-            "driverVersion": cli.DRIVER_VERSIONS["terraform"],
+            "driverVersion": controller.DRIVER_VERSIONS["terraform"],
         },
     }
 
 
 def test_desired_round_trip_assigns_canonical_identity_and_authority():
-    parsed = cli.parse_desired_unit_document(legacy_desired("infra"), "infra")
+    parsed = controller.parse_desired_unit_document(legacy_desired("infra"), "infra")
 
     assert parsed.is_legacy_compatibility
     with pytest.raises(OperationError, match="must be canonical"):
-        cli.serialize_unit_document(parsed)
+        controller.serialize_unit_document(parsed)
 
     adopted = parsed.with_metadata(ResourceMetadata.new_source_tracked(parsed.name))
-    document = cli.serialize_unit_document(adopted)
+    document = controller.serialize_unit_document(adopted)
     assert document["metadata"]["uid"]
     assert document["metadata"]["lifecycle"] == {"management": {"mode": "sourceTracked"}}
 
-    round_tripped = cli.parse_desired_unit_document(document, "infra")
+    round_tripped = controller.parse_desired_unit_document(document, "infra")
     assert not round_tripped.is_legacy_compatibility
     assert round_tripped.metadata.uid == document["metadata"]["uid"]
 
@@ -59,7 +59,7 @@ def test_authored_metadata_rejects_lifecycle_fields():
     }
 
     with pytest.raises(OperationError, match="authored unit metadata may contain only name"):
-        cli.parse_authored_unit_document(document, "infra")
+        controller.parse_authored_unit_document(document, "infra")
 
 
 @pytest.mark.parametrize("field", ["uid", "lifecycle"])
@@ -73,13 +73,13 @@ def test_desired_metadata_rejects_explicit_null_lifecycle_fields(field):
                 "path": ".",
                 "revision": "a" * 40,
                 "inputHash": "sha256:inputs",
-                "driverVersion": cli.DRIVER_VERSIONS["terraform"],
+                "driverVersion": controller.DRIVER_VERSIONS["terraform"],
             }
         },
     }
 
     with pytest.raises(OperationError, match="null values"):
-        cli.parse_desired_unit_document(document, "infra")
+        controller.parse_desired_unit_document(document, "infra")
 
 
 def test_lifecycle_model_requires_exactly_one_authority():
@@ -98,10 +98,10 @@ def test_lifecycle_model_requires_exactly_one_authority():
 
 
 def test_owner_uid_fencing_and_cycles_are_validated():
-    owner_resource = cli.parse_desired_unit_document(legacy_desired("owner"), "owner").with_metadata(
+    owner_resource = controller.parse_desired_unit_document(legacy_desired("owner"), "owner").with_metadata(
         ResourceMetadata.new_source_tracked("owner")
     )
-    owner_document = cli.serialize_unit_document(owner_resource)
+    owner_document = controller.serialize_unit_document(owner_resource)
     owner_uid = owner_document["metadata"]["uid"]
     child_document = {
         **legacy_desired("child"),
@@ -121,8 +121,8 @@ def test_owner_uid_fencing_and_cycles_are_validated():
         },
         "spec": {"source": {"path": ".", "revision": "a" * 40, "driverVersion": 2}},
     }
-    owner_resource = cli.parse_desired_unit_document(owner_document, "owner")
-    child_resource = cli.parse_desired_unit_document(child_document, "child")
+    owner_resource = controller.parse_desired_unit_document(owner_document, "owner")
+    child_resource = controller.parse_desired_unit_document(child_document, "child")
     validate_desired_resource_graph(
         {
             ("unit.gitopsctr.io/v1", "Terraform", "owner"): owner_resource,
@@ -144,7 +144,9 @@ def test_owner_uid_fencing_and_cycles_are_validated():
         validate_desired_resource_graph(
             {
                 ("unit.gitopsctr.io/v1", "Terraform", "owner"): owner_resource,
-                ("unit.gitopsctr.io/v1", "Terraform", "child"): cli.parse_desired_unit_document(bad_child, "child"),
+                ("unit.gitopsctr.io/v1", "Terraform", "child"): controller.parse_desired_unit_document(
+                    bad_child, "child"
+                ),
             }
         )
 
@@ -161,7 +163,11 @@ def test_owner_uid_fencing_and_cycles_are_validated():
     }
     with pytest.raises(ValueError, match="acyclic"):
         validate_desired_resource_graph(
-            {("unit.gitopsctr.io/v1", "Terraform", "child"): cli.parse_desired_unit_document(cycle_document, "child")}
+            {
+                ("unit.gitopsctr.io/v1", "Terraform", "child"): controller.parse_desired_unit_document(
+                    cycle_document, "child"
+                )
+            }
         )
 
     with pytest.raises(ValueError, match="mapping key"):
@@ -178,7 +184,7 @@ def test_owner_uid_fencing_and_cycles_are_validated():
 
 
 def test_legacy_resources_are_compatibility_roots_but_not_owner_targets():
-    legacy_owner = cli.parse_desired_unit_document(legacy_desired("owner"), "owner")
+    legacy_owner = controller.parse_desired_unit_document(legacy_desired("owner"), "owner")
     validate_desired_resource_graph({("unit.gitopsctr.io/v1", "Terraform", "owner"): legacy_owner})
 
     child_document = legacy_desired("child")
@@ -197,7 +203,7 @@ def test_legacy_resources_are_compatibility_roots_but_not_owner_targets():
             }
         },
     }
-    child = cli.parse_desired_unit_document(child_document, "child")
+    child = controller.parse_desired_unit_document(child_document, "child")
     with pytest.raises(ValueError, match="legacy compatibility root"):
         validate_desired_resource_graph(
             {
@@ -227,31 +233,31 @@ def test_build_candidate_retains_uid_and_source_absent_cleanup_inputs(tmp_path: 
     current_units.mkdir(parents=True)
     observed.mkdir()
 
-    existing = cli.parse_desired_unit_document(legacy_desired("infra"), "infra")
-    existing_document = cli.serialize_unit_document(
+    existing = controller.parse_desired_unit_document(legacy_desired("infra"), "infra")
+    existing_document = controller.serialize_unit_document(
         existing.with_metadata(ResourceMetadata.new_source_tracked(existing.name))
     )
     (current_units / "infra.json").write_text(json.dumps(existing_document))
     (current_units / "orphan.json").write_text(json.dumps(legacy_desired("orphan")))
     existing_uid = existing_document["metadata"]["uid"]
 
-    authored = cli.parse_authored_unit_document(authored_terraform("infra"), "infra")
-    monkeypatch.setattr(cli, "load_environment_specifications", lambda *_args: {"infra": authored})
+    authored = controller.parse_authored_unit_document(authored_terraform("infra"), "infra")
+    monkeypatch.setattr(controller, "load_environment_specifications", lambda *_args: {"infra": authored})
     monkeypatch.setattr(
-        cli,
+        controller,
         "resolved_unit_source",
-        lambda *_args: cli.ResolvedUnitSourceResult(
-            source=cli.DesiredSource(
+        lambda *_args: controller.ResolvedUnitSourceResult(
+            source=controller.DesiredSource(
                 path=".",
                 revision="b" * 40,
                 inputHash="sha256:inputs",
-                driverVersion=cli.DRIVER_VERSIONS["terraform"],
+                driverVersion=controller.DRIVER_VERSIONS["terraform"],
             ),
             inputs_changed=False,
         ),
     )
 
-    result = cli.build_desired_candidate(
+    result = controller.build_desired_candidate(
         "dev",
         source_root,
         "b" * 40,
@@ -262,15 +268,15 @@ def test_build_candidate_retains_uid_and_source_absent_cleanup_inputs(tmp_path: 
         verbose=False,
     )
 
-    retained = cli.load_desired_unit(candidate / "units/infra.json", "infra")
-    orphan = cli.load_desired_unit(candidate / "units/orphan.json", "orphan")
+    retained = controller.load_desired_unit(candidate / "units/infra.json", "infra")
+    orphan = controller.load_desired_unit(candidate / "units/orphan.json", "orphan")
     assert retained.metadata.uid == existing_uid
     assert orphan.metadata.lifecycle is not None
     assert orphan.metadata.lifecycle.management is not None
     assert "orphan" in result.cleanup_inputs
 
     repeated_candidate = tmp_path / "candidate-repeat"
-    cli.build_desired_candidate(
+    controller.build_desired_candidate(
         "dev",
         source_root,
         "b" * 40,
@@ -280,7 +286,7 @@ def test_build_candidate_retains_uid_and_source_absent_cleanup_inputs(tmp_path: 
         repeated_candidate,
         verbose=False,
     )
-    assert cli.directory_files(candidate) == cli.directory_files(repeated_candidate)
+    assert controller.directory_files(candidate) == controller.directory_files(repeated_candidate)
 
 
 def test_direct_same_name_resource_is_not_adopted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -316,16 +322,18 @@ def test_direct_same_name_resource_is_not_adopted(tmp_path: Path, monkeypatch: p
         }
     )
     (current_units / "infra.json").write_text(json.dumps(direct))
-    authored = cli.parse_authored_unit_document(authored_terraform("infra"), "infra")
-    monkeypatch.setattr(cli, "load_environment_specifications", lambda *_args: {"infra": authored})
+    authored = controller.parse_authored_unit_document(authored_terraform("infra"), "infra")
+    monkeypatch.setattr(controller, "load_environment_specifications", lambda *_args: {"infra": authored})
     monkeypatch.setattr(
-        cli,
+        controller,
         "resolved_unit_source",
         lambda *_args: (
-            cli.DesiredSource(path=".", revision="b" * 40, inputHash="sha256:inputs", driverVersion=2),
+            controller.DesiredSource(path=".", revision="b" * 40, inputHash="sha256:inputs", driverVersion=2),
             False,
         ),
     )
 
     with pytest.raises(OperationError, match="directly managed"):
-        cli.build_desired_candidate("dev", source_root, "b" * 40, current, observed, None, candidate, verbose=False)
+        controller.build_desired_candidate(
+            "dev", source_root, "b" * 40, current, observed, None, candidate, verbose=False
+        )

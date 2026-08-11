@@ -8,7 +8,7 @@ from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
-from gitopsctr import cli
+from gitopsctr import controller
 from gitopsctr.contracts import (
     DesiredLifecycle,
     LifecycleManagement,
@@ -25,7 +25,7 @@ def stack_tree(root: Path) -> tuple[str, str]:
     """Create a direct Stack with one UID-owned generated Unit."""
     stack_uid = "d1-stack-direct"
     template = StackResource(
-        cli.GVK(cli.CORE_API_VERSION, "StackTemplate"),
+        controller.GVK(controller.CORE_API_VERSION, "StackTemplate"),
         ResourceMetadata(
             name="preview",
             uid="d1-template",
@@ -35,7 +35,7 @@ def stack_tree(root: Path) -> tuple[str, str]:
             parameters=[],
             resources=[
                 StackTemplateResource(
-                    apiVersion=cli.UNIT_API_VERSION,
+                    apiVersion=controller.UNIT_API_VERSION,
                     kind="Terraform",
                     name="preview-app",
                     spec=ParameterTemplateObject({}),
@@ -50,33 +50,33 @@ def stack_tree(root: Path) -> tuple[str, str]:
         requestIdentity="pull-123",
     )
     stack = StackResource(
-        cli.GVK(cli.CORE_API_VERSION, "Stack"),
+        controller.GVK(controller.CORE_API_VERSION, "Stack"),
         ResourceMetadata(
             name="preview",
             uid=stack_uid,
             lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
         ),
-        cli.DesiredStackSpec(template="preview", parameters=JsonObjectValue({}), provenance=provenance),
+        controller.DesiredStackSpec(template="preview", parameters=JsonObjectValue({}), provenance=provenance),
     )
     root.mkdir(parents=True)
     (root / "stack-templates").mkdir()
     (root / "stacks").mkdir()
     (root / "stack-templates/preview.json").write_text(
-        json.dumps(cli.RESOURCE_CATALOG.serialize_stack_resource(template, profile="desired"))
+        json.dumps(controller.RESOURCE_CATALOG.serialize_stack_resource(template, profile="desired"))
     )
     (root / "stacks/preview.json").write_text(
-        json.dumps(cli.RESOURCE_CATALOG.serialize_stack_resource(stack, profile="desired"))
+        json.dumps(controller.RESOURCE_CATALOG.serialize_stack_resource(stack, profile="desired"))
     )
-    unit = cli.RESOURCE_CATALOG.parse_unit(
+    unit = controller.RESOURCE_CATALOG.parse_unit(
         {
-            "apiVersion": cli.UNIT_API_VERSION,
+            "apiVersion": controller.UNIT_API_VERSION,
             "kind": "Terraform",
             "metadata": {
                 "name": "preview--preview-app",
                 "uid": "d1-preview-app",
                 "lifecycle": {
                     "owner": {
-                        "apiVersion": cli.CORE_API_VERSION,
+                        "apiVersion": controller.CORE_API_VERSION,
                         "kind": "Stack",
                         "name": "preview",
                         "uid": stack_uid,
@@ -88,7 +88,7 @@ def stack_tree(root: Path) -> tuple[str, str]:
                     "path": ".",
                     "revision": "a" * 40,
                     "inputHash": "sha256:" + "0" * 64,
-                    "driverVersion": cli.DRIVER_VERSIONS["terraform"],
+                    "driverVersion": controller.DRIVER_VERSIONS["terraform"],
                 },
                 "terraform": {"backend": {}, "variables": {}, "observeOutputs": []},
             },
@@ -96,7 +96,7 @@ def stack_tree(root: Path) -> tuple[str, str]:
         profile="desired",
         expected_name="preview--preview-app",
     )
-    cli.write_desired_candidate_unit(root / "units/preview--preview-app.json", unit, root)
+    controller.write_desired_candidate_unit(root / "units/preview--preview-app.json", unit, root)
     return stack_uid, "preview--preview-app"
 
 

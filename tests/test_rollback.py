@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from gitopsctr import cli as deploy_release
+from gitopsctr import controller as deploy_release
 from tests.conftest import receipt_document, write_test_document
 
 

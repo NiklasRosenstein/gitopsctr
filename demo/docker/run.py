@@ -15,7 +15,7 @@ from pathlib import Path
 import yaml
 
 from demo.utils import DemoRepository, RefHeads, docker_platform, remove_docker_images, require_commands, run
-from gitopsctr import cli
+from gitopsctr import controller
 from gitopsctr.state import GitStateStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -279,11 +279,11 @@ def stack_acceptance(registry_port: int, app_port: int) -> None:
         remove_stack_source()
         _run_controller("advance-desired", "--environment", "dev", "--source-revision", "HEAD")
         desired = _desired_tree()
-        stack_intent = cli.load_desired_stack_deletion_intents(desired).get("preview")
+        stack_intent = controller.load_desired_stack_deletion_intents(desired).get("preview")
         if stack_intent is None:
             raise RuntimeError("Stack removal did not create a deletion intent")
         for identity in reversed(stack_intent.owned_unit_closure):
-            unit_intent = cli.load_desired_deletion_intents(desired).get(identity.unit_name)
+            unit_intent = controller.load_desired_deletion_intents(desired).get(identity.unit_name)
             if unit_intent is None:
                 raise RuntimeError(f"Stack removal did not create a Unit deletion intent for {identity.unit_name}")
             _run_controller(

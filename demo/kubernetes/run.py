@@ -21,7 +21,7 @@ from typing import Literal, cast
 import yaml
 
 from demo.utils import DemoRepository, RefHeads, docker_platform, remove_docker_images, require_commands, run
-from gitopsctr.cli import color_enabled
+from gitopsctr.controller import color_enabled
 
 Provider = Literal["kind", "minikube"]
 Delivery = Literal["direct", "argocd"]

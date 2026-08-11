@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from gitopsctr import cli
+from gitopsctr import controller
 from gitopsctr.driver import DriverError, TeardownResult
 from gitopsctr.errors import OperationError
 from tests.stack_support import project_repository
@@ -19,7 +19,7 @@ from tests.test_finalization import _finalize_args, _terraform_unit
 
 def _stub_effect_lease(monkeypatch: pytest.MonkeyPatch) -> None:
     def acquire(_ref: str, revision: str, unit_name: str, uid: str, **_kwargs: object):
-        lease = cli.EffectLease(
+        lease = controller.EffectLease(
             unit_name=unit_name,
             uid=uid,
             token="acceptance-lease",
@@ -27,28 +27,28 @@ def _stub_effect_lease(monkeypatch: pytest.MonkeyPatch) -> None:
             desired_revision=revision,
             expires_at=2_000_000_000,
         )
-        return cli.EffectLeaseAcquisition(lease=lease, revision=revision)
+        return controller.EffectLeaseAcquisition(lease=lease, revision=revision)
 
     class NoopHeartbeat:
-        def __init__(self, acquisition: cli.EffectLeaseAcquisition):
+        def __init__(self, acquisition: controller.EffectLeaseAcquisition):
             self.acquisition = acquisition
 
-        def stop(self) -> cli.EffectLeaseAcquisition:
+        def stop(self) -> controller.EffectLeaseAcquisition:
             return self.acquisition
 
-    monkeypatch.setattr(cli, "acquire_effect_lease", acquire)
-    monkeypatch.setattr(cli, "release_effect_lease", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(controller, "acquire_effect_lease", acquire)
+    monkeypatch.setattr(controller, "release_effect_lease", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        cli, "start_effect_lease_heartbeat", lambda _ref, acquisition, **_kwargs: NoopHeartbeat(acquisition)
+        controller, "start_effect_lease_heartbeat", lambda _ref, acquisition, **_kwargs: NoopHeartbeat(acquisition)
     )
-    monkeypatch.setattr(cli, "validate_effect_lease_head", lambda _ref, *_args: "c" * 40)
+    monkeypatch.setattr(controller, "validate_effect_lease_head", lambda _ref, *_args: "c" * 40)
     monkeypatch.setattr(
-        cli,
+        controller,
         "rebase_effect_completion",
         lambda _ref, acquisition, unit_name, uid, root: (
             replace(
                 acquisition,
-                lease=replace(acquisition.lease, snapshot=cli.effect_lease_snapshot(root, unit_name, uid)),
+                lease=replace(acquisition.lease, snapshot=controller.effect_lease_snapshot(root, unit_name, uid)),
             )
             if acquisition.lease.snapshot is None
             else acquisition
@@ -62,10 +62,12 @@ def test_failed_teardown_survives_restart_and_retries_from_durable_intent(tmp_pa
     unit_path.parent.mkdir(parents=True)
     unit_document = _terraform_unit("application", "d1-application")
     unit_path.write_text(json.dumps(unit_document))
-    unit = cli.load_desired_unit(unit_path, "application")
-    intent = cli.UnitDeletionIntent.from_unit(unit, unit_path, desired_state)
-    cli.write_deletion_intent(desired_state, intent)
-    cli.write_desired_transition_blocks(desired_state, {"application": cli.deletion_intent_reason(intent)})
+    unit = controller.load_desired_unit(unit_path, "application")
+    intent = controller.UnitDeletionIntent.from_unit(unit, unit_path, desired_state)
+    controller.write_deletion_intent(desired_state, intent)
+    controller.write_desired_transition_blocks(
+        desired_state, {"application": controller.deletion_intent_reason(intent)}
+    )
     observed_state = tmp_path / "observed-state"
     observed_state.mkdir()
 
@@ -81,13 +83,13 @@ def test_failed_teardown_survives_restart_and_retries_from_durable_intent(tmp_pa
         shutil.copytree(directory, target)
         return "d" * 40
 
-    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
-    monkeypatch.setattr(cli, "observed_tree", observed_tree)
-    monkeypatch.setattr(cli, "fetch_ref", lambda _ref: "c" * 40)
-    monkeypatch.setattr(cli, "materialize_revision", lambda _revision, output: output.mkdir(parents=True))
-    monkeypatch.setattr(cli, "change_gate", lambda *_args: "none")
-    monkeypatch.setattr(cli, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
-    monkeypatch.setattr(cli, "publish_tree", publish_tree)
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(controller, "observed_tree", observed_tree)
+    monkeypatch.setattr(controller, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(controller, "materialize_revision", lambda _revision, output: output.mkdir(parents=True))
+    monkeypatch.setattr(controller, "change_gate", lambda *_args: "none")
+    monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+    monkeypatch.setattr(controller, "publish_tree", publish_tree)
     _stub_effect_lease(monkeypatch)
 
     teardown_calls = []
@@ -98,16 +100,16 @@ def test_failed_teardown_survives_restart_and_retries_from_durable_intent(tmp_pa
             raise DriverError("transient destroy failure")
         return TeardownResult(details={"attempt": len(teardown_calls)})
 
-    monkeypatch.setattr(type(cli.UNIT_DRIVERS["terraform"]), "teardown", teardown)
+    monkeypatch.setattr(type(controller.UNIT_DRIVERS["terraform"]), "teardown", teardown)
 
-    assert cli.command_finalize(_finalize_args()) is False
-    assert cli.load_desired_deletion_intents(desired_state)["application"] == intent
+    assert controller.command_finalize(_finalize_args()) is False
+    assert controller.load_desired_deletion_intents(desired_state)["application"] == intent
 
     # A new controller process sees the same durable intent and retries it.
-    assert cli.command_finalize(_finalize_args()) is True
+    assert controller.command_finalize(_finalize_args()) is True
     assert len(teardown_calls) == 2
-    assert cli.load_desired_deletion_intents(desired_state) == {}
-    assert not cli.unit_document_path(desired_state, "application").exists()
+    assert controller.load_desired_deletion_intents(desired_state) == {}
+    assert not controller.unit_document_path(desired_state, "application").exists()
 
 
 def test_evidence_publication_crash_is_restart_safe_without_repeating_teardown(
@@ -117,10 +119,12 @@ def test_evidence_publication_crash_is_restart_safe_without_repeating_teardown(
     unit_path = desired_state / "units/application.json"
     unit_path.parent.mkdir(parents=True)
     unit_path.write_text(json.dumps(_terraform_unit("application", "d1-application")))
-    unit = cli.load_desired_unit(unit_path, "application")
-    intent = cli.UnitDeletionIntent.from_unit(unit, unit_path, desired_state)
-    cli.write_deletion_intent(desired_state, intent)
-    cli.write_desired_transition_blocks(desired_state, {"application": cli.deletion_intent_reason(intent)})
+    unit = controller.load_desired_unit(unit_path, "application")
+    intent = controller.UnitDeletionIntent.from_unit(unit, unit_path, desired_state)
+    controller.write_deletion_intent(desired_state, intent)
+    controller.write_desired_transition_blocks(
+        desired_state, {"application": controller.deletion_intent_reason(intent)}
+    )
     observed_state = tmp_path / "observed-state"
     observed_state.mkdir()
     desired_revision = "c" * 40
@@ -146,27 +150,27 @@ def test_evidence_publication_crash_is_restart_safe_without_repeating_teardown(
             desired_revision = "d" * 40
         return "d" * 40
 
-    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
-    monkeypatch.setattr(cli, "observed_tree", observed_tree)
-    monkeypatch.setattr(cli, "fetch_ref", lambda _ref: desired_revision)
-    monkeypatch.setattr(cli, "materialize_revision", materialize_revision)
-    monkeypatch.setattr(cli, "publish_tree", publish_tree)
-    monkeypatch.setattr(cli, "validate_effect_lease_head", lambda _ref, *_args: desired_revision)
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(controller, "observed_tree", observed_tree)
+    monkeypatch.setattr(controller, "fetch_ref", lambda _ref: desired_revision)
+    monkeypatch.setattr(controller, "materialize_revision", materialize_revision)
+    monkeypatch.setattr(controller, "publish_tree", publish_tree)
+    monkeypatch.setattr(controller, "validate_effect_lease_head", lambda _ref, *_args: desired_revision)
     monkeypatch.setattr(
-        cli,
+        controller,
         "rebase_effect_completion",
         lambda _ref, acquisition, _unit_name, _uid, _root: acquisition,
     )
 
     class NoopHeartbeat:
-        def __init__(self, acquisition: cli.EffectLeaseAcquisition):
+        def __init__(self, acquisition: controller.EffectLeaseAcquisition):
             self.acquisition = acquisition
 
-        def stop(self) -> cli.EffectLeaseAcquisition:
+        def stop(self) -> controller.EffectLeaseAcquisition:
             return self.acquisition
 
     monkeypatch.setattr(
-        cli, "start_effect_lease_heartbeat", lambda _ref, acquisition, **_kwargs: NoopHeartbeat(acquisition)
+        controller, "start_effect_lease_heartbeat", lambda _ref, acquisition, **_kwargs: NoopHeartbeat(acquisition)
     )
 
     teardown_calls = []
@@ -175,29 +179,32 @@ def test_evidence_publication_crash_is_restart_safe_without_repeating_teardown(
         teardown_calls.append(context)
         return TeardownResult(details={"destroyed": True})
 
-    monkeypatch.setattr(type(cli.UNIT_DRIVERS["terraform"]), "teardown", teardown)
-    original_publish_desired_change = cli.publish_desired_change
+    monkeypatch.setattr(type(controller.UNIT_DRIVERS["terraform"]), "teardown", teardown)
+    original_publish_desired_change = controller.publish_desired_change
     monkeypatch.setattr(
-        cli,
+        controller,
         "publish_desired_change",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("controller crashed after evidence")),
     )
 
     with pytest.raises(RuntimeError, match="controller crashed after evidence"):
-        cli.command_finalize(_finalize_args())
+        controller.command_finalize(_finalize_args())
 
     assert len(teardown_calls) == 1
-    assert cli.load_teardown_evidence(observed_state, "application", intent.uid, intent.deletion_generation) is not None
-    assert cli.load_desired_effect_leases(desired_state)["application"].uid == intent.uid
+    assert (
+        controller.load_teardown_evidence(observed_state, "application", intent.uid, intent.deletion_generation)
+        is not None
+    )
+    assert controller.load_desired_effect_leases(desired_state)["application"].uid == intent.uid
 
     # A fresh controller resumes from the durable evidence and removes the
     # lease and deletion intent without invoking the external driver again.
-    monkeypatch.setattr(cli, "publish_desired_change", original_publish_desired_change)
-    assert cli.command_finalize(_finalize_args()) is True
+    monkeypatch.setattr(controller, "publish_desired_change", original_publish_desired_change)
+    assert controller.command_finalize(_finalize_args()) is True
     assert len(teardown_calls) == 1
-    assert cli.load_desired_deletion_intents(desired_state) == {}
-    assert cli.load_desired_effect_leases(desired_state) == {}
-    assert not cli.unit_document_path(desired_state, "application").exists()
+    assert controller.load_desired_deletion_intents(desired_state) == {}
+    assert controller.load_desired_effect_leases(desired_state) == {}
+    assert not controller.unit_document_path(desired_state, "application").exists()
 
 
 def test_stale_delete_request_cannot_target_recreated_same_name(tmp_path: Path, monkeypatch):
@@ -217,26 +224,28 @@ def test_stale_delete_request_cannot_target_recreated_same_name(tmp_path: Path, 
     current.mkdir()
     observed.mkdir()
     old_uid = "d1-finalized-application"
-    cli.write_unit_incarnation_tombstone(
+    controller.write_unit_incarnation_tombstone(
         current,
-        cli.UnitIncarnationTombstone(unit_name="application", uid=old_uid),
+        controller.UnitIncarnationTombstone(unit_name="application", uid=old_uid),
     )
     candidate = tmp_path / "candidate"
-    cli.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate, verbose=False)
-    recreated = cli.load_desired_unit(candidate / "units/application.json", "application")
+    controller.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate, verbose=False)
+    recreated = controller.load_desired_unit(candidate / "units/application.json", "application")
     assert recreated.metadata.uid != old_uid
 
     def observed_tree(_ref: str, output: Path):
         shutil.copytree(candidate, output)
         return "c" * 40
 
-    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
-    monkeypatch.setattr(cli, "observed_tree", observed_tree)
-    monkeypatch.setattr(cli, "fetch_ref", lambda _ref: "c" * 40)
-    monkeypatch.setattr(cli, "publish_desired_change", lambda *_args, **_kwargs: pytest.fail("stale request published"))
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(controller, "observed_tree", observed_tree)
+    monkeypatch.setattr(controller, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(
+        controller, "publish_desired_change", lambda *_args, **_kwargs: pytest.fail("stale request published")
+    )
 
     with pytest.raises(OperationError, match="not directly managed"):
-        cli.command_request_delete_direct_unit(
+        controller.command_request_delete_direct_unit(
             _finalize_args(uid=old_uid, desired_ref="deploy/dev", observed_ref=None, deletion_generation=None)
         )
 
@@ -245,21 +254,21 @@ def test_operator_resolves_permanently_unparseable_root_with_uid_fence(tmp_path:
     current = tmp_path / "current"
     current.mkdir()
     uid = "d1-unparseable-application"
-    cli.write_opaque_cleanup_root(
+    controller.write_opaque_cleanup_root(
         current,
         "application",
-        cli.OpaqueCleanupRoot(
+        controller.OpaqueCleanupRoot(
             path=current / ".gitopsctr/cleanup/units/application.json",
             payload="not a Unit document",
-            metadata=cli.ResourceMetadata(
+            metadata=controller.ResourceMetadata(
                 name="application",
                 uid=uid,
-                lifecycle=cli.DesiredLifecycle(management=cli.LifecycleManagement(mode="sourceTracked")),
+                lifecycle=controller.DesiredLifecycle(management=controller.LifecycleManagement(mode="sourceTracked")),
             ),
             source=None,
         ),
     )
-    cli.write_desired_transition_blocks(current, {"application": "opaque cleanup root retained"})
+    controller.write_desired_transition_blocks(current, {"application": "opaque cleanup root retained"})
     published: list[Path] = []
 
     def observed_tree(_ref: str, output: Path):
@@ -272,10 +281,10 @@ def test_operator_resolves_permanently_unparseable_root_with_uid_fence(tmp_path:
         published.append(snapshot)
         return "d" * 40, None
 
-    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
-    monkeypatch.setattr(cli, "observed_tree", observed_tree)
-    monkeypatch.setattr(cli, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
-    monkeypatch.setattr(cli, "publish_desired_change", publish)
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(controller, "observed_tree", observed_tree)
+    monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+    monkeypatch.setattr(controller, "publish_desired_change", publish)
 
     args = Namespace(
         environment="dev",
@@ -287,11 +296,11 @@ def test_operator_resolves_permanently_unparseable_root_with_uid_fence(tmp_path:
         candidate_ref=None,
         dry=False,
     )
-    assert cli.command_resolve_opaque_unit(args) is True
+    assert controller.command_resolve_opaque_unit(args) is True
     resolved = published[0]
-    assert cli.load_desired_cleanup_roots(resolved) == {}
-    assert cli.load_desired_transition_blocks(resolved) == {}
-    assert cli.load_desired_unit_incarnation_tombstones(resolved)["application"].uid == uid
+    assert controller.load_desired_cleanup_roots(resolved) == {}
+    assert controller.load_desired_transition_blocks(resolved) == {}
+    assert controller.load_desired_unit_incarnation_tombstones(resolved)["application"].uid == uid
 
 
 def test_operator_resolution_rejects_parseable_root_and_missing_confirmation(tmp_path: Path, monkeypatch):
@@ -299,22 +308,24 @@ def test_operator_resolution_rejects_parseable_root_and_missing_confirmation(tmp
     current.mkdir()
     uid = "d1-parseable-application"
     payload = _terraform_unit("application", uid)
-    cli.write_opaque_cleanup_root(
+    controller.write_opaque_cleanup_root(
         current,
         "application",
-        cli.OpaqueCleanupRoot(
+        controller.OpaqueCleanupRoot(
             path=current / ".gitopsctr/cleanup/units/application.json",
             payload=payload,
-            metadata=cli.ResourceMetadata(
+            metadata=controller.ResourceMetadata(
                 name="application",
                 uid=uid,
-                lifecycle=cli.DesiredLifecycle(management=cli.LifecycleManagement(mode="sourceTracked")),
+                lifecycle=controller.DesiredLifecycle(management=controller.LifecycleManagement(mode="sourceTracked")),
             ),
             source=None,
         ),
     )
-    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
-    monkeypatch.setattr(cli, "observed_tree", lambda _ref, output: (shutil.copytree(current, output), "c" * 40)[1])
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(
+        controller, "observed_tree", lambda _ref, output: (shutil.copytree(current, output), "c" * 40)[1]
+    )
 
     missing_confirmation = Namespace(
         environment="dev",
@@ -327,8 +338,8 @@ def test_operator_resolution_rejects_parseable_root_and_missing_confirmation(tmp
         dry=False,
     )
     with pytest.raises(OperationError, match="confirm-external-cleanup"):
-        cli.command_resolve_opaque_unit(missing_confirmation)
+        controller.command_resolve_opaque_unit(missing_confirmation)
 
     parseable = Namespace(**{**vars(missing_confirmation), "confirm_external_cleanup": True})
     with pytest.raises(OperationError, match="parseable; use recover-opaque-unit"):
-        cli.command_resolve_opaque_unit(parseable)
+        controller.command_resolve_opaque_unit(parseable)

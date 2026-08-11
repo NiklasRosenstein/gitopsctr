@@ -11,7 +11,7 @@ from typing import cast
 
 import pytest
 
-from gitopsctr import cli
+from gitopsctr import controller
 from gitopsctr.errors import OperationError
 from gitopsctr.state import ControllerPin, ControllerPinClaim
 from tests.stack_deletion_support import deletion_args as _args
@@ -88,14 +88,14 @@ def test_stack_source_variants_pin_and_reconcile_from_desired_projection(tmp_pat
         },
     )
     desired = tmp_path / "desired"
-    projection = cli.project_stack_resources(source, "dev", "a" * 40, desired, source)
+    projection = controller.project_stack_resources(source, "dev", "a" * 40, desired, source)
     assert sorted(projection.generated_units) == ["application--deploy", "application--image"]
-    stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(next((desired / "stacks").glob("application.*"))),
+    stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((desired / "stacks").glob("application.*"))),
         profile="desired",
         expected_name="application",
     )
-    assert isinstance(stack.spec, cli.DesiredStackSpec)
+    assert isinstance(stack.spec, controller.DesiredStackSpec)
     assert stack.spec.resolvedSource is not None
     assert stack.spec.resolvedSource.fromGit.commit == "a" * 40
     assert stack.spec.resolvedSource.fromGit.resourcePath == "deployment/stack-templates/application.json"
@@ -106,7 +106,7 @@ def test_stack_source_variants_pin_and_reconcile_from_desired_projection(tmp_pat
     assert stack.spec.resolvedProjection is not None
     write_projected_units(desired, projection, source)
     (source / "deployment/stack-templates/application.json").unlink()
-    specifications, dependencies = cli.load_convergence_specifications(
+    specifications, dependencies = controller.load_convergence_specifications(
         source, "dev", desired, "b" * 40, tmp_path / "reconcile-projection"
     )
     assert "application--deploy" in specifications
@@ -156,21 +156,21 @@ def test_from_git_stack_source_does_not_create_catalog_or_read_source_during_rec
         )
     )
     desired = tmp_path / "desired"
-    projection = cli.project_stack_resources(source, "dev", "c" * 40, desired, source)
+    projection = controller.project_stack_resources(source, "dev", "c" * 40, desired, source)
     assert not list((desired / "stack-templates").glob("*"))
     assert projection.generated_units
-    stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(next((desired / "stacks").glob("application.*"))),
+    stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((desired / "stacks").glob("application.*"))),
         profile="desired",
         expected_name="application",
     )
-    assert isinstance(stack.spec, cli.DesiredStackSpec)
+    assert isinstance(stack.spec, controller.DesiredStackSpec)
     assert stack.spec.resolvedSource is not None
     assert stack.spec.resolvedSource.fromGit.ref == "refs/heads/main"
     assert stack.spec.resolvedSource.fromGit.resourcePath == "deployment/stack-templates/application.json"
     write_projected_units(desired, projection, source)
     shutil.rmtree(external)
-    specifications, _ = cli.load_convergence_specifications(
+    specifications, _ = controller.load_convergence_specifications(
         source, "dev", desired, "d" * 40, tmp_path / "reconcile-projection"
     )
     assert "application--image" in specifications
@@ -190,7 +190,7 @@ def test_from_promotion_copies_exact_source_and_projects_subset(tmp_path: Path):
         },
     )
     dev_desired = tmp_path / "dev-desired"
-    dev_projection = cli.project_stack_resources(source, "dev", "e" * 40, dev_desired, source)
+    dev_projection = controller.project_stack_resources(source, "dev", "e" * 40, dev_desired, source)
     write_projected_units(dev_desired, dev_projection, source)
     _write_project_template(
         source,
@@ -209,7 +209,7 @@ def test_from_promotion_copies_exact_source_and_projects_subset(tmp_path: Path):
         },
     )
     staging = tmp_path / "staging"
-    promotion = cli.PromotionContext(
+    promotion = controller.PromotionContext(
         source_environment="dev",
         desired_ref="deploy/dev",
         desired_revision="e" * 40,
@@ -218,22 +218,22 @@ def test_from_promotion_copies_exact_source_and_projects_subset(tmp_path: Path):
         specification_revision="e" * 40,
         desired_root=dev_desired,
     )
-    projection = cli.project_stack_resources(source, "staging", "f" * 40, staging, source, promotion=promotion)
+    projection = controller.project_stack_resources(source, "staging", "f" * 40, staging, source, promotion=promotion)
     assert sorted(projection.generated_units) == ["staging--deploy"]
-    stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(next((staging / "stacks").glob("staging.*"))),
+    stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((staging / "stacks").glob("staging.*"))),
         profile="desired",
         expected_name="staging",
     )
-    assert isinstance(stack.spec, cli.DesiredStackSpec)
+    assert isinstance(stack.spec, controller.DesiredStackSpec)
     assert stack.spec.resolvedSource is not None
     assert stack.spec.resolvedSource.fromGit.commit == "e" * 40
-    dev_stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(next((dev_desired / "stacks").glob("application.*"))),
+    dev_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((dev_desired / "stacks").glob("application.*"))),
         profile="desired",
         expected_name="application",
     )
-    assert isinstance(dev_stack.spec, cli.DesiredStackSpec)
+    assert isinstance(dev_stack.spec, controller.DesiredStackSpec)
     assert dev_stack.spec.resolvedSource == stack.spec.resolvedSource
 
 
@@ -242,21 +242,21 @@ def test_source_tracked_stack_cleanup_is_durable_across_restart(tmp_path: Path):
     environment = project_repository(source)
     write_stack_source(environment)
     initial = tmp_path / "initial"
-    projection = cli.project_stack_resources(source, "dev", "a" * 40, initial, source)
-    initial_stack = cli.RESOURCE_CATALOG.parse_stack(
-        cli.RESOURCE_CATALOG.load_document(next((initial / "stacks").glob("web.*"))),
+    projection = controller.project_stack_resources(source, "dev", "a" * 40, initial, source)
+    initial_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((initial / "stacks").glob("web.*"))),
         profile="desired",
         expected_name="web",
     )
 
     write_projected_units(initial, projection, source)
-    cli.load_desired_resource_graph(initial)
+    controller.load_desired_resource_graph(initial)
 
     (environment / "stacks/web.json").unlink()
     observed = tmp_path / "observed"
     observed.mkdir()
     candidate = tmp_path / "candidate"
-    first = cli.build_desired_candidate(
+    first = controller.build_desired_candidate(
         "dev",
         source,
         "b" * 40,
@@ -267,18 +267,18 @@ def test_source_tracked_stack_cleanup_is_durable_across_restart(tmp_path: Path):
         verbose=False,
     )
 
-    first_intent = cli.load_desired_stack_deletion_intents(candidate)["web"]
+    first_intent = controller.load_desired_stack_deletion_intents(candidate)["web"]
     assert first.blocked == {}
     assert initial_stack.metadata.uid is not None
     assert first_intent.uid == initial_stack.metadata.uid
     assert [identity.unit_name for identity in first_intent.owned_unit_closure] == ["web--preview-app"]
     assert (
-        cli.load_desired_unit(candidate / "units/web--preview-app.json", "web--preview-app").metadata.uid
+        controller.load_desired_unit(candidate / "units/web--preview-app.json", "web--preview-app").metadata.uid
         == "d1-web--preview-app"
     )
 
     restarted = tmp_path / "restarted"
-    second = cli.build_desired_candidate(
+    second = controller.build_desired_candidate(
         "dev",
         source,
         "c" * 40,
@@ -289,15 +289,15 @@ def test_source_tracked_stack_cleanup_is_durable_across_restart(tmp_path: Path):
         verbose=False,
     )
 
-    second_intent = cli.load_desired_stack_deletion_intents(restarted)["web"]
+    second_intent = controller.load_desired_stack_deletion_intents(restarted)["web"]
     assert second.blocked == {}
     assert second_intent == first_intent
-    retained_unit = cli.load_desired_unit(restarted / "units/web--preview-app.json", "web--preview-app")
+    retained_unit = controller.load_desired_unit(restarted / "units/web--preview-app.json", "web--preview-app")
     assert retained_unit.metadata.uid == "d1-web--preview-app"
     assert retained_unit.metadata.lifecycle is not None
     assert retained_unit.metadata.lifecycle.owner is not None
     assert retained_unit.metadata.lifecycle.owner.uid == initial_stack.metadata.uid
-    assert cli.load_desired_resource_graph(restarted)
+    assert controller.load_desired_resource_graph(restarted)
 
 
 def test_two_stacks_from_one_template_have_independent_generated_units(tmp_path: Path):
@@ -316,13 +316,13 @@ def test_two_stacks_from_one_template_have_independent_generated_units(tmp_path:
     )
 
     candidate = tmp_path / "candidate"
-    projection = cli.project_stack_resources(source, "dev", "a" * 40, candidate, source)
+    projection = controller.project_stack_resources(source, "dev", "a" * 40, candidate, source)
     assert sorted(projection.generated_units) == ["api--preview-app", "web--preview-app"]
     assert projection.owners["api--preview-app"].name == "api"
     assert projection.owners["web--preview-app"].name == "web"
     write_projected_units(candidate, projection, source)
 
-    graph = cli.load_desired_resource_graph(candidate)
+    graph = controller.load_desired_resource_graph(candidate)
     assert ("unit.gitopsctr.io/v1", "Terraform", "api--preview-app") in graph
     assert ("unit.gitopsctr.io/v1", "Terraform", "web--preview-app") in graph
 
@@ -358,13 +358,13 @@ def test_direct_stack_finalization_retries_after_injected_publication_failure(tm
         delete_controller_pin_claim=lambda name, revision: deleted_claims.append((name, revision)) or True,
     )
 
-    monkeypatch.setattr(cli, "REPOSITORY_ROOT", tmp_path)
-    monkeypatch.setattr(cli, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
-    monkeypatch.setattr(cli, "fetch_ref", lambda _ref: "c" * 40)
-    monkeypatch.setattr(cli, "materialize_revision", lambda _revision, output: shutil.copytree(current, output))
-    monkeypatch.setattr(cli, "state_store", lambda: store)
-    monkeypatch.setattr(cli, "git", _fake_git)
-    monkeypatch.setattr(cli, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+    monkeypatch.setattr(controller, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(controller, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(controller, "materialize_revision", lambda _revision, output: shutil.copytree(current, output))
+    monkeypatch.setattr(controller, "state_store", lambda: store)
+    monkeypatch.setattr(controller, "git", _fake_git)
+    monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
 
     def publish(_environment: str, candidate: Path, *_args: object, **_kwargs: object):
         snapshot = tmp_path / f"published-{len(published)}"
@@ -372,31 +372,33 @@ def test_direct_stack_finalization_retries_after_injected_publication_failure(tm
         published.append(snapshot)
         return "d" * 40, None
 
-    monkeypatch.setattr(cli, "publish_desired_change", publish)
-    assert cli.command_request_delete_direct_stack(_args()) is True
+    monkeypatch.setattr(controller, "publish_desired_change", publish)
+    assert controller.command_request_delete_direct_stack(_args()) is True
 
     requested = published[0]
     retryable = tmp_path / "retryable"
     shutil.copytree(requested, retryable)
     (retryable / "units" / f"{unit_name}.json").unlink()
-    for path in cli.document_candidates(retryable / ".gitopsctr/deletion-intents/units", unit_name):
+    for path in controller.document_candidates(retryable / ".gitopsctr/deletion-intents/units", unit_name):
         path.unlink()
 
-    monkeypatch.setattr(cli, "materialize_revision", lambda _revision, output: shutil.copytree(retryable, output))
     monkeypatch.setattr(
-        cli,
+        controller, "materialize_revision", lambda _revision, output: shutil.copytree(retryable, output)
+    )
+    monkeypatch.setattr(
+        controller,
         "publish_desired_change",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OperationError("injected publication failure")),
     )
     with pytest.raises(OperationError, match="injected publication failure"):
-        cli.command_finalize_stack(_args())
+        controller.command_finalize_stack(_args())
 
-    assert cli.load_desired_stack_deletion_intents(retryable)["preview"].uid == stack_uid
+    assert controller.load_desired_stack_deletion_intents(retryable)["preview"].uid == stack_uid
     assert released == []
 
-    monkeypatch.setattr(cli, "publish_desired_change", publish)
-    assert cli.command_finalize_stack(_args()) is True
-    assert cli.load_desired_stack_deletion_intents(published[-1]) == {}
+    monkeypatch.setattr(controller, "publish_desired_change", publish)
+    assert controller.command_finalize_stack(_args()) is True
+    assert controller.load_desired_stack_deletion_intents(published[-1]) == {}
     assert not list((published[-1] / "stacks").glob("preview.*"))
     assert released == [("stacks/dev/preview/d1-stack-direct", "a" * 40)]
     assert deleted_claims == [("stacks/dev/preview/d1-stack-direct", "e" * 40)]
@@ -418,12 +420,12 @@ def test_dependencies_cli_preserves_explicit_stack_order_after_restart(tmp_path:
 
     source_revision = "a" * 40
     monkeypatch.setattr(
-        cli,
+        controller,
         "git",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=source_revision + "\n"),
     )
-    monkeypatch.setattr(cli, "materialize_revision", lambda _revision, output: shutil.copytree(source, output))
-    args = cli.build_parser().parse_args(
+    monkeypatch.setattr(controller, "materialize_revision", lambda _revision, output: shutil.copytree(source, output))
+    args = controller.build_parser().parse_args(
         [
             "dependencies",
             "--environment",

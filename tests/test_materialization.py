@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from gitopsctr import cli
+from gitopsctr import controller
 from gitopsctr.contracts import (
     AuthoredSource,
     DesiredSource,
@@ -88,11 +88,11 @@ def write_json(path: Path, value: object) -> None:
 
 def install_render_only(monkeypatch: pytest.MonkeyPatch) -> RenderOnlyPlugin:
     plugin = RenderOnlyPlugin()
-    monkeypatch.setitem(cli.UNIT_DRIVERS, "render-only", plugin)
-    monkeypatch.setitem(cli.MATERIALIZATION_DRIVERS, "render-only", plugin)
-    monkeypatch.setitem(cli.DRIVER_VERSIONS, "render-only", plugin.version)
-    monkeypatch.setitem(cli.DRIVER_GVKS, "render-only", "unit.gitopsctr.io/v1/RenderOnly")
-    monkeypatch.setitem(cli.DRIVER_NAMES_BY_GVK, "unit.gitopsctr.io/v1/RenderOnly", "render-only")
+    monkeypatch.setitem(controller.UNIT_DRIVERS, "render-only", plugin)
+    monkeypatch.setitem(controller.MATERIALIZATION_DRIVERS, "render-only", plugin)
+    monkeypatch.setitem(controller.DRIVER_VERSIONS, "render-only", plugin.version)
+    monkeypatch.setitem(controller.DRIVER_GVKS, "render-only", "unit.gitopsctr.io/v1/RenderOnly")
+    monkeypatch.setitem(controller.DRIVER_NAMES_BY_GVK, "unit.gitopsctr.io/v1/RenderOnly", "render-only")
     return plugin
 
 
@@ -138,7 +138,7 @@ def materialize_candidate(
     observed = tmp_path / f"{name}-observed"
     current.mkdir(parents=True, exist_ok=True)
     observed.mkdir()
-    cli.build_desired_candidate(
+    controller.build_desired_candidate(
         "dev",
         source,
         "a" * 40,
@@ -157,7 +157,7 @@ def test_advancement_materializes_and_reuses_an_unchanged_payload(tmp_path, monk
     source_tree(source)
 
     first = materialize_candidate(tmp_path, source, tmp_path / "empty", "first")
-    first_unit = cli.load_desired_unit(first / "units/rendered.json", "rendered")
+    first_unit = controller.load_desired_unit(first / "units/rendered.json", "rendered")
 
     assert plugin.calls == 1
     assert (first / "materialized/rendered/rendered.yaml").read_text() == (
@@ -165,20 +165,22 @@ def test_advancement_materializes_and_reuses_an_unchanged_payload(tmp_path, monk
     )
     assert first_unit.spec.materialization == MaterializationDocument(
         path="materialized/rendered",
-        digest=cli.materialization_tree_digest(first / "materialized/rendered"),
+        digest=controller.materialization_tree_digest(first / "materialized/rendered"),
         mediaType="application/yaml",
         metadata={"renderer": "test"},
     )
-    assert cli.reconciliation_statuses(["rendered"], first, tmp_path / "first-observed") == [
+    assert controller.reconciliation_statuses(["rendered"], first, tmp_path / "first-observed") == [
         ("rendered", "MATERIALIZED", "desired payload is published for external delivery")
     ]
 
     second = materialize_candidate(tmp_path, source, first, "second")
 
     assert plugin.calls == 1
-    assert cli.directory_files(second / "materialized/rendered") == cli.directory_files(first / "materialized/rendered")
+    assert controller.directory_files(second / "materialized/rendered") == controller.directory_files(
+        first / "materialized/rendered"
+    )
     assert (
-        cli.load_desired_unit(second / "units/rendered.json", "rendered").spec.materialization
+        controller.load_desired_unit(second / "units/rendered.json", "rendered").spec.materialization
         == first_unit.spec.materialization
     )
 
@@ -190,10 +192,10 @@ def test_materialized_payload_tampering_fails_before_status_or_promotion(tmp_pat
     desired = materialize_candidate(tmp_path, source, tmp_path / "empty", "desired")
     (desired / "materialized/rendered/rendered.yaml").write_text("tampered: true\n")
 
-    with pytest.raises(cli.OperationError, match="does not match its digest"):
-        cli.reconciliation_statuses(["rendered"], desired, tmp_path / "desired-observed")
-    with pytest.raises(cli.OperationError, match="does not match its digest"):
-        cli.require_clean_source(desired, tmp_path / "desired-observed", "materialized")
+    with pytest.raises(controller.OperationError, match="does not match its digest"):
+        controller.reconciliation_statuses(["rendered"], desired, tmp_path / "desired-observed")
+    with pytest.raises(controller.OperationError, match="does not match its digest"):
+        controller.require_clean_source(desired, tmp_path / "desired-observed", "materialized")
 
 
 def test_materialized_promotion_evidence_is_explicit_and_needs_no_observed_ref(tmp_path, monkeypatch):
@@ -203,16 +205,16 @@ def test_materialized_promotion_evidence_is_explicit_and_needs_no_observed_ref(t
     desired = materialize_candidate(tmp_path, source, tmp_path / "empty", "desired")
     observed = tmp_path / "desired-observed"
 
-    with pytest.raises(cli.OperationError, match="not fully reconciled"):
-        cli.require_clean_source(desired, observed)
+    with pytest.raises(controller.OperationError, match="not fully reconciled"):
+        controller.require_clean_source(desired, observed)
 
-    cli.require_clean_source(desired, observed, cli.minimum_promotion_evidence(source, "dev"))
-    assert cli.find_clean_observed_snapshot("observed/dev", desired, ["rendered"], tmp_path / "history") is None
+    controller.require_clean_source(desired, observed, controller.minimum_promotion_evidence(source, "dev"))
+    assert controller.find_clean_observed_snapshot("observed/dev", desired, ["rendered"], tmp_path / "history") is None
 
 
 def test_observations_cannot_depend_on_materialization_only_units(tmp_path, monkeypatch):
     install_render_only(monkeypatch)
     source_tree(tmp_path, consumer=True)
 
-    with pytest.raises(cli.OperationError, match="cannot observe materialization-only unit 'rendered'"):
-        cli.load_environment_specifications(tmp_path, "dev")
+    with pytest.raises(controller.OperationError, match="cannot observe materialization-only unit 'rendered'"):
+        controller.load_environment_specifications(tmp_path, "dev")

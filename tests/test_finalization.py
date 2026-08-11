@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from gitopsctr import cli as deploy_release
+from gitopsctr import controller as deploy_release
 from gitopsctr.contracts import DesiredOwnerReference, DesiredSource
 from gitopsctr.driver import TeardownResult
 from gitopsctr.errors import OperationError
