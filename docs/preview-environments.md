@@ -145,3 +145,19 @@ to the controller.
   outside gitopsctr, use `resolve-opaque-unit --uid ... --reason ...
   --confirm-external-cleanup`. The command is UID-fenced and rejects parseable
   roots, active leases, and roots with deletion intents.
+
+## Compatibility audit
+
+Before retiring legacy desired-Unit handling, audit each supported desired ref:
+
+```console
+gitopsctr audit-desired-compatibility \
+  --environment dev \
+  --desired-ref deploy/dev
+```
+
+The command is read-only. It always prints versioned JSON. A clean ref has
+`"clean": true` and no findings. Legacy or partial Units, invalid resource
+graphs, ambiguous cleanup state, unverified deletion identities, and opaque
+cleanup roots produce findings and a non-zero exit status. Run it for every
+supported desired ref before removing compatibility handling.

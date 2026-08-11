@@ -219,3 +219,11 @@ The document migration tool now assigns deterministic source-tracked metadata to
 source revision to the migrated source commit, preserves existing Project ref configuration, and migrates configured
 desired and observed refs instead of assuming `deploy/*` and `observed/*`. Live compatibility retirement remains open
 until deployments provide a complete supported-ref inventory and pass a clean audit.
+
+### 8.2 Desired compatibility audit — complete for one explicit ref
+
+The read-only `audit-desired-compatibility` command now materializes one exact desired ref and emits versioned JSON.
+It reports legacy or partial Units, invalid resource graphs, ambiguous cleanup state, unverified deletion identities,
+and opaque cleanup roots. It returns non-zero when findings exist. Three focused tests cover clean canonical state,
+legacy state, and unsafe cleanup state. Full verification remains at 553 tests. Live legacy retirement still needs a
+complete supported-ref inventory and a clean audit for every ref.

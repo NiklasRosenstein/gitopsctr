@@ -221,6 +221,13 @@ class RevisionSnapshot(TypedDict):
     revision: str | None
 
 
+class CompatibilityFinding(TypedDict):
+    code: str
+    path: str
+    unit: str
+    message: str
+
+
 class UnitStatusSnapshot(TypedDict):
     unit: str
     status: str
@@ -7865,6 +7872,235 @@ def command_resolve_desired(args: argparse.Namespace) -> None:
     print(revision)
 
 
+def _compatibility_finding(code: str, path: str, unit: str, message: str) -> CompatibilityFinding:
+    return {"code": code, "path": path, "unit": unit, "message": message}
+
+
+def _compatibility_path(root: Path, path: Path) -> str:
+    return path.relative_to(root).as_posix()
+
+
+def _compatibility_document_paths(root: Path, relative_directory: PurePosixPath) -> tuple[Path, ...]:
+    directory = root.joinpath(*relative_directory.parts)
+    if not directory.is_dir():
+        return ()
+    return tuple(
+        sorted(path for path in directory.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"})
+    )
+
+
+def _compatibility_partial_unit(document: object) -> bool:
+    if not isinstance(document, dict) or document.get("apiVersion") is None:
+        return False
+    metadata = document.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    has_uid = "uid" in metadata
+    has_lifecycle = "lifecycle" in metadata
+    return has_uid != has_lifecycle or (has_uid and (metadata.get("uid") is None or metadata.get("lifecycle") is None))
+
+
+def _audit_desired_compatibility(root: Path) -> list[CompatibilityFinding]:
+    findings: list[CompatibilityFinding] = []
+    unit_paths = _compatibility_document_paths(root, PurePosixPath("units"))
+    unit_parse_failed = False
+    by_unit: dict[str, list[Path]] = {}
+    for path in unit_paths:
+        by_unit.setdefault(path.stem, []).append(path)
+
+    for unit_name, paths in sorted(by_unit.items()):
+        if len(paths) > 1:
+            for path in paths:
+                findings.append(
+                    _compatibility_finding(
+                        "ambiguous-unit-state",
+                        _compatibility_path(root, path),
+                        unit_name,
+                        "multiple desired Unit documents use the same name",
+                    )
+                )
+            unit_parse_failed = True
+            continue
+        path = paths[0]
+        try:
+            document = load_json(path)
+        except Exception:
+            findings.append(
+                _compatibility_finding(
+                    "unparseable-unit",
+                    _compatibility_path(root, path),
+                    unit_name,
+                    "desired Unit document cannot be read",
+                )
+            )
+            unit_parse_failed = True
+            continue
+        try:
+            unit = parse_desired_unit_document(document, unit_name)
+        except Exception:
+            code = "partial-unit" if _compatibility_partial_unit(document) else "unparseable-unit"
+            findings.append(
+                _compatibility_finding(
+                    code,
+                    _compatibility_path(root, path),
+                    unit_name,
+                    "desired Unit lifecycle state is incomplete"
+                    if code == "partial-unit"
+                    else "desired Unit is invalid",
+                )
+            )
+            unit_parse_failed = True
+            continue
+        if unit.is_legacy_compatibility:
+            findings.append(
+                _compatibility_finding(
+                    "legacy-unit",
+                    _compatibility_path(root, path),
+                    unit_name,
+                    "desired Unit has no lifecycle identity",
+                )
+            )
+            unit_parse_failed = True
+
+    if unit_paths and not unit_parse_failed:
+        try:
+            load_desired_resource_graph(root)
+        except Exception:
+            findings.append(
+                _compatibility_finding(
+                    "unparseable-resource-graph",
+                    "",
+                    "",
+                    "desired resource graph is invalid",
+                )
+            )
+
+    intent_paths = _compatibility_document_paths(root, DESIRED_DELETION_INTENTS_PATH)
+    intent_by_unit: dict[str, list[Path]] = {}
+    for path in intent_paths:
+        intent_by_unit.setdefault(path.stem, []).append(path)
+    for unit_name, paths in sorted(intent_by_unit.items()):
+        if len(paths) > 1:
+            findings.append(
+                _compatibility_finding(
+                    "ambiguous-cleanup-state",
+                    _compatibility_path(root, paths[0].parent),
+                    unit_name,
+                    "multiple deletion intent documents use the same name",
+                )
+            )
+
+    if all(len(paths) == 1 for paths in intent_by_unit.values()):
+        try:
+            intents = load_desired_deletion_intents(root)
+        except Exception:
+            findings.append(
+                _compatibility_finding(
+                    "unparseable-cleanup-state",
+                    DESIRED_DELETION_INTENTS_PATH.as_posix(),
+                    "",
+                    "deletion intent state cannot be read",
+                )
+            )
+        else:
+            for unit_name, intent in sorted(intents.items()):
+                if not intent.retained_identity_known:
+                    intent_path = intent_by_unit[unit_name][0]
+                    findings.append(
+                        _compatibility_finding(
+                            "unverified-deletion-identity",
+                            _compatibility_path(root, intent_path),
+                            unit_name,
+                            "deletion intent retained identity is not verified",
+                        )
+                    )
+
+    cleanup_paths = _compatibility_document_paths(root, DESIRED_CLEANUP_UNITS_PATH)
+    cleanup_by_unit: dict[str, list[Path]] = {}
+    for path in cleanup_paths:
+        cleanup_by_unit.setdefault(path.stem, []).append(path)
+    for unit_name, paths in sorted(cleanup_by_unit.items()):
+        if len(paths) > 1:
+            findings.append(
+                _compatibility_finding(
+                    "ambiguous-cleanup-state",
+                    _compatibility_path(root, paths[0].parent),
+                    unit_name,
+                    "multiple opaque cleanup documents use the same name",
+                )
+            )
+            continue
+        path = paths[0]
+        try:
+            load_desired_cleanup_roots(root)
+        except Exception:
+            findings.append(
+                _compatibility_finding(
+                    "unparseable-cleanup-state",
+                    _compatibility_path(root, path),
+                    unit_name,
+                    "opaque cleanup state is invalid",
+                )
+            )
+            break
+        findings.append(
+            _compatibility_finding(
+                "opaque-cleanup-root",
+                _compatibility_path(root, path),
+                unit_name,
+                "opaque cleanup root requires migration or explicit recovery",
+            )
+        )
+
+    return sorted(findings, key=lambda finding: (finding["path"], finding["code"], finding["unit"]))
+
+
+def command_audit_desired_compatibility(args: argparse.Namespace) -> None:
+    """Audit one desired ref without publishing or invoking a driver."""
+
+    _resource_name(args.environment, "environment name")
+    if not isinstance(args.desired_ref, str) or not args.desired_ref:
+        raise OperationError("audit-desired-compatibility requires --desired-ref")
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        desired = Path(temporary_directory) / "desired"
+        try:
+            revision = observed_tree(args.desired_ref, desired)
+        except Exception:
+            revision = None
+            findings = [
+                _compatibility_finding(
+                    "unavailable-ref",
+                    "",
+                    "",
+                    "desired ref cannot be inspected",
+                )
+            ]
+        else:
+            if revision is None:
+                findings = [
+                    _compatibility_finding(
+                        "missing-ref",
+                        "",
+                        "",
+                        "desired ref does not exist",
+                    )
+                ]
+            else:
+                findings = _audit_desired_compatibility(desired)
+
+    result = {
+        "schema": 1,
+        "environment": args.environment,
+        "ref": args.desired_ref,
+        "revision": revision,
+        "clean": not findings,
+        "findings": findings,
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if findings:
+        raise OperationError(f"desired compatibility audit found {len(findings)} finding(s)")
+
+
 def command_status(args: argparse.Namespace) -> None:
     if args.environment is None:
         if args.unit or args.desired_ref or args.desired_revision or args.observed_ref or args.verbose:
@@ -9580,7 +9816,10 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
                 "finalize-stack",
             ),
         ),
-        ("Inspection", ("status", "list", "show", "verify", "dependencies")),
+        (
+            "Inspection",
+            ("status", "list", "show", "verify", "dependencies", "audit-desired-compatibility"),
+        ),
         ("Reconciliation", ("reconcile", "converge")),
         ("Git data", ("read-tree", "publish-tree")),
     )
@@ -9943,6 +10182,14 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--desired-ref", required=True)
     resolve.add_argument("--desired-revision")
     resolve.set_defaults(handler=command_resolve_desired)
+
+    audit_compatibility = commands.add_parser(
+        "audit-desired-compatibility",
+        help="audit one desired ref before retiring legacy compatibility",
+    )
+    audit_compatibility.add_argument("--environment", required=True)
+    audit_compatibility.add_argument("--desired-ref", required=True)
+    audit_compatibility.set_defaults(handler=command_audit_desired_compatibility)
 
     status = commands.add_parser(
         "status",

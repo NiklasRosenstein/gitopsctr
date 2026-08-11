@@ -34,9 +34,9 @@ implementation.
 | Forge eligibility/expiry/orphan recovery | **GitHub and GitLab eligibility implemented; merge enforcement remains external** | `36a529b` implements fail-closed GitHub eligibility, expiry, pin comparison, and UID-fenced cleanup requests for present roots. The read-only `glab` adapter and CAS-fenced orphan recovery are now implemented. Authoritative merge-time enforcement remains deployment configuration. |
 | Stack dependency ordering | **Convergence and multi-instance isolation implemented** | `3b25f04` includes Stack-generated and desired-only Stack Units in convergence/status and preserves explicit cross-kind Stack edges during teardown; the current increment scopes generated names as `<stack>--<template-unit>`. External-driver acceptance remains. |
 | Argo integration and external publication | **Boundary and Argo absence observation implemented; external publication remains deployment-owned** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. Argo-backed Kubernetes Units now wait for Application absence during teardown, and the Kubernetes/Argo acceptance job proves external delivery and observation. This repository still does not publish preview manifests or own ApplicationSet resources. |
-| End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. Forge policy configuration and legacy migration completion remain open. |
+| End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. The read-only compatibility audit now reports unsafe state for one explicit desired ref. Forge policy configuration and complete legacy migration remain open. |
 
-The repository verification suite currently passes (`550` tests), including the landed concurrency, recovery,
+The repository verification suite currently passes (`553` tests), including the landed concurrency, recovery,
 incarnation, evidence, direct-root, and candidate-freshness regressions. Passing verification is therefore necessary,
 not sufficient, for the remaining preview-environment milestones because forge policy configuration,
 Stack-specific external acceptance, and legacy migration are still open.
@@ -301,7 +301,11 @@ source-tracked roots:
   explicit identity and management metadata; authoritative source absence begins normal finalization while retaining
   the legacy cleanup snapshot.
 - Diagnostics and migration coverage remain until every supported desired ref has been adopted. The compatibility
-  reader and this exception are then removed.
+  reader and this exception are then removed. The read-only
+  `audit-desired-compatibility --environment ... --desired-ref ...` command emits
+  versioned JSON and returns non-zero while one ref has legacy, partial,
+  unparseable, ambiguous, opaque, or unverified cleanup state. A complete
+  supported-ref inventory and clean audit are still required before removal.
 
 ## Acceptance contract
 
