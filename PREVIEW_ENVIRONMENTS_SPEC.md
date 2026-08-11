@@ -34,11 +34,43 @@ this repository.
 | Argo integration and external publication | **Boundary and Argo absence observation implemented; external publication remains deployment-owned** | `46c2a67` documents the trusted ApplicationSet boundary, cleanup contract, and operations. Argo-backed Kubernetes Units now wait for Application absence during teardown, and the Kubernetes/Argo acceptance job proves external delivery and observation. This repository still does not publish preview manifests or own ApplicationSet resources. |
 | End-to-end acceptance, security, operations, and legacy retirement | **Acceptance and operational guidance implemented; forge policy and retirement pending** | Operational/security guidance, direct and Stack-backed Docker/Terraform, Kubernetes, Argo, restart, focused recovery, Unit hardening acceptance, and a real temporary-repository Stack harness are implemented. The read-only compatibility audit covers one explicit ref or all Project-configured environments. Forge policy configuration and complete legacy migration remain open. |
 
-The repository verification suite passes (`543` tests), including concurrency, recovery, incarnation, evidence,
+The repository verification suite passes (`548` tests), including concurrency, recovery, incarnation, evidence,
 direct-root, and candidate-freshness checks. The suite does not prove deployment-owned forge policy, external
 publication, or legacy migration.
 The current checkout has no `deployment/environments` path, so `audit-desired-compatibility --all` reports
 `unavailable-environments-path`; a deployment-owned supported-ref inventory is still required before legacy retirement.
+
+### Current StackTemplate source model — implemented in this increment
+
+The following contract is now implemented and schema-published:
+
+- `Project.spec.stackTemplatesPath` defaults to `deployment/stack-templates`.
+- A `StackTemplate` uses `spec.unitTemplates`, a map keyed by logical Unit name. The old list form remains an input
+  compatibility form and is emitted as the map form.
+- A Stack selects a template with `template.name` and one source variant:
+  `fromResource`, `fromGit`, or `fromPromotion`.
+- `units` selects projected logical Units. Missing `units` selects all. Unknown Units, duplicate selections, and
+  selected-to-omitted dependencies fail before publication.
+- Desired Stack and StackTemplate documents store exact resolved source data: repository location, full commit,
+  resource path, and content digest. Desired Stack also stores its selected projection.
+- `fromResource` resolves the current same-environment desired catalog entry. Its UID is the reference fence.
+- `fromGit` resolves a local project path or a validated external Git URL during advancement. Mutable refs are
+  normalized and resolved to a commit. Reconcile uses the desired projection and does not reread Git.
+- `fromPromotion` copies the pinned source Stack projection and exact source record. The current implementation
+  supports projection copying and Unit subset selection. Artifact import materialization is still open.
+- `fromEnvironment` is only a Unit-template value expression. It reads the target Environment value during desired
+  resolution. It is not a StackTemplate source or lifecycle reference.
+
+The new acceptance tests cover all three Stack source variants, selected projection, exact source pinning, and
+reconcile from desired state. They use temporary repositories and deterministic Unit drivers.
+
+Remaining implementation work:
+
+- Resolve `fromArtifact` for an omitted producer through explicit `artifactImports` and a pinned promotion observed
+  revision. Persist import evidence separately from local dependency fingerprints and carry it through promotion.
+- Add full remote-ref movement and first-hop/staging-to-production artifact acceptance, including stale UID, receipt,
+  GVK, digest, and import ambiguity failures.
+- Keep legacy desired-resource compatibility until every supported desired ref has been audited.
 
 ## Problem and scope
 
@@ -462,11 +494,11 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
   ruleset, and merge-queue configuration remains deployment-owned.
 - [x] Add a read-only compatibility audit for one desired ref and an aggregate mode for all Project-configured
   environments; keep legacy retirement pending until out-of-band refs are inventoried and every audit is clean.
-- [ ] Define direct Stack template selection for a pinned revision and an explicit latest-refresh policy. Record the
-  resolved revision in provenance, retain one revision per Stack incarnation, and make refresh create a new fenced
-  incarnation after the old one is finalized.
-- [ ] Define how promotion supplies template selection. Validate the selected revision or trusted ref from the
-  promotion source; do not treat a moving ref or forge identity as lifecycle authority.
+- [x] Define and implement Stack template selection with `template.name`, `fromResource`, `fromGit`,
+  `fromPromotion`, optional `units`, and exact desired-state source pins. A future refresh command may add a new
+  explicit operation, but reconcile never follows a moving source.
+- [x] Define and implement promotion source copying for the resolved Stack source and projection. Full artifact
+  import validation and promotion-context materialization remain open work below.
 - [ ] Configure and verify required forge freshness checks or merge-queue/branch-protection enforcement at merge time;
   repository CI now verifies GitHub `pull_request` and `merge_group` heads, but required-check policy remains external.
 - [ ] Remove legacy implicit-root compatibility after the documented migration condition is met.
@@ -502,3 +534,5 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
 | 2026-08-11 | Add acceptance for direct Stack instantiation from a source-tracked StackTemplate. Keep template selection and latest-refresh semantics as explicit follow-up work. |
 | 2026-08-11 | Read-only GitHub API verification reports `main` is not branch protected; required freshness checks and merge-queue enforcement remain an external prerequisite. |
 | 2026-08-11 | Treat forge identity as provenance only. PR CI may imperatively use `gitopsctr` lifecycle primitives; scheduled CI handles missed forge events by enumerating lineage and consulting the forge outside core lifecycle logic. |
+| 2026-08-11 | Keep StackTemplate as a first-class desired catalog resource. Use `fromResource` for same-environment catalog tracking, `fromGit` for direct repository sources, and `fromPromotion` for exact Stack projection promotion. |
+| 2026-08-11 | Store the full resolved source and selected Stack projection in desired state so reconcile is independent of mutable source branches and remotes. |

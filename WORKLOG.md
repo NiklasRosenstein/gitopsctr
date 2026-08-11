@@ -293,3 +293,20 @@ The temporary-repository acceptance flow now starts with a source-tracked `Stack
 It invokes `instantiate-stack`, verifies direct Stack ownership and exact template provenance, and replays the same
 request identity. The replay does not publish a second desired revision. Template selection by pinned revision or
 explicit latest refresh, including promotion input, remains open design work.
+
+### 8.11 StackTemplate source variants and desired projection — complete for the current slice
+
+Implemented project-level `StackTemplate` catalog entries, `unitTemplates` maps, tagged Stack sources
+(`fromResource`, `fromGit`, `fromPromotion`), Unit selection, dependency validation, exact source records, and desired
+Stack projections. Reconcile now loads Stack-owned Units and dependency edges from desired state when available; it
+does not reread mutable template sources.
+
+Acceptance coverage checks all three source variants, exact commit/path/digest records, selected Unit projection,
+promotion source copying from the promotion desired tree, and reconcile after source removal. `fromEnvironment` is
+supported as a Unit-template value lookup only.
+
+Verification: focused preview and contract tests pass; full suite passes with 548 tests. Schemas were regenerated.
+
+Remaining work: materialize explicit promoted artifact imports from pinned source desired/observed refs, validate source
+UID/receipt/GVK/digest lineage, carry imports through staging-to-production promotion, and add remote-ref movement and
+failure-case acceptance coverage.
