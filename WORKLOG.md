@@ -243,3 +243,9 @@ Scheduled recovery is disabled unless `GITOPSCTR_RECOVERY_ENABLED=true` and `PRE
 runs default to dry-run and can override the environment, label, and dry-run mode. The workflow checks out the trusted
 default branch and grants only Git contents and pull-request write access needed for cleanup and change-gated requests.
 Deployment-owned alerts, token policy, environment coverage, and self-hosted GitLab scheduling remain open.
+
+### 8.5 Forge policy verification — external prerequisite confirmed
+
+A read-only GitHub API check on 2026-08-11 returned `404 Branch not protected` for `main`. Repository CI verifies
+candidate freshness, but the result is not authoritative until branch protection or a merge queue requires that check.
+No GitHub settings were changed because this requires deployment-owner authority.

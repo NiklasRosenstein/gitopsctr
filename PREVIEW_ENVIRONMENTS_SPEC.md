@@ -468,3 +468,4 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
 | 2026-08-11 | Validate Stack cleanup with the real Docker/Terraform drivers: add a source Stack, converge its generated Unit, remove it, and finalize the Unit before the Stack root. |
 | 2026-08-11 | Resolve a permanently unparseable cleanup root only with an exact UID, explicit external-cleanup confirmation, and a durable Unit incarnation tombstone; parseable roots must use driver-backed recovery. |
 | 2026-08-11 | Make document migration canonicalize legacy desired Units and resolve refs from the Project configuration; compatibility retirement still requires a complete supported-ref inventory and clean audit. |
+| 2026-08-11 | Read-only GitHub API verification reports `main` is not branch protected; required freshness checks and merge-queue enforcement remain an external prerequisite. |
