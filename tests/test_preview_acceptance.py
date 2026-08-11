@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -15,6 +17,236 @@ from gitopsctr.resources import ResourceMetadata
 from gitopsctr.state import ControllerPin, ControllerPinClaim
 from tests.test_stack_deletion import _args, _fake_git, _stack_tree
 from tests.test_stack_projection import _project, _write_stack_source
+
+
+def _write_project_template(root: Path, environment_name: str, stack: dict[str, object]) -> Path:
+    environment = root / "deployment/environments" / environment_name
+    environment.mkdir(parents=True, exist_ok=True)
+    (environment / "environment.json").write_text(
+        json.dumps(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "Environment",
+                "metadata": {"name": environment_name},
+                "spec": {},
+            }
+        )
+    )
+    (environment / "stacks").mkdir(exist_ok=True)
+    stack_name = cast(dict[str, object], stack["metadata"])["name"]
+    (environment / f"stacks/{stack_name}.json").write_text(json.dumps(stack))
+    templates = root / "deployment/stack-templates"
+    templates.mkdir(parents=True, exist_ok=True)
+    (templates / "application.json").write_text(
+        json.dumps(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "StackTemplate",
+                "metadata": {"name": "application"},
+                "spec": {
+                    "unitTemplates": {
+                        "image": {
+                            "apiVersion": "unit.gitopsctr.io/v1",
+                            "kind": "Terraform",
+                            "spec": {"source": {"path": "."}},
+                        },
+                        "deploy": {
+                            "apiVersion": "unit.gitopsctr.io/v1",
+                            "kind": "Terraform",
+                            "spec": {
+                                "source": {"path": "."},
+                                "terraform": {
+                                    "variables": {
+                                        "image": "promoted",
+                                    }
+                                },
+                            },
+                        },
+                    }
+                },
+            }
+        )
+    )
+    return environment
+
+
+def _write_project_units(root: Path, projection: cli.StackProjection, source_root: Path) -> None:
+    for name, unit in projection.generated_units.items():
+        cli.write_desired_candidate_unit(
+            root / "units" / f"{name}.json",
+            unit.with_metadata(
+                ResourceMetadata(
+                    name=name, uid=f"d1-{name}", lifecycle=cli.DesiredLifecycle(owner=projection.owners[name])
+                )
+            ),
+            source_root,
+        )
+
+
+def test_stack_source_variants_pin_and_reconcile_from_desired_projection(tmp_path: Path):
+    source = tmp_path / "source"
+    _project(source)
+    _write_project_template(
+        source,
+        "dev",
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Stack",
+            "metadata": {"name": "application"},
+            "spec": {
+                "template": {"name": "application", "source": {"fromResource": {}}},
+                "units": ["image", "deploy"],
+            },
+        },
+    )
+    desired = tmp_path / "desired"
+    projection = cli.project_stack_resources(source, "dev", "a" * 40, desired, source)
+    assert sorted(projection.generated_units) == ["application--deploy", "application--image"]
+    stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(next((desired / "stacks").glob("application.*"))),
+        profile="desired",
+        expected_name="application",
+    )
+    assert isinstance(stack.spec, cli.DesiredStackSpec)
+    assert stack.spec.resolvedSource is not None
+    assert stack.spec.resolvedSource.fromGit.commit == "a" * 40
+    assert stack.spec.resolvedSource.fromGit.resourcePath == "deployment/stack-templates/application.json"
+    assert (
+        stack.spec.resolvedSource.fromGit.digest
+        == hashlib.sha256((source / "deployment/stack-templates/application.json").read_bytes()).hexdigest()
+    )
+    assert stack.spec.resolvedProjection is not None
+    _write_project_units(desired, projection, source)
+    (source / "deployment/stack-templates/application.json").unlink()
+    specifications, dependencies = cli.load_convergence_specifications(
+        source, "dev", desired, "b" * 40, tmp_path / "reconcile-projection"
+    )
+    assert "application--deploy" in specifications
+    assert dependencies["application--deploy"] == ()
+
+
+def test_from_git_stack_source_does_not_create_catalog_or_read_source_during_reconcile(tmp_path: Path):
+    source = tmp_path / "source"
+    _project(source)
+    external = source / "external"
+    external.mkdir()
+    (external / "gitopsctr.yaml").write_text(
+        json.dumps(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "Project",
+                "metadata": {"name": "external"},
+                "spec": {},
+            }
+        )
+    )
+    _write_project_template(
+        external,
+        "unused",
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Stack",
+            "metadata": {"name": "unused"},
+            "spec": {"template": "application"},
+        },
+    )
+    dev_stacks = source / "deployment/environments/dev/stacks"
+    dev_stacks.mkdir(parents=True, exist_ok=True)
+    (dev_stacks / "application.json").write_text(
+        json.dumps(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "Stack",
+                "metadata": {"name": "application"},
+                "spec": {
+                    "template": {
+                        "name": "application",
+                        "source": {"fromGit": {"path": "external", "ref": "main"}},
+                    }
+                },
+            }
+        )
+    )
+    desired = tmp_path / "desired"
+    projection = cli.project_stack_resources(source, "dev", "c" * 40, desired, source)
+    assert not list((desired / "stack-templates").glob("*"))
+    assert projection.generated_units
+    stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(next((desired / "stacks").glob("application.*"))),
+        profile="desired",
+        expected_name="application",
+    )
+    assert isinstance(stack.spec, cli.DesiredStackSpec)
+    assert stack.spec.resolvedSource is not None
+    assert stack.spec.resolvedSource.fromGit.ref == "refs/heads/main"
+    assert stack.spec.resolvedSource.fromGit.resourcePath == "deployment/stack-templates/application.json"
+    _write_project_units(desired, projection, source)
+    shutil.rmtree(external)
+    specifications, _ = cli.load_convergence_specifications(
+        source, "dev", desired, "d" * 40, tmp_path / "reconcile-projection"
+    )
+    assert "application--image" in specifications
+
+
+def test_from_promotion_copies_exact_source_and_projects_subset(tmp_path: Path):
+    source = tmp_path / "source"
+    _project(source)
+    _write_project_template(
+        source,
+        "dev",
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Stack",
+            "metadata": {"name": "application"},
+            "spec": {"template": "application"},
+        },
+    )
+    dev_desired = tmp_path / "dev-desired"
+    dev_projection = cli.project_stack_resources(source, "dev", "e" * 40, dev_desired, source)
+    _write_project_units(dev_desired, dev_projection, source)
+    _write_project_template(
+        source,
+        "staging",
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Stack",
+            "metadata": {"name": "staging"},
+            "spec": {
+                "template": {
+                    "name": "application",
+                    "source": {"fromPromotion": {"stack": "application"}},
+                },
+                "units": ["deploy"],
+            },
+        },
+    )
+    staging = tmp_path / "staging"
+    promotion = cli.PromotionContext(
+        source_environment="dev",
+        desired_ref="deploy/dev",
+        desired_revision="e" * 40,
+        observed_ref="observed/dev",
+        observed_revision=None,
+        specification_revision="e" * 40,
+        desired_root=dev_desired,
+    )
+    projection = cli.project_stack_resources(source, "staging", "f" * 40, staging, source, promotion=promotion)
+    assert sorted(projection.generated_units) == ["staging--deploy"]
+    stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(next((staging / "stacks").glob("staging.*"))),
+        profile="desired",
+        expected_name="staging",
+    )
+    assert isinstance(stack.spec, cli.DesiredStackSpec)
+    assert stack.spec.resolvedSource is not None
+    assert stack.spec.resolvedSource.fromGit.commit == "e" * 40
+    dev_stack = cli.RESOURCE_CATALOG.parse_stack(
+        cli.RESOURCE_CATALOG.load_document(next((dev_desired / "stacks").glob("application.*"))),
+        profile="desired",
+        expected_name="application",
+    )
+    assert isinstance(dev_stack.spec, cli.DesiredStackSpec)
+    assert dev_stack.spec.resolvedSource == stack.spec.resolvedSource
 
 
 def test_source_tracked_stack_cleanup_is_durable_across_restart(tmp_path: Path):

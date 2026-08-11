@@ -20,12 +20,14 @@ from gitopsctr.contracts import (
     DesiredStackDocument,
     DesiredStackSpec,
     DesiredStackTemplateDocument,
+    DesiredStackTemplateSpec,
     LifecycleManagement,
     ReceiptDesired,
     ResolvedInputs,
     StackDocument,
     StackSpec,
     StackTemplateDocument,
+    StackTemplateFromResource,
     StackTemplateSpec,
     StrictModel,
     scope_stack_template_resources,
@@ -139,7 +141,7 @@ class StackResource:
 
     gvk: GVK
     metadata: ResourceMetadata
-    spec: StackSpec | DesiredStackSpec | StackTemplateSpec
+    spec: StackSpec | DesiredStackSpec | StackTemplateSpec | DesiredStackTemplateSpec
 
     @property
     def name(self) -> str:
@@ -151,6 +153,20 @@ class StackResource:
 
 
 DesiredGraphResource = UnitResource[Any] | StackResource
+
+
+def _stack_template_name(spec: StackSpec | DesiredStackSpec) -> str:
+    """Return the logical template name from old or current Stack syntax."""
+
+    template = spec.template
+    return template if isinstance(template, str) else template.name
+
+
+def _stack_uses_resource_template(spec: StackSpec | DesiredStackSpec) -> bool:
+    """Return whether the Stack must resolve a sibling desired StackTemplate."""
+
+    template = spec.template
+    return isinstance(template, str) or isinstance(template.source, StackTemplateFromResource)
 
 
 def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], DesiredGraphResource]) -> None:
@@ -228,13 +244,6 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
     ):
         if not isinstance(stack.spec, (StackSpec, DesiredStackSpec)):
             raise ValueError(f"Stack {stack.name!r} has an invalid Stack spec")
-        template = templates.get(stack.spec.template)
-        if template is None:
-            raise ValueError(
-                f"Stack {stack.name!r} references missing StackTemplate {stack.spec.template!r} in this ref"
-            )
-        assert isinstance(template.spec, StackTemplateSpec)
-        expanded = scope_stack_template_resources(stack.name, template.spec.expand(stack.spec.parameters))
         lifecycle = stack.metadata.lifecycle
         if lifecycle is None or lifecycle.management is None:
             raise ValueError(f"Stack {stack.name!r} must be a root resource")
@@ -243,6 +252,16 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
             raise ValueError(f"direct Stack {stack.name!r} is missing instantiation provenance")
         if lifecycle.management.mode == "sourceTracked" and has_provenance:
             raise ValueError(f"source-tracked Stack {stack.name!r} must not carry direct instantiation provenance")
+        if not _stack_uses_resource_template(stack.spec):
+            # Git and promotion sources are self-contained in the desired
+            # Stack projection. They do not require a sibling catalog entry.
+            continue
+        template_name = _stack_template_name(stack.spec)
+        template = templates.get(template_name)
+        if template is None:
+            raise ValueError(f"Stack {stack.name!r} references missing StackTemplate {template_name!r} in this ref")
+        assert isinstance(template.spec, StackTemplateSpec)
+        expanded = scope_stack_template_resources(stack.name, template.spec.expand(stack.spec.parameters))
         expanded_by_name = {resource.name: resource for resource in expanded}
         for generated in expanded:
             generated_key = (generated.apiVersion, generated.kind, generated.name)
@@ -495,11 +514,20 @@ class ResourceCatalog:
                     spec=resource.spec,
                 )
             else:
+                desired_template_spec = (
+                    resource.spec
+                    if isinstance(resource.spec, DesiredStackTemplateSpec)
+                    else DesiredStackTemplateSpec(
+                        parameters=resource.spec.parameters,
+                        unitTemplates=resource.spec.unitTemplates,
+                        resources=resource.spec.resources,
+                    )
+                )
                 document = DesiredStackTemplateDocument(
                     apiVersion=CORE_API_VERSION,
                     kind="StackTemplate",
                     metadata=resource.metadata.as_desired(),
-                    spec=resource.spec,
+                    spec=desired_template_spec,
                 )
             contract = cast(TypedDocumentContract[Any], CORE_CONTRACTS[f"stack-template-{profile}"])
         elif resource.gvk.kind == "Stack":

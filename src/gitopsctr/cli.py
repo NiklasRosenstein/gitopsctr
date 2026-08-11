@@ -36,19 +36,30 @@ from gitopsctr.artifacts import require_artifact_api
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
     ArtifactDescriptor,
+    ArtifactImport,
     AuthoredSource,
     DesiredLifecycle,
     DesiredOwnerReference,
     DesiredSource,
     DesiredStackSpec,
+    DesiredStackTemplateSpec,
+    GitSourceRequest,
     LifecycleManagement,
     MaterializationDocument,
     ReceiptDesired,
+    ResolvedGitSource,
+    ResolvedStackTemplateSource,
     StackInstantiationProvenance,
     StackSpec,
+    StackTemplateFromGit,
+    StackTemplateFromPromotion,
+    StackTemplateReference,
+    StackTemplateResource,
     StackTemplateSpec,
+    StackTemplateUnitTemplate,
     StrictModel,
     scope_stack_template_resources,
+    stack_generated_unit_name,
     with_schema,
 )
 from gitopsctr.dependencies import (
@@ -145,6 +156,7 @@ from gitopsctr.templates import (
     ReceiptReference,
     TemplateError,
     TemplateValue,
+    dump_template_value,
     parse_template_value,
 )
 from gitopsctr.templates import (
@@ -180,6 +192,7 @@ class PromotionContext:
     observed_revision: str | None
     specification_revision: str
     desired_root: Path
+    observed_root: Path | None = None
 
     def document(self) -> dict[str, Any]:
         return with_schema(
@@ -733,7 +746,15 @@ def load_desired_resource_graph(root: Path) -> dict[tuple[str, str, str], UnitRe
             stack_key = (CORE_API_VERSION, "Stack", stack_name)
             stack_resource = resources.get(stack_key)
             template_resource = (
-                resources.get((CORE_API_VERSION, "StackTemplate", stack_resource.spec.template))
+                resources.get(
+                    (
+                        CORE_API_VERSION,
+                        "StackTemplate",
+                        stack_resource.spec.template
+                        if isinstance(stack_resource.spec.template, str)
+                        else stack_resource.spec.template.name,
+                    )
+                )
                 if isinstance(stack_resource, StackResource)
                 and isinstance(stack_resource.spec, (StackSpec, DesiredStackSpec))
                 else None
@@ -786,8 +807,36 @@ def stack_dependency_edges(
     ):
         if not isinstance(stack.spec, (StackSpec, DesiredStackSpec)):
             continue
-        template = templates.get(stack.spec.template)
+        template_name = stack.spec.template if isinstance(stack.spec.template, str) else stack.spec.template.name
+        template = templates.get(template_name)
         if template is None or not isinstance(template.spec, StackTemplateSpec):
+            projection = stack.spec.resolvedProjection if isinstance(stack.spec, DesiredStackSpec) else None
+            units = projection.get("units") if isinstance(projection, dict) else None
+            if not isinstance(units, dict):
+                continue
+            for logical_name, value in units.items():
+                if not isinstance(logical_name, str) or not isinstance(value, dict):
+                    continue
+                dependencies = value.get("dependsOn", [])
+                if not isinstance(dependencies, list):
+                    continue
+                generated_name = stack_generated_unit_name(stack.name, logical_name)
+                if include_missing or any(
+                    isinstance(item, UnitResource) and item.name == generated_name for item in resources.values()
+                ):
+                    edges.setdefault(generated_name, set()).update(
+                        stack_generated_unit_name(stack.name, dependency)
+                        for dependency in dependencies
+                        if isinstance(dependency, str)
+                        and (
+                            include_missing
+                            or any(
+                                isinstance(item, UnitResource)
+                                and item.name == stack_generated_unit_name(stack.name, dependency)
+                                for item in resources.values()
+                            )
+                        )
+                    )
             continue
         expanded_by_name = {
             resource.name: resource
@@ -1305,6 +1354,8 @@ def resolve_template(
     target_gvk: GVK | None = None,
     pointer: str = "",
     dry: bool = False,
+    environment_document: Mapping[str, Any] | None = None,
+    artifact_imports: Sequence[ArtifactImport] = (),
 ) -> TemplateResolution:
     def resolve_promotion(reference: PromotionReferenceSelection) -> FingerprintedValue:
         if promotion is None:
@@ -1354,13 +1405,58 @@ def resolve_template(
         )
 
     def resolve_artifact(reference):
-        if observed_revision is None:
+        if observed_revision is None and not artifact_imports:
             raise ReferenceUnavailable(f"receipt does not exist: {reference.unit}")
+        validate_artifact_reference_target(reference)
+        producer_path = unit_document_path(candidate, reference.unit)
+        if not producer_path.is_file():
+            imported = next(
+                (
+                    item
+                    for item in artifact_imports
+                    if item.name == reference.name and item.apiVersion == reference.apiVersion
+                    if item.kind == reference.kind
+                    and (item.unit == reference.unit or reference.unit.endswith(f"--{item.unit}"))
+                ),
+                None,
+            )
+            if imported is None or promotion is None or promotion.observed_root is None:
+                raise ReferenceUnavailable(f"artifact producer is not selected: {reference.unit}")
+            source_stack_path = document_candidates(promotion.desired_root / "stacks", imported.fromPromotion.stack)
+            if len(source_stack_path) != 1:
+                raise ReferenceUnavailable(f"promoted source Stack is unavailable: {imported.fromPromotion.stack}")
+            source_stack = RESOURCE_CATALOG.parse_stack(
+                RESOURCE_CATALOG.load_document(source_stack_path[0]),
+                profile="desired",
+                expected_name=imported.fromPromotion.stack,
+            )
+            source_unit_path = unit_document_path(
+                promotion.desired_root,
+                stack_generated_unit_name(imported.fromPromotion.stack, imported.unit),
+            )
+            if not source_unit_path.is_file():
+                source_unit_path = unit_document_path(promotion.desired_root, reference.unit)
+            if not source_unit_path.is_file():
+                raise ReferenceUnavailable(f"promoted source Unit is unavailable: {reference.unit}")
+            source_unit = load_desired_unit(source_unit_path, source_unit_path.stem)
+            source_lifecycle = source_unit.metadata.lifecycle
+            source_owner = source_lifecycle.owner if source_lifecycle is not None else None
+            source_uid = source_stack.metadata.uid
+            if source_owner is None or source_uid is None or source_owner.uid != source_uid:
+                raise ReferenceUnavailable("promoted artifact producer has an invalid Stack owner fence")
+            source_receipt = current_receipt(
+                promotion.observed_root, promotion.desired_root / "units", source_unit.name
+            )
+            if source_receipt is None:
+                raise ReferenceUnavailable(f"promoted artifact receipt is stale: {source_unit.name}")
+            document, digest = load_artifact_document(
+                promotion.observed_root, source_unit, source_receipt, reference.name
+            )
+            return FingerprintedValue(json_pointer(document, reference.pointer), digest, imported=True)
         receipt = current_receipt(observed, candidate / "units", reference.unit)
         if receipt is None:
             raise ReferenceUnavailable(f"receipt is stale: {reference.unit}")
-        validate_artifact_reference_target(reference)
-        producer_unit = load_desired_unit(unit_document_path(candidate, reference.unit), reference.unit)
+        producer_unit = load_desired_unit(producer_path, reference.unit)
         producer_driver = producer_unit.driver
         artifact_kind = producer_driver.artifact_outputs.get(reference.name) if producer_driver is not None else None
         if artifact_kind is None:
@@ -1372,12 +1468,21 @@ def resolve_template(
         document, digest = load_artifact_document(observed, producer_unit, receipt, reference.name)
         return FingerprintedValue(json_pointer(document, reference.pointer), digest)
 
+    def resolve_environment(pointer: str) -> FingerprintedValue:
+        if environment_document is None:
+            raise ReferenceUnavailable("Environment resource is unavailable")
+        return FingerprintedValue(
+            json_pointer(dict(environment_document), pointer),
+            hashlib.sha256(canonical_json(environment_document)).hexdigest(),
+        )
+
     return resolve_template_value(
         value,
         ResolutionContext(
             receipt=resolve_receipt,
             artifact=resolve_artifact,
             promotion=resolve_promotion,
+            environment=resolve_environment,
             unit=target_unit,
             dry=dry,
         ),
@@ -1730,11 +1835,19 @@ def _document_paths(directory: Path) -> dict[str, Path]:
 def _load_authored_stack_resources(
     source_root: Path, environment_name: str
 ) -> tuple[dict[str, StackResource], dict[str, StackResource]]:
-    """Load the inert templates and concrete stacks from the environment source tree."""
+    """Load project-level templates and environment-local Stack resources.
+
+    The environment-local template directory remains a compatibility fallback
+    for pre-migration projects.
+    """
 
     environment_root = project_environment_root(source_root, environment_name)
     templates: dict[str, StackResource] = {}
-    for name, path in _document_paths(environment_root / "stack-templates").items():
+    project = load_project_config(source_root)
+    template_root = source_root.joinpath(*project.stack_templates_path.parts)
+    if not template_root.is_dir():
+        template_root = environment_root / "stack-templates"
+    for name, path in _document_paths(template_root).items():
         templates[name] = RESOURCE_CATALOG.parse_stack_template(
             RESOURCE_CATALOG.load_document(path), profile="authored", expected_name=name
         )
@@ -1756,6 +1869,7 @@ class StackProjection:
     generated_units: dict[str, UnitResource[Any]]
     owners: dict[str, DesiredOwnerReference]
     dependencies: dict[str, tuple[str, ...]]
+    artifact_imports: dict[str, tuple[ArtifactImport, ...]] = field(default_factory=dict)
 
 
 def _write_desired_stack_resource(path: Path, resource: StackResource, project_root: Path) -> Path:
@@ -1766,6 +1880,148 @@ def _write_desired_stack_resource(path: Path, resource: StackResource, project_r
     else:
         selected = DocumentFormat.YAML if path.suffix in {".yaml", ".yml"} else DocumentFormat.JSON
     return write_document(path, document, format=selected)
+
+
+def _stack_template_reference(spec: StackSpec) -> StackTemplateReference:
+    template = spec.template
+    return template if isinstance(template, StackTemplateReference) else StackTemplateReference(name=template)
+
+
+def _resolve_stack_template(
+    source_root: Path,
+    template_ref: StackTemplateReference,
+    templates: Mapping[str, StackResource],
+    source_revision: str,
+    current_desired: Path | None = None,
+    promotion: PromotionContext | None = None,
+) -> tuple[StackResource, ResolvedStackTemplateSource]:
+    """Resolve one StackTemplate source for desired-state projection."""
+
+    source = template_ref.source
+    if isinstance(source, StackTemplateFromPromotion):
+        source_desired = promotion.desired_root if promotion is not None else current_desired
+        if source_desired is None:
+            raise OperationError("fromPromotion StackTemplate source requires a pinned source Stack")
+        source_path = document_candidates(source_desired / "stacks", source.fromPromotion.stack)
+        if len(source_path) != 1:
+            raise OperationError(f"promoted source Stack {source.fromPromotion.stack!r} is not available")
+        source_stack = RESOURCE_CATALOG.parse_stack(
+            RESOURCE_CATALOG.load_document(source_path[0]),
+            profile="desired",
+            expected_name=source.fromPromotion.stack,
+        )
+        if not isinstance(source_stack.spec, DesiredStackSpec) or source_stack.spec.resolvedProjection is None:
+            raise OperationError("promoted source Stack has no resolved projection")
+        projection_units = source_stack.spec.resolvedProjection.get("units")
+        if not isinstance(projection_units, dict):
+            raise OperationError("promoted source Stack projection is invalid")
+        unit_templates = {
+            logical_name: StackTemplateUnitTemplate(
+                apiVersion=cast(str, value["apiVersion"]),
+                kind=cast(str, value["kind"]),
+                spec=cast(Any, value.get("spec", {})),
+                dependsOn=[cast(str, item) for item in cast(list[Any], value.get("dependsOn", []))],
+            )
+            for logical_name, value in projection_units.items()
+            if isinstance(logical_name, str) and isinstance(value, dict)
+        }
+        promoted_template = StackResource(
+            GVK(CORE_API_VERSION, "StackTemplate"),
+            ResourceMetadata(name=template_ref.name),
+            StackTemplateSpec(parameters=[], unitTemplates=unit_templates),
+        )
+        if source_stack.spec.resolvedSource is None:
+            raise OperationError("promoted source Stack has no resolved source")
+        return promoted_template, source_stack.spec.resolvedSource
+    if isinstance(source, StackTemplateFromGit):
+        request = source.fromGit
+        if request.remote is not None:
+            with tempfile.TemporaryDirectory(prefix="gitopsctr-stack-template-") as temporary_directory:
+                checkout = Path(temporary_directory) / "repo"
+                clone = subprocess.run(
+                    ("git", "clone", "--no-checkout", "--quiet", request.remote, str(checkout)),
+                    text=True,
+                    capture_output=True,
+                )
+                if clone.returncode != 0:
+                    raise OperationError(
+                        f"could not fetch StackTemplate source {request.remote!r}: {clone.stderr.strip()}"
+                    )
+                selected = request.commit
+                if selected is None:
+                    assert request.ref is not None
+                    revision = subprocess.run(
+                        ("git", "-C", str(checkout), "rev-parse", f"{request.ref}^{{commit}}"),
+                        text=True,
+                        capture_output=True,
+                    )
+                    if revision.returncode != 0:
+                        raise OperationError(f"Git ref {request.ref!r} does not exist in {request.remote!r}")
+                    selected = revision.stdout.strip()
+                checkout_result = subprocess.run(
+                    ("git", "-C", str(checkout), "checkout", "--quiet", "--detach", selected),
+                    text=True,
+                    capture_output=True,
+                )
+                if checkout_result.returncode != 0:
+                    raise OperationError(f"Git commit {selected!r} is not available in {request.remote!r}")
+                project = load_project_config(checkout)
+                catalog_root = checkout.joinpath(*project.stack_templates_path.parts)
+                paths = document_candidates(catalog_root, template_ref.name)
+                if len(paths) != 1:
+                    raise OperationError(f"expected exactly one StackTemplate document for {template_ref.name!r}")
+                template_path = paths[0]
+                template = RESOURCE_CATALOG.parse_stack_template(
+                    RESOURCE_CATALOG.load_document(template_path),
+                    profile="authored",
+                    expected_name=template_ref.name,
+                )
+                return template, ResolvedStackTemplateSource(
+                    fromGit=ResolvedGitSource(
+                        remote=request.remote,
+                        commit=selected,
+                        resourcePath=template_path.relative_to(checkout).as_posix(),
+                        digest=hashlib.sha256(template_path.read_bytes()).hexdigest(),
+                        ref=request.ref,
+                    )
+                )
+        template_root = source_root
+        if request.path != ".":
+            template_root = source_root.joinpath(*PurePosixPath(cast(str, request.path)).parts)
+        project = load_project_config(template_root)
+        catalog_root = template_root.joinpath(*project.stack_templates_path.parts)
+        path = document_candidates(catalog_root, template_ref.name)
+        if len(path) != 1:
+            raise OperationError(f"expected exactly one StackTemplate document for {template_ref.name!r}")
+        template = RESOURCE_CATALOG.parse_stack_template(
+            RESOURCE_CATALOG.load_document(path[0]), profile="authored", expected_name=template_ref.name
+        )
+        return template, ResolvedStackTemplateSource(
+            fromGit=ResolvedGitSource(
+                path=request.path,
+                commit=source_revision,
+                resourcePath=path[0].relative_to(template_root).as_posix(),
+                digest=hashlib.sha256(path[0].read_bytes()).hexdigest(),
+                ref=request.ref,
+            )
+        )
+    template = templates.get(template_ref.name)
+    if template is None:
+        raise OperationError(f"Stack {template_ref.name!r} references missing StackTemplate")
+    path_candidates = document_candidates(
+        source_root.joinpath(*load_project_config(source_root).stack_templates_path.parts), template_ref.name
+    )
+    resource_path = (
+        path_candidates[0].relative_to(source_root).as_posix() if len(path_candidates) == 1 else template_ref.name
+    )
+    return template, ResolvedStackTemplateSource(
+        fromGit=ResolvedGitSource(
+            path=".",
+            commit=source_revision,
+            resourcePath=resource_path,
+            digest=hashlib.sha256(path_candidates[0].read_bytes() if len(path_candidates) == 1 else b"").hexdigest(),
+        )
+    )
 
 
 def _stack_root_metadata(
@@ -1845,6 +2101,7 @@ def project_stack_resources(
     candidate: Path,
     project_root: Path,
     current_desired: Path | None = None,
+    promotion: PromotionContext | None = None,
 ) -> StackProjection:
     """Persist Stack roots and expand concrete Stacks into authored Unit inputs."""
 
@@ -1854,35 +2111,112 @@ def project_stack_resources(
     generated: dict[str, UnitResource[Any]] = {}
     owners: dict[str, DesiredOwnerReference] = {}
     dependencies: dict[str, tuple[str, ...]] = {}
+    artifact_imports: dict[str, tuple[ArtifactImport, ...]] = {}
     for name, template in templates.items():
+        authored_template_spec = cast(StackTemplateSpec, template.spec)
+        template_candidates = document_candidates(
+            source_root.joinpath(*load_project_config(source_root).stack_templates_path.parts), name
+        )
+        template_path = template_candidates[0] if len(template_candidates) == 1 else None
+        template_spec = DesiredStackTemplateSpec(
+            parameters=authored_template_spec.parameters,
+            unitTemplates=authored_template_spec.unitTemplates,
+            resources=authored_template_spec.resources,
+            requestedSource=StackTemplateFromGit(fromGit=GitSourceRequest(path=".")),
+            resolvedSource=ResolvedStackTemplateSource(
+                fromGit=ResolvedGitSource(
+                    path=".",
+                    commit=source_revision,
+                    resourcePath=(
+                        template_path.relative_to(source_root).as_posix()
+                        if template_path is not None
+                        else f"stack-templates/{name}.yaml"
+                    ),
+                    digest=hashlib.sha256(template_path.read_bytes() if template_path else b"").hexdigest(),
+                )
+            ),
+        )
         desired = StackResource(
             template.gvk,
             _stack_root_metadata("StackTemplate", name, source_revision, current_desired),
-            template.spec,
+            template_spec,
         )
         _write_desired_stack_resource(candidate / "stack-templates" / f"{name}.json", desired, project_root)
     for name, authored_stack in stacks.items():
         assert isinstance(authored_stack.spec, StackSpec)
-        template_name = authored_stack.spec.template
-        template = templates.get(template_name)
-        if template is None:
-            raise OperationError(f"Stack {name!r} references missing StackTemplate {template_name!r}")
+        template_ref = _stack_template_reference(authored_stack.spec)
+        template, resolved_source = _resolve_stack_template(
+            source_root, template_ref, templates, source_revision, current_desired, promotion
+        )
         stack = StackResource(
             authored_stack.gvk,
             _stack_root_metadata("Stack", name, source_revision, current_desired),
-            authored_stack.spec,
+            DesiredStackSpec(
+                template=template_ref,
+                parameters=authored_stack.spec.parameters,
+                units=authored_stack.spec.units,
+                artifactImports=authored_stack.spec.artifactImports,
+                requestedSource=template_ref.source,
+                resolvedSource=resolved_source,
+                resolvedProjection=None,
+            ),
         )
+        template_spec = cast(StackTemplateSpec, template.spec)
+        expanded_template = template_spec.expand(authored_stack.spec.parameters)
+        selected_names = set(authored_stack.spec.units or (resource.name for resource in expanded_template))
+        known_names = {resource.name for resource in expanded_template}
+        unknown = sorted(selected_names - known_names)
+        if unknown:
+            raise OperationError(f"Stack {name!r} selects unknown Unit templates: {', '.join(unknown)}")
+        for imported in authored_stack.spec.artifactImports:
+            if imported.unit not in known_names:
+                raise OperationError(f"Stack {name!r} imports an artifact from unknown Unit template {imported.unit!r}")
+            if imported.unit in selected_names:
+                raise OperationError(
+                    f"Stack {name!r} imports an artifact from selected Unit template {imported.unit!r}"
+                )
+        for resource in expanded_template:
+            if resource.name in selected_names:
+                omitted = sorted(set(resource.dependsOn) - selected_names)
+                if omitted:
+                    raise OperationError(
+                        f"Stack {name!r} selects {resource.name!r} but omits dependencies: {', '.join(omitted)}"
+                    )
+        expanded_template = tuple(resource for resource in expanded_template if resource.name in selected_names)
+        projection_document: JsonObjectValue = JsonObjectValue(
+            {
+                "units": {
+                    resource.name: {
+                        "apiVersion": resource.apiVersion,
+                        "kind": resource.kind,
+                        "spec": cast(JsonObjectValue, dump_template_value(cast(TemplateValue, resource.spec))),
+                        "dependsOn": list(resource.dependsOn),
+                    }
+                    for resource in expanded_template
+                }
+            }
+        )
+        stack = replace(stack, spec=replace(cast(DesiredStackSpec, stack.spec), resolvedProjection=projection_document))
         _write_desired_stack_resource(candidate / "stacks" / f"{name}.json", stack, project_root)
         assert isinstance(template.spec, StackTemplateSpec)
         for resource in scope_stack_template_resources(
             name,
-            template.spec.expand(authored_stack.spec.parameters),
+            tuple(
+                StackTemplateResource(
+                    apiVersion=item.apiVersion,
+                    kind=item.kind,
+                    name=item.name,
+                    spec=item.spec,
+                    dependsOn=item.dependsOn,
+                )
+                for item in expanded_template
+            ),
         ):
             document: JsonObject = {
                 "apiVersion": resource.apiVersion,
                 "kind": resource.kind,
                 "metadata": {"name": resource.name},
-                "spec": cast(JsonObjectValue, resource.spec),
+                "spec": cast(JsonObjectValue, dump_template_value(cast(TemplateValue, resource.spec))),
             }
             unit = RESOURCE_CATALOG.parse_unit(document, profile="authored", expected_name=resource.name)
             require_unit_specification(unit, resource.name)
@@ -1892,6 +2226,7 @@ def project_stack_resources(
                 )
             generated[resource.name] = unit
             dependencies[resource.name] = tuple(resource.dependsOn)
+            artifact_imports[resource.name] = tuple(authored_stack.spec.artifactImports)
             assert stack.metadata.uid is not None
             owners[resource.name] = DesiredOwnerReference(
                 apiVersion=stack.gvk.api_version,
@@ -1913,7 +2248,7 @@ def project_stack_resources(
                 target = candidate / ("stack-templates" if kind == "StackTemplate" else "stacks") / previous_path.name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(previous_path, target)
-    return StackProjection(generated, owners, dependencies)
+    return StackProjection(generated, owners, dependencies, artifact_imports)
 
 
 def load_convergence_specifications(
@@ -1932,21 +2267,10 @@ def load_convergence_specifications(
     """
 
     specifications = load_environment_specifications(source_root, environment_name)
-    projection = project_stack_resources(
-        source_root,
-        environment_name,
-        projection_revision,
-        projection_root,
-        source_root,
-        current_desired,
-    )
-    for name, generated in projection.generated_units.items():
-        if name in specifications:
-            raise OperationError(f"generated Stack Unit {name!r} collides with a source Unit")
-        specifications[name] = generated
-    dependency_edges = dict(projection.dependencies)
-
+    dependency_edges: dict[str, tuple[str, ...]] = {}
     if _current_desired_stack_paths(current_desired, "Stack"):
+        # A desired Stack is an immutable projection. Reconcile must not
+        # rebuild it from a mutable source branch or remote repository.
         resources = load_desired_resource_graph(current_desired)
         dependency_edges.update(stack_dependency_edges(resources))
         deletion_intents = load_desired_deletion_intents(current_desired)
@@ -1969,6 +2293,20 @@ def load_convergence_specifications(
             if existing is not None and existing.gvk != resource.gvk:
                 raise OperationError(f"desired-only Unit {resource.name!r} collides with a source Unit")
             specifications[resource.name] = resource
+    else:
+        projection = project_stack_resources(
+            source_root,
+            environment_name,
+            projection_revision,
+            projection_root,
+            source_root,
+            current_desired,
+        )
+        for name, generated in projection.generated_units.items():
+            if name in specifications:
+                raise OperationError(f"generated Stack Unit {name!r} collides with a source Unit")
+            specifications[name] = generated
+        dependency_edges.update(projection.dependencies)
 
     return specifications, {name: tuple(sorted(values)) for name, values in dependency_edges.items()}
 
@@ -4758,8 +5096,15 @@ def build_desired_candidate(
     (candidate / "stacks").mkdir(parents=True)
     copy_stack_incarnation_tombstones(current_desired, candidate)
     stack_projection = project_stack_resources(
-        source_root, environment_name, source_revision, candidate, source_root, current_desired
+        source_root,
+        environment_name,
+        source_revision,
+        candidate,
+        source_root,
+        current_desired,
+        promotion,
     )
+    imported_artifact_fingerprints: dict[str, dict[str, str]] = {}
     # Direct Stacks are controller-owned roots, so they must survive source
     # advances just like direct Units. An active deletion intent is retained
     # with the same root until finalization removes it explicitly.
@@ -5022,12 +5367,13 @@ def build_desired_candidate(
         progressed = False
         for unit_name in sorted(unresolved):
             authored, resolved_source = prepared[unit_name]
+            unit_artifact_imports = stack_projection.artifact_imports.get(authored.name, ())
             try:
                 resolution = authored.driver.resolve_unit(
                     authored.spec,
                     UnitResolutionContext(
                         source=resolved_source,
-                        resolve_template=lambda value, pointer, target_unit=authored.name, target_gvk=authored.gvk: (
+                        resolve_template=lambda value, pointer, target_unit=authored.name, target_gvk=authored.gvk, artifact_imports=unit_artifact_imports: (
                             resolve_template(
                                 value,
                                 candidate,
@@ -5038,6 +5384,8 @@ def build_desired_candidate(
                                 target_gvk=target_gvk,
                                 pointer=pointer,
                                 dry=dry,
+                                environment_document=load_environment(source_root, environment_name),
+                                artifact_imports=artifact_imports,
                             )
                         ),
                     ),
@@ -5078,6 +5426,11 @@ def build_desired_candidate(
             promotions = fingerprints.promotions if fingerprints is not None else None
             receipts = fingerprints.receipts if fingerprints is not None else None
             artifacts = fingerprints.artifacts if fingerprints is not None else None
+            imported_artifacts = fingerprints.importedArtifacts if fingerprints is not None else None
+            if imported_artifacts:
+                owner = stack_projection.owners.get(unit_name)
+                if owner is not None:
+                    imported_artifact_fingerprints.setdefault(owner.name, {}).update(imported_artifacts)
             if promotions:
                 promotion_resolution = (
                     "new promotion changes resolved inputs"
@@ -5127,6 +5480,27 @@ def build_desired_candidate(
         if verbose:
             log_status("WAIT", f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}")
         blocked[unit_name] = unavailable[unit_name]
+
+    for stack_name, fingerprints in imported_artifact_fingerprints.items():
+        stack_path = next(
+            iter(document_candidates(candidate / "stacks", stack_name)),
+            None,
+        )
+        if stack_path is None:
+            continue
+        stack_resource = RESOURCE_CATALOG.parse_stack(
+            RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name=stack_name
+        )
+        if not isinstance(stack_resource.spec, DesiredStackSpec):
+            continue
+        stack_resource = replace(
+            stack_resource,
+            spec=replace(
+                stack_resource.spec,
+                resolvedArtifactImports=JsonObjectValue(dict(fingerprints)),
+            ),
+        )
+        _write_desired_stack_resource(stack_path, stack_resource, source_root)
 
     for unit_name, retained in retained_transitions.items():
         previous_path = unit_document_path(current_desired, unit_name)
@@ -5302,6 +5676,10 @@ def load_promotion_context(current_desired: Path, temporary: Path) -> PromotionC
         raise OperationError("promotion source observed revision changed unexpectedly")
     desired_root = temporary / "promotion-source"
     materialize_revision(desired_revision, desired_root)
+    observed_root = None
+    if observed_revision is not None:
+        observed_root = temporary / "promotion-observed"
+        materialize_revision(observed_revision, observed_root)
     return PromotionContext(
         source_environment=source_environment,
         desired_ref=desired_ref,
@@ -5310,6 +5688,7 @@ def load_promotion_context(current_desired: Path, temporary: Path) -> PromotionC
         observed_revision=observed_revision,
         specification_revision=specification_revision,
         desired_root=desired_root,
+        observed_root=observed_root,
     )
 
 
@@ -5819,6 +6198,7 @@ def command_promote(args: argparse.Namespace) -> None:
             observed_revision=source_observed_revision,
             specification_revision=specification_revision,
             desired_root=source_desired,
+            observed_root=source_observed,
         )
         build_desired_candidate(
             args.to_environment,
@@ -6649,14 +7029,22 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
             if (
                 provenance.requestIdentity == args.request_id
                 and provenance.templateRevision == source_revision
-                and existing.spec.template == args.template
+                and (
+                    existing.spec.template == args.template
+                    or (
+                        isinstance(existing.spec.template, StackTemplateReference)
+                        and existing.spec.template.name == args.template
+                    )
+                )
                 and existing.spec.parameters == parameters
             ):
                 return False
             raise OperationError(f"desired Stack {args.stack!r} already exists with a different instantiation request")
 
         materialize_revision(source_revision, source)
-        template_root = project_environment_root(source, args.environment) / "stack-templates"
+        template_root = source.joinpath(*load_project_config(source).stack_templates_path.parts)
+        if not template_root.is_dir():
+            template_root = project_environment_root(source, args.environment) / "stack-templates"
         template_paths = document_candidates(template_root, args.template)
         if len(template_paths) != 1:
             raise OperationError(f"expected exactly one StackTemplate document for {args.template!r}")
@@ -6721,9 +7109,17 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
             lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
         )
         direct_spec = DesiredStackSpec(
-            template=args.template,
+            template=StackTemplateReference(name=args.template),
             parameters=parameters,
             provenance=template_provenance,
+            resolvedSource=ResolvedStackTemplateSource(
+                fromGit=ResolvedGitSource(
+                    path=".",
+                    commit=source_revision,
+                    resourcePath=template_path.relative_to(source).as_posix(),
+                    digest=template_provenance.templateDigest,
+                )
+            ),
         )
         direct_stack = StackResource(GVK(CORE_API_VERSION, "Stack"), direct_metadata, direct_spec)
         stack_path = _current_desired_stack_paths(candidate, "Stack").get(args.stack)
@@ -6910,7 +7306,7 @@ def _stack_intent_for_resource(
             uid=stack.metadata.uid,
             blob=file_blob(stack_path),
         ),
-        retained_template=stack.spec.template,
+        retained_template=(stack.spec.template if isinstance(stack.spec.template, str) else stack.spec.template.name),
         retained_parameters=stack.spec.parameters,
         retained_provenance=stack.spec.provenance,
         owned_unit_closure=closure,
