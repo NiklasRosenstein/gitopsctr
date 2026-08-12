@@ -257,6 +257,28 @@ def _preview_ref_heads(environment: str) -> RefHeads:
     return RefHeads(desired, observed)
 
 
+def _print_preview_ref_histories() -> None:
+    """Print the final desired and observed histories for the preview acceptance."""
+
+    store = GitStateStore(PREVIEW_WORKTREE)
+    print("\nPreview acceptance ref history:")
+    for category in ("desired", "observed"):
+        for environment in ("dev", "staging", "preview"):
+            ref = f"gitopsctr/{category}/{environment}"
+            snapshot = store.fetch(ref)
+            if snapshot.revision is None:
+                raise RuntimeError(f"preview acceptance has no final ref {ref}")
+            history = store.git(
+                "log",
+                "--oneline",
+                "--reverse",
+                f"refs/remotes/origin/{ref}",
+            ).stdout.splitlines()
+            print(f"{ref} ({len(history)} advancements):")
+            for line in history:
+                print(f"  {line}")
+
+
 def _preview_desired_tree(environment: str, label: str) -> Path:
     store = GitStateStore(PREVIEW_WORKTREE)
     revision = store.fetch(f"gitopsctr/desired/{environment}").revision
@@ -599,6 +621,7 @@ def preview_acceptance(registry_port: int) -> None:
             raise RuntimeError("direct preview R2 did not produce a new image digest")
 
         _delete_direct_preview()
+        _print_preview_ref_histories()
         print("Preview acceptance passed: R1 promotion, R2 advancement, direct update, and cleanup verified.")
     finally:
         clean_preview_acceptance(registry)
