@@ -34,7 +34,6 @@ spec:
     deploy:
       apiVersion: unit.gitopsctr.io/v1
       kind: Terraform
-      dependsOn: [image]
       spec:
         source:
           path: infrastructure

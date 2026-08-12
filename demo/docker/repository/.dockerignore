@@ -1,5 +1,7 @@
 .git
 .terraform
 *.tfstate*
+__pycache__
+*.pyc
 deployment
 infrastructure

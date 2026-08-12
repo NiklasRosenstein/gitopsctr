@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -133,7 +134,7 @@ def write_preview_stacks(registry: str) -> None:
         "kind": "Stack",
         "metadata": {"name": "application"},
         "spec": {
-            "template": {"name": "application", "source": {"fromPromotion": {"stack": "application"}}},
+            "template": "application",
             "parameters": parameters("staging"),
             "units": ["deploy"],
             "artifactImports": [
@@ -232,11 +233,18 @@ def _run_controller_at(worktree: Path, *args: str, check: bool = True) -> subpro
         *args,
         cwd=worktree,
         capture=True,
-        check=check,
+        check=False,
     )
     output = result.stdout + result.stderr
     if output:
         print(output, end="" if output.endswith("\n") else "\n")
+    if check and result.returncode:
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            result.args,
+            output=result.stdout,
+            stderr=result.stderr,
+        )
     return result
 
 
@@ -333,11 +341,32 @@ def _preview_converge(environment: str, source_revision: str | None = None) -> N
     args = ["converge", "--environment", environment, "--yes"]
     if source_revision is not None:
         args.extend(("--source-revision", source_revision))
-    _run_controller_at(PREVIEW_WORKTREE, *args)
+    for _ in range(4):
+        result = _run_controller_at(PREVIEW_WORKTREE, *args, check=False)
+        if result.returncode == 0:
+            return
+        output = result.stdout + result.stderr
+        if "convergence stalled with no ready unit" not in output:
+            raise subprocess.CalledProcessError(
+                result.returncode, result.args, output=result.stdout, stderr=result.stderr
+            )
+    raise RuntimeError(f"preview {environment} did not converge after four passes")
 
 
 def _preview_source_revision() -> str:
     return run("git", "rev-parse", "HEAD", cwd=PREVIEW_WORKTREE, capture=True).stdout.strip()
+
+
+def _initialize_preview_desired(source_revision: str) -> None:
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        initial = Path(temporary_directory) / "desired"
+        controller.project_stack_resources(PREVIEW_WORKTREE, "preview", source_revision, initial, PREVIEW_WORKTREE)
+        GitStateStore(PREVIEW_WORKTREE).publish(
+            "gitopsctr/desired/preview",
+            initial,
+            None,
+            "Initialize direct preview desired state",
+        )
 
 
 def _advance_preview_version() -> str:
@@ -352,7 +381,7 @@ def _advance_preview_version() -> str:
     return _preview_source_revision()
 
 
-def _update_direct_preview(source_revision: str, request_id: str) -> None:
+def _update_direct_preview(source_revision: str, request_id: str, registry: str) -> None:
     desired_revision = GitStateStore(PREVIEW_WORKTREE).fetch("gitopsctr/desired/preview").revision
     if desired_revision is None:
         raise RuntimeError("direct preview has no desired head before update")
@@ -372,6 +401,7 @@ def _update_direct_preview(source_revision: str, request_id: str) -> None:
             "container-name": PREVIEW_APP_NAMES["preview"],
             "host-port": PREVIEW_PORTS["preview"],
             "terraform-state": PREVIEW_TERRAFORM_STATES["preview"].as_posix(),
+            "image-repository": f"{registry}/gitopsctr-preview/preview",
         },
         separators=(",", ":"),
     )
@@ -508,6 +538,7 @@ def preview_acceptance(registry_port: int) -> None:
         if staging_r1 != dev_r1:
             raise RuntimeError("staging did not import the exact dev R1 image artifact")
 
+        _initialize_preview_desired(r1)
         preview_parameters = json.dumps(
             {
                 "container-name": PREVIEW_APP_NAMES["preview"],
@@ -534,7 +565,7 @@ def preview_acceptance(registry_port: int) -> None:
             "demo:gitopsctr-preview#1",
         )
         _preview_converge("preview", r1)
-        _update_direct_preview(r1, "demo:gitopsctr-preview#resolve-r1")
+        _update_direct_preview(r1, "demo:gitopsctr-preview#resolve-r1", registry)
         _preview_converge("preview", r1)
         preview_r1 = _assert_deployed_version("preview", "R1", "r1-preview")
         if preview_r1 == dev_r1:
@@ -554,15 +585,14 @@ def preview_acceptance(registry_port: int) -> None:
         if _assert_deployed_version("staging", "R1", "stable-staging") != staging_r1:
             raise RuntimeError("staging changed during the dev-only R2 change")
 
-        _preview_converge("preview", r2)
         if _preview_ref_heads("preview") != preview_heads:
             raise RuntimeError("direct preview advanced before update-direct-stack")
         if _assert_deployed_version("preview", "R1", "stable-preview") != preview_r1:
             raise RuntimeError("direct preview changed during the dev-only R2 change")
 
-        _update_direct_preview(r2, "demo:gitopsctr-preview#update-r2")
+        _update_direct_preview(r2, "demo:gitopsctr-preview#update-r2", registry)
         _preview_converge("preview", r2)
-        _update_direct_preview(r2, "demo:gitopsctr-preview#resolve-r2")
+        _update_direct_preview(r2, "demo:gitopsctr-preview#resolve-r2", registry)
         _preview_converge("preview", r2)
         preview_r2 = _assert_deployed_version("preview", "R2", "r2-preview")
         if preview_r2 == preview_r1:

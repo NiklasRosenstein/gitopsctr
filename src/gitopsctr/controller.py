@@ -5609,6 +5609,7 @@ def build_desired_candidate(
                 )
             unresolved.remove(unit_name)
             unavailable.pop(unit_name, None)
+            blocked_transitions.pop(unit_name, None)
             progressed = True
         if not progressed:
             break
