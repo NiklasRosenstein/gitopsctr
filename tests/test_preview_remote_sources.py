@@ -80,7 +80,7 @@ def _remote_repository(tmp_path: Path, *, include_template: bool = True) -> tupl
                 "apiVersion": "gitopsctr.io/v1",
                 "kind": "Project",
                 "metadata": {"name": "remote"},
-                "spec": {},
+                "spec": {"effectLease": None},
             }
         )
     )

@@ -46,7 +46,7 @@ def _local_effect_lease(monkeypatch):
     monkeypatch.setattr(
         deploy_release,
         "rebase_effect_completion",
-        lambda _ref, acquisition, _unit_name, _uid, _root: acquisition,
+        lambda _ref, acquisition, _unit_name, _uid, _root, **_kwargs: acquisition,
     )
 
 
@@ -669,7 +669,7 @@ def test_planned_reconcile_applies_plan_source_policy(tmp_path, monkeypatch, cap
                     "apiVersion": "gitopsctr.io/v1",
                     "kind": "Project",
                     "metadata": {"name": "example"},
-                    "spec": project_spec,
+                    "spec": {**project_spec, "effectLease": None},
                 },
             )
             _write_json(output / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})

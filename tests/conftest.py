@@ -31,7 +31,7 @@ def write_test_document(path: Path, value: object) -> None:
                         "apiVersion": "gitopsctr.io/v1",
                         "kind": "Project",
                         "metadata": {"name": "test-project"},
-                        "spec": {},
+                        "spec": {"effectLease": None},
                     }
                 )
             )

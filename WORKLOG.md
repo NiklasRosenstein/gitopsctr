@@ -327,3 +327,13 @@ and final cleanup. Its command is `mise run demo-preview-acceptance`.
 
 The observed artifact receipt blob contract now accepts both the current Git blob ID and the historical SHA-256 form.
 This keeps older observed documents readable while matching the repository's Git-backed identity implementation.
+
+### 8.13 Project-configured effect lease stores — implemented
+
+`Project.spec.effectLease` is required. `null` and `store: null` disable leases. A shared branch store supports a
+fixed ref or an `{environment}` ref template. New projects default to `gitopsctr/leases`. Lease acquisition,
+renewal, release, recovery, promotion checks, finalization, rollback, and opaque-root recovery use the configured
+store. Lease history is separate from desired history when configured on another branch.
+
+The multi-environment acceptance test runs with the default branch-backed store and with leases disabled. The latter
+verifies that desired and observed history remains functional without lease commits.

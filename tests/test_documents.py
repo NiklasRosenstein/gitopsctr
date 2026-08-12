@@ -16,12 +16,18 @@ from gitopsctr.formats import DocumentFormat, DocumentFormatError, load_project_
 
 
 def project_document(*, name: str = "test-project", spec: str = "{}") -> str:
-    return f"""apiVersion: gitopsctr.io/v1
-kind: Project
-metadata:
-  name: {name}
-spec: {spec}
-"""
+    specification = yaml.safe_load(spec) or {}
+    if isinstance(specification, dict):
+        specification.setdefault("effectLease", None)
+    return yaml.safe_dump(
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Project",
+            "metadata": {"name": name},
+            "spec": specification,
+        },
+        sort_keys=False,
+    )
 
 
 def test_yaml_is_the_default_and_project_config_can_select_json(tmp_path: Path):
@@ -359,6 +365,7 @@ def test_migration_script_canonicalizes_legacy_desired_units_and_uses_configured
                     "candidate": "changes/{environment}/{id}",
                 }
             },
+            "effectLease": None,
         },
     }
     environment_root = tmp_path / "config/environments/dev"

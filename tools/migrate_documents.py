@@ -147,6 +147,7 @@ def write_project(tree: Path, project_name: str) -> None:
                         "candidate": "gitopsctr/candidates/{environment}/{id}",
                     }
                 },
+                "effectLease": None,
             },
         },
         format=DocumentFormat.YAML,

@@ -66,6 +66,25 @@ The acceptance tests cover all three Stack source variants, selected projection,
 desired state, and the complete dev/staging/direct-preview flow. They use temporary repositories and deterministic Unit
 drivers. The Docker/Terraform demo covers the same flow against real external effects.
 
+### Effect lease storage — implemented
+
+`Project.spec.effectLease` is required. `effectLease: null` and
+`effectLease.store: null` both disable effect leases. A branch-backed shared
+store is configured as follows:
+
+```yaml
+effectLease:
+  store:
+    branch:
+      ref: gitopsctr/leases
+      format: shared
+```
+
+The branch ref may contain `{environment}`. Lease commits then stay outside
+the desired ref. `gitopsctr create project` uses the shared
+`gitopsctr/leases` branch by default. The temporary-repository acceptance
+story runs once with this setting and once with leases disabled.
+
 Remaining implementation work:
 
 - Keep legacy desired-resource compatibility until every supported desired ref has been audited.

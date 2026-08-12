@@ -23,7 +23,11 @@ def project_document(
         "apiVersion": "gitopsctr.io/v1",
         "kind": "Project",
         "metadata": {"name": name},
-        "spec": {"writeFormat": write_format, "environmentsPath": environments_path},
+        "spec": {
+            "writeFormat": write_format,
+            "environmentsPath": environments_path,
+            "effectLease": None,
+        },
     }
 
 
@@ -78,6 +82,14 @@ def test_create_project_writes_a_valid_canonical_resource(tmp_path: Path, capsys
                     "desired": "gitopsctr/desired/{environment}",
                     "observed": "gitopsctr/observed/{environment}",
                     "candidate": "gitopsctr/candidates/{environment}/{id}",
+                }
+            },
+            "effectLease": {
+                "store": {
+                    "branch": {
+                        "ref": "gitopsctr/leases",
+                        "format": "shared",
+                    }
                 }
             },
         },
@@ -166,6 +178,31 @@ def test_project_source_revision_policy_defaults_and_parses(tmp_path: Path):
     assert policy.unavailable_when.value == "outside-candidate-history"
     assert policy.when_unavailable_during_advance.value == "refresh"
     assert policy.when_unavailable_during_plan.value == "refresh"
+
+
+def test_project_effect_lease_store_supports_disabled_and_branch_modes(tmp_path: Path):
+    document = project_document()
+    write_yaml(tmp_path / "gitopsctr.yaml", document)
+    assert controller.load_project_config(tmp_path).effect_lease_store is None
+
+    document["spec"]["effectLease"] = {"store": None}
+    write_yaml(tmp_path / "gitopsctr.yaml", document)
+    assert controller.load_project_config(tmp_path).effect_lease_store is None
+
+    document["spec"]["effectLease"] = {"store": {"branch": {"ref": "leases/{environment}", "format": "shared"}}}
+    write_yaml(tmp_path / "gitopsctr.yaml", document)
+    store = controller.load_project_config(tmp_path).effect_lease_store
+    assert store is not None
+    assert store.ref == "leases/{environment}"
+    assert store.format == "shared"
+
+
+def test_project_requires_effect_lease_policy(tmp_path: Path):
+    document = project_document()
+    del document["spec"]["effectLease"]
+    write_yaml(tmp_path / "gitopsctr.yaml", document)
+    with pytest.raises(controller.DocumentFormatError, match="effectLease"):
+        controller.load_project_config(tmp_path)
 
 
 def test_create_project_rejects_ambiguous_configuration_even_with_force(tmp_path: Path):

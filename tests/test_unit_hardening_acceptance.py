@@ -45,7 +45,7 @@ def _stub_effect_lease(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         controller,
         "rebase_effect_completion",
-        lambda _ref, acquisition, unit_name, uid, root: (
+        lambda _ref, acquisition, unit_name, uid, root, **_kwargs: (
             replace(
                 acquisition,
                 lease=replace(acquisition.lease, snapshot=controller.effect_lease_snapshot(root, unit_name, uid)),
@@ -159,7 +159,7 @@ def test_evidence_publication_crash_is_restart_safe_without_repeating_teardown(
     monkeypatch.setattr(
         controller,
         "rebase_effect_completion",
-        lambda _ref, acquisition, _unit_name, _uid, _root: acquisition,
+        lambda _ref, acquisition, _unit_name, _uid, _root, **_kwargs: acquisition,
     )
 
     class NoopHeartbeat:

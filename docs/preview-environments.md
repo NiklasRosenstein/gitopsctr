@@ -6,6 +6,22 @@ desired snapshot.
 
 ## Authored layout
 
+Projects must select effect-lease storage explicitly. Use `null` for no
+leases, or place leases on a separate shared branch:
+
+```yaml
+spec:
+  effectLease:
+    store:
+      branch:
+        ref: gitopsctr/leases
+        format: shared
+```
+
+`effectLease: null` and `effectLease.store: null` have the same meaning.
+The `gitopsctr create project` command writes the branch-backed form by
+default. A branch ref may contain `{environment}`.
+
 Authored resources live below the environment:
 
 ```text

@@ -198,7 +198,7 @@ def test_advance_desired_retains_direct_root_when_authored_source_is_absent(tmp_
             "apiVersion": "gitopsctr.io/v1",
             "kind": "Project",
             "metadata": {"name": "test-project"},
-            "spec": {},
+            "spec": {"effectLease": None},
         },
     )
     _write(

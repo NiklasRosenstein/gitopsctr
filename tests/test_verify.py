@@ -47,7 +47,7 @@ def _local_effect_lease(monkeypatch):
     monkeypatch.setattr(
         deploy_release,
         "rebase_effect_completion",
-        lambda _ref, acquisition, _unit_name, _uid, _root: acquisition,
+        lambda _ref, acquisition, _unit_name, _uid, _root, **_kwargs: acquisition,
     )
 
 

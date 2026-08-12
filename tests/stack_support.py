@@ -20,7 +20,7 @@ def project_repository(root: Path) -> Path:
                 "apiVersion": "gitopsctr.io/v1",
                 "kind": "Project",
                 "metadata": {"name": "test"},
-                "spec": {},
+                "spec": {"effectLease": None},
             }
         )
     )

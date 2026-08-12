@@ -40,7 +40,7 @@ def project(root: Path, write_format: str) -> None:
                 "apiVersion": "gitopsctr.io/v1",
                 "kind": "Project",
                 "metadata": {"name": "artifacts-test"},
-                "spec": {"writeFormat": write_format},
+                "spec": {"writeFormat": write_format, "effectLease": None},
             },
             sort_keys=False,
         )

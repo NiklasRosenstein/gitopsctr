@@ -39,7 +39,7 @@ def _write_project_and_environments(
         "apiVersion": "gitopsctr.io/v1",
         "kind": "Project",
         "metadata": {"name": "audit-test"},
-        "spec": {"environmentsPath": environments_path},
+        "spec": {"environmentsPath": environments_path, "effectLease": None},
     }
     (root / "gitopsctr.yaml").write_text(json.dumps(project))
     for name, desired_ref in environments.items():
@@ -204,6 +204,7 @@ def test_aggregate_compatibility_audit_uses_custom_project_and_environment_refs(
                 "spec": {
                     "environmentsPath": "config/environments",
                     "environmentDefaults": {"refs": {"desired": "release/{environment}"}},
+                    "effectLease": None,
                 },
             }
         )

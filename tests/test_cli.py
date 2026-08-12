@@ -2450,7 +2450,8 @@ def test_environment_refs_use_project_defaults_and_allow_environment_and_cli_ove
                         "desired": "deployments/{environment}",
                         "observed": "observations/{environment}",
                     }
-                }
+                },
+                "effectLease": None,
             },
         },
     )
@@ -2497,7 +2498,8 @@ def test_environment_refs_must_differ_after_project_template_expansion(tmp_path)
                         "desired": "state/{environment}",
                         "observed": "state/{environment}",
                     }
-                }
+                },
+                "effectLease": None,
             },
         },
     )
@@ -2521,7 +2523,10 @@ def test_candidate_ref_templates_use_project_and_environment_configuration(tmp_p
             "apiVersion": "gitopsctr.io/v1",
             "kind": "Project",
             "metadata": {"name": "test-project"},
-            "spec": {"environmentDefaults": {"refs": {"candidate": "changes/{environment}/{operation}/{id}"}}},
+            "spec": {
+                "environmentDefaults": {"refs": {"candidate": "changes/{environment}/{operation}/{id}"}},
+                "effectLease": None,
+            },
         },
     )
     assert deploy_release.resolve_candidate_ref(tmp_path, "staging", "rollback", "def456") == (

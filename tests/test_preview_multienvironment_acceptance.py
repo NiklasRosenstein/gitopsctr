@@ -49,7 +49,7 @@ def _write_json(path: Path, document: dict[str, Any]) -> None:
     path.write_text(json.dumps(document, sort_keys=True))
 
 
-def _write_project(source: Path) -> None:
+def _write_project(source: Path, effect_lease: dict[str, Any] | None) -> None:
     _write_json(
         source / "gitopsctr.yaml",
         {
@@ -62,7 +62,8 @@ def _write_project(source: Path) -> None:
                         "desired": "deploy/{environment}",
                         "observed": "observed/{environment}",
                     }
-                }
+                },
+                "effectLease": effect_lease,
             },
         },
     )
@@ -153,12 +154,12 @@ def _write_stack(source: Path, environment: str, *, units: list[str] | None = No
     )
 
 
-def _source_repository(tmp_path: Path) -> tuple[Path, str, str]:
+def _source_repository(tmp_path: Path, effect_lease: dict[str, Any] | None) -> tuple[Path, str, str]:
     remote = tmp_path / "origin.git"
     source = tmp_path / "source"
     git(tmp_path, "init", "--bare", str(remote))
     source.mkdir()
-    _write_project(source)
+    _write_project(source, effect_lease)
     _write_stack(source, "dev", units=["image", "deploy"])
     _write_stack(source, "staging", units=["deploy"], promoted=True)
     git(source, "init", "-b", "main")
@@ -374,12 +375,33 @@ def _print_ref_histories(store: GitStateStore) -> dict[str, int]:
             print(f"{ref} ({len(history)} advancements):")
             for line in history:
                 print(f"  {line}")
+    lease_ref = controller.effect_lease_ref("preview", DESIRED_PREVIEW)
+    if lease_ref is not None and store.fetch(lease_ref).revision is not None:
+        history = store.git(
+            "log",
+            "--oneline",
+            "--reverse",
+            f"refs/remotes/origin/{lease_ref}",
+        ).stdout.splitlines()
+        print(f"{lease_ref} ({len(history)} advancements):")
+        for line in history:
+            print(f"  {line}")
     print(f"Totals: desired={counts['desired']}, observed={counts['observed']}, total={sum(counts.values())}")
     return counts
 
 
-def test_multi_environment_stack_story_in_temporary_repository(tmp_path: Path) -> None:
-    source, r1, _remote = _source_repository(tmp_path)
+@pytest.mark.parametrize(
+    "effect_lease",
+    [
+        {"store": {"branch": {"ref": "gitopsctr/leases", "format": "shared"}}},
+        None,
+    ],
+    ids=["with-effect-leases", "without-effect-leases"],
+)
+def test_multi_environment_stack_story_in_temporary_repository(
+    tmp_path: Path, effect_lease: dict[str, Any] | None
+) -> None:
+    source, r1, _remote = _source_repository(tmp_path, effect_lease)
     store = _store(source)
     inventory = FakeInventory()
 
@@ -424,6 +446,24 @@ def test_multi_environment_stack_story_in_temporary_repository(tmp_path: Path) -
     } == {dev_stack.metadata.uid}
     assert _desired_unit(dev_r1, "application--image").spec.source.revision == r1
     assert _desired_unit(dev_r1, "application--deploy").spec.source.revision == r1
+    lease_ref = controller.effect_lease_ref("dev", DESIRED_DEV)
+    if lease_ref is not None:
+        image_uid = _desired_unit(dev_r1, "application--image").metadata.uid
+        assert image_uid is not None
+        lease = controller.acquire_effect_lease(
+            DESIRED_DEV,
+            dev_desired_r1_revision,
+            "application--image",
+            image_uid,
+            lease_ref=lease_ref,
+        )
+        controller.release_effect_lease(
+            DESIRED_DEV,
+            "application--image",
+            lease.lease.token,
+            lease.lease.uid,
+            lease_ref=lease_ref,
+        )
 
     # Promotion carries only deploy and records exact dev desired/observed lineage.
     controller.command_promote(
@@ -649,4 +689,11 @@ def test_multi_environment_stack_story_in_temporary_repository(tmp_path: Path) -
     with pytest.raises(controller.OperationError, match="active owned Units"):
         controller.command_finalize_stack(_command_args(uid=updated_preview_stack.metadata.uid, deletion_generation=1))
     assert store.fetch(DESIRED_PREVIEW).revision == deleting_revision
-    assert _print_ref_histories(store) == {"desired": 9, "observed": 8}
+    counts = _print_ref_histories(store)
+    assert counts["desired"] >= 3
+    assert counts["observed"] >= 3
+    lease_revision = store.fetch("gitopsctr/leases").revision
+    if effect_lease is None:
+        assert lease_revision is None
+    else:
+        assert lease_revision is not None

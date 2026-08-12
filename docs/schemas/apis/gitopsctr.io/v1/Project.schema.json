@@ -30,6 +30,56 @@
     "spec": {
       "additionalProperties": false,
       "properties": {
+        "effectLease": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "store": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "branch": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "format": {
+                              "const": "shared"
+                            },
+                            "ref": {
+                              "minLength": 1,
+                              "pattern": "^(?:[^{}]|\\{environment\\}|\\{unit\\})+$",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "ref",
+                            "format"
+                          ],
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "branch"
+                      ],
+                      "type": "object"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "store"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "environmentDefaults": {
           "additionalProperties": false,
           "properties": {
@@ -113,6 +163,9 @@
           ]
         }
       },
+      "required": [
+        "effectLease"
+      ],
       "type": "object"
     }
   },

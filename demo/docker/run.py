@@ -277,6 +277,20 @@ def _print_preview_ref_histories() -> None:
             print(f"{ref} ({len(history)} advancements):")
             for line in history:
                 print(f"  {line}")
+    lease_store = controller.load_project_config(PREVIEW_WORKTREE).effect_lease_store
+    if lease_store is not None:
+        lease_ref = lease_store.ref.replace("{environment}", "preview").removeprefix("refs/heads/")
+        snapshot = store.fetch(lease_ref)
+        if snapshot.revision is not None:
+            history = store.git(
+                "log",
+                "--oneline",
+                "--reverse",
+                f"refs/remotes/origin/{lease_ref}",
+            ).stdout.splitlines()
+            print(f"{lease_ref} ({len(history)} advancements):")
+            for line in history:
+                print(f"  {line}")
 
 
 def _preview_desired_tree(environment: str, label: str) -> Path:

@@ -46,7 +46,7 @@ def _local_effect_lease(monkeypatch):
     monkeypatch.setattr(
         deploy_release,
         "rebase_effect_completion",
-        lambda _ref, acquisition, unit_name, uid, root: (
+        lambda _ref, acquisition, unit_name, uid, root, **_kwargs: (
             replace(
                 acquisition,
                 lease=replace(
@@ -635,7 +635,7 @@ def test_finalize_releases_lease_when_local_lease_materialization_fails(tmp_path
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OperationError("local lease write failed")),
     )
     monkeypatch.setattr(
-        deploy_release, "release_pre_effect_lease", lambda _ref, acquisition: released.append(acquisition)
+        deploy_release, "release_pre_effect_lease", lambda _ref, acquisition, **_kwargs: released.append(acquisition)
     )
 
     with pytest.raises(OperationError, match="local lease write failed"):
@@ -667,7 +667,7 @@ def test_finalize_releases_lease_when_heartbeat_startup_fails(tmp_path, monkeypa
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OperationError("heartbeat unavailable")),
     )
     monkeypatch.setattr(
-        deploy_release, "release_pre_effect_lease", lambda _ref, acquisition: released.append(acquisition)
+        deploy_release, "release_pre_effect_lease", lambda _ref, acquisition, **_kwargs: released.append(acquisition)
     )
 
     with pytest.raises(OperationError, match="heartbeat unavailable"):

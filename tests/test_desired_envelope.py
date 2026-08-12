@@ -225,7 +225,7 @@ def test_build_candidate_retains_uid_and_source_absent_cleanup_inputs(tmp_path: 
                 "apiVersion": "gitopsctr.io/v1",
                 "kind": "Project",
                 "metadata": {"name": "test"},
-                "spec": {},
+                "spec": {"effectLease": None},
             }
         )
     )
@@ -301,7 +301,7 @@ def test_direct_same_name_resource_is_not_adopted(tmp_path: Path, monkeypatch: p
                 "apiVersion": "gitopsctr.io/v1",
                 "kind": "Project",
                 "metadata": {"name": "test"},
-                "spec": {},
+                "spec": {"effectLease": None},
             }
         )
     )

@@ -1792,6 +1792,33 @@ def deployment_refs(
     return desired_ref, observed_ref
 
 
+def effect_lease_ref(environment: str, desired_ref: str) -> str | None:
+    """Resolve the configured lease store for one environment.
+
+    ``None`` disables leases. Low-level lease helpers keep their historical
+    co-located behavior when called without this resolved value.
+    """
+
+    try:
+        store = load_project_config(REPOSITORY_ROOT).effect_lease_store
+    except DocumentFormatError:
+        # Unit-level callers can exercise the lease primitives without a full
+        # repository. Real controller entry points validate Project first.
+        return desired_ref
+    if store is None:
+        return None
+    if store.format != "shared":
+        raise OperationError(f"unsupported effect lease store format: {store.format!r}")
+    ref = store.ref.replace("{environment}", environment)
+    if "{unit}" in ref:
+        raise OperationError("effect lease store refs with {unit} are not supported yet")
+    if ref.startswith("refs/heads/"):
+        ref = ref.removeprefix("refs/heads/")
+    if not ref:
+        raise OperationError("effect lease store branch ref must not be empty")
+    return ref
+
+
 def candidate_ref_template(source_root: Path, environment_name: str) -> str:
     environment = load_environment(source_root, environment_name)
     configured = environment.get("refs", {})
@@ -3476,11 +3503,38 @@ class EffectLeaseAcquisition:
     revision: str
 
 
+def _effect_lease_store_root(
+    desired_ref: str,
+    desired_revision: str,
+    desired_root: Path,
+    lease_ref: str | None,
+    output: Path,
+) -> tuple[Path, str | None]:
+    """Materialize the lease store and return its root and current revision."""
+
+    if lease_ref is None or lease_ref == desired_ref:
+        return desired_root, desired_revision
+    lease_revision = fetch_ref(lease_ref)
+    if lease_revision is None:
+        output.mkdir(parents=True, exist_ok=True)
+    else:
+        materialize_revision(lease_revision, output)
+    marker = output / ".gitopsctr/effect-leases/.store"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("shared\n")
+    return output, lease_revision
+
+
+def _effect_lease_publish_ref(desired_ref: str, lease_ref: str | None) -> str:
+    return desired_ref if lease_ref is None else lease_ref
+
+
 def renew_effect_lease(
     desired_ref: str,
     acquisition: EffectLeaseAcquisition,
     *,
     ttl_seconds: int = EFFECT_LEASE_TTL_SECONDS,
+    lease_ref: str | None = None,
 ) -> EffectLeaseAcquisition:
     """Renew one lease against the latest head while fencing the same Unit snapshot."""
 
@@ -3495,7 +3549,14 @@ def renew_effect_lease(
         with tempfile.TemporaryDirectory() as temporary_directory:
             current = Path(temporary_directory) / "desired"
             materialize_revision(current_revision, current)
-            existing = load_desired_effect_leases(current).get(acquisition.lease.unit_name)
+            lease_root, lease_revision = _effect_lease_store_root(
+                desired_ref,
+                current_revision,
+                current,
+                lease_ref,
+                Path(temporary_directory) / "leases",
+            )
+            existing = load_desired_effect_leases(lease_root).get(acquisition.lease.unit_name)
             if (
                 existing is None
                 or existing.token != acquisition.lease.token
@@ -3513,27 +3574,37 @@ def renew_effect_lease(
                 desired_revision=current_revision,
                 expires_at=None,
             )
-            write_effect_lease(current, renewed)
+            write_effect_lease(lease_root, renewed)
             try:
                 published_revision = publish_tree(
-                    desired_ref,
-                    current,
-                    current_revision,
+                    _effect_lease_publish_ref(desired_ref, lease_ref),
+                    lease_root,
+                    lease_revision,
                     f"Renew effect lease for {renewed.unit_name} ({renewed.token})",
                 )
             except subprocess.CalledProcessError as exc:
                 if attempt == 4 or not retryable_push_failure(exc):
                     raise
                 continue
-            return EffectLeaseAcquisition(lease=renewed, revision=published_revision)
+            return EffectLeaseAcquisition(
+                lease=renewed,
+                revision=published_revision if lease_ref is None else current_revision,
+            )
     raise EffectLeaseUnavailable(f"could not renew the effect lease for {acquisition.lease.unit_name!r}; retry")
 
 
 class EffectLeaseHeartbeat:
     """Renew a desired-state lease while a driver effect is in progress."""
 
-    def __init__(self, desired_ref: str, acquisition: EffectLeaseAcquisition, interval_seconds: float):
+    def __init__(
+        self,
+        desired_ref: str,
+        acquisition: EffectLeaseAcquisition,
+        interval_seconds: float,
+        lease_ref: str | None = None,
+    ):
         self._desired_ref = desired_ref
+        self._lease_ref = lease_ref
         self._latest = acquisition
         self._interval_seconds = interval_seconds
         self._stop = threading.Event()
@@ -3549,7 +3620,14 @@ class EffectLeaseHeartbeat:
         while not self._stop.wait(self._interval_seconds):
             try:
                 with self._lock:
-                    self._latest = renew_effect_lease(self._desired_ref, self._latest)
+                    if self._lease_ref is None:
+                        self._latest = renew_effect_lease(self._desired_ref, self._latest)
+                    else:
+                        self._latest = renew_effect_lease(
+                            self._desired_ref,
+                            self._latest,
+                            lease_ref=self._lease_ref,
+                        )
             except Exception as exc:
                 self._error = exc
                 self._stop.set()
@@ -3571,9 +3649,10 @@ def start_effect_lease_heartbeat(
     acquisition: EffectLeaseAcquisition,
     *,
     interval_seconds: float | None = None,
+    lease_ref: str | None = None,
 ) -> EffectLeaseHeartbeat:
     interval = interval_seconds if interval_seconds is not None else min(30.0, EFFECT_LEASE_TTL_SECONDS / 3)
-    return EffectLeaseHeartbeat(desired_ref, acquisition, max(0.01, interval)).start()
+    return EffectLeaseHeartbeat(desired_ref, acquisition, max(0.01, interval), lease_ref).start()
 
 
 @dataclass(frozen=True)
@@ -4130,6 +4209,7 @@ def acquire_effect_lease(
     ttl_seconds: int = EFFECT_LEASE_TTL_SECONDS,
     precondition: Callable[[Path], None] | None = None,
     resume_existing: bool = False,
+    lease_ref: str | None = None,
 ) -> EffectLeaseAcquisition:
     if ttl_seconds < 1:
         raise OperationError("effect lease TTL must be positive")
@@ -4141,6 +4221,13 @@ def acquire_effect_lease(
         with tempfile.TemporaryDirectory() as temporary_directory:
             current = Path(temporary_directory) / "desired"
             materialize_revision(current_revision, current)
+            lease_root, lease_revision = _effect_lease_store_root(
+                desired_ref,
+                current_revision,
+                current,
+                lease_ref,
+                Path(temporary_directory) / "leases",
+            )
             if expected_snapshot is None:
                 if current_revision == desired_revision:
                     expected_snapshot = effect_lease_snapshot(current, unit_name, uid)
@@ -4153,7 +4240,7 @@ def acquire_effect_lease(
                 raise EffectLeaseUnavailable(
                     f"desired Unit {unit_name!r} changed before acquiring its effect lease; retry"
                 )
-            leases = load_desired_effect_leases(current)
+            leases = load_desired_effect_leases(lease_root)
             existing = leases.get(unit_name)
             if existing is not None:
                 if resume_existing:
@@ -4183,19 +4270,22 @@ def acquire_effect_lease(
             )
             if precondition is not None:
                 precondition(current)
-            write_effect_lease(current, lease)
+            write_effect_lease(lease_root, lease)
             try:
                 published_revision = publish_tree(
-                    desired_ref,
-                    current,
-                    current_revision,
+                    _effect_lease_publish_ref(desired_ref, lease_ref),
+                    lease_root,
+                    lease_revision,
                     f"Acquire effect lease for {unit_name} ({lease.token})",
                 )
             except subprocess.CalledProcessError as exc:
                 if attempt == 4 or not retryable_push_failure(exc):
                     raise
                 continue
-            return EffectLeaseAcquisition(lease=lease, revision=published_revision)
+            return EffectLeaseAcquisition(
+                lease=lease,
+                revision=published_revision if lease_ref is None else current_revision,
+            )
     raise EffectLeaseUnavailable(f"could not acquire the effect lease for {unit_name!r}; retry")
 
 
@@ -4206,6 +4296,7 @@ def release_effect_lease(
     uid: str | None = None,
     *,
     verify_snapshot: bool = True,
+    lease_ref: str | None = None,
 ) -> str | None:
     for attempt in range(5):
         current_revision = fetch_ref(desired_ref)
@@ -4214,7 +4305,14 @@ def release_effect_lease(
         with tempfile.TemporaryDirectory() as temporary_directory:
             current = Path(temporary_directory) / "desired"
             materialize_revision(current_revision, current)
-            leases = load_desired_effect_leases(current)
+            lease_root, lease_revision = _effect_lease_store_root(
+                desired_ref,
+                current_revision,
+                current,
+                lease_ref,
+                Path(temporary_directory) / "leases",
+            )
+            leases = load_desired_effect_leases(lease_root)
             existing = leases.get(unit_name)
             if existing is None:
                 return current_revision
@@ -4225,12 +4323,12 @@ def release_effect_lease(
                 or effect_lease_snapshot(current, unit_name, existing.uid) != existing.snapshot
             ):
                 raise EffectLeaseUnavailable(f"effect lease for {unit_name!r} no longer fences the same Unit snapshot")
-            remove_effect_lease(current, unit_name)
+            remove_effect_lease(lease_root, unit_name)
             try:
                 return publish_tree(
-                    desired_ref,
-                    current,
-                    current_revision,
+                    _effect_lease_publish_ref(desired_ref, lease_ref),
+                    lease_root,
+                    lease_revision,
                     f"Release effect lease for {unit_name}",
                 )
             except subprocess.CalledProcessError as exc:
@@ -4239,7 +4337,12 @@ def release_effect_lease(
     raise OperationError(f"could not release the effect lease for {unit_name!r}; explicit recovery remains available")
 
 
-def release_pre_effect_lease(desired_ref: str, acquisition: EffectLeaseAcquisition) -> None:
+def release_pre_effect_lease(
+    desired_ref: str,
+    acquisition: EffectLeaseAcquisition,
+    *,
+    lease_ref: str | None = None,
+) -> None:
     """Release a lease before driver invocation, when no external effect can be uncertain."""
 
     release_effect_lease(
@@ -4248,10 +4351,18 @@ def release_pre_effect_lease(desired_ref: str, acquisition: EffectLeaseAcquisiti
         acquisition.lease.token,
         acquisition.lease.uid,
         verify_snapshot=False,
+        lease_ref=lease_ref,
     )
 
 
-def recover_effect_lease(desired_ref: str, unit_name: str, uid: str, token: str) -> str | None:
+def recover_effect_lease(
+    desired_ref: str,
+    unit_name: str,
+    uid: str,
+    token: str,
+    *,
+    lease_ref: str | None = None,
+) -> str | None:
     """Explicitly clear an abandoned lease after the external effect is verified stopped."""
 
     for attempt in range(5):
@@ -4261,19 +4372,26 @@ def recover_effect_lease(desired_ref: str, unit_name: str, uid: str, token: str)
         with tempfile.TemporaryDirectory() as temporary_directory:
             current = Path(temporary_directory) / "desired"
             materialize_revision(current_revision, current)
-            existing = load_desired_effect_leases(current).get(unit_name)
+            lease_root, lease_revision = _effect_lease_store_root(
+                desired_ref,
+                current_revision,
+                current,
+                lease_ref,
+                Path(temporary_directory) / "leases",
+            )
+            existing = load_desired_effect_leases(lease_root).get(unit_name)
             if existing is None:
                 return current_revision
             if existing.uid != uid or existing.token != token:
                 raise EffectLeaseUnavailable(
                     f"effect lease recovery fence did not match the current {unit_name!r} lease"
                 )
-            remove_effect_lease(current, unit_name)
+            remove_effect_lease(lease_root, unit_name)
             try:
                 return publish_tree(
-                    desired_ref,
-                    current,
-                    current_revision,
+                    _effect_lease_publish_ref(desired_ref, lease_ref),
+                    lease_root,
+                    lease_revision,
                     f"Recover abandoned effect lease for {unit_name}",
                 )
             except subprocess.CalledProcessError as exc:
@@ -4288,6 +4406,8 @@ def rebase_effect_completion(
     unit_name: str,
     uid: str,
     current_root: Path,
+    *,
+    lease_ref: str | None = None,
 ) -> EffectLeaseAcquisition:
     """Refresh local desired state after an effect while preserving its Unit fence."""
 
@@ -4295,29 +4415,49 @@ def rebase_effect_completion(
         raise EffectLeaseUnavailable(
             f"effect lease for {unit_name!r} lacks an immutable completion snapshot; retry or recover explicitly"
         )
-    latest_revision = fetch_ref(desired_ref)
-    if latest_revision is None:
-        raise EffectLeaseUnavailable(f"desired ref disappeared before completing {unit_name!r}")
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        latest = Path(temporary_directory) / "desired"
-        materialize_revision(latest_revision, latest)
-        existing = load_desired_effect_leases(latest).get(unit_name)
-        if (
-            existing is None
-            or existing.token != acquisition.lease.token
-            or existing.uid != uid
-            or existing.snapshot != acquisition.lease.snapshot
-            or effect_lease_snapshot(latest, unit_name, uid) != acquisition.lease.snapshot
-        ):
-            raise EffectLeaseUnavailable(
-                f"desired Unit {unit_name!r} changed during effect completion; result was not published"
+    for attempt in range(5):
+        latest_revision = fetch_ref(desired_ref)
+        if latest_revision is None:
+            raise EffectLeaseUnavailable(f"desired ref disappeared before completing {unit_name!r}")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            latest = Path(temporary_directory) / "desired"
+            materialize_revision(latest_revision, latest)
+            lease_root, lease_revision = _effect_lease_store_root(
+                desired_ref,
+                latest_revision,
+                latest,
+                lease_ref,
+                Path(temporary_directory) / "leases",
             )
-        shutil.rmtree(current_root)
-        shutil.copytree(latest, current_root)
-        return EffectLeaseAcquisition(
-            lease=replace(existing, desired_revision=latest_revision),
-            revision=latest_revision,
-        )
+            existing = load_desired_effect_leases(lease_root).get(unit_name)
+            if (
+                existing is None
+                or existing.token != acquisition.lease.token
+                or existing.uid != uid
+                or existing.snapshot != acquisition.lease.snapshot
+                or effect_lease_snapshot(latest, unit_name, uid) != acquisition.lease.snapshot
+            ):
+                raise EffectLeaseUnavailable(
+                    f"desired Unit {unit_name!r} changed during effect completion; result was not published"
+                )
+            rebased = replace(existing, desired_revision=latest_revision)
+            if lease_ref is not None and lease_ref != desired_ref and existing.desired_revision != latest_revision:
+                write_effect_lease(lease_root, rebased)
+                try:
+                    publish_tree(
+                        lease_ref,
+                        lease_root,
+                        lease_revision,
+                        f"Rebase effect lease for {unit_name} ({rebased.token})",
+                    )
+                except subprocess.CalledProcessError as exc:
+                    if attempt == 4 or not retryable_push_failure(exc):
+                        raise
+                    continue
+            shutil.rmtree(current_root)
+            shutil.copytree(latest, current_root)
+            return EffectLeaseAcquisition(lease=rebased, revision=latest_revision)
+    raise EffectLeaseUnavailable(f"could not rebase the effect lease for {unit_name!r}; retry")
 
 
 def validate_effect_lease_head(
@@ -4326,6 +4466,8 @@ def validate_effect_lease_head(
     uid: str,
     token: str,
     snapshot: EffectLeaseSnapshot | None,
+    *,
+    lease_ref: str | None = None,
 ) -> str:
     """Validate one Unit fence at the latest desired head without fencing unrelated Units."""
 
@@ -4337,7 +4479,14 @@ def validate_effect_lease_head(
     with tempfile.TemporaryDirectory() as temporary_directory:
         latest = Path(temporary_directory) / "desired"
         materialize_revision(latest_revision, latest)
-        existing = load_desired_effect_leases(latest).get(unit_name)
+        lease_root, _lease_revision = _effect_lease_store_root(
+            desired_ref,
+            latest_revision,
+            latest,
+            lease_ref,
+            Path(temporary_directory) / "leases",
+        )
+        existing = load_desired_effect_leases(lease_root).get(unit_name)
         if (
             existing is None
             or existing.token != token
@@ -4347,6 +4496,26 @@ def validate_effect_lease_head(
         ):
             raise EffectLeaseUnavailable(f"desired Unit {unit_name!r} changed before completion publication")
     return latest_revision
+
+
+def validate_effect_lease_head_for_store(
+    desired_ref: str,
+    unit_name: str,
+    uid: str,
+    token: str,
+    snapshot: EffectLeaseSnapshot | None,
+    lease_ref: str | None,
+) -> str:
+    if lease_ref is None:
+        return validate_effect_lease_head(desired_ref, unit_name, uid, token, snapshot)
+    return validate_effect_lease_head(
+        desired_ref,
+        unit_name,
+        uid,
+        token,
+        snapshot,
+        lease_ref=lease_ref,
+    )
 
 
 def load_desired_deletion_intents(root: Path) -> dict[str, UnitDeletionIntent]:
@@ -4522,6 +4691,7 @@ def publish_teardown_observation_cas(
     desired_revision: str,
     *,
     desired_ref: str | None = None,
+    lease_ref: str | None = None,
     lease_token: str | None = None,
     lease_snapshot: EffectLeaseSnapshot | None = None,
     details: Mapping[str, object] | None = None,
@@ -4533,12 +4703,13 @@ def publish_teardown_observation_cas(
             observed = Path(temporary_directory) / "observed"
             observed_revision = observed_tree(observed_ref, observed)
             if desired_ref is not None and lease_token is not None:
-                desired_revision = validate_effect_lease_head(
+                desired_revision = validate_effect_lease_head_for_store(
                     desired_ref,
                     intent.unit_name,
                     intent.uid,
                     lease_token,
                     lease_snapshot,
+                    lease_ref=lease_ref,
                 )
             existing = load_teardown_evidence(
                 observed,
@@ -4589,12 +4760,13 @@ def publish_teardown_observation_cas(
                 / teardown_evidence_filename(intent.unit_name, intent.uid, intent.deletion_generation)
             )
             if desired_ref is not None and lease_token is not None:
-                latest_revision = validate_effect_lease_head(
+                latest_revision = validate_effect_lease_head_for_store(
                     desired_ref,
                     intent.unit_name,
                     intent.uid,
                     lease_token,
                     lease_snapshot,
+                    lease_ref=lease_ref,
                 )
                 if latest_revision != desired_revision:
                     desired_revision = latest_revision
@@ -4862,6 +5034,7 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
         args.desired_ref,
         None,
     )
+    lease_ref = effect_lease_ref(args.environment, desired_ref)
     with unit_effect_lock(args.environment, args.unit):
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary = Path(temporary_directory)
@@ -4872,6 +5045,15 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
             current_revision = observed_tree(desired_ref, current)
             if current_revision is None:
                 raise OperationError(f"desired ref {desired_ref!r} has no state to recover")
+            lease_root = current
+            if lease_ref != desired_ref:
+                lease_root, _lease_revision = _effect_lease_store_root(
+                    desired_ref,
+                    current_revision,
+                    current,
+                    lease_ref,
+                    temporary / "leases",
+                )
 
             opaque = load_desired_cleanup_roots(current).get(args.unit)
             if opaque is None:
@@ -4907,7 +5089,7 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
                 intent = replace(intent, deletion_generation=2)
             if any(
                 effect_lease_active(lease)
-                for lease in load_desired_effect_leases(current).values()
+                for lease in load_desired_effect_leases(lease_root).values()
                 if lease.unit_name == args.unit
             ):
                 raise OperationError(f"active effect lease blocks opaque recovery for {args.unit!r}")
@@ -5061,6 +5243,16 @@ def command_resolve_opaque_unit(args: argparse.Namespace) -> bool:
         current_revision = observed_tree(desired_ref, current)
         if current_revision is None:
             raise OperationError(f"desired ref {desired_ref!r} has no state")
+        lease_ref = effect_lease_ref(args.environment, desired_ref)
+        lease_root = current
+        if lease_ref != desired_ref:
+            lease_root, _lease_revision = _effect_lease_store_root(
+                desired_ref,
+                current_revision,
+                current,
+                lease_ref,
+                temporary / "leases",
+            )
 
         opaque = load_desired_cleanup_roots(current).get(args.unit)
         if opaque is None:
@@ -5073,7 +5265,7 @@ def command_resolve_opaque_unit(args: argparse.Namespace) -> bool:
             raise OperationError(
                 f"opaque cleanup root for {args.unit!r} has a deletion intent; restore the Unit before resolving it"
             )
-        lease = load_desired_effect_leases(current).get(args.unit)
+        lease = load_desired_effect_leases(lease_root).get(args.unit)
         if lease is not None and effect_lease_active(lease):
             raise OperationError(f"active effect lease blocks opaque resolution for {args.unit!r}")
         if isinstance(opaque.payload, dict):
@@ -6000,6 +6192,8 @@ def advance_desired(
             probe_root = Path(probe_directory) / "source"
             materialize_revision(requested_source_revision, probe_root)
             desired_ref, observed_ref = deployment_refs(probe_root, environment, desired_ref, observed_ref)
+    configured_lease_ref = effect_lease_ref(environment, desired_ref)
+    lease_ref = configured_lease_ref if configured_lease_ref != desired_ref else desired_ref
     if verbose:
         log_status("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
     for attempt in range(5):
@@ -6012,11 +6206,22 @@ def advance_desired(
             candidate = temporary / "candidate"
             current_revision = observed_tree(desired_ref, current_desired)
             if current_revision is not None:
+                lease_root = current_desired
+                lease_temporary_directory = None
+                if lease_ref != desired_ref:
+                    lease_temporary_directory = tempfile.TemporaryDirectory()
+                    lease_root, lease_revision = _effect_lease_store_root(
+                        desired_ref,
+                        current_revision,
+                        current_desired,
+                        lease_ref,
+                        Path(lease_temporary_directory.name) / "leases",
+                    )
                 active_leases = [
-                    lease
-                    for lease in load_desired_effect_leases(current_desired).values()
-                    if effect_lease_active(lease)
+                    lease for lease in load_desired_effect_leases(lease_root).values() if effect_lease_active(lease)
                 ]
+                if lease_temporary_directory is not None:
+                    lease_temporary_directory.cleanup()
                 if active_leases:
                     if verbose:
                         log_status(
@@ -6068,6 +6273,13 @@ def advance_desired(
                 dry=dry,
                 verbose=verbose,
                 source_revision_operation="advance",
+            )
+            validate_effect_leases_preserved(
+                desired_ref,
+                current_revision,
+                candidate,
+                current_desired,
+                lease_ref=lease_ref,
             )
             if candidate_result is not None:
                 for unit_name, reason in sorted(candidate_result.blocked_transitions.items()):
@@ -6131,12 +6343,14 @@ def validate_effect_leases_preserved(
     candidate: Path,
     current_root: Path | None = None,
     allow_removed_units: frozenset[str] = frozenset(),
+    lease_ref: str | None = None,
 ) -> None:
     """Prevent a desired-ref mutation from dropping an in-flight effect fence."""
 
     if target_revision is None:
         return
     temporary_directory = None
+    lease_temporary_directory = None
     if current_root is None:
         temporary_directory = tempfile.TemporaryDirectory()
         current = Path(temporary_directory.name) / "current"
@@ -6144,12 +6358,22 @@ def validate_effect_leases_preserved(
     else:
         current = current_root
     try:
+        lease_root = current
+        if lease_ref is not None and lease_ref != target_ref:
+            lease_temporary_directory = tempfile.TemporaryDirectory()
+            lease_root = Path(lease_temporary_directory.name) / "leases"
+            lease_revision = fetch_ref(lease_ref)
+            if lease_revision is None:
+                return
+            materialize_revision(lease_revision, lease_root)
         active = {
-            name: lease for name, lease in load_desired_effect_leases(current).items() if effect_lease_active(lease)
+            name: lease for name, lease in load_desired_effect_leases(lease_root).items() if effect_lease_active(lease)
         }
         if not active:
             return
-        candidate_leases = load_desired_effect_leases(candidate)
+        candidate_leases = (
+            {} if lease_ref is not None and lease_ref != target_ref else load_desired_effect_leases(candidate)
+        )
         empty_snapshot = EffectLeaseSnapshot(
             unit_path=None,
             unit_blob=None,
@@ -6163,7 +6387,9 @@ def validate_effect_leases_preserved(
             cleanup_blob=None,
         )
         for name, lease in sorted(active.items()):
-            candidate_lease = candidate_leases.get(name)
+            candidate_lease = candidate_leases.get(
+                name, lease if lease_ref is not None and lease_ref != target_ref else None
+            )
             if lease.snapshot is None:
                 raise EffectLeaseUnavailable(
                     f"active effect lease for {name!r} lacks an immutable snapshot; explicit recovery is required"
@@ -6190,6 +6416,8 @@ def validate_effect_leases_preserved(
     finally:
         if temporary_directory is not None:
             temporary_directory.cleanup()
+        if lease_temporary_directory is not None:
+            lease_temporary_directory.cleanup()
 
 
 def copy_active_effect_leases(current: Path, candidate: Path) -> None:
@@ -6211,9 +6439,17 @@ def publish_change_candidate(
     current_root: Path | None = None,
     allow_removed_units: frozenset[str] = frozenset(),
     request_change: bool = True,
+    lease_ref: str | None = None,
 ) -> tuple[str, ChangeRequestResult | ManualChangeRequest | None]:
     load_desired_resource_graph(candidate)
-    validate_effect_leases_preserved(target_ref, target_revision, candidate, current_root, allow_removed_units)
+    validate_effect_leases_preserved(
+        target_ref,
+        target_revision,
+        candidate,
+        current_root,
+        allow_removed_units,
+        lease_ref=lease_ref,
+    )
     if git("check-ref-format", "--branch", candidate_ref, check=False).returncode != 0:
         raise OperationError(f"invalid change candidate ref: {candidate_ref!r}")
     if candidate_ref == target_ref:
@@ -6381,8 +6617,16 @@ def command_promote(args: argparse.Namespace) -> None:
             promotion=promotion,
         )
         load_desired_resource_graph(candidate)
-        copy_active_effect_leases(current_target, candidate)
-        validate_effect_leases_preserved(target_desired_ref, target_revision, candidate)
+        target_lease_ref = effect_lease_ref(args.to_environment, target_desired_ref)
+        if target_lease_ref == target_desired_ref:
+            copy_active_effect_leases(current_target, candidate)
+        validate_effect_leases_preserved(
+            target_desired_ref,
+            target_revision,
+            candidate,
+            current_target,
+            lease_ref=target_lease_ref,
+        )
 
         commit_message = f"Promote {args.from_environment} to {args.to_environment} from {source_desired_revision}"
         title = f"Promote {args.from_environment} to {args.to_environment}"
@@ -6424,6 +6668,7 @@ def command_promote(args: argparse.Namespace) -> None:
                 title,
                 body,
                 current_target,
+                lease_ref=target_lease_ref,
             )
             log_status(
                 "CANDIDATE",
@@ -6500,7 +6745,15 @@ def publish_desired_change(
     request_change: bool = True,
 ) -> tuple[str, ChangeRequestResult | ManualChangeRequest | None]:
     load_desired_resource_graph(candidate)
-    validate_effect_leases_preserved(target_ref, target_revision, candidate, current_root, allow_removed_units)
+    lease_ref = effect_lease_ref(environment, target_ref)
+    validate_effect_leases_preserved(
+        target_ref,
+        target_revision,
+        candidate,
+        current_root,
+        allow_removed_units,
+        lease_ref=lease_ref,
+    )
     gate = change_gate(REPOSITORY_ROOT, environment)
     if dry:
         log_status("DRY", f"{style_branch(target_ref)} would receive {title.lower()}")
@@ -6517,6 +6770,7 @@ def publish_desired_change(
             current_root,
             allow_removed_units,
             request_change,
+            lease_ref,
         )
         log_status(
             "CANDIDATE",
@@ -6790,7 +7044,19 @@ def command_rollback(args: argparse.Namespace) -> None:
         current_revision = observed_tree(desired_ref, current)
         if current_revision is None:
             raise OperationError(f"{desired_ref} does not exist")
-        active_leases = [lease for lease in load_desired_effect_leases(current).values() if effect_lease_active(lease)]
+        lease_ref = effect_lease_ref(args.environment, desired_ref)
+        lease_root = current
+        if lease_ref != desired_ref:
+            lease_root, _lease_revision = _effect_lease_store_root(
+                desired_ref,
+                current_revision,
+                current,
+                lease_ref,
+                temporary / "leases",
+            )
+        active_leases = [
+            lease for lease in load_desired_effect_leases(lease_root).values() if effect_lease_active(lease)
+        ]
         if active_leases:
             raise OperationError(
                 "rollback is blocked by active desired-state effect lease(s): "
@@ -8339,6 +8605,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
         args.desired_ref,
         args.observed_ref,
     )
+    lease_ref = effect_lease_ref(args.environment, desired_ref)
     log_heading(f"Finalize {style_unit(args.unit)}")
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
@@ -8485,6 +8752,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                 intent.uid,
                 precondition=assert_no_active_teardown_dependents,
                 resume_existing=existing_evidence is not None,
+                lease_ref=lease_ref,
             )
         except EffectLeaseUnavailable as exc:
             log_status("WAIT", f"{style_unit(args.unit)}: {exc}")
@@ -8505,11 +8773,11 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                 assert_desired_ref_fence(desired_ref, current_revision, args.unit, intent.uid)
                 assert isinstance(driver, TeardownCapability)
                 teardown_driver = cast(TeardownCapability, driver)
-                heartbeat = start_effect_lease_heartbeat(desired_ref, lease_acquisition)
+                heartbeat = start_effect_lease_heartbeat(desired_ref, lease_acquisition, lease_ref=lease_ref)
         except BaseException:
             if not driver_started:
                 try:
-                    release_pre_effect_lease(desired_ref, lease_acquisition)
+                    release_pre_effect_lease(desired_ref, lease_acquisition, lease_ref=lease_ref)
                 except Exception as release_exc:
                     log_status(
                         "WAIT",
@@ -8549,7 +8817,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                     pass
                 if not driver_started:
                     try:
-                        release_pre_effect_lease(desired_ref, lease_acquisition)
+                        release_pre_effect_lease(desired_ref, lease_acquisition, lease_ref=lease_ref)
                     except (OperationError, subprocess.CalledProcessError) as release_exc:
                         log_status(
                             "WAIT",
@@ -8567,7 +8835,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                     pass
                 if not driver_started:
                     try:
-                        release_pre_effect_lease(desired_ref, lease_acquisition)
+                        release_pre_effect_lease(desired_ref, lease_acquisition, lease_ref=lease_ref)
                     except (OperationError, subprocess.CalledProcessError):
                         pass
                 raise
@@ -8584,6 +8852,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                 args.unit,
                 intent.uid,
                 current,
+                lease_ref=lease_ref,
             )
         except EffectLeaseUnavailable as exc:
             log_status("WAIT", f"{style_unit(args.unit)}: {exc}; teardown evidence was not published")
@@ -8595,6 +8864,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                 intent,
                 current_revision,
                 desired_ref=desired_ref,
+                lease_ref=lease_ref,
                 lease_token=lease_acquisition.lease.token,
                 lease_snapshot=lease_acquisition.lease.snapshot,
                 details=teardown_details,
@@ -8609,6 +8879,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                 args.unit,
                 intent.uid,
                 current,
+                lease_ref=lease_ref,
             )
         except EffectLeaseUnavailable as exc:
             log_status("WAIT", f"{style_unit(args.unit)}: {exc}; teardown completion was not published")
@@ -8626,6 +8897,7 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                         args.unit,
                         intent.uid,
                         current,
+                        lease_ref=lease_ref,
                     )
                 except EffectLeaseUnavailable as exc:
                     log_status("WAIT", f"{style_unit(args.unit)}: {exc}; finalization was not published")
@@ -8695,6 +8967,15 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                 log_status("RETRY", f"finalization publication attempt {attempt + 2}/5")
         else:
             return False
+        if outcome is None:
+            release_effect_lease(
+                desired_ref,
+                args.unit,
+                lease_acquisition.lease.token,
+                intent.uid,
+                verify_snapshot=False,
+                lease_ref=lease_ref,
+            )
         if outcome is not None:
             log_status(
                 "REVIEW",
@@ -8726,7 +9007,13 @@ def command_recover_effect_lease(args: argparse.Namespace) -> None:
         None,
     )
     with unit_effect_lock(args.environment, args.unit):
-        revision = recover_effect_lease(desired_ref, args.unit, args.uid, args.token)
+        revision = recover_effect_lease(
+            desired_ref,
+            args.unit,
+            args.uid,
+            args.token,
+            lease_ref=effect_lease_ref(args.environment, desired_ref),
+        )
     if revision is not None:
         print(revision)
 
@@ -9552,6 +9839,7 @@ def publish_observation_cas(
     desired_revision: str,
     *,
     desired_ref: str | None = None,
+    lease_ref: str | None = None,
     expected_uid: str | None = None,
     lease_token: str | None = None,
     lease_snapshot: EffectLeaseSnapshot | None = None,
@@ -9563,12 +9851,13 @@ def publish_observation_cas(
             observed = Path(temporary_directory) / "observed"
             observed_revision = observed_tree(observed_ref, observed)
             if desired_ref is not None and lease_token is not None:
-                desired_revision = validate_effect_lease_head(
+                desired_revision = validate_effect_lease_head_for_store(
                     desired_ref,
                     unit_name,
                     expected_uid or "",
                     lease_token,
                     lease_snapshot,
+                    lease_ref=lease_ref,
                 )
                 receipt = replace(
                     receipt,
@@ -9601,12 +9890,13 @@ def publish_observation_cas(
                 status=replace(receipt.status, artifacts=typed_descriptors or None),
             )
             if desired_ref is not None and lease_token is not None:
-                latest_revision = validate_effect_lease_head(
+                latest_revision = validate_effect_lease_head_for_store(
                     desired_ref,
                     unit_name,
                     expected_uid or "",
                     lease_token,
                     lease_snapshot,
+                    lease_ref=lease_ref,
                 )
                 if latest_revision != desired_revision:
                     desired_revision = latest_revision
@@ -9641,12 +9931,13 @@ def publish_observation_cas(
                     )
                 return observed_revision
             if desired_ref is not None and lease_token is not None:
-                latest_revision = validate_effect_lease_head(
+                latest_revision = validate_effect_lease_head_for_store(
                     desired_ref,
                     unit_name,
                     expected_uid or "",
                     lease_token,
                     lease_snapshot,
+                    lease_ref=lease_ref,
                 )
                 if latest_revision != desired_revision:
                     desired_revision = latest_revision
@@ -9779,6 +10070,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             args.desired_ref,
             args.observed_ref,
         )
+        lease_ref = effect_lease_ref(args.environment, desired_ref)
         if args.plan or (args.advance and not args.desired_revision):
             require_environment_unit(ref_source_root, args.environment, args.unit)
         detail("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
@@ -9981,25 +10273,31 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 raise OperationError(f"{args.unit} uses {driver_name}, which does not support reconciliation") from exc
 
         lease_acquisition: EffectLeaseAcquisition | None = None
-        if not args.plan:
+        if not args.plan and lease_ref is not None:
             assert unit.metadata.uid is not None
             try:
-                lease_acquisition = acquire_effect_lease(desired_ref, desired_revision, args.unit, unit.metadata.uid)
+                lease_acquisition = acquire_effect_lease(
+                    desired_ref,
+                    desired_revision,
+                    args.unit,
+                    unit.metadata.uid,
+                    lease_ref=lease_ref,
+                )
             except EffectLeaseUnavailable as exc:
                 log_status("WAIT", f"{style_unit(args.unit)}: {exc}")
                 log_status("DONE", f"{style_unit(args.unit)}: no changes")
                 write_reconcile_outputs(False)
                 return False
             try:
-                if lease_acquisition.revision == desired_revision:
+                if lease_ref == desired_ref and lease_acquisition.revision == desired_revision:
                     write_effect_lease(desired, lease_acquisition.lease)
-                else:
+                elif lease_ref == desired_ref:
                     refresh_materialized_root(lease_acquisition.revision, desired)
                 desired_revision = lease_acquisition.revision
                 assert_desired_ref_fence(desired_ref, desired_revision, args.unit, unit.metadata.uid)
             except BaseException:
                 try:
-                    release_pre_effect_lease(desired_ref, lease_acquisition)
+                    release_pre_effect_lease(desired_ref, lease_acquisition, lease_ref=lease_ref)
                 except Exception as release_exc:
                     log_status(
                         "WAIT",
@@ -10048,10 +10346,10 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         driver_started = False
         if lease_acquisition is not None:
             try:
-                heartbeat = start_effect_lease_heartbeat(desired_ref, lease_acquisition)
+                heartbeat = start_effect_lease_heartbeat(desired_ref, lease_acquisition, lease_ref=lease_ref)
             except BaseException:
                 try:
-                    release_pre_effect_lease(desired_ref, lease_acquisition)
+                    release_pre_effect_lease(desired_ref, lease_acquisition, lease_ref=lease_ref)
                 except Exception as release_exc:
                     log_status(
                         "WAIT",
@@ -10104,7 +10402,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                     pass
             if lease_acquisition is not None and not driver_started:
                 try:
-                    release_pre_effect_lease(desired_ref, lease_acquisition)
+                    release_pre_effect_lease(desired_ref, lease_acquisition, lease_ref=lease_ref)
                 except Exception as release_exc:
                     log_status(
                         "WAIT",
@@ -10130,6 +10428,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                     args.unit,
                     unit.metadata.uid,
                     desired,
+                    lease_ref=lease_ref,
                 )
             except EffectLeaseUnavailable as exc:
                 log_status("WAIT", f"{style_unit(args.unit)}: {exc}; reconciliation result was not published")
@@ -10167,6 +10466,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 output.artifacts,
                 desired_revision,
                 desired_ref=desired_ref,
+                lease_ref=lease_ref,
                 expected_uid=unit.metadata.uid,
                 lease_token=lease_acquisition.lease.token if lease_acquisition is not None else None,
                 lease_snapshot=lease_acquisition.lease.snapshot if lease_acquisition is not None else None,
@@ -10193,7 +10493,13 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         )
         if lease_acquisition is not None:
             try:
-                release_effect_lease(desired_ref, args.unit, lease_acquisition.lease.token, unit.metadata.uid)
+                release_effect_lease(
+                    desired_ref,
+                    args.unit,
+                    lease_acquisition.lease.token,
+                    unit.metadata.uid,
+                    lease_ref=lease_ref,
+                )
             except OperationError as exc:
                 log_status("WAIT", f"{style_unit(args.unit)}: effect lease release pending expiry: {exc}")
                 write_reconcile_outputs(True, pre_advanced_revision)
@@ -10695,6 +11001,14 @@ def command_create_project(args: argparse.Namespace) -> None:
                     "desired": args.desired_ref_template,
                     "observed": args.observed_ref_template,
                     "candidate": args.candidate_ref_template,
+                }
+            },
+            "effectLease": {
+                "store": {
+                    "branch": {
+                        "ref": "gitopsctr/leases",
+                        "format": "shared",
+                    }
                 }
             },
         },

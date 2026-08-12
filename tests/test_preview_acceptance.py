@@ -124,7 +124,7 @@ def test_from_git_stack_source_does_not_create_catalog_or_read_source_during_rec
                 "apiVersion": "gitopsctr.io/v1",
                 "kind": "Project",
                 "metadata": {"name": "external"},
-                "spec": {},
+                "spec": {"effectLease": None},
             }
         )
     )

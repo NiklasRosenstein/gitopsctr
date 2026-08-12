@@ -33,7 +33,7 @@ def _repository(root: Path) -> None:
                 "apiVersion": "gitopsctr.io/v1",
                 "kind": "Project",
                 "metadata": {"name": "preview-artifacts"},
-                "spec": {},
+                "spec": {"effectLease": None},
             }
         )
     )
