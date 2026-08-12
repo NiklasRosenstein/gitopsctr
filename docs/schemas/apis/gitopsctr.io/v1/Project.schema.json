@@ -49,9 +49,6 @@
                         "branch": {
                           "additionalProperties": false,
                           "properties": {
-                            "format": {
-                              "const": "shared"
-                            },
                             "ref": {
                               "minLength": 1,
                               "pattern": "^(?:[^{}]|\\{environment\\}|\\{unit\\})+$",
@@ -59,8 +56,7 @@
                             }
                           },
                           "required": [
-                            "ref",
-                            "format"
+                            "ref"
                           ],
                           "type": "object"
                         }

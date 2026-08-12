@@ -88,7 +88,6 @@ def test_create_project_writes_a_valid_canonical_resource(tmp_path: Path, capsys
                 "store": {
                     "branch": {
                         "ref": "gitopsctr/leases",
-                        "format": "shared",
                     }
                 }
             },
@@ -189,12 +188,11 @@ def test_project_effect_lease_store_supports_disabled_and_branch_modes(tmp_path:
     write_yaml(tmp_path / "gitopsctr.yaml", document)
     assert controller.load_project_config(tmp_path).effect_lease_store is None
 
-    document["spec"]["effectLease"] = {"store": {"branch": {"ref": "leases/{environment}", "format": "shared"}}}
+    document["spec"]["effectLease"] = {"store": {"branch": {"ref": "leases/{environment}"}}}
     write_yaml(tmp_path / "gitopsctr.yaml", document)
     store = controller.load_project_config(tmp_path).effect_lease_store
     assert store is not None
     assert store.ref == "leases/{environment}"
-    assert store.format == "shared"
 
 
 def test_project_requires_effect_lease_policy(tmp_path: Path):

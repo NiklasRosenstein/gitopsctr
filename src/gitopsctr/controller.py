@@ -1807,8 +1807,6 @@ def effect_lease_ref(environment: str, desired_ref: str) -> str | None:
         return desired_ref
     if store is None:
         return None
-    if store.format != "shared":
-        raise OperationError(f"unsupported effect lease store format: {store.format!r}")
     ref = store.ref.replace("{environment}", environment)
     if "{unit}" in ref:
         raise OperationError("effect lease store refs with {unit} are not supported yet")
@@ -3521,7 +3519,7 @@ def _effect_lease_store_root(
         materialize_revision(lease_revision, output)
     marker = output / ".gitopsctr/effect-leases/.store"
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text("shared\n")
+    marker.write_text("branch\n")
     return output, lease_revision
 
 
@@ -11007,7 +11005,6 @@ def command_create_project(args: argparse.Namespace) -> None:
                 "store": {
                     "branch": {
                         "ref": "gitopsctr/leases",
-                        "format": "shared",
                     }
                 }
             },

@@ -144,10 +144,9 @@ PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
                                                             "type": "string",
                                                             "minLength": 1,
                                                             "pattern": EFFECT_LEASE_REF_TEMPLATE_PATTERN,
-                                                        },
-                                                        "format": {"const": "shared"},
+                                                        }
                                                     },
-                                                    "required": ["ref", "format"],
+                                                    "required": ["ref"],
                                                     "additionalProperties": False,
                                                 }
                                             },
@@ -212,7 +211,6 @@ class SourceRevisionAction(StrEnum):
 @dataclass(frozen=True)
 class EffectLeaseBranch:
     ref: str
-    format: str = "shared"
 
 
 @dataclass(frozen=True)
@@ -283,7 +281,6 @@ def validate_project_document(value: object, path: Path) -> Project:
             branch = cast(dict[str, Any], store)["branch"]
             effect_lease_store = EffectLeaseBranch(
                 ref=cast(str, branch["ref"]),
-                format=cast(str, branch["format"]),
             )
     return Project(
         name=project_name,

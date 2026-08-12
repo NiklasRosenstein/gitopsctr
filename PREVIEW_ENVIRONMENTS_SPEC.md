@@ -77,7 +77,6 @@ effectLease:
   store:
     branch:
       ref: gitopsctr/leases
-      format: shared
 ```
 
 The branch ref may contain `{environment}`. Lease commits then stay outside
@@ -93,8 +92,8 @@ stopped. A separate branch keeps coordination commits out of reviewable
 desired history; a desired-branch store co-locates them for deployments that
 prefer one history.
 
-The current branch store supports `format: shared`. `{environment}` is
-supported in the branch ref. `{unit}` is reserved and is not implemented.
+The branch ref may contain `{environment}`. `{unit}` is reserved and is not
+implemented.
 The configuration and operator workflow are documented in
 [Project configuration](docs/project-configuration.md#effect-lease-storage).
 

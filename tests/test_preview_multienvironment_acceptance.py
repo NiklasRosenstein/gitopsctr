@@ -393,7 +393,7 @@ def _print_ref_histories(store: GitStateStore) -> dict[str, int]:
 @pytest.mark.parametrize(
     "effect_lease",
     [
-        {"store": {"branch": {"ref": "gitopsctr/leases", "format": "shared"}}},
+        {"store": {"branch": {"ref": "gitopsctr/leases"}}},
         None,
     ],
     ids=["with-effect-leases", "without-effect-leases"],

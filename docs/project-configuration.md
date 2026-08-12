@@ -27,7 +27,6 @@ spec:
     store:
       branch:
         ref: gitopsctr/leases
-        format: shared
   environmentDefaults:
     refs:
       desired: gitopsctr/desired/{environment}
@@ -82,8 +81,8 @@ branch keeps this coordination history out of the reviewable desired branch.
 | `store.branch.ref: gitopsctr/desired/{environment}` | Co-locate leases with that environment's desired history. |
 | `store.branch.ref: gitopsctr/leases` | Keep leases for all environments in one shared branch. |
 
-The current branch store uses `format: shared`. The branch ref may contain
-`{environment}`. Lease recovery is UID- and token-fenced; use
+The branch ref may contain `{environment}`. Lease recovery is UID- and
+token-fenced; use
 `recover-effect-lease` only after confirming that the external effect has
 stopped.
 
