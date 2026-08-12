@@ -4,33 +4,24 @@ Preview environments are controller-owned `Stack` lifecycles. A source-tracked
 `StackTemplate` is inert; a concrete `Stack` expands it into owned Units in one
 desired snapshot.
 
+Direct instantiation creates a `Stack` root. It does not make a
+`StackTemplate` or an arbitrary Unit directly managed. The generated Units are
+owned by the Stack and are reconciled and finalized as one lifecycle.
+
 ## Authored layout
 
-Projects must select effect-lease storage explicitly. Use `null` for no
-leases, or place leases on a separate shared branch:
-
-```yaml
-spec:
-  effectLease:
-    store:
-      branch:
-        ref: gitopsctr/leases
-        format: shared
-```
-
-`effectLease: null` and `effectLease.store: null` have the same meaning.
-The `gitopsctr create project` command writes the branch-backed form by
-default. A branch ref may contain `{environment}`.
-
-Authored resources live below the environment:
+Authored resources use the project-level StackTemplate path and the
+environment-level Stack path:
 
 ```text
-deployment/environments/dev/
-├── environment.yaml
-├── stack-templates/
-│   └── preview.yaml
-└── stacks/
-    └── application.yaml
+deployment/
+├── environments/
+│   └── dev/
+│       ├── environment.yaml
+│       └── stacks/
+│           └── application.yaml
+└── stack-templates/
+    └── preview.yaml
 ```
 
 The generated desired ref stores the corresponding roots under
@@ -40,6 +31,26 @@ control convergence and reverse teardown order; receipt and artifact references
 remain separate dependency edges. Generated Unit names are scoped to the
 concrete Stack, for example `web--preview-app`, so multiple Stack instances can
 use one template in the same desired ref.
+
+See [Project configuration](project-configuration.md) for the path settings
+and effect-lease policy.
+
+## Effect lease policy
+
+An effect lease protects an external Unit effect from a conflicting desired
+state change. The lease stores the Unit identity and effect snapshot, and is
+renewed while the driver runs. A stale lease cannot be recovered without its
+exact token and confirmation that the effect stopped.
+
+Use `effectLease: null` or `effectLease.store: null` to disable leases. Use
+`gitopsctr/desired/{environment}` to co-locate leases with desired history, or
+`gitopsctr/leases` to keep coordination commits in one shared branch. A branch
+ref may contain `{environment}`. `gitopsctr create project` selects the shared
+branch form by default.
+
+The acceptance test runs once with the default branch store and once with
+leases disabled. This verifies both coordination behavior and the no-lease
+path.
 
 ## Direct preview workflow
 
@@ -58,6 +69,10 @@ gitopsctr instantiate-stack \
   --request-id github:example-org/application#123
 ```
 
+The request is replay-safe. Keep the same request ID when retrying the same
+operation. The source revision must be trusted CI input; a moving ref is
+resolved and pinned during instantiation.
+
 Instantiation creates a CAS-fenced controller claim and pins the exact template
 revision on a controller-owned ref. The pin remains available while the Stack
 and its Units are being torn down and is released only after successful
@@ -73,6 +88,52 @@ finalization commands. The core CLI does not inspect forge state, decide
 eligibility, detect orphaned previews, or release pins through an out-of-band
 path. The Unit finalization commands must complete the owned closure before the
 Stack root can be finalized.
+
+### Update and deletion
+
+Save the Stack UID and current desired revision from the instantiation result.
+Use both as fences for an update:
+
+```console
+gitopsctr update-direct-stack \
+  --environment preview \
+  --stack pr-123 \
+  --uid "$STACK_UID" \
+  --desired-revision "$DESIRED_REVISION" \
+  --template preview \
+  --source-revision "$GITHUB_SHA" \
+  --parameters '{"namespace":"preview-123","expiresAt":1735689600}' \
+  --request-id github:example-org/application#123:refresh
+```
+
+If an input artifact is not observed yet, advance and reconcile the producer,
+then retry the update with a new request ID. The update preserves the Stack and
+child Unit UIDs.
+
+When the preview is no longer eligible, request deletion with the current Stack
+UID:
+
+```console
+gitopsctr request-delete-direct-stack \
+  --environment preview \
+  --stack pr-123 \
+  --uid "$STACK_UID"
+```
+
+Reconcile and finalize each owned Unit in reverse dependency order. Then
+finalize the Stack root with its deletion generation:
+
+```console
+gitopsctr finalize-stack \
+  --environment preview \
+  --stack pr-123 \
+  --uid "$STACK_UID" \
+  --deletion-generation "$STACK_DELETION_GENERATION"
+```
+
+Do not delete desired documents or controller pins manually. If an operation
+is gated or interrupted, repeat it with the same UID and generation fences
+after the required candidate or observation is available.
 
 ## Argo CD boundary
 

@@ -85,6 +85,19 @@ the desired ref. `gitopsctr create project` uses the shared
 `gitopsctr/leases` branch by default. The temporary-repository acceptance
 story runs once with this setting and once with leases disabled.
 
+An effect lease protects an external Unit effect from a conflicting desired
+state change. It records the Unit identity and effect snapshot, is renewed
+while the driver runs, and is released after the effect completes. Recovery is
+UID- and token-fenced and requires confirmation that the external effect
+stopped. A separate branch keeps coordination commits out of reviewable
+desired history; a desired-branch store co-locates them for deployments that
+prefer one history.
+
+The current branch store supports `format: shared`. `{environment}` is
+supported in the branch ref. `{unit}` is reserved and is not implemented.
+The configuration and operator workflow are documented in
+[Project configuration](docs/project-configuration.md#effect-lease-storage).
+
 Remaining implementation work:
 
 - Keep legacy desired-resource compatibility until every supported desired ref has been audited.
@@ -311,8 +324,9 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
   and external-driver acceptance are covered by the temporary-repository inventory harness and Docker/Terraform demo.
 - Secrets are references to an external secret mechanism, not plaintext Stack parameters committed to Git.
 
-The implementation currently uses `deployment/environments/<environment>/stack-templates/` and `stacks/` for authored
-resources, `stack-templates/` and `stacks/` in desired state, and the `instantiate-stack`, `update-direct-stack`,
+The implementation currently uses `deployment/stack-templates/` for authored
+StackTemplates and `deployment/environments/<environment>/stacks/` for authored
+Stacks. Desired state uses `stack-templates/` and `stacks/`, and the `instantiate-stack`, `update-direct-stack`,
 `request-delete-direct-stack`, and `finalize-stack` commands. These names are **Settled for this increment**; future
 API compatibility review may still revise them before production.
 
@@ -418,6 +432,10 @@ file may remain. Out-of-band demo cleanup is only a final safety net.
   external inventory are absent while the StackTemplate retains the same UID and content.
 - Any controller source pin remains through teardown and is released only after successful finalization.
 - Repeated deletion is inert; recreating the name receives a new UID and cannot reuse old receipts.
+- Run the same flow with the configured branch lease store and with
+  `effectLease: null`. The branch-store run must publish lease coordination
+  separately from desired state; the no-lease run must complete without lease
+  records.
 
 ### C. One template across dev, staging, and preview
 

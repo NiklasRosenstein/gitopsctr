@@ -22,6 +22,12 @@ metadata:
 spec:
   writeFormat: yaml
   environmentsPath: deployment/environments
+  stackTemplatesPath: deployment/stack-templates
+  effectLease:
+    store:
+      branch:
+        ref: gitopsctr/leases
+        format: shared
   environmentDefaults:
     refs:
       desired: gitopsctr/desired/{environment}
@@ -51,6 +57,35 @@ copy of a document.
 `<environmentsPath>/dev/units/`. Absolute paths and paths containing `..` are
 rejected. Generated desired and observed branches continue to store documents
 under top-level `units/`.
+
+`spec.stackTemplatesPath` is relative to the source-tree root and defaults to
+`deployment/stack-templates`. A StackTemplate is authored once at project
+level and may be selected by Stacks in several environments.
+
+`spec.effectLease` is required. Set it to `null`, or set `store` to `null`, to
+disable effect leases. The example keeps lease commits in one shared branch.
+Use `{environment}` in the branch ref when each environment needs its own
+lease branch. `gitopsctr create project` writes the shared branch form by
+default.
+
+## Effect lease storage
+
+An effect lease serializes desired-state changes while a Unit driver runs an
+external effect. It records the Unit identity and effect snapshot, and blocks
+conflicting changes until the effect releases the lease. A separate lease
+branch keeps this coordination history out of the reviewable desired branch.
+
+| Configuration | Behavior |
+| --- | --- |
+| `effectLease: null` | No effect leases. Use only when external effects are otherwise serialized. |
+| `effectLease.store: null` | Same as `effectLease: null`. |
+| `store.branch.ref: gitopsctr/desired/{environment}` | Co-locate leases with that environment's desired history. |
+| `store.branch.ref: gitopsctr/leases` | Keep leases for all environments in one shared branch. |
+
+The current branch store uses `format: shared`. The branch ref may contain
+`{environment}`. Lease recovery is UID- and token-fenced; use
+`recover-effect-lease` only after confirming that the external effect has
+stopped.
 
 ## Environment ref defaults
 
