@@ -76,6 +76,24 @@ The source commit contains authored resources. `gitopsctr/desired/dev` contains 
 `gitopsctr/observed/dev` contains
 receipts and artifacts proving what was applied. See [Concepts](concepts.md) for the full state model.
 
+## Source-tracked and directly managed resources
+
+This tutorial uses source-tracked Units: source YAML declares them, and
+`advance-desired` controls their lifecycle. Preview CI can also create a
+directly managed Stack in the desired ref:
+
+```console
+gitopsctr create stack --in=state --or-update \
+  --environment preview --name pr-123 --template preview \
+  --source-revision "$GITHUB_SHA" \
+  --request-id "github:example/application#123:sync:$GITHUB_SHA"
+```
+
+The command is safe to retry with the same request ID and inputs. A later
+source revision is a new mutation and needs a new request ID. Reusing an ID
+with different inputs is rejected. See [Preview environments](preview-environments.md)
+for deletion and finalization.
+
 ## Prove clean convergence
 
 Return to the source checkout and run the demo again:

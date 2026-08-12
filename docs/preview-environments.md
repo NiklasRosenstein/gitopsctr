@@ -31,6 +31,12 @@ scaffolding convenience, while `apply` is the state mutation API.
 mutation. Retry the same mutation with the same value. Use a new value for a
 new mutation. Reusing a value with different inputs is rejected.
 
+CI delivery is at least once: a job may lose the response after the mutation
+was accepted and send the request again. The request ID lets `gitopsctr`
+recognize that retry as the same logical mutation instead of treating it as a
+new one. UID and desired-revision fences still protect against stale or
+concurrent resource updates; the request ID handles retry identity.
+
 The value is opaque to `gitopsctr`. An integration may use a convention such
 as `github:example/application#123:sync:abc123`; `gitopsctr` does not parse or
 validate its meaning.
