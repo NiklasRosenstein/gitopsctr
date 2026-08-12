@@ -24,6 +24,9 @@ OBSERVED_STAGING = "observed/staging"
 DESIRED_PREVIEW = "deploy/preview"
 OBSERVED_PREVIEW = "observed/preview"
 
+DESIRED_REFS = (DESIRED_DEV, DESIRED_STAGING, DESIRED_PREVIEW)
+OBSERVED_REFS = (OBSERVED_DEV, OBSERVED_STAGING, OBSERVED_PREVIEW)
+
 
 class FakeInventory:
     """Deterministic observation ledger used instead of Docker or Terraform."""
@@ -352,6 +355,29 @@ def _command_args(**values: Any) -> Namespace:
     return Namespace(**arguments)
 
 
+def _print_ref_histories(store: GitStateStore) -> dict[str, int]:
+    """Print the final desired and observed ref histories and return commit counts."""
+
+    counts = {"desired": 0, "observed": 0}
+    print("\nAcceptance ref history:")
+    for category, refs in (("desired", DESIRED_REFS), ("observed", OBSERVED_REFS)):
+        for ref in refs:
+            snapshot = store.fetch(ref)
+            assert snapshot.revision is not None, f"expected final ref {ref!r}"
+            history = store.git(
+                "log",
+                "--oneline",
+                "--reverse",
+                f"refs/remotes/origin/{ref}",
+            ).stdout.splitlines()
+            counts[category] += len(history)
+            print(f"{ref} ({len(history)} advancements):")
+            for line in history:
+                print(f"  {line}")
+    print(f"Totals: desired={counts['desired']}, observed={counts['observed']}, total={sum(counts.values())}")
+    return counts
+
+
 def test_multi_environment_stack_story_in_temporary_repository(tmp_path: Path) -> None:
     source, r1, _remote = _source_repository(tmp_path)
     store = _store(source)
@@ -623,3 +649,4 @@ def test_multi_environment_stack_story_in_temporary_repository(tmp_path: Path) -
     with pytest.raises(controller.OperationError, match="active owned Units"):
         controller.command_finalize_stack(_command_args(uid=updated_preview_stack.metadata.uid, deletion_generation=1))
     assert store.fetch(DESIRED_PREVIEW).revision == deleting_revision
+    assert _print_ref_histories(store) == {"desired": 9, "observed": 8}
