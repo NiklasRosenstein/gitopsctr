@@ -90,13 +90,17 @@ def test_direct_stack_instantiation_from_template_only_source_is_replay_safe(tmp
     monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
     args = controller.build_parser().parse_args(
         [
-            "instantiate-stack",
+            "create",
+            "stack",
+            "--in=state",
             "--environment",
             "dev",
-            "--stack",
+            "--name",
             "web",
             "--template",
             "preview",
+            "--units",
+            "preview-db,preview-app",
             "--source-revision",
             source_revision,
             "--parameters",
@@ -110,7 +114,7 @@ def test_direct_stack_instantiation_from_template_only_source_is_replay_safe(tmp
         ]
     )
 
-    assert controller.command_instantiate_stack(args) is True
+    controller.command_create_stack(args)
     instantiated_revision = store.fetch("deploy/dev").revision
     assert instantiated_revision is not None
     assert instantiated_revision != desired.revision
@@ -142,7 +146,7 @@ def test_direct_stack_instantiation_from_template_only_source_is_replay_safe(tmp
     assert not list((environment / "stacks").glob("web.*"))
     assert git(source, "rev-parse", "HEAD") == source_head
 
-    assert controller.command_instantiate_stack(args) is False
+    controller.command_create_stack(args)
     assert store.fetch("deploy/dev").revision == instantiated_revision
 
 

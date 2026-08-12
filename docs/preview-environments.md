@@ -1,12 +1,33 @@
 # Preview environments
 
-Preview environments are controller-owned `Stack` lifecycles. A source-tracked
-`StackTemplate` is inert; a concrete `Stack` expands it into owned Units in one
-desired snapshot.
+A controller-owned `Stack` is one recommended model for a preview environment.
+A source-tracked `StackTemplate` is inert; a concrete `Stack` expands it into
+owned Units in one desired snapshot. A preview can also contain one or more
+directly managed Units without a Stack.
 
 Direct instantiation creates a `Stack` root. It does not make a
 `StackTemplate` or an arbitrary Unit directly managed. The generated Units are
 owned by the Stack and are reconciled and finalized as one lifecycle.
+
+## Resource commands
+
+Source and desired state have different workflows:
+
+| Command | Target | Purpose |
+| --- | --- | --- |
+| `create <kind> --in=source` | Project files | Scaffold an authored resource. |
+| `create stack --in=state` | Desired ref | Create a direct Stack from a trusted template revision. |
+| `apply <kind> --in=state` | Desired ref | Create or update a direct resource. |
+| `delete <kind> --in=source` | Project files | Remove an authored resource; Git records the change. |
+| `delete <kind> --in=state` | Desired ref | Request UID-fenced lifecycle deletion. |
+
+There is no source `apply` operation. Edit existing source YAML and commit it;
+`advance-desired` resolves that source into desired state. `create` is a
+scaffolding convenience, while `apply` is the state mutation API.
+
+For a one-Unit preview, `create unit --in=state` or `apply unit --in=state`
+takes a canonical desired Unit document with direct lifecycle metadata. The
+Unit is a direct root and can later be removed with `delete unit --in=state`.
 
 ## Authored layout
 
@@ -60,14 +81,20 @@ forge reference such as `github:OWNER/REPOSITORY#NUMBER`. Include an `expiresAt`
 Unix timestamp in the Stack parameters when the preview has a time limit:
 
 ```console
-gitopsctr instantiate-stack \
+gitopsctr create stack \
+  --in=state \
   --environment dev \
-  --stack pr-123 \
+  --name pr-123 \
   --template preview \
+  --units image,deploy \
   --source-revision "$GITHUB_SHA" \
   --parameters '{"namespace":"preview-123","expiresAt":1735689600}' \
   --request-id github:example-org/application#123
 ```
+
+Use `--or-update` with `create stack` when a retrying workflow wants one
+convenience entry point. The generic form is `apply stack --in=state`; it uses
+the same UID, desired-head, and request-identity fences.
 
 The request is replay-safe. Keep the same request ID when retrying the same
 operation. The source revision must be trusted CI input; a moving ref is
@@ -81,7 +108,7 @@ candidate is applied; a later `finalize-stack` retry releases the pin and claim
 under their UID-/revision fences. Unclaimed legacy pins remain retained.
 
 When a pull request closes, loses its required label, or expires, trusted CI may
-request deletion immediately with `request-delete-direct-stack`. A scheduled CI
+request deletion immediately with `delete stack --in=state`. A scheduled CI
 job owned by the deployment may recover missed events by enumerating preview
 lineage, consulting the forge, and invoking the same UID-fenced deletion and
 finalization commands. The core CLI does not inspect forge state, decide
@@ -95,9 +122,10 @@ Save the Stack UID and current desired revision from the instantiation result.
 Use both as fences for an update:
 
 ```console
-gitopsctr update-direct-stack \
+gitopsctr apply stack \
+  --in=state \
   --environment preview \
-  --stack pr-123 \
+  --name pr-123 \
   --uid "$STACK_UID" \
   --desired-revision "$DESIRED_REVISION" \
   --template preview \
@@ -114,9 +142,10 @@ When the preview is no longer eligible, request deletion with the current Stack
 UID:
 
 ```console
-gitopsctr request-delete-direct-stack \
+gitopsctr delete stack \
+  --in=state \
   --environment preview \
-  --stack pr-123 \
+  --name pr-123 \
   --uid "$STACK_UID"
 ```
 

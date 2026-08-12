@@ -337,3 +337,16 @@ store. Lease history is separate from desired history when configured on another
 
 The multi-environment acceptance test runs with the default branch-backed store and with leases disabled. The latter
 verifies that desired and observed history remains functional without lease commits.
+
+### 8.14 Generic resource mutation API — implemented in this increment
+
+Added public `create`, `apply`, and `delete` resource commands. Source `create`
+scaffolds Project, Environment, Unit, Stack, and StackTemplate files. State
+`create stack` creates a direct Stack from a trusted template revision;
+`apply stack` updates it with existing UID, desired-head, and request fences.
+State Unit creation and apply accept canonical desired documents and create
+direct Unit roots. State delete routes through the existing durable,
+UID-fenced deletion lifecycle. Typed Stack selection validates dependencies.
+
+Focused CLI, Stack, preview, direct-update, and deletion tests pass. Full
+repository verification passed with 581 tests.

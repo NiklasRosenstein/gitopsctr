@@ -26,7 +26,7 @@ this repository.
 | Change-gated candidate freshness | **Local and CI verifier implemented** | `88ae0b9` rejects stale, rebased, multi-commit, merge, root, and missing-head candidates before review creation. CI now verifies the exact GitHub pull-request and merge-queue event head and target; required check and branch-protection policy remain forge configuration. |
 | StackTemplate/Stack contracts and deterministic parameter expansion | **Implemented** | Commits `eb0bcb9` and `84d7ddb`; direct desired Stack provenance is typed and schema-published. |
 | Generated Stack resource graphs with UID-fenced ownership | **Implemented projection and closure** | `b441941` and `d071c1e` project source-authored/direct Stack-owned Units and retain a UID-fenced closure through deletion. |
-| Direct Stack instantiation and update | **Implemented with durable incarnation fencing** | `84d7ddb` adds replay-fenced `instantiate-stack` and exact template provenance; `a18c23f` and `f12329a` add desired-head and durable Stack tombstone fencing. `update-direct-stack` now applies UID- and desired-head-fenced source updates, preserves Stack and child Unit UIDs, and supports image-first convergence. A request ledger for richer replay history remains optional follow-up. |
+| Direct Stack instantiation and update | **Implemented with durable incarnation fencing** | The public `create stack --in=state` and `apply stack --in=state` APIs use the replay, UID, desired-head, and durable Stack tombstone fences implemented by the typed lifecycle handlers. The older `instantiate-stack` and `update-direct-stack` names remain compatibility wrappers. A request ledger for richer replay history remains optional follow-up. |
 | Direct and source-tracked Stack deletion/finalization | **Implemented core lifecycle** | `d071c1e` adds source-absence intents, direct UID/generation-fenced requests, child obligations, and root finalization after owned Units. |
 | Controller-owned source pins | **Lifecycle and claims implemented** | `5d3a5a0` provides fenced refs and the current implementation adds CAS-fenced `gitopsctr/pin-claims/stacks/...` records. Direct Stack deletion and finalization retain UID-/revision-fenced pins and claims; orphan enumeration and reaping remain external CI responsibilities. |
 | Forge provenance and recovery boundary | **Core boundary implemented; forge orchestration remains external** | Direct Stack provenance, source pins, claims, UID-fenced deletion, and finalization are core lifecycle primitives. PR/MR identity does not own desired resources. Forge CI may enumerate refs/resources, consult the forge, and invoke normal `gitopsctr` CLI primitives; the core has no forge eligibility or orphan-recovery command. |
@@ -274,7 +274,7 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
   terminal evidence is controller-owned and suppresses repeat teardown. `TeardownResult.details` are validated as
   strict JSON and persisted in UID-/generation-fenced observed evidence, with legacy evidence defaulting to empty
   details. A crash after evidence publication resumes finalization from the existing lease and does not repeat teardown.
-- **Done in `f9cc2ac` — direct-Unit lifecycle:** `request-delete-direct-unit` creates an exact UID-/generation-fenced
+- **Done in `f9cc2ac` — direct-Unit lifecycle:** The public `delete unit --in=state` API routes to the exact UID-/generation-fenced
   deletion intent only for a canonical directly managed root, retains the root even when authored source is absent,
   and reuses the existing finalization path. Source-tracked, owned, legacy, and stale-UID requests are rejected;
   repeated requests for the same direct intent are inert. Source material remains available to Terraform finalization
@@ -305,9 +305,9 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
 - **Implemented in `84d7ddb` and `d071c1e`:** A direct Stack retains a cleanup-capable snapshot and pins its exact
   template revision. The pin remains through teardown and is released only after successful finalization. It does not
   continuously follow later template changes in the first implementation.
-- The temporary-repository acceptance flow now invokes `instantiate-stack` with a source-tracked StackTemplate and no
+- The temporary-repository acceptance flow now invokes `create stack --in=state` with a source-tracked StackTemplate and no
   source Stack. It verifies direct management, exact template provenance, generated ownership, and replay idempotence.
-- `update-direct-stack` applies a new pinned source revision to an existing direct Stack under its UID and desired-head
+- `apply stack --in=state` applies a new pinned source revision to an existing direct Stack under its UID and desired-head
   fences. It preserves the Stack and generated Unit UIDs. If a downstream artifact is not yet observed, it records a
   transition block and the caller repeats the update after the producer converges.
 - A source-tracked Stack is a concrete source resource. It may select a source-tracked StackTemplate, or copy a pinned
@@ -325,9 +325,26 @@ to close the Unit milestone; they are not changes to the settled lifecycle model
 
 The implementation currently uses `deployment/stack-templates/` for authored
 StackTemplates and `deployment/environments/<environment>/stacks/` for authored
-Stacks. Desired state uses `stack-templates/` and `stacks/`, and the `instantiate-stack`, `update-direct-stack`,
-`request-delete-direct-stack`, and `finalize-stack` commands. These names are **Settled for this increment**; future
-API compatibility review may still revise them before production.
+Stacks. Desired state uses `stack-templates/` and `stacks/`. The generic
+`create`, `apply`, and `delete` commands are the public mutation API; the
+typed Stack lifecycle commands remain implementation-level compatibility
+wrappers. These names are **Settled for this increment**; future API
+compatibility review may still revise them before production.
+
+The public resource mutation model is:
+
+- `create <kind> --in=source` scaffolds an authored resource file.
+- `create stack --in=state` creates a direct Stack from a trusted template
+  revision.
+- `apply <kind> --in=state` creates or updates a direct Unit or Stack.
+- `delete <kind> --in=source` removes an authored file for the caller to
+  commit.
+- `delete <kind> --in=state` publishes a UID-fenced deletion intent.
+
+The command dispatcher is generic, but resource kinds retain their own
+validation and lifecycle rules. Stack apply performs template projection,
+ownership, source pinning, and claims. Unit apply accepts a canonical desired
+document and creates a direct root.
 
 ## Preview orchestration
 
@@ -546,7 +563,8 @@ of permanently unparseable roots. Forge-side required-check/merge-queue enforcem
   by the demo acceptance flow.
 - [x] Add temporary-repository acceptance for direct Stack instantiation from a source-tracked StackTemplate, with
   replay idempotence and exact template provenance.
-- [x] Add `update-direct-stack` with UID and desired-head fencing, child UID preservation, and image-first convergence.
+- [x] Add public `create stack --in=state`, `apply stack --in=state`, and `delete stack --in=state` APIs with UID,
+  desired-head, request, and durable deletion fencing. The typed lifecycle commands remain compatibility wrappers.
 - [x] Add temporary-repository acceptance for dev source projection, staging promotion, independent preview updates,
   source isolation across R2, and UID-fenced preview cleanup.
 - [x] Add instance-scoped generated Unit naming and acceptance coverage for two concurrent Stacks from one template.

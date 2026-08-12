@@ -1838,6 +1838,7 @@ def candidate_identifier(
         "request-delete-direct-stack",
         "instantiate-stack",
         "update-direct-stack",
+        "apply-unit",
         "resolve-opaque-unit",
     ],
     environment_name: str,
@@ -1874,6 +1875,7 @@ def resolve_candidate_ref(
         "request-delete-direct-stack",
         "instantiate-stack",
         "update-direct-stack",
+        "apply-unit",
         "resolve-opaque-unit",
     ],
     candidate_id: str,
@@ -7383,6 +7385,33 @@ def _direct_stack_uid(
     return f"d1-{digest}"
 
 
+def _selected_stack_template_resources(
+    stack_name: str,
+    resources: Sequence[StackTemplateResource],
+    selected: str | None,
+) -> tuple[StackTemplateResource, ...]:
+    """Select a complete dependency-closed Unit projection from a template."""
+
+    if selected is None:
+        return tuple(resources)
+    names = [name.strip() for name in selected.split(",") if name.strip()]
+    if not names or len(set(names)) != len(names):
+        raise OperationError("--units must contain one or more unique Unit template names")
+    by_name = {resource.name: resource for resource in resources}
+    unknown = sorted(set(names) - set(by_name))
+    if unknown:
+        raise OperationError(f"Stack {stack_name!r} selects unknown Unit templates: {', '.join(unknown)}")
+    selected_names = set(names)
+    for resource in resources:
+        if resource.name in selected_names:
+            omitted = sorted(set(resource.dependsOn) - selected_names)
+            if omitted:
+                raise OperationError(
+                    f"Stack {stack_name!r} selects {resource.name!r} but omits dependencies: {', '.join(omitted)}"
+                )
+    return tuple(resource for resource in resources if resource.name in selected_names)
+
+
 def _stack_pin_name(environment: str, stack_name: str, uid: str) -> str:
     return f"stacks/{environment}/{stack_name}/{uid}"
 
@@ -7500,6 +7529,7 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
     _resource_name(args.environment, "environment name")
     _resource_name(args.stack, "Stack name")
     _resource_name(args.template, "StackTemplate name")
+    requested_units = getattr(args, "units", None)
     parameters = _parse_stack_parameters(args.parameters)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/#!-]{0,127}", args.request_id):
         raise OperationError("--request-id has an invalid format")
@@ -7560,7 +7590,10 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
         )
         if not isinstance(template.spec, StackTemplateSpec):
             raise OperationError(f"StackTemplate {args.template!r} has an invalid specification")
-        expanded = scope_stack_template_resources(args.stack, template.spec.expand(parameters))
+        selected_template_resources = _selected_stack_template_resources(
+            args.stack, template.spec.expand(parameters), requested_units
+        )
+        expanded = scope_stack_template_resources(args.stack, selected_template_resources)
         template_provenance = StackInstantiationProvenance(
             templateRevision=source_revision,
             templatePath=template_path.relative_to(source).as_posix(),
@@ -7575,13 +7608,16 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
             raise OperationError(f"Stack {args.stack!r} is source-authored; direct instantiation would collide")
         project = load_project_config(synthetic_source)
         synthetic_stack_path = synthetic_environment / "stacks" / f"{args.stack}{project.write_format.suffix}"
+        synthetic_spec: dict[str, Any] = {"template": args.template, "parameters": dict(parameters)}
+        if requested_units is not None:
+            synthetic_spec["units"] = [resource.name for resource in selected_template_resources]
         write_document(
             synthetic_stack_path,
             {
                 "apiVersion": CORE_API_VERSION,
                 "kind": "Stack",
                 "metadata": {"name": args.stack},
-                "spec": {"template": args.template, "parameters": dict(parameters)},
+                "spec": synthetic_spec,
             },
             format=project.write_format,
         )
@@ -7628,13 +7664,16 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
                         "spec": cast(JsonObjectValue, dump_template_value(cast(TemplateValue, resource.spec))),
                         "dependsOn": list(resource.dependsOn),
                     }
-                    for resource in template.spec.expand(parameters)
+                    for resource in _selected_stack_template_resources(
+                        args.stack, template.spec.expand(parameters), requested_units
+                    )
                 }
             }
         )
         direct_spec = DesiredStackSpec(
             template=StackTemplateReference(name=args.template),
             parameters=parameters,
+            units=[resource.name for resource in selected_template_resources] if requested_units is not None else None,
             provenance=template_provenance,
             resolvedSource=ResolvedStackTemplateSource(
                 fromGit=ResolvedGitSource(
@@ -7975,21 +8014,17 @@ def _command_update_direct_stack(args: argparse.Namespace) -> bool:
             expanded_template = template.spec.expand(parameters)
         except (TemplateError, TypeError, ValueError) as exc:
             raise OperationError(f"StackTemplate parameters are unsafe: {exc}") from exc
-        selected_names = set(existing.spec.units or (resource.name for resource in expanded_template))
-        known_names = {resource.name for resource in expanded_template}
-        unknown = sorted(selected_names - known_names)
-        if unknown:
-            raise OperationError(f"Stack {args.stack!r} selects unknown Unit templates: {', '.join(unknown)}")
-        for resource in expanded_template:
-            if resource.name in selected_names:
-                omitted = sorted(set(resource.dependsOn) - selected_names)
-                if omitted:
-                    raise OperationError(
-                        f"Stack {args.stack!r} selects {resource.name!r} but omits dependencies: {', '.join(omitted)}"
-                    )
+        selection = getattr(args, "units", None)
+        if selection is None and existing.spec.units is not None:
+            selection = ",".join(existing.spec.units)
+        expanded_template = _selected_stack_template_resources(
+            args.stack,
+            expanded_template,
+            selection,
+        )
         expanded = scope_stack_template_resources(
             args.stack,
-            tuple(resource for resource in expanded_template if resource.name in selected_names),
+            expanded_template,
         )
 
         shutil.copytree(source, synthetic_source)
@@ -8000,8 +8035,9 @@ def _command_update_direct_stack(args: argparse.Namespace) -> bool:
         project = load_project_config(synthetic_source)
         synthetic_stack_path = synthetic_environment / "stacks" / f"{args.stack}{project.write_format.suffix}"
         synthetic_spec: dict[str, Any] = {"template": args.template, "parameters": dict(parameters)}
-        if existing.spec.units is not None:
-            synthetic_spec["units"] = list(existing.spec.units)
+        selected_units = tuple(resource.name for resource in expanded_template)
+        if selected_units != tuple(resource.name for resource in template.spec.expand(parameters)):
+            synthetic_spec["units"] = list(selected_units)
         if existing.spec.artifactImports:
             synthetic_spec["artifactImports"] = [item.to_dict() for item in existing.spec.artifactImports]
         write_document(
@@ -8058,7 +8094,7 @@ def _command_update_direct_stack(args: argparse.Namespace) -> bool:
             DesiredStackSpec(
                 template=StackTemplateReference(name=args.template),
                 parameters=parameters,
-                units=existing.spec.units,
+                units=list(selected_units),
                 artifactImports=existing.spec.artifactImports,
                 provenance=template_provenance,
                 resolvedSource=ResolvedStackTemplateSource(
@@ -10985,6 +11021,245 @@ def _document_format_for_path(path: Path) -> DocumentFormat:
     return DocumentFormat.JSON if path.suffix.lower() == ".json" else DocumentFormat.YAML
 
 
+def _source_resource_path(kind: str, name: str, environment: str | None, project: Any) -> Path:
+    if kind == "StackTemplate":
+        return REPOSITORY_ROOT.joinpath(*project.stack_templates_path.parts) / f"{name}{project.write_format.suffix}"
+    if environment is None:
+        raise OperationError(f"{kind} operations require --environment")
+    environment_root = project_environment_root(REPOSITORY_ROOT, environment)
+    directory = {"Stack": "stacks", "Unit": "units"}.get(kind)
+    if directory is None:
+        raise OperationError(f"source operations do not support {kind}")
+    return environment_root / directory / f"{name}{project.write_format.suffix}"
+
+
+def _parse_optional_units(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    units = [item.strip() for item in value.split(",") if item.strip()]
+    if not units or len(set(units)) != len(units):
+        raise OperationError("--units must contain one or more unique Unit template names")
+    return units
+
+
+def _stack_operation_namespace(args: argparse.Namespace) -> argparse.Namespace:
+    return argparse.Namespace(
+        environment=args.environment,
+        stack=args.name,
+        template=args.template,
+        units=getattr(args, "units", None),
+        source_revision=args.source_revision,
+        parameters=args.parameters,
+        request_id=args.request_id,
+        desired_ref=getattr(args, "desired_ref", None),
+        observed_ref=getattr(args, "observed_ref", None),
+        candidate_ref=getattr(args, "candidate_ref", None),
+        dry=getattr(args, "dry", False),
+    )
+
+
+def command_create_stacktemplate(args: argparse.Namespace) -> None:
+    if args.input_location != "source":
+        raise OperationError("StackTemplate state creation is not supported; use source-authored StackTemplates")
+    _resource_name(args.name, "StackTemplate name")
+    project = load_project_config(REPOSITORY_ROOT)
+    source = Path(args.file)
+    if not source.is_absolute():
+        source = REPOSITORY_ROOT / source
+    document = RESOURCE_CATALOG.load_document(source)
+    template = RESOURCE_CATALOG.parse_stack_template(document, profile="authored", expected_name=args.name)
+    target = _creation_target(
+        REPOSITORY_ROOT.joinpath(*project.stack_templates_path.parts),
+        args.name,
+        suffix=project.write_format.suffix,
+        force=args.or_update,
+    )
+    written = write_document(
+        target,
+        RESOURCE_CATALOG.serialize_stack_resource(template, profile="authored"),
+        format=_document_format_for_path(target),
+    )
+    _print_created(written)
+
+
+def command_create_stack(args: argparse.Namespace) -> None:
+    if args.input_location == "state":
+        if not args.source_revision or not args.request_id:
+            raise OperationError("state Stack creation requires --source-revision and --request-id")
+        operation = _stack_operation_namespace(args)
+        if args.or_update:
+            return command_apply_stack(operation)
+        command_instantiate_stack(operation)
+        return
+    _resource_name(args.name, "Stack name")
+    project = load_project_config(REPOSITORY_ROOT)
+    environment_root = project_environment_root(REPOSITORY_ROOT, args.environment)
+    load_environment(REPOSITORY_ROOT, args.environment)
+    parameters = _parse_stack_parameters(args.parameters)
+    stack = StackResource(
+        GVK(CORE_API_VERSION, "Stack"),
+        ResourceMetadata(name=args.name),
+        StackSpec(
+            template=args.template,
+            parameters=parameters,
+            units=_parse_optional_units(args.units),
+        ),
+    )
+    target = _creation_target(
+        environment_root / "stacks",
+        args.name,
+        suffix=project.write_format.suffix,
+        force=args.or_update,
+    )
+    written = write_document(
+        target,
+        RESOURCE_CATALOG.serialize_stack_resource(stack, profile="authored"),
+        format=_document_format_for_path(target),
+    )
+    _print_created(written)
+
+
+def command_apply_stack(args: argparse.Namespace) -> None:
+    operation = args if hasattr(args, "stack") else _stack_operation_namespace(args)
+    operation.input_location = "state"
+    desired_ref, _observed_ref = deployment_refs(REPOSITORY_ROOT, operation.environment, operation.desired_ref, None)
+    current_revision = fetch_ref(desired_ref)
+    if current_revision is None:
+        raise OperationError(f"desired ref {desired_ref!r} has no state")
+    current = Path(tempfile.mkdtemp(prefix="gitopsctr-apply-stack-"))
+    try:
+        materialize_revision(current_revision, current)
+        path = _current_desired_stack_paths(current, "Stack").get(operation.stack)
+        if path is None:
+            command_instantiate_stack(operation)
+            return
+        existing = RESOURCE_CATALOG.parse_stack(
+            RESOURCE_CATALOG.load_document(path), profile="desired", expected_name=operation.stack
+        )
+        lifecycle = existing.metadata.lifecycle
+        if (
+            lifecycle is None
+            or lifecycle.management is None
+            or lifecycle.management.mode != "direct"
+            or existing.metadata.uid is None
+        ):
+            raise OperationError(f"desired Stack {operation.stack!r} is not directly managed")
+        operation.uid = getattr(args, "uid", None) or existing.metadata.uid
+        operation.desired_revision = getattr(args, "desired_revision", None) or current_revision
+        command_update_direct_stack(operation)
+    finally:
+        shutil.rmtree(current, ignore_errors=True)
+
+
+def command_apply_unit(args: argparse.Namespace) -> None:
+    if args.input_location != "state":
+        raise OperationError("apply only supports --in=state; edit and commit source YAML directly")
+    if not args.file:
+        raise OperationError("apply unit requires --file")
+    _resource_name(args.environment, "environment name")
+    document = RESOURCE_CATALOG.load_document(Path(args.file))
+    unit = RESOURCE_CATALOG.parse_unit(document, profile="desired")
+    if unit.metadata.lifecycle is None or unit.metadata.lifecycle.management is None:
+        raise OperationError("apply unit requires desired lifecycle metadata")
+    if unit.metadata.lifecycle.owner is not None or unit.metadata.lifecycle.management.mode != "direct":
+        raise OperationError("apply unit requires a directly managed root Unit")
+    if unit.metadata.uid is None:
+        raise OperationError("apply unit requires a Unit UID")
+    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, None)
+    current_revision = fetch_ref(desired_ref)
+    if current_revision is None:
+        raise OperationError(f"desired ref {desired_ref!r} has no state")
+    with tempfile.TemporaryDirectory(prefix="gitopsctr-apply-unit-") as temporary_directory:
+        current = Path(temporary_directory) / "current"
+        candidate = Path(temporary_directory) / "candidate"
+        materialize_revision(current_revision, current)
+        existing_path = unit_document_path(current, unit.name, REPOSITORY_ROOT)
+        if existing_path.is_file():
+            if not getattr(args, "or_update", True):
+                raise OperationError(f"desired Unit {unit.name!r} already exists")
+            existing = load_desired_unit(existing_path, unit.name)
+            if existing.metadata.uid != unit.metadata.uid:
+                raise OperationError(f"stale desired Unit UID for {unit.name!r}")
+            if args.uid is not None and args.uid != unit.metadata.uid:
+                raise OperationError(f"stale desired Unit UID for {unit.name!r}")
+            if args.desired_revision is not None and args.desired_revision != current_revision:
+                raise OperationError(f"stale desired head for {unit.name!r}")
+        elif args.uid is not None:
+            raise OperationError(f"desired Unit {unit.name!r} is not present")
+        shutil.copytree(current, candidate)
+        write_desired_candidate_unit(candidate / "units" / existing_path.name, unit, REPOSITORY_ROOT)
+        load_desired_resource_graph(candidate)
+        request_id = args.request_id or f"apply:{args.environment}/{unit.name}:{unit.metadata.uid}"
+        candidate_id = candidate_identifier(
+            "apply-unit",
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            {"unit": unit.name, "request": request_id},
+        )
+        candidate_ref = resolve_candidate_ref(
+            REPOSITORY_ROOT, args.environment, "apply-unit", candidate_id, args.candidate_ref
+        )
+        if candidate_ref in {desired_ref, observed_ref}:
+            raise OperationError("apply candidate ref conflicts with deployment state")
+        revision, outcome = publish_desired_change(
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            candidate_ref,
+            f"Apply direct Unit {unit.name}",
+            f"Apply direct Unit {unit.name}",
+            f"Apply request `{request_id}`.",
+            args.dry,
+            current,
+        )
+        if args.dry:
+            return
+        print(revision)
+        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
+
+
+def command_delete_resource(args: argparse.Namespace) -> None:
+    if args.input_location == "state":
+        if args.kind == "StackTemplate":
+            raise OperationError("StackTemplates are source-authored resources and cannot be state-managed")
+        if not args.uid:
+            raise OperationError("state deletion requires --uid")
+        if args.kind == "Stack":
+            command_request_delete_direct_stack(
+                argparse.Namespace(
+                    environment=args.environment,
+                    stack=args.name,
+                    uid=args.uid,
+                    desired_ref=args.desired_ref,
+                    candidate_ref=args.candidate_ref,
+                    dry=args.dry,
+                )
+            )
+        else:
+            command_request_delete_direct_unit(
+                argparse.Namespace(
+                    environment=args.environment,
+                    unit=args.name,
+                    uid=args.uid,
+                    desired_ref=args.desired_ref,
+                    candidate_ref=args.candidate_ref,
+                    dry=args.dry,
+                )
+            )
+        return
+    project = load_project_config(REPOSITORY_ROOT)
+    target = _source_resource_path(args.kind, args.name, args.environment, project)
+    candidates = document_candidates(target.parent, args.name)
+    if not candidates:
+        raise OperationError(f"source {args.kind} {args.name!r} does not exist")
+    for path in candidates:
+        path.unlink()
+    print(f"deleted {args.kind} {args.name}")
+
+
 def command_create_project(args: argparse.Namespace) -> None:
     project_document = {
         "$schema": resource_schema_url(CORE_API_VERSION, "Project"),
@@ -11047,6 +11322,13 @@ def command_create_environment(args: argparse.Namespace) -> None:
 
 
 def command_create_unit(args: argparse.Namespace) -> None:
+    if getattr(args, "input_location", "source") == "state":
+        if not args.file:
+            raise OperationError("create unit --in=state requires --file")
+        command_apply_unit(args)
+        return
+    if not args.name or not args.driver:
+        raise OperationError("source Unit creation requires --name and --driver")
     _resource_name(args.name, "unit name")
     safe_source_path(args.source_path, f"{args.name} source path")
     try:
@@ -11078,7 +11360,7 @@ def command_create_unit(args: argparse.Namespace) -> None:
         environment_root / "units",
         args.name,
         suffix=project.write_format.suffix,
-        force=args.force,
+        force=args.force or getattr(args, "or_update", False),
     )
     written = write_document(
         target,
@@ -11293,7 +11575,7 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
     """Render the root command list in functional groups."""
 
     COMMAND_GROUPS = (
-        ("Project", ("create", "validate")),
+        ("Project", ("create", "apply", "delete", "validate")),
         ("Schemas", ("schemas",)),
         (
             "Deployment",
@@ -11364,9 +11646,10 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
 
-    create = commands.add_parser("create", help="create a Project, Environment, or Unit resource")
+    create = commands.add_parser("create", help="create a source or directly managed resource")
     create_commands = create.add_subparsers(dest="create_command", required=True)
     create_project = create_commands.add_parser("project", help="create the repository Project resource")
+    create_project.add_argument("--in", dest="input_location", choices=("source",), default="source")
     create_project.add_argument("--name", required=True, help="DNS-1123 project name")
     create_project.add_argument("--write-format", choices=("yaml", "json"), default="yaml")
     create_project.add_argument(
@@ -11393,22 +11676,101 @@ def build_parser() -> argparse.ArgumentParser:
     create_project.set_defaults(handler=command_create_project)
 
     create_environment = create_commands.add_parser("environment", help="create an authored Environment resource")
+    create_environment.add_argument("--in", dest="input_location", choices=("source",), default="source")
     create_environment.add_argument("--name", required=True)
     create_environment.add_argument("--change-gate", choices=("none", "pullRequest"), default="none")
     create_environment.add_argument("--force", action="store_true", help="replace an existing Environment resource")
     create_environment.set_defaults(handler=command_create_environment)
 
     create_unit = create_commands.add_parser("unit", help="create a driver-specific authored Unit resource")
+    create_unit.add_argument("--in", dest="input_location", choices=("source", "state"), default="source")
     create_unit.add_argument("--environment", required=True)
-    create_unit.add_argument("--name", required=True)
-    create_unit.add_argument("--driver", required=True, choices=tuple(sorted(UNIT_DRIVERS)))
+    create_unit.add_argument("--name")
+    create_unit.add_argument("--driver", choices=tuple(sorted(UNIT_DRIVERS)))
     create_unit.add_argument(
         "--source-path",
         default=".",
         help="path relative to the root of the selected source revision",
     )
     create_unit.add_argument("--force", action="store_true", help="replace an existing Unit resource")
+    create_unit.add_argument("--file", help="desired Unit document when using --in=state")
+    create_unit.add_argument("--or-update", action="store_true", help="update an existing state Unit")
+    create_unit.add_argument("--uid", help="expected direct Unit UID when updating state")
+    create_unit.add_argument("--desired-revision", help="expected desired-state head when updating state")
+    create_unit.add_argument("--request-id", help="stable replay identity for a state apply")
+    create_unit.add_argument("--desired-ref", help="override the environment's desired ref")
+    create_unit.add_argument("--candidate-ref", help="override the candidate ref")
+    create_unit.add_argument("--dry", action="store_true")
     create_unit.set_defaults(handler=command_create_unit)
+
+    create_template = create_commands.add_parser(
+        "stacktemplate", help="create a source-authored StackTemplate from a document"
+    )
+    create_template.add_argument("--in", dest="input_location", choices=("source",), default="source")
+    create_template.add_argument("--name", required=True)
+    create_template.add_argument("--file", required=True, help="authored StackTemplate document")
+    create_template.add_argument("--or-update", action="store_true", help="replace an existing source document")
+    create_template.set_defaults(handler=command_create_stacktemplate)
+
+    create_stack = create_commands.add_parser("stack", help="create a source or directly managed Stack")
+    create_stack.add_argument("--in", dest="input_location", choices=("source", "state"), default="source")
+    create_stack.add_argument("--environment", required=True)
+    create_stack.add_argument("--name", required=True)
+    create_stack.add_argument("--template", required=True)
+    create_stack.add_argument("--units", help="comma-separated Unit template names")
+    create_stack.add_argument("--parameters", default="{}", help="Stack parameters as a JSON object")
+    create_stack.add_argument("--source-revision", help="trusted full Git revision or ref for state creation")
+    create_stack.add_argument("--request-id", help="stable replay identity for state creation")
+    create_stack.add_argument("--or-update", action="store_true", help="update an existing resource")
+    create_stack.add_argument("--desired-ref")
+    create_stack.add_argument("--observed-ref")
+    create_stack.add_argument("--candidate-ref")
+    create_stack.add_argument("--dry", action="store_true")
+    create_stack.set_defaults(handler=command_create_stack)
+
+    apply = commands.add_parser("apply", help="create or update a directly managed state resource")
+    apply_commands = apply.add_subparsers(dest="apply_kind", required=True)
+    apply_stack = apply_commands.add_parser("stack", help="apply a directly managed Stack")
+    apply_stack.add_argument("--in", dest="input_location", choices=("state",), default="state")
+    apply_stack.add_argument("--environment", required=True)
+    apply_stack.add_argument("--name", required=True)
+    apply_stack.add_argument("--template", required=True)
+    apply_stack.add_argument("--units")
+    apply_stack.add_argument("--parameters", default="{}")
+    apply_stack.add_argument("--source-revision", required=True)
+    apply_stack.add_argument("--request-id", required=True)
+    apply_stack.add_argument("--uid")
+    apply_stack.add_argument("--desired-revision")
+    apply_stack.add_argument("--desired-ref")
+    apply_stack.add_argument("--observed-ref")
+    apply_stack.add_argument("--candidate-ref")
+    apply_stack.add_argument("--dry", action="store_true")
+    apply_stack.set_defaults(handler=command_apply_stack)
+
+    apply_unit = apply_commands.add_parser("unit", help="apply a directly managed Unit document")
+    apply_unit.add_argument("--in", dest="input_location", choices=("state",), default="state")
+    apply_unit.add_argument("--environment", required=True)
+    apply_unit.add_argument("--file", required=True)
+    apply_unit.add_argument("--uid")
+    apply_unit.add_argument("--desired-revision")
+    apply_unit.add_argument("--request-id")
+    apply_unit.add_argument("--desired-ref")
+    apply_unit.add_argument("--candidate-ref")
+    apply_unit.add_argument("--dry", action="store_true")
+    apply_unit.set_defaults(handler=command_apply_unit)
+
+    delete = commands.add_parser("delete", help="delete a source or directly managed state resource")
+    delete_commands = delete.add_subparsers(dest="delete_kind", required=True)
+    for delete_name, delete_kind in (("stack", "Stack"), ("unit", "Unit"), ("stacktemplate", "StackTemplate")):
+        delete_parser = delete_commands.add_parser(delete_name, help=f"delete a {delete_kind}")
+        delete_parser.add_argument("--in", dest="input_location", choices=("source", "state"), default="source")
+        delete_parser.add_argument("--environment")
+        delete_parser.add_argument("--name", required=True)
+        delete_parser.add_argument("--uid")
+        delete_parser.add_argument("--desired-ref")
+        delete_parser.add_argument("--candidate-ref")
+        delete_parser.add_argument("--dry", action="store_true")
+        delete_parser.set_defaults(handler=command_delete_resource, kind=delete_kind)
 
     validate = commands.add_parser("validate", help="validate Project, Environment, and Unit resources")
     validate.add_argument(
@@ -11470,6 +11832,10 @@ def build_parser() -> argparse.ArgumentParser:
     instantiate_stack.add_argument("--environment", required=True)
     instantiate_stack.add_argument("--stack", required=True)
     instantiate_stack.add_argument("--template", required=True)
+    instantiate_stack.add_argument(
+        "--units",
+        help="comma-separated Unit template names to instantiate; defaults to all Units",
+    )
     instantiate_stack.add_argument("--source-revision", required=True, help="trusted full Git revision or ref")
     instantiate_stack.add_argument("--parameters", required=True, help="concrete Stack parameters as a JSON object")
     instantiate_stack.add_argument("--request-id", required=True, help="stable replay identity for this request")
@@ -11495,6 +11861,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="exact current desired-state head used to fence this update",
     )
     update_direct_stack.add_argument("--template", required=True)
+    update_direct_stack.add_argument(
+        "--units",
+        help="comma-separated Unit template names to instantiate; defaults to the current selection",
+    )
     update_direct_stack.add_argument("--source-revision", required=True, help="trusted full Git revision or ref")
     update_direct_stack.add_argument("--parameters", required=True, help="concrete Stack parameters as a JSON object")
     update_direct_stack.add_argument("--request-id", required=True, help="stable replay identity for this update")

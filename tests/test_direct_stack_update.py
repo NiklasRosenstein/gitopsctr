@@ -135,6 +135,40 @@ def test_update_direct_stack_preserves_uid_owner_and_updates_pin_provenance(tmp_
     assert pin.revision == source_revision
 
 
+def test_apply_stack_is_the_public_update_api(tmp_path: Path, monkeypatch):
+    source, store, desired_revision, uid, source_revision = _direct_stack(tmp_path, monkeypatch)
+    args = controller.build_parser().parse_args(
+        [
+            "apply",
+            "stack",
+            "--in=state",
+            "--environment",
+            "dev",
+            "--name",
+            "web",
+            "--template",
+            "preview",
+            "--source-revision",
+            source_revision,
+            "--parameters",
+            '{"source-path":"."}',
+            "--request-id",
+            "github:example/application#update-1",
+            "--uid",
+            uid,
+            "--desired-revision",
+            desired_revision,
+            "--desired-ref",
+            "deploy/dev",
+            "--observed-ref",
+            "observed/dev",
+        ]
+    )
+
+    controller.command_apply_stack(args)
+    assert store.fetch("deploy/dev").revision != desired_revision
+
+
 def test_update_direct_stack_replay_is_idempotent(tmp_path: Path, monkeypatch):
     source, store, desired_revision, uid, source_revision = _direct_stack(tmp_path, monkeypatch)
     args = _args(source, uid=uid, desired_revision=desired_revision, source_revision=source_revision)

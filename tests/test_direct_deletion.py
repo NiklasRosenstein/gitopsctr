@@ -114,6 +114,30 @@ def test_request_delete_direct_unit_publishes_retained_uid_fenced_intent(tmp_pat
     ] == ("direct")
 
 
+def test_generic_delete_unit_uses_the_public_state_api(tmp_path, monkeypatch):
+    _current, published = _prepare(tmp_path, monkeypatch, _unit_document())
+    args = deploy_release.build_parser().parse_args(
+        [
+            "delete",
+            "unit",
+            "--in=state",
+            "--environment",
+            "dev",
+            "--name",
+            "application",
+            "--uid",
+            "direct-application",
+            "--desired-ref",
+            "deploy/dev",
+        ]
+    )
+
+    deploy_release.command_delete_resource(args)
+
+    assert len(published) == 1
+    assert deploy_release.load_desired_deletion_intents(published[0])["application"].management_mode == "direct"
+
+
 def test_request_delete_direct_unit_rejects_stale_uid(tmp_path, monkeypatch):
     _current, published = _prepare(tmp_path, monkeypatch, _unit_document())
 

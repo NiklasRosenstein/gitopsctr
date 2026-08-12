@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -98,6 +99,107 @@ def test_create_project_writes_a_valid_canonical_resource(tmp_path: Path, capsys
         "$schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Project.schema.json\n"
     )
     assert capsys.readouterr().out == "gitopsctr.yaml\n"
+
+
+def test_create_stack_and_stacktemplate_write_source_resources(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    create_project(tmp_path)
+    create_environment(tmp_path)
+    template_path = tmp_path / "template.json"
+    template_path.write_text(
+        json.dumps(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "StackTemplate",
+                "metadata": {"name": "application"},
+                "spec": {
+                    "unitTemplates": {
+                        "deploy": {
+                            "apiVersion": "unit.gitopsctr.io/v1",
+                            "kind": "Terraform",
+                            "spec": {"source": {"path": "."}},
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    run_command(
+        tmp_path,
+        [
+            "create",
+            "stacktemplate",
+            "--name",
+            "application",
+            "--file",
+            str(template_path),
+        ],
+    )
+    run_command(
+        tmp_path,
+        [
+            "create",
+            "stack",
+            "--environment",
+            "dev",
+            "--name",
+            "application",
+            "--template",
+            "application",
+            "--units",
+            "deploy",
+            "--parameters",
+            "{}",
+        ],
+    )
+
+    assert (tmp_path / "deployment/stack-templates/application.yaml").is_file()
+    stack = yaml.safe_load((tmp_path / "deployment/environments/dev/stacks/application.yaml").read_text())
+    assert stack["spec"]["template"]["name"] == "application"
+    assert stack["spec"]["parameters"] == {}
+    assert stack["spec"]["units"] == ["deploy"]
+    assert capsys.readouterr().out.splitlines()[-1].endswith("application.yaml")
+
+
+def test_create_unit_state_uses_the_desired_document(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    create_project(tmp_path)
+    controller.REPOSITORY_ROOT = tmp_path
+    desired = tmp_path / "unit.json"
+    desired.write_text(
+        json.dumps(
+            {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "Terraform",
+                "metadata": {
+                    "name": "preview",
+                    "uid": "d1-preview",
+                    "lifecycle": {"management": {"mode": "direct"}},
+                },
+                "spec": {
+                    "source": {"path": ".", "revision": "a" * 40},
+                    "terraform": {"backend": {}, "variables": {}, "observeOutputs": []},
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("desired/dev", "observed/dev"))
+    monkeypatch.setattr(controller, "fetch_ref", lambda _ref: "b" * 40)
+    monkeypatch.setattr(controller, "materialize_revision", lambda _revision, output: output.mkdir(parents=True))
+    published: list[Path] = []
+
+    def publish(_environment, candidate, *_args, **_kwargs):
+        snapshot = tmp_path / f"published-{len(published)}"
+        shutil.copytree(candidate, snapshot)
+        published.append(snapshot)
+        return "c" * 40, None
+
+    monkeypatch.setattr(controller, "publish_desired_change", publish)
+    monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+
+    run_command(tmp_path, ["create", "unit", "--in=state", "--environment", "dev", "--file", str(desired)])
+
+    preview_path = next((published[0] / "units").glob("preview.*"))
+    assert controller.load_desired_unit(preview_path, "preview").metadata.uid == "d1-preview"
 
 
 def test_create_project_validates_before_writing_and_requires_force(tmp_path: Path):
