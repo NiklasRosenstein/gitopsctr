@@ -18,6 +18,7 @@ from gitopsctr import controller as deploy_release
 from gitopsctr.contracts import DesiredSource, ResolvedInputs
 from gitopsctr.contrib.drivers.frontend_s3_cloudfront import FrontendDesiredUnit
 from gitopsctr.driver import UnitResolution
+from gitopsctr.errors import ReferenceUnavailable
 from gitopsctr.resources import ResourceMetadata
 from tests.conftest import receipt_document, receipt_resource, write_test_document
 
@@ -1205,7 +1206,8 @@ def test_outside_candidate_history_refreshes_dangling_previous_source_revision(t
 
     assert result.source is not None
     assert result.source.revision == candidate_revision
-    assert result.inputs_changed is True
+    assert result.disposition is deploy_release.SourceResolutionDisposition.REVISION_REFRESHED
+    assert result.inputs_changed is False
     assert result.refresh_reason is not None
     assert "outside candidate history" in result.refresh_reason
 
@@ -1221,7 +1223,8 @@ def test_matching_input_hash_refreshes_unavailable_previous_source_revision(tmp_
 
     assert result.source is not None
     assert result.source.revision == candidate_revision
-    assert result.inputs_changed is True
+    assert result.disposition is deploy_release.SourceResolutionDisposition.REVISION_REFRESHED
+    assert result.inputs_changed is False
 
 
 def test_changed_input_hash_uses_candidate_source_revision(tmp_path, monkeypatch):
@@ -1345,6 +1348,108 @@ def test_outside_candidate_history_refreshes_desired_state_and_logs(tmp_path, mo
     assert (
         "REFRESH  aws-application: retained source aaaaaaaaaaaa is outside candidate history; use bbbbbbbbbbbb"
     ) in output
+
+
+def test_revision_refresh_carries_last_resolved_dependencies_when_upstream_is_stale(tmp_path, monkeypatch, capsys):
+    source = tmp_path / "source"
+    current = tmp_path / "current"
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
+    for unit_name in ("application-images", "aws-application"):
+        _write_json(
+            source / f"deployment/environments/dev/units/{unit_name}.json",
+            {
+                "schema": 1,
+                "name": unit_name,
+                "driver": "frontend-s3-cloudfront",
+                "source": {"path": "."},
+            },
+        )
+    driver_version = deploy_release.DRIVER_VERSIONS["frontend-s3-cloudfront"]
+    _write_json(
+        current / "units/application-images.json",
+        {
+            "apiVersion": "unit.gitopsctr.io/v1",
+            "kind": "FrontendS3Cloudfront",
+            "metadata": {
+                "name": "application-images",
+                "uid": "uid-application-images",
+                "lifecycle": {"management": {"mode": "sourceTracked"}},
+            },
+            "spec": {
+                "source": {
+                    "path": ".",
+                    "revision": "a" * 40,
+                    "inputHash": "sha256:old",
+                    "driverVersion": driver_version,
+                },
+            },
+        },
+    )
+    _write_json(
+        current / "units/aws-application.json",
+        {
+            "apiVersion": "unit.gitopsctr.io/v1",
+            "kind": "FrontendS3Cloudfront",
+            "metadata": {
+                "name": "aws-application",
+                "uid": "uid-aws-application",
+                "lifecycle": {"management": {"mode": "sourceTracked"}},
+            },
+            "spec": {
+                "source": {
+                    "path": ".",
+                    "revision": "a" * 40,
+                    "inputHash": "sha256:same",
+                    "driverVersion": driver_version,
+                },
+                "resolvedInputs": {"receipts": {"application-images": "old-receipt"}},
+            },
+        },
+    )
+    observed.mkdir()
+
+    def resolve_source(specification, *_args):
+        refreshed = specification.name == "aws-application"
+        return deploy_release.ResolvedUnitSourceResult(
+            source=DesiredSource(
+                path=".",
+                revision="b" * 40,
+                inputHash="sha256:same" if refreshed else "sha256:new",
+                driverVersion=driver_version,
+            ),
+            disposition=(
+                deploy_release.SourceResolutionDisposition.REVISION_REFRESHED
+                if refreshed
+                else deploy_release.SourceResolutionDisposition.INPUTS_CHANGED
+            ),
+            refresh_reason="retained source aaaaaaaaaaaa is unavailable; use bbbbbbbbbbbb" if refreshed else None,
+        )
+
+    monkeypatch.setattr(deploy_release, "resolved_unit_source", resolve_source)
+
+    def resolve_unit(unit, context):
+        if context.source is not None and context.source.inputHash == "sha256:same":
+            raise ReferenceUnavailable("receipt is stale: application-images")
+        return UnitResolution(FrontendDesiredUnit(source=context.source), None)
+
+    monkeypatch.setattr(deploy_release.UNIT_DRIVERS["frontend-s3-cloudfront"], "resolve_unit", resolve_unit)
+
+    result = deploy_release.build_desired_candidate(
+        "dev", source, "b" * 40, current, observed, None, candidate, verbose=True
+    )
+
+    refreshed = deploy_release.load_desired_unit(candidate / "units/aws-application.json", "aws-application")
+    upstream = deploy_release.load_desired_unit(candidate / "units/application-images.json", "application-images")
+    assert result.blocked == {"aws-application": "receipt is stale: application-images"}
+    assert refreshed.spec.source.revision == "b" * 40
+    assert refreshed.spec.resolvedInputs == ResolvedInputs(receipts={"application-images": "old-receipt"})
+    assert upstream.spec.source.revision == "b" * 40
+    assert (
+        "CARRY    aws-application: receipt is stale: application-images; preserve last resolved inputs"
+        in capsys.readouterr().err
+    )
 
 
 def test_advance_policy_error_leaves_the_candidate_unpublished(tmp_path, monkeypatch):

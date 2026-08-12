@@ -21,6 +21,7 @@ from gitopsctr.driver import (
     UnitResolution,
     UnitResolutionContext,
 )
+from gitopsctr.errors import ReferenceUnavailable
 from tests.conftest import write_test_document
 
 
@@ -183,6 +184,52 @@ def test_advancement_materializes_and_reuses_an_unchanged_payload(tmp_path, monk
         controller.load_desired_unit(second / "units/rendered.json", "rendered").spec.materialization
         == first_unit.spec.materialization
     )
+
+
+def test_revision_refresh_carries_valid_materialization_when_dependency_is_stale(tmp_path, monkeypatch):
+    plugin = install_render_only(monkeypatch)
+    source = tmp_path / "source"
+    source_tree(source)
+    first = materialize_candidate(tmp_path, source, tmp_path / "empty", "first-refresh")
+    first_unit = controller.load_desired_unit(first / "units/rendered.json", "rendered")
+    assert first_unit.spec.source.inputHash is not None
+
+    monkeypatch.setattr(
+        controller,
+        "resolved_unit_source",
+        lambda *_args: controller.ResolvedUnitSourceResult(
+            source=DesiredSource(
+                path=".",
+                inputs=["input.txt"],
+                revision="b" * 40,
+                inputHash=first_unit.spec.source.inputHash,
+                driverVersion=plugin.version,
+            ),
+            disposition=controller.SourceResolutionDisposition.REVISION_REFRESHED,
+            refresh_reason="retained source aaaaaaaaaaaa is unavailable; use bbbbbbbbbbbb",
+        ),
+    )
+    monkeypatch.setattr(
+        plugin,
+        "resolve_unit",
+        lambda _unit, _context: (_ for _ in ()).throw(ReferenceUnavailable("receipt is stale: upstream")),
+    )
+
+    candidate = tmp_path / "second-refresh"
+    observed = tmp_path / "second-refresh-observed"
+    observed.mkdir()
+    result = controller.build_desired_candidate(
+        "dev", source, "b" * 40, first, observed, None, candidate, verbose=False
+    )
+
+    carried = controller.load_desired_unit(candidate / "units/rendered.json", "rendered")
+    assert result.blocked == {"rendered": "receipt is stale: upstream"}
+    assert carried.spec.source.revision == "b" * 40
+    assert carried.spec.materialization == first_unit.spec.materialization
+    assert controller.directory_files(candidate / "materialized/rendered") == controller.directory_files(
+        first / "materialized/rendered"
+    )
+    assert plugin.calls == 1
 
 
 def test_materialized_payload_tampering_fails_before_status_or_promotion(tmp_path, monkeypatch):

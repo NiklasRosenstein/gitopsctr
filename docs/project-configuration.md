@@ -122,6 +122,32 @@ The history check uses `git merge-base --is-ancestor`. Under
 Source-less units are not affected. If planning fails, run `advance-desired`
 from a durable source revision first.
 
+### Provenance-only source refreshes
+
+Source resolution has three dispositions: `unchanged`, `inputs-changed`, and `revision-refreshed`. A revision refresh is
+safe only when the previous and candidate `source.inputHash` values are identical. That hash is the equivalence boundary:
+it covers the declared source inputs, driver version, and authored driver specification. Correct `source.inputs`
+declarations are therefore critical; a file omitted from the list can make two revisions appear equivalent when they are
+not.
+
+If a refreshed unit cannot resolve a dependency because an upstream receipt is stale, advancement may **carry forward**
+the previous fully resolved dependency snapshot. This preserves `resolvedInputs`, resolved driver values, and valid
+materialization descriptors while replacing only the source identity. Carry forward does not mean that new upstream state
+was resolved, and advancement may update a downstream unit while its upstream receipt is stale. The blockage remains
+visible in the log as `CARRY`.
+
+The refreshed desired unit is a real desired-state change. Its source revision changes the unit blob, so the old receipt is
+stale and is never silently rebound; the downstream unit may perform a no-op reconciliation using the carried snapshot. Once
+the upstream receipt is current, a later advancement resolves the downstream unit again and replaces the carried-forward
+dependency fingerprints. Dependency-aware convergence still selects the stale upstream unit first.
+
+Persistent advancement should use a durable, eligible source revision, normally enforced with the project's retained source
+ref or `--require-source-ref`. `advance-desired --dry` reports refresh and carry-forward decisions without publishing.
+`reconcile --plan` remains read-only and follows `whenUnavailableDuringPlan`; when that policy is `error`, it does not
+perform an implicit persistent repair. If there is no previous fully resolved unit, its validation fails, inputs or authored
+specification changed, policy rejects the refresh, or materialized data is not valid under the unchanged input hash, the
+existing blocked behavior is retained.
+
 Create an environment in that configured location with:
 
 ```console
