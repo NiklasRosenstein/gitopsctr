@@ -11697,7 +11697,10 @@ def build_parser() -> argparse.ArgumentParser:
     create_unit.add_argument("--or-update", action="store_true", help="update an existing state Unit")
     create_unit.add_argument("--uid", help="expected direct Unit UID when updating state")
     create_unit.add_argument("--desired-revision", help="expected desired-state head when updating state")
-    create_unit.add_argument("--request-id", help="stable replay identity for a state apply")
+    create_unit.add_argument(
+        "--request-id",
+        help="opaque idempotency key; reuse for the same mutation and change for a new mutation",
+    )
     create_unit.add_argument("--desired-ref", help="override the environment's desired ref")
     create_unit.add_argument("--candidate-ref", help="override the candidate ref")
     create_unit.add_argument("--dry", action="store_true")
@@ -11720,7 +11723,10 @@ def build_parser() -> argparse.ArgumentParser:
     create_stack.add_argument("--units", help="comma-separated Unit template names")
     create_stack.add_argument("--parameters", default="{}", help="Stack parameters as a JSON object")
     create_stack.add_argument("--source-revision", help="trusted full Git revision or ref for state creation")
-    create_stack.add_argument("--request-id", help="stable replay identity for state creation")
+    create_stack.add_argument(
+        "--request-id",
+        help="opaque idempotency key; reuse for the same mutation and change for a new mutation",
+    )
     create_stack.add_argument("--or-update", action="store_true", help="update an existing resource")
     create_stack.add_argument("--desired-ref")
     create_stack.add_argument("--observed-ref")
@@ -11738,7 +11744,11 @@ def build_parser() -> argparse.ArgumentParser:
     apply_stack.add_argument("--units")
     apply_stack.add_argument("--parameters", default="{}")
     apply_stack.add_argument("--source-revision", required=True)
-    apply_stack.add_argument("--request-id", required=True)
+    apply_stack.add_argument(
+        "--request-id",
+        required=True,
+        help="opaque idempotency key; reuse for the same mutation and change for a new mutation",
+    )
     apply_stack.add_argument("--uid")
     apply_stack.add_argument("--desired-revision")
     apply_stack.add_argument("--desired-ref")
@@ -11838,7 +11848,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     instantiate_stack.add_argument("--source-revision", required=True, help="trusted full Git revision or ref")
     instantiate_stack.add_argument("--parameters", required=True, help="concrete Stack parameters as a JSON object")
-    instantiate_stack.add_argument("--request-id", required=True, help="stable replay identity for this request")
+    instantiate_stack.add_argument(
+        "--request-id",
+        required=True,
+        help="opaque idempotency key; reuse for the same mutation and change for a new mutation",
+    )
     instantiate_stack.add_argument("--desired-ref", help="override the environment's desired ref")
     instantiate_stack.add_argument("--observed-ref", help="override the environment's observed ref")
     instantiate_stack.add_argument(
@@ -11867,7 +11881,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     update_direct_stack.add_argument("--source-revision", required=True, help="trusted full Git revision or ref")
     update_direct_stack.add_argument("--parameters", required=True, help="concrete Stack parameters as a JSON object")
-    update_direct_stack.add_argument("--request-id", required=True, help="stable replay identity for this update")
+    update_direct_stack.add_argument(
+        "--request-id",
+        required=True,
+        help="opaque idempotency key; reuse for the same mutation and change for a new mutation",
+    )
     update_direct_stack.add_argument("--desired-ref", help="override the environment's desired ref")
     update_direct_stack.add_argument("--observed-ref", help="override the environment's observed ref")
     update_direct_stack.add_argument(

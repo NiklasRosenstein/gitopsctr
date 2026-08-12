@@ -179,6 +179,17 @@ The current Unit envelope uses an explicit `management.mode` discriminator with 
 Keep this representation unless a later resource family needs materially different authority-specific fields; empty
 `sourceTracked: {}` and `direct: {}` marker objects are not required for the current contract.
 
+State mutation commands that accept `--request-id` MUST treat it as an opaque,
+caller-defined idempotency key for one logical mutation. Retrying the same
+mutation with the same request ID MUST be safe. A logically new mutation MUST
+use a new request ID. Reusing a request ID with different mutation inputs MUST
+be rejected. The core MUST NOT assign semantics to the value or parse
+integration conventions such as `github:example/application#123:sync:abc123`.
+
+PR CI MAY use `create --in=state --or-update` for both initial creation and
+later updates. The command selects the create or update lifecycle from the
+current desired state; request-ID rules remain unchanged.
+
 ### Forge provenance and orchestration boundary — Settled
 
 - Forge identity such as provider, pull request or merge request number, source head, and forge URL is provenance.

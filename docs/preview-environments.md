@@ -25,6 +25,21 @@ There is no source `apply` operation. Edit existing source YAML and commit it;
 `advance-desired` resolves that source into desired state. `create` is a
 scaffolding convenience, while `apply` is the state mutation API.
 
+## Request IDs
+
+`--request-id` is a caller-defined idempotency key for one logical state
+mutation. Retry the same mutation with the same value. Use a new value for a
+new mutation. Reusing a value with different inputs is rejected.
+
+The value is opaque to `gitopsctr`. An integration may use a convention such
+as `github:example/application#123:sync:abc123`; `gitopsctr` does not parse or
+validate its meaning.
+
+PR CI can use `create stack --in=state --or-update` for both the first
+creation and later updates. Use the same request ID when retrying one CI run,
+and a new request ID for a later source revision. Stack deletion uses the
+Stack UID as its lifecycle fence.
+
 For a one-Unit preview, `create unit --in=state` or `apply unit --in=state`
 takes a canonical desired Unit document with direct lifecycle metadata. The
 Unit is a direct root and can later be removed with `delete unit --in=state`.
@@ -92,9 +107,10 @@ gitopsctr create stack \
   --request-id github:example-org/application#123
 ```
 
-Use `--or-update` with `create stack` when a retrying workflow wants one
-convenience entry point. The generic form is `apply stack --in=state`; it uses
-the same UID, desired-head, and request-identity fences.
+PR CI can use `create stack --in=state --or-update` for every synchronization.
+The command creates an absent Stack and updates an existing direct Stack. The
+generic form is `apply stack --in=state`; both forms use the same UID,
+desired-head, and request-identity fences.
 
 The request is replay-safe. Keep the same request ID when retrying the same
 operation. The source revision must be trusted CI input; a moving ref is
