@@ -910,7 +910,7 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
     assert "==> aws-application · dev" in output
     assert "CHANGED  No observation exists" in output
     assert "ACTION   Run terraform reconciliation" in output
-    assert "RECONCILE SUCCEEDED" in output
+    assert "APPLY    SUCCEEDED" in output
     assert "UPDATED  Observation observed/dev bbbbbbbbbbbb → ffffffffffff" in output
     assert "UPDATED  Desired state deploy/dev to dddddddddddd" in output
 

@@ -371,7 +371,7 @@ def style_units(unit_names: Sequence[str], stream: TextIO | None = None) -> str:
 
 
 def status_role(status: str, message: str) -> str:
-    if status.upper() in {"RESULT", "RECONCILE", "PLAN"}:
+    if status.upper() in {"RESULT", "APPLY", "PLAN"}:
         result = message.split(":", 1)[0].strip().upper()
         if result.startswith("FAILED"):
             return "error"
@@ -9150,7 +9150,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         def log_compact_failure() -> None:
             if verbose:
                 return
-            log_status("PLAN" if args.plan else "RECONCILE", "FAILED")
+            log_status("PLAN" if args.plan else "APPLY", "FAILED")
             log_status(
                 "UNCHANGED",
                 f"Observation {style_branch(observed_ref)} at {describe_revision(observed_revision)}",
@@ -9347,7 +9347,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 if verbose:
                     log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully; desired advance deferred")
                 else:
-                    log_status("RECONCILE", "SUCCEEDED; desired advance deferred")
+                    log_status("APPLY", "SUCCEEDED; desired advance deferred")
                     observation_status = "UPDATED" if revision != observed_revision else "UNCHANGED"
                     log_status(
                         observation_status,
@@ -9362,7 +9362,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         if verbose:
             log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully")
         else:
-            log_status("RECONCILE", "SUCCEEDED")
+            log_status("APPLY", "SUCCEEDED")
             observation_status = "UPDATED" if revision != observed_revision else "UNCHANGED"
             log_status(
                 observation_status,
