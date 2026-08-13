@@ -93,7 +93,7 @@ class DemoRepository:
         run("git", "remote", "add", "origin", str(self.remote), cwd=self.worktree)
         run("git", "push", "--set-upstream", "origin", "main", cwd=self.worktree)
 
-    def heads(self) -> RefHeads:
+    def heads(self, environment: str = "dev") -> RefHeads:
         def head(ref: str) -> str:
             if not isinstance(self.remote, Path):
                 output = run("git", "ls-remote", self.remote, f"refs/heads/{ref}", capture=True).stdout.split()
@@ -110,8 +110,8 @@ class DemoRepository:
             ).stdout.strip()
 
         return RefHeads(
-            desired=head("gitopsctr/desired/dev"),
-            observed=head("gitopsctr/observed/dev"),
+            desired=head(f"gitopsctr/desired/{environment}"),
+            observed=head(f"gitopsctr/observed/{environment}"),
         )
 
     def clean(self) -> None:

@@ -1,0 +1,12 @@
+# yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Stack/authored.schema.json
+apiVersion: gitopsctr.io/v1
+kind: Stack
+metadata:
+  name: application
+spec:
+  template: application
+  parameters:
+    container-name: gitopsctr-demo-app
+    host-port: __APP_PORT__
+    terraform-state: __TERRAFORM_STATE__
+    image-repository: __REGISTRY__/gitopsctr-demo/app

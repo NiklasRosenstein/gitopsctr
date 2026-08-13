@@ -2,7 +2,7 @@
 apiVersion: gitopsctr.io/v1
 kind: Project
 metadata:
-  name: gitopsctr-kubernetes-demo
+  name: gitopsctr-k8s-demo
 spec:
   writeFormat: yaml
   environmentsPath: deployment/environments

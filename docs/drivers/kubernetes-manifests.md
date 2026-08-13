@@ -131,26 +131,25 @@ specification and promoted inputs; rollback restores the selected historical des
 
 ## Local Kubernetes acceptance
 
-The repository includes a real image-build and Helm/direct-delivery demo. Docker must be running; mise provides the
-remaining tools. Select kind or minikube explicitly:
+The repository includes a real Stack-based image-build and Helm delivery demo. Docker must be running; mise provides
+the remaining tools. kind is the default provider; select minikube with `GITOPSCTR_K8S_PROVIDER=minikube`:
 
 ```console
 mise install
 mise run sync
-mise run kubernetes-demo -- kind
-mise run kubernetes-demo-clean -- kind
-mise run kubernetes-demo -- minikube
-mise run kubernetes-demo-clean -- minikube
+mise run demo-k8s run
+mise run demo-k8s clean
+GITOPSCTR_K8S_PROVIDER=minikube mise run demo-k8s run
 ```
 
-`mise run kubernetes-acceptance -- PROVIDER` starts from empty state, exports the built image to the selected cluster,
-renders and applies the workload, verifies the running application through the CLI, proves a second convergence moves
-no Git refs, and always removes the cluster.
+`mise run demo-k8s acceptance` starts from empty state, reconciles the source-tracked dev Stack, promotes its exact
+image artifact into staging, verifies both workloads, proves clean convergence, and always removes the cluster.
+`mise run demo-k8s acceptance --preview` instead instantiates, updates, and requests deletion of a directly managed
+preview Stack built from the same template.
 
-`mise run argocd-acceptance -- PROVIDER` exercises external delivery. It installs an isolated Argo CD Core instance,
-creates an automated Application before the first materialized payload exists, advances the rendered Helm payload,
-explicitly refreshes the Application, and observes Argo CD syncing that exact desired revision. Argo CD, not gitopsctr,
-applies the workload.
+Add `--delivery argocd` to any Kubernetes demo command to exercise external delivery. It installs an isolated Argo CD
+Core instance, creates automated Applications before their materialized payloads exist, and observes Argo CD syncing
+the exact desired revisions. Argo CD, not gitopsctr, applies the workloads.
 
 ## Schemas
 

@@ -247,13 +247,16 @@ def test_yaml_demo_documents_validate_against_published_resource_schemas():
     paths = [
         root / "gitopsctr.yaml",
         root / "demo/docker/repository/gitopsctr.yaml",
-        root / "demo/kubernetes/repository/gitopsctr.yaml",
+        root / "demo/k8s/repository/gitopsctr.yaml",
         root / "demo/docker/repository/deployment/environments/dev/environment.yaml",
-        root / "demo/docker/repository/deployment/environments/dev/units/demo-image.yaml",
-        root / "demo/docker/repository/deployment/environments/dev/units/demo-service.yaml",
-        root / "demo/kubernetes/repository/deployment/environments/dev/environment.yaml",
-        root / "demo/kubernetes/repository/deployment/environments/dev/units/demo-image.yaml",
-        root / "demo/kubernetes/repository/deployment/environments/dev/units/web.yaml",
+        root / "demo/docker/repository/deployment/environments/dev/stacks/application.yaml",
+        root / "demo/docker/repository/deployment/stack-templates/application.yaml",
+        root / "demo/k8s/repository/deployment/environments/dev/environment.yaml",
+        root / "demo/k8s/repository/deployment/environments/dev/stacks/application.yaml",
+        root / "demo/k8s/repository/deployment/environments/staging/environment.yaml",
+        root / "demo/k8s/repository/deployment/environments/staging/stacks/application.yaml",
+        root / "demo/k8s/repository/deployment/environments/preview/environment.yaml",
+        root / "demo/k8s/repository/deployment/stack-templates/application.yaml",
     ]
     for path in paths:
         text = path.read_text()

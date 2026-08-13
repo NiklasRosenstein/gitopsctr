@@ -27,7 +27,7 @@ The CLI is the same in local use, CI, and the composite GitHub Action.
 - [GitHub Action](https://niklasrosenstein.github.io/gitopsctr/github-action/)
 - [JSON Schemas](https://niklasrosenstein.github.io/gitopsctr/schemas/)
 
-The repository also contains [Docker](demo/docker/) and [Kubernetes](demo/kubernetes/) demos.
+The repository also contains [Docker](demo/docker/) and [Kubernetes](demo/k8s/) Stack demos.
 
 ## Development
 

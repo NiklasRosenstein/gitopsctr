@@ -335,13 +335,17 @@ def test_artifact_reference_requires_an_explicit_registered_type() -> None:
 
 
 def test_artifact_reference_validation_identifies_unit_file_and_field(tmp_path: Path) -> None:
-    template = Path(__file__).parents[1] / "demo" / "kubernetes" / "repository"
+    template = Path(__file__).parents[1] / "demo" / "k8s" / "repository"
     shutil.copytree(template, tmp_path, dirs_exist_ok=True)
-    unit_path = tmp_path / "deployment" / "environments" / "dev" / "units" / "web.yaml"
-    unit = yaml.safe_load(unit_path.read_text())
+    template_path = tmp_path / "deployment" / "stack-templates" / "application.yaml"
+    stack_template = yaml.safe_load(template_path.read_text())
+    unit = stack_template["spec"]["unitTemplates"]["deploy"]
+    unit["metadata"] = {"name": "web"}
     reference = unit["spec"]["materialize"]["values"]["image"]["fromArtifact"]
     del reference["apiVersion"]
     del reference["kind"]
+    unit_path = tmp_path / "deployment" / "environments" / "dev" / "units" / "web.yaml"
+    unit_path.parent.mkdir(exist_ok=True)
     unit_path.write_text(yaml.safe_dump(unit, sort_keys=False))
 
     with pytest.raises(

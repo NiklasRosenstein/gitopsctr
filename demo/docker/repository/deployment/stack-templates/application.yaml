@@ -19,10 +19,10 @@ spec:
       kind: OciImages
       spec:
         source:
-          path: acceptance
+          path: .
           inputs: [Dockerfile, app.py]
         build:
-          dockerfile: acceptance/Dockerfile
+          dockerfile: Dockerfile
           platform: __DOCKER_PLATFORM__
         publish:
           targets:

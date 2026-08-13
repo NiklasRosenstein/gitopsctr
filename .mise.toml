@@ -50,46 +50,24 @@ depends = ["actionlint", "docs", "lint", "schemas-check", "typecheck", "test"]
 [tasks.build]
 run = "uv build"
 
-[tasks.demo]
-description = "Run the real local Docker/Terraform demo"
-run = "uv run python -m demo.docker.run run"
+[tasks.demo-docker]
+description = "Run, clean, or accept the source-tracked Docker Stack demo"
+usage = '''
+arg "[operation]" default="run" {
+  choices "run" "clean" "acceptance"
+}
+'''
+run = 'uv run python -m demo.docker.run "${usage_operation?}"'
 
-[tasks.demo-reset]
-description = "Recreate and run the local demo from scratch"
-run = "uv run python -m demo.docker.run reset"
-
-[tasks.demo-clean]
-description = "Remove the local demo resources and state"
-run = "uv run python -m demo.docker.run clean"
-
-[tasks.demo-acceptance]
-description = "Deploy, prove clean convergence, and clean the real local demo"
-run = "uv run python -m demo.docker.run acceptance"
-
-[tasks.demo-preview-acceptance]
-description = "Run the multi-environment Docker/Terraform Stack promotion acceptance"
-run = "uv run python -m demo.docker.run preview-acceptance"
-
-[tasks.kubernetes-demo]
-description = "Build and deploy the demo to an explicitly selected kind or minikube cluster"
-run = "uv run python -m demo.kubernetes.run run"
-
-[tasks.kubernetes-demo-clean]
-description = "Remove the explicitly selected Kubernetes demo cluster and state"
-run = "uv run python -m demo.kubernetes.run clean"
-
-[tasks.kubernetes-acceptance]
-description = "Build, deploy, verify, prove clean convergence, and clean the selected Kubernetes demo"
-run = "uv run python -m demo.kubernetes.run acceptance"
-
-[tasks.argocd-demo]
-description = "Build, materialize, and observe the selected Kubernetes demo through Argo CD"
-run = "uv run python -m demo.kubernetes.run run --delivery argocd"
-
-[tasks.argocd-demo-clean]
-description = "Remove the selected Argo CD Kubernetes demo cluster and state"
-run = "uv run python -m demo.kubernetes.run clean --delivery argocd"
-
-[tasks.argocd-acceptance]
-description = "Build, materialize, observe through Argo CD, and clean the selected Kubernetes demo"
-run = "uv run python -m demo.kubernetes.run acceptance --delivery argocd"
+[tasks.demo-k8s]
+description = "Run, clean, or accept the promoted/direct-preview Kubernetes Stack demo"
+usage = '''
+arg "[operation]" default="run" {
+  choices "run" "clean" "acceptance"
+}
+flag "--preview" help="Use a directly managed preview Stack"
+flag "--delivery <delivery>" default="direct" {
+  choices "direct" "argocd"
+}
+'''
+run = 'uv run python -m demo.k8s.run "${usage_operation?}" ${usage_preview:+--preview} --delivery "${usage_delivery?}"'

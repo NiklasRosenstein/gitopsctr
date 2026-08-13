@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Stack/authored.schema.json
+apiVersion: gitopsctr.io/v1
+kind: Stack
+metadata:
+  name: application
+spec:
+  template: application
+  parameters:
+    workload-name: gitopsctr-k8s-dev
+    workload-resource: deployment/gitopsctr-k8s-dev
+    message: rendered and reconciled in dev
+    cluster-name: __CLUSTER_NAME__
+    kube-context: __KUBE_CONTEXT__
+    argocd-application: gitopsctr-k8s-dev
+  units: [image, deploy]

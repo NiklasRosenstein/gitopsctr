@@ -65,10 +65,10 @@ jobs:
           install_args: python uv terraform
       - run: uv sync --locked --all-groups
       - name: Deploy and prove clean convergence
-        run: mise run demo-acceptance
+        run: mise run demo-docker acceptance
       - name: Clean up demo resources
         if: always()
-        run: mise run demo-clean
+        run: mise run demo-docker clean
 
   kubernetes-acceptance:
     name: Real Kubernetes demo (kind)
@@ -81,10 +81,26 @@ jobs:
           install_args: python uv helm kind kubectl
       - run: uv sync --locked --all-groups
       - name: Render, deploy, verify, and prove clean convergence
-        run: mise run kubernetes-acceptance -- kind
+        run: mise run demo-k8s acceptance
       - name: Clean up Kubernetes resources
         if: always()
-        run: mise run kubernetes-demo-clean -- kind
+        run: mise run demo-k8s clean
+
+  kubernetes-preview-acceptance:
+    name: Real Kubernetes preview demo (kind)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: python uv helm kind kubectl
+      - run: uv sync --locked --all-groups
+      - name: Instantiate, deploy, verify, and delete a direct preview
+        run: mise run demo-k8s acceptance --preview
+      - name: Clean up Kubernetes resources
+        if: always()
+        run: mise run demo-k8s clean
 
   argocd-acceptance:
     name: Argo CD Kubernetes demo (kind)
@@ -97,7 +113,7 @@ jobs:
           install_args: python uv helm kind kubectl
       - run: uv sync --locked --all-groups
       - name: Build, materialize, observe, and prove clean convergence
-        run: mise run argocd-acceptance -- kind
+        run: mise run demo-k8s acceptance --delivery argocd
       - name: Clean up Argo CD Kubernetes resources
         if: always()
-        run: mise run argocd-demo-clean -- kind
+        run: mise run demo-k8s clean

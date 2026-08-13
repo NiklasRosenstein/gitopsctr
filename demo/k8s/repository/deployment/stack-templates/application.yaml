@@ -1,0 +1,78 @@
+# yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/StackTemplate/authored.schema.json
+apiVersion: gitopsctr.io/v1
+kind: StackTemplate
+metadata:
+  name: application
+spec:
+  parameters:
+    - name: workload-name
+      type: string
+    - name: workload-resource
+      type: string
+    - name: message
+      type: string
+    - name: cluster-name
+      type: string
+    - name: kube-context
+      type: string
+    - name: argocd-application
+      type: string
+  unitTemplates:
+    image:
+      apiVersion: unit.gitopsctr.io/v1
+      kind: OciImages
+      spec:
+        source:
+          path: .
+          inputs: [Dockerfile, app.py]
+        build:
+          dockerfile: Dockerfile
+          platform: __DOCKER_PLATFORM__
+        publish:
+          targets:
+            application:
+              type: kind
+              cluster:
+                fromParameter:
+                  name: cluster-name
+    deploy:
+      apiVersion: unit.gitopsctr.io/v1
+      kind: KubernetesManifests
+      spec:
+        source:
+          path: charts/web
+          inputs: ["**/*"]
+        materialize:
+          type: helm
+          releaseName:
+            fromParameter:
+              name: workload-name
+          namespace: default
+          values:
+            name:
+              fromParameter:
+                name: workload-name
+            message:
+              fromParameter:
+                name: message
+            image:
+              fromArtifact:
+                unit: image
+                name: containers
+                apiVersion: artifact.gitopsctr.io/v1
+                kind: ContainerImages
+                pointer: /images/application/uri
+          allowSecrets: false
+        delivery:
+          mode: direct
+          kubeContext:
+            fromParameter:
+              name: kube-context
+          prune: false
+          wait:
+            - resource:
+                fromParameter:
+                  name: workload-resource
+              namespace: default
+              condition: Available
+              timeoutSeconds: 120

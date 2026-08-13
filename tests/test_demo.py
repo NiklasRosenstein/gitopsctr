@@ -6,72 +6,42 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from demo.docker import run as demo
-from demo.kubernetes import run as kubernetes_demo
+from demo.docker import run as docker_demo
+from demo.k8s import run as k8s_demo
 from demo.utils import RefHeads
 from gitopsctr import controller
 
 
-def test_kubernetes_controller_preserves_terminal_color_when_capturing(monkeypatch, tmp_path):
+def test_k8s_controller_preserves_terminal_color_when_capturing(monkeypatch, tmp_path):
     captured: dict[str, object] = {}
 
     monkeypatch.delenv("NO_COLOR", raising=False)
-    monkeypatch.setattr(kubernetes_demo, "color_enabled", lambda _stream: True)
-    monkeypatch.setattr(kubernetes_demo, "repository", lambda _provider: SimpleNamespace(worktree=tmp_path))
+    monkeypatch.setattr(k8s_demo, "color_enabled", lambda _stream: True)
+    monkeypatch.setattr(k8s_demo, "repository", lambda *_args, **_kwargs: SimpleNamespace(worktree=tmp_path))
 
     def fake_run(*args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
         captured.update(kwargs)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr(kubernetes_demo, "run", fake_run)
+    monkeypatch.setattr(k8s_demo, "run", fake_run)
 
-    kubernetes_demo.controller("kind", "converge", capture=True)
+    k8s_demo.run_controller("kind", "converge", capture=True)
 
     environment = captured["env"]
     assert isinstance(environment, Mapping)
     assert environment["FORCE_COLOR"] == "1"
 
 
-def test_demo_repository_exercises_observation_driven_convergence():
-    specifications = controller.load_environment_specifications(demo.TEMPLATE, "dev")
-
-    selection = controller.convergence_scope(specifications, ["demo-service"])
-    targets, scope = selection.targets, selection.scope
-
-    assert targets == ("demo-service",)
-    assert scope == ("demo-image", "demo-service")
-    assert controller.convergence_order(specifications, scope) == ("demo-image", "demo-service")
-
-
-def test_demo_runner_materializes_local_runtime_configuration(tmp_path, monkeypatch):
+def test_docker_demo_projects_only_stack_owned_units(tmp_path, monkeypatch):
     worktree = tmp_path / "repository"
     state = tmp_path / "terraform.tfstate"
-    shutil.copytree(demo.TEMPLATE, worktree)
-    monkeypatch.setattr(demo, "WORKTREE", worktree)
-    monkeypatch.setattr(demo, "TERRAFORM_STATE", state)
-    monkeypatch.setattr(demo, "docker_platform", lambda: "linux/arm64")
+    shutil.copytree(docker_demo.TEMPLATE, worktree)
+    monkeypatch.setattr(docker_demo, "WORKTREE", worktree)
+    monkeypatch.setattr(docker_demo, "TERRAFORM_STATE", state)
+    monkeypatch.setattr(docker_demo, "docker_platform", lambda: "linux/arm64")
 
-    demo.configure_template("localhost:5001", 18081)
-
-    image = yaml.safe_load((worktree / "deployment/environments/dev/units/demo-image.yaml").read_text())
-    service = yaml.safe_load((worktree / "deployment/environments/dev/units/demo-service.yaml").read_text())
-    assert image["spec"]["build"]["platform"] == "linux/arm64"
-    assert image["spec"]["publish"]["targets"]["application"] == {
-        "type": "registry",
-        "repository": "localhost:5001/gitopsctr-demo/app",
-    }
-    assert service["spec"]["terraform"]["backend"]["path"] == str(state)
-    assert service["spec"]["terraform"]["variables"]["host_port"] == 18081
-
-
-def test_demo_stack_source_projects_parameterized_terraform_unit(tmp_path, monkeypatch):
-    worktree = tmp_path / "repository"
-    stack_state = tmp_path / "stack-terraform.tfstate"
-    shutil.copytree(demo.TEMPLATE, worktree)
-    monkeypatch.setattr(demo, "WORKTREE", worktree)
-    monkeypatch.setattr(demo, "STACK_TERRAFORM_STATE", stack_state)
-    monkeypatch.setattr(demo, "_commit_source", lambda _message: "a" * 40)
-    demo.add_stack_source(18082)
+    docker_demo.configure_template("localhost:5001", 18081)
+    assert controller.load_environment_specifications(worktree, "dev") == {}
 
     projection = controller.project_stack_resources(
         worktree,
@@ -81,297 +51,212 @@ def test_demo_stack_source_projects_parameterized_terraform_unit(tmp_path, monke
         worktree,
     )
 
-    generated_name = "preview--demo-service"
-    assert tuple(projection.generated_units) == (generated_name,)
-    assert projection.dependencies == {generated_name: ()}
-    generated = projection.generated_units[generated_name]
-    assert generated.driver_name == "terraform"
-    specification = generated.driver.unit_contract.dump(generated.spec)
-    assert specification["terraform"]["backend"]["path"] == str(stack_state)
-    assert specification["terraform"]["variables"]["container_name"] == "gitopsctr-demo-stack-app"
-    assert specification["terraform"]["variables"]["host_port"] == 18082
-    assert specification["terraform"]["variables"]["image"]["fromArtifact"]["unit"] == "demo-image"
+    assert set(projection.generated_units) == {"application--image", "application--deploy"}
+    image = projection.generated_units["application--image"]
+    deploy = projection.generated_units["application--deploy"]
+    assert image.spec.build.platform == "linux/arm64"
+    assert image.spec.publish.targets["application"].repository == "localhost:5001/gitopsctr-demo/app"
+    deploy_spec = deploy.driver.unit_contract.dump(deploy.spec)
+    assert deploy_spec["terraform"]["backend"]["path"] == str(state)
+    assert deploy_spec["terraform"]["variables"]["container_name"] == "gitopsctr-demo-app"
+    assert deploy_spec["terraform"]["variables"]["host_port"] == 18081
+    assert deploy_spec["terraform"]["variables"]["image"]["fromArtifact"]["unit"] == "application--image"
 
 
-def _planned_stack_teardown_commands(stack_name, stack_uid, owned_units):
-    """Describe the smallest CLI sequence for UID-fenced Stack cleanup."""
-
-    commands = [("advance-desired", "--environment", "dev", "--source-revision", "HEAD")]
-    for unit_name, unit_uid in reversed(owned_units):
-        commands.append(
-            (
-                "finalize",
-                "unit",
-                "--environment",
-                "dev",
-                "--name",
-                unit_name,
-                "--uid",
-                unit_uid,
-                "--deletion-generation",
-                "1",
-            )
-        )
-    commands.append(
-        (
-            "finalize",
-            "stack",
-            "--environment",
-            "dev",
-            "--name",
-            stack_name,
-            "--uid",
-            stack_uid,
-            "--deletion-generation",
-            "1",
-        )
-    )
-    return commands
-
-
-def test_demo_stack_cleanup_commands_match_planned_cli_contract():
-    commands = _planned_stack_teardown_commands(
-        "demo-preview",
-        "stack-uid",
-        (("demo-preview--database", "database-uid"), ("demo-preview--service", "service-uid")),
-    )
-
-    assert commands == [
-        ("advance-desired", "--environment", "dev", "--source-revision", "HEAD"),
-        (
-            "finalize",
-            "unit",
-            "--environment",
-            "dev",
-            "--name",
-            "demo-preview--service",
-            "--uid",
-            "service-uid",
-            "--deletion-generation",
-            "1",
-        ),
-        (
-            "finalize",
-            "unit",
-            "--environment",
-            "dev",
-            "--name",
-            "demo-preview--database",
-            "--uid",
-            "database-uid",
-            "--deletion-generation",
-            "1",
-        ),
-        (
-            "finalize",
-            "stack",
-            "--environment",
-            "dev",
-            "--name",
-            "demo-preview",
-            "--uid",
-            "stack-uid",
-            "--deletion-generation",
-            "1",
-        ),
-    ]
-
-
-def test_demo_acceptance_delegates_stack_cleanup_after_clean_direct_convergence(monkeypatch):
+def test_docker_acceptance_proves_clean_convergence_then_finalizes(monkeypatch):
     events: list[object] = []
     heads = iter((RefHeads("desired", "observed"), RefHeads("desired", "observed")))
-    monkeypatch.setattr(demo, "clean", lambda registry: events.append(("clean", registry)))
+    monkeypatch.setattr(docker_demo, "clean", lambda registry: events.append(("clean", registry)))
     monkeypatch.setattr(
-        demo,
+        docker_demo,
         "converge",
         lambda registry_port, app_port, **kwargs: events.append(("converge", registry_port, app_port, kwargs)),
     )
-    monkeypatch.setattr(demo, "deployment_heads", lambda: next(heads))
+    monkeypatch.setattr(docker_demo, "deployment_heads", lambda: next(heads))
     monkeypatch.setattr(
-        demo,
-        "stack_acceptance",
-        lambda registry_port, app_port: (
-            events.append(("stack_acceptance", registry_port, app_port)),
-            RefHeads("final-desired", "final-observed"),
-        )[1],
+        docker_demo,
+        "remove_and_finalize_source_stack",
+        lambda: events.append(("finalize",)),
     )
 
-    demo.acceptance(5001, 18081)
+    docker_demo.acceptance(5001, 18081)
 
     assert events == [
         ("clean", "localhost:5001"),
         ("converge", 5001, 18081, {}),
         ("converge", 5001, 18081, {"expect_clean": True}),
-        ("stack_acceptance", 5001, 18081),
+        ("finalize",),
         ("clean", "localhost:5001"),
     ]
 
 
-def test_demo_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):
-    events: list[object] = []
-    heads = iter((RefHeads("desired", "observed"), RefHeads("desired", "observed")))
-    monkeypatch.setattr(demo, "clean", lambda registry: events.append(("clean", registry)))
-    monkeypatch.setattr(
-        demo,
-        "converge",
-        lambda registry_port, app_port, **kwargs: events.append(("converge", registry_port, app_port, kwargs)),
-    )
-    monkeypatch.setattr(demo, "deployment_heads", lambda: next(heads))
-    monkeypatch.setattr(demo, "stack_acceptance", lambda *_args: RefHeads("final-desired", "final-observed"))
-
-    demo.acceptance(5001, 18081)
-
-    assert events == [
-        ("clean", "localhost:5001"),
-        ("converge", 5001, 18081, {}),
-        ("converge", 5001, 18081, {"expect_clean": True}),
-        ("clean", "localhost:5001"),
-    ]
-
-
-def test_demo_acceptance_cleans_after_a_failed_invariant(monkeypatch):
+def test_docker_acceptance_always_cleans_after_failed_invariant(monkeypatch):
     cleaned: list[str] = []
     heads = iter((RefHeads("desired-1", "observed"), RefHeads("desired-2", "observed")))
-    monkeypatch.setattr(demo, "clean", cleaned.append)
-    monkeypatch.setattr(demo, "converge", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(demo, "deployment_heads", lambda: next(heads))
-    monkeypatch.setattr(demo, "stack_acceptance", lambda *_args: None)
+    monkeypatch.setattr(docker_demo, "clean", cleaned.append)
+    monkeypatch.setattr(docker_demo, "converge", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(docker_demo, "deployment_heads", lambda: next(heads))
+    monkeypatch.setattr(docker_demo, "remove_and_finalize_source_stack", lambda: None)
 
     with pytest.raises(RuntimeError, match="moved desired or observed refs"):
-        demo.acceptance(5001, 18081)
+        docker_demo.acceptance(5001, 18081)
 
     assert cleaned == ["localhost:5001", "localhost:5001"]
 
 
 @pytest.mark.parametrize("provider", ("kind", "minikube"))
-def test_kubernetes_demo_is_a_real_image_and_helm_delivery(tmp_path, monkeypatch, provider):
+def test_k8s_demo_projects_source_tracked_stack_for_provider(tmp_path, monkeypatch, provider):
     worktree = tmp_path / provider / "repository"
-    shutil.copytree(kubernetes_demo.TEMPLATE, worktree)
-    monkeypatch.setattr(kubernetes_demo, "docker_platform", lambda: "linux/amd64")
-    kubernetes_demo.configure_template(provider, worktree)
-    specifications = controller.load_environment_specifications(worktree, "dev")
-    specification = specifications["web"]
+    shutil.copytree(k8s_demo.TEMPLATE, worktree)
+    monkeypatch.setattr(k8s_demo, "docker_platform", lambda: "linux/amd64")
 
-    assert controller.convergence_order(specifications, ["demo-image", "web"]) == ("demo-image", "web")
-    assert specification.spec.source.inputs == ["**/*"]
-    assert specification.spec.materialize.type == "helm"
-    assert specification.spec.materialize.values._serialize()["image"]["fromArtifact"] == {
-        "unit": "demo-image",
-        "name": "containers",
-        "apiVersion": "artifact.gitopsctr.io/v1",
-        "kind": "ContainerImages",
-        "pointer": "/images/application/uri",
-    }
-    assert specification.driver.unit_contract.dump(specification.spec)["delivery"] == {
+    k8s_demo.configure_template(provider, worktree)
+    assert controller.load_environment_specifications(worktree, "dev") == {}
+    projection = controller.project_stack_resources(
+        worktree,
+        "dev",
+        "a" * 40,
+        tmp_path / provider / "candidate",
+        worktree,
+    )
+
+    assert set(projection.generated_units) == {"application--image", "application--deploy"}
+    image = projection.generated_units["application--image"]
+    deploy = projection.generated_units["application--deploy"]
+    target = image.spec.publish.targets["application"]
+    assert target.type == provider
+    assert getattr(target, "cluster" if provider == "kind" else "profile") == k8s_demo.cluster_name("direct")
+    assert deploy.spec.materialize.values._serialize()["image"]["fromArtifact"]["unit"] == "application--image"
+    assert deploy.driver.unit_contract.dump(deploy.spec)["delivery"] == {
         "mode": "direct",
-        "kubeContext": kubernetes_demo.kube_context(provider),
+        "kubeContext": k8s_demo.kube_context(provider),
         "prune": False,
         "wait": [
             {
-                "resource": "deployment/gitopsctr-kubernetes-demo",
+                "resource": "deployment/gitopsctr-k8s-dev",
                 "namespace": "default",
                 "condition": "Available",
                 "timeoutSeconds": 120,
             }
         ],
     }
-    image_target = specifications["demo-image"].spec.publish.targets["application"]
-    assert image_target.type == provider
-    assert getattr(image_target, "cluster" if provider == "kind" else "profile") == kubernetes_demo.CLUSTER_NAME
 
 
-def test_kubernetes_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):
-    events: list[object] = []
-    heads = iter((RefHeads("desired", "observed"), RefHeads("desired", "observed")))
-    monkeypatch.setattr(kubernetes_demo, "clean", lambda provider: events.append(("clean", provider)))
-    monkeypatch.setattr(kubernetes_demo, "start", lambda provider: events.append(("start", provider)))
-    monkeypatch.setattr(
-        kubernetes_demo,
-        "converge",
-        lambda provider, **kwargs: events.append(("converge", provider, kwargs)),
-    )
-    monkeypatch.setattr(kubernetes_demo, "deployment_heads", lambda _provider: next(heads))
+def test_k8s_staging_stack_is_promotion_backed():
+    stack = yaml.safe_load((k8s_demo.TEMPLATE / "deployment/environments/staging/stacks/application.yaml").read_text())
 
-    kubernetes_demo.acceptance("kind")
-
-    assert events == [
-        ("clean", "kind"),
-        ("start", "kind"),
-        ("converge", "kind", {"expect_clean": True}),
-        ("clean", "kind"),
+    assert stack["spec"]["template"]["source"] == {"fromPromotion": {"stack": "application"}}
+    assert stack["spec"]["units"] == ["deploy"]
+    assert stack["spec"]["artifactImports"] == [
+        {
+            "unit": "image",
+            "name": "containers",
+            "apiVersion": "artifact.gitopsctr.io/v1",
+            "kind": "ContainerImages",
+            "fromPromotion": {"stack": "application"},
+        }
     ]
 
 
-def test_kubernetes_acceptance_cleans_after_a_failed_invariant(monkeypatch):
-    events: list[object] = []
-    heads = iter((RefHeads("desired-1", "observed"), RefHeads("desired-2", "observed")))
-    monkeypatch.setattr(kubernetes_demo, "clean", lambda provider: events.append(("clean", provider)))
-    monkeypatch.setattr(kubernetes_demo, "start", lambda _provider: None)
-    monkeypatch.setattr(kubernetes_demo, "converge", lambda _provider, **_kwargs: None)
-    monkeypatch.setattr(kubernetes_demo, "deployment_heads", lambda _provider: next(heads))
-
-    with pytest.raises(RuntimeError, match="moved desired or observed refs"):
-        kubernetes_demo.acceptance("minikube")
-
-    assert events == [("clean", "minikube"), ("clean", "minikube")]
-
-
 @pytest.mark.parametrize("provider", ("kind", "minikube"))
-def test_argocd_demo_uses_the_external_observer_and_materialized_payload(tmp_path, monkeypatch, provider):
+def test_argocd_delivery_uses_parameterized_stack_observer(tmp_path, monkeypatch, provider):
     worktree = tmp_path / provider / "repository"
-    shutil.copytree(kubernetes_demo.TEMPLATE, worktree)
-    monkeypatch.setattr(kubernetes_demo, "docker_platform", lambda: "linux/amd64")
+    shutil.copytree(k8s_demo.TEMPLATE, worktree)
+    monkeypatch.setattr(k8s_demo, "docker_platform", lambda: "linux/amd64")
 
-    kubernetes_demo.configure_template(provider, worktree, "argocd")
+    k8s_demo.configure_template(provider, worktree, "argocd")
+    projection = controller.project_stack_resources(
+        worktree,
+        "dev",
+        "a" * 40,
+        tmp_path / provider / "candidate",
+        worktree,
+    )
+    deploy = projection.generated_units["application--deploy"]
 
-    specification = controller.load_environment_specifications(worktree, "dev")["web"]
-    assert specification.driver.unit_contract.dump(specification.spec)["delivery"] == {
+    assert deploy.driver.unit_contract.dump(deploy.spec)["delivery"] == {
         "mode": "external",
         "observer": {
             "type": "argocd",
             "access": "kubernetes",
-            "application": kubernetes_demo.ARGO_APPLICATION,
-            "applicationNamespace": kubernetes_demo.ARGO_NAMESPACE,
-            "kubeContext": kubernetes_demo.kube_context(provider, "argocd"),
+            "application": "gitopsctr-k8s-dev",
+            "applicationNamespace": k8s_demo.ARGO_NAMESPACE,
+            "kubeContext": k8s_demo.kube_context(provider, "argocd"),
             "timeoutSeconds": 600,
         },
     }
-    application = kubernetes_demo.argo_application_document()
+    application = k8s_demo.argo_application_document("dev")
     assert application["spec"]["source"] == {
-        "repoURL": f"git://{kubernetes_demo.ARGO_GIT_SERVICE}.{kubernetes_demo.ARGO_NAMESPACE}.svc.cluster.local:9418/origin.git",
+        "repoURL": f"git://{k8s_demo.ARGO_GIT_SERVICE}.{k8s_demo.ARGO_NAMESPACE}.svc.cluster.local:9418/origin.git",
         "targetRevision": "gitopsctr/desired/dev",
-        "path": "materialized/web",
+        "path": "materialized/application--deploy",
     }
-    assert application["spec"]["syncPolicy"] == {"automated": {}}
 
 
-def test_refresh_argo_application_requests_application_refresh(monkeypatch):
+def test_preview_application_targets_direct_stack_projection():
+    application = k8s_demo.argo_application_document("preview", preview=True)
+    assert application["spec"]["source"]["targetRevision"] == "gitopsctr/desired/preview"
+    assert application["spec"]["source"]["path"] == "materialized/preview--deploy"
+
+
+def test_existing_preview_at_current_source_only_converges(monkeypatch, tmp_path):
+    events: list[object] = []
+    monkeypatch.setattr(k8s_demo, "repository", lambda *_args, **_kwargs: SimpleNamespace(worktree=tmp_path))
+    monkeypatch.setattr(k8s_demo, "source_revision", lambda _worktree: "a" * 40)
+    monkeypatch.setattr(k8s_demo, "instantiate_preview", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(k8s_demo, "update_preview", lambda *_args, **_kwargs: events.append("update"))
+    monkeypatch.setattr(
+        k8s_demo,
+        "converge",
+        lambda *args, **kwargs: events.append(("converge", args, kwargs)),
+    )
+    monkeypatch.setattr(k8s_demo, "verify_workload", lambda *_args, **_kwargs: "application--image:r1")
+    monkeypatch.setattr(
+        k8s_demo,
+        "deployment_heads",
+        lambda *_args, **_kwargs: RefHeads("desired", "observed"),
+    )
+
+    heads, image = k8s_demo.run_preview_story("kind", "direct")
+
+    assert heads == RefHeads("desired", "observed")
+    assert image == "application--image:r1"
+    assert [event for event in events if event == "update"] == []
+    assert len(events) == 1
+    assert events[0][0] == "converge"
+
+
+def test_provider_defaults_to_kind_and_accepts_minikube(monkeypatch):
+    monkeypatch.delenv("GITOPSCTR_K8S_PROVIDER", raising=False)
+    assert k8s_demo.provider_from_environment() == "kind"
+
+    monkeypatch.setenv("GITOPSCTR_K8S_PROVIDER", "minikube")
+    assert k8s_demo.provider_from_environment() == "minikube"
+
+    monkeypatch.setenv("GITOPSCTR_K8S_PROVIDER", "docker-desktop")
+    with pytest.raises(RuntimeError, match="must be 'kind' or 'minikube'"):
+        k8s_demo.provider_from_environment()
+
+
+def test_refresh_argo_application_requests_environment_application_refresh(monkeypatch):
     calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
 
     def fake_run(*args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append((args, kwargs))
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr(kubernetes_demo, "run", fake_run)
+    monkeypatch.setattr(k8s_demo, "run", fake_run)
 
-    kubernetes_demo.refresh_argo_application("kind")
+    k8s_demo.refresh_argo_application("kind", "staging")
 
-    assert calls == [
-        (
-            (
-                "kubectl",
-                "--context",
-                kubernetes_demo.kube_context("kind", "argocd"),
-                "--namespace",
-                kubernetes_demo.ARGO_NAMESPACE,
-                "patch",
-                "application.argoproj.io",
-                kubernetes_demo.ARGO_APPLICATION,
-                "--type",
-                "merge",
-                "--patch",
-                '{"metadata": {"annotations": {"argocd.argoproj.io/refresh": "normal"}}}',
-            ),
-            {},
-        )
-    ]
+    assert calls[0][0][0:8] == (
+        "kubectl",
+        "--context",
+        k8s_demo.kube_context("kind", "argocd"),
+        "--namespace",
+        k8s_demo.ARGO_NAMESPACE,
+        "patch",
+        "application.argoproj.io",
+        "gitopsctr-k8s-staging",
+    )
+    assert calls[0][1] == {"check": False}
