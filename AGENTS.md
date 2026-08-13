@@ -32,3 +32,12 @@ untrusted editor hint and must never fetch it.
 - Do not return heterogeneous positional tuples whose elements are not self-explanatory at call sites, especially
   undocumented tuples. Use a `TypedDict` or dataclass with named fields instead, and document any fields or invariants
   that are not obvious from their names and types.
+
+## Temporary desired-resource migration guard
+
+- Legacy desired Units lacking lifecycle-authority metadata MUST be treated as source-tracked roots until an explicit
+  migration or adoption record is durably committed. Never infer direct management, ownership, or deletion from
+  missing metadata or an unauthoritative source-path absence. This protects legacy desired state until it has
+  an explicit migration or adoption record.
+- New desired-state writers MUST NOT emit the legacy shape. Keep its diagnostics and migration coverage until every
+  supported desired ref has explicit lifecycle metadata, then remove the compatibility path and this guard.

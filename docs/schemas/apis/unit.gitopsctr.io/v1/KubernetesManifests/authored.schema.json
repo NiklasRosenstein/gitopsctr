@@ -53,6 +53,36 @@
         {
           "additionalProperties": false,
           "properties": {
+            "fromEnvironment": {
+              "additionalProperties": false,
+              "properties": {
+                "dryFallback": {
+                  "$ref": "#/$defs/TemplateValue",
+                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
+                },
+                "pointer": {
+                  "description": "JSON Pointer relative to the target Environment resource.",
+                  "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
+                  "type": "string"
+                },
+                "unit": {
+                  "description": "Logical name of the unit that provides the referenced value.",
+                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "type": "string"
+                }
+              },
+              "required": [],
+              "type": "object"
+            }
+          },
+          "required": [
+            "fromEnvironment"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "fromPromotion": {
               "additionalProperties": false,
               "properties": {
@@ -114,6 +144,28 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
+          "properties": {
+            "fromParameter": {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "fromParameter"
+          ],
+          "type": "object"
+        },
+        {
           "type": "null"
         },
         {
@@ -139,6 +191,8 @@
             "not": {
               "enum": [
                 "fromArtifact",
+                "fromEnvironment",
+                "fromParameter",
                 "fromPromotion",
                 "fromReceipt"
               ]
@@ -352,6 +406,8 @@
                     "not": {
                       "enum": [
                         "fromArtifact",
+                        "fromEnvironment",
+                        "fromParameter",
                         "fromPromotion",
                         "fromReceipt"
                       ]

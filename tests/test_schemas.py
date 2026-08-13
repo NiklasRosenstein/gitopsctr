@@ -9,14 +9,14 @@ import pytest
 from jsonschema import Draft202012Validator, ValidationError
 from referencing import Registry, Resource
 
-from gitopsctr import cli, schemas
+from gitopsctr import controller, schemas
 from gitopsctr.contracts import CORE_CONTRACTS, ContractError, DesiredSource, MaterializationDocument
 from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import DriverError, MaterializationCapability, UnitResolutionContext
 from gitopsctr.errors import ReferenceUnavailable
 from gitopsctr.registry import UNIT_DRIVERS
 from gitopsctr.resolution import FingerprintedValue, ResolutionContext, resolve_template
-from gitopsctr.resources import UnitResource
+from gitopsctr.resources import ResourceMetadata, UnitResource
 
 ROOT = Path(__file__).parents[1]
 REVISION = "a" * 40
@@ -25,7 +25,7 @@ DIGEST = "sha256:" + "1" * 64
 
 def authored_examples() -> list[UnitResource]:
     paths = sorted((ROOT / "tests/fixtures").rglob("units/*.json")) + sorted((ROOT / "demo").rglob("units/*.json"))
-    return [cli.parse_authored_unit_document(json.loads(path.read_text()), path.stem) for path in paths]
+    return [controller.parse_authored_unit_document(json.loads(path.read_text()), path.stem) for path in paths]
 
 
 def desired_example(unit: UnitResource) -> UnitResource:
@@ -73,7 +73,7 @@ def desired_example(unit: UnitResource) -> UnitResource:
                 metadata=JsonObjectValue(metadata),
             ),
         )
-    return unit.with_spec(desired)
+    return unit.with_spec(desired).with_metadata(ResourceMetadata.new_source_tracked(unit.name))
 
 
 def has_incomplete_frontend_inputs(unit: UnitResource) -> bool:
@@ -227,17 +227,29 @@ def test_generated_schemas_and_examples_validate_from_the_local_catalog():
     for document in published:
         Draft202012Validator.check_schema(document)
     for authored in authored_examples():
-        authored_resource = cli.serialize_unit_document(authored, profile="authored")
+        authored_resource = controller.serialize_unit_document(authored, profile="authored")
         Draft202012Validator(by_id[authored_resource["$schema"]], registry=registry).validate(authored_resource)
         if has_incomplete_frontend_inputs(authored):
             continue
         desired = desired_example(authored)
-        desired_resource = cli.serialize_unit_document(desired, profile="desired")
+        desired_resource = controller.serialize_unit_document(desired, profile="desired")
         validator = Draft202012Validator(by_id[desired_resource["$schema"]], registry=registry)
         validator.validate(desired_resource)
     for path in sorted((ROOT / "tests/fixtures").rglob("environment.json")):
         environment = {key: value for key, value in json.loads(path.read_text()).items() if key != "schema"}
         Draft202012Validator(by_id[environment["$schema"]], registry=registry).validate(environment)
+
+
+@pytest.mark.parametrize("field", ["uid", "lifecycle"])
+def test_generated_desired_schema_rejects_explicit_null_metadata(field):
+    authored = authored_examples()[0]
+    desired = desired_example(authored)
+    document = controller.serialize_unit_document(desired, profile="desired")
+    document["metadata"][field] = None
+    schema = next(schema for schema in schemas.schema_documents().values() if schema.get("$id") == document["$schema"])
+
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
 
 
 def test_schema_catalog_is_deterministic_checkable_and_prunes_obsolete_schemas(tmp_path):
@@ -270,7 +282,7 @@ def test_core_schemas_are_draft_2020_12_and_environment_examples_validate():
         Draft202012Validator.check_schema(contract.json_schema())
     for path in sorted((ROOT / "tests/fixtures").rglob("environment.json")):
         CORE_CONTRACTS["environment"].validate(
-            cli.normalize_environment_document(json.loads(path.read_text()), path.parent.name)
+            controller.normalize_environment_document(json.loads(path.read_text()), path.parent.name)
         )
 
 

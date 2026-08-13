@@ -25,8 +25,8 @@ movement from silently changing the promoted input. `observedRevision` may be `n
 materialized promotion evidence.
 
 During desired-state resolution, [`fromPromotion`](../references.md#promotion-selectors) reads public unit `spec`
-values from the pinned source desired revision. Broken selectors in an active Promotion are errors rather than waiting
-conditions.
+values from the pinned source desired revision. Broken selectors in an active Promotion are errors. They do not make
+the controller wait.
 
 Promotion resources should not be authored or edited manually. The
-[Promotion schema](../schemas/apis/gitopsctr.io/v1/Promotion.schema.json) is the exhaustive structural reference.
+[Promotion schema](../schemas/apis/gitopsctr.io/v1/Promotion.schema.json) is the complete structural reference.

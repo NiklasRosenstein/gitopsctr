@@ -4,6 +4,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from gitopsctr import forges as deployment_forges
 
 
@@ -208,3 +210,48 @@ def test_explicit_adapter_is_the_plugin_seam_for_other_forges():
 
     assert result == expected
     assert adapter.received == _spec()
+
+
+@pytest.mark.parametrize("event", ["pull_request", "merge_group"])
+def test_github_candidate_event_requires_exact_heads(event):
+    candidate = "a" * 40
+    target = "b" * 40
+    payload = (
+        {
+            "pull_request": {
+                "head": {"sha": candidate},
+                "base": {"sha": target},
+            }
+        }
+        if event == "pull_request"
+        else {"head_sha": candidate, "base_sha": target}
+    )
+
+    result = deployment_forges.verify_github_candidate_heads(
+        payload,
+        event,
+        candidate_revision=candidate,
+        target_revision=target,
+    )
+
+    assert result.candidate_revision == candidate
+    assert result.target_revision == target
+
+
+@pytest.mark.parametrize(
+    ("payload", "event", "message"),
+    [
+        ({}, "pull_request", "missing"),
+        ({"head_sha": "a" * 40, "base_sha": "b" * 40}, "pull_request", "missing"),
+        ({"head_sha": "a" * 40, "base_sha": "b" * 40}, "merge_group", "does not match"),
+        ({"head_sha": "a" * 40, "base_sha": "b" * 40}, "unknown", "unsupported"),
+    ],
+)
+def test_github_candidate_event_fails_closed(payload, event, message):
+    with pytest.raises(deployment_forges.OperationError, match=message):
+        deployment_forges.verify_github_candidate_heads(
+            payload,
+            event,
+            candidate_revision="c" * 40,
+            target_revision="b" * 40,
+        )

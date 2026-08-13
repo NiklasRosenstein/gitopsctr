@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from gitopsctr import cli
+from gitopsctr import controller as controller_module
 
 FIXTURE_REPOSITORY = Path(__file__).parent / "fixtures/repository"
 
@@ -23,7 +23,7 @@ def write_test_document(path: Path, value: object) -> None:
     if deployment_index is not None:
         project_root = Path(*parts[:deployment_index])
         project_path = project_root / "gitopsctr.yaml"
-        if not any((project_root / name).is_file() for name in cli.PROJECT_CONFIG_NAMES):
+        if not any((project_root / name).is_file() for name in controller_module.PROJECT_CONFIG_NAMES):
             project_root.mkdir(parents=True, exist_ok=True)
             project_path.write_text(
                 json.dumps(
@@ -31,15 +31,17 @@ def write_test_document(path: Path, value: object) -> None:
                         "apiVersion": "gitopsctr.io/v1",
                         "kind": "Project",
                         "metadata": {"name": "test-project"},
-                        "spec": {},
+                        "spec": {"effectLease": None},
                     }
                 )
             )
         if path.stem == "environment":
-            value = cli.serialize_environment_document(cli.normalize_environment_document(value, path.parent.name))
+            value = controller_module.serialize_environment_document(
+                controller_module.normalize_environment_document(value, path.parent.name)
+            )
         elif path.parent.name == "units":
-            value = cli.serialize_unit_document(
-                cli.parse_authored_unit_document(value, path.stem),
+            value = controller_module.serialize_unit_document(
+                controller_module.parse_authored_unit_document(value, path.stem),
                 profile="authored",
             )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,12 +58,12 @@ def receipt_document(
     controller: dict[str, object] | None = None,
     artifacts: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    plugin = cli.UNIT_DRIVERS[driver]
+    plugin = controller_module.UNIT_DRIVERS[driver]
     if result is None and driver == "terraform":
         result = {"applied": {"sourceRevision": "0" * 40}, "outputs": {}}
     typed_result = plugin.result_contract.parse(result or {})
     document: dict[str, object] = {
-        "$schema": cli.resource_schema_url(plugin.api_version, plugin.kind, "receipt"),
+        "$schema": controller_module.resource_schema_url(plugin.api_version, plugin.kind, "receipt"),
         "apiVersion": "gitopsctr.io/v1",
         "kind": "Receipt",
         "metadata": {"name": unit},
@@ -92,7 +94,7 @@ def receipt_resource(
     artifacts: dict[str, object] | None = None,
 ):
     if artifacts is None:
-        plugin = cli.UNIT_DRIVERS[driver]
+        plugin = controller_module.UNIT_DRIVERS[driver]
         if plugin.artifact_outputs:
             artifacts = {
                 name: {
@@ -100,11 +102,11 @@ def receipt_resource(
                     "kind": artifact_kind.gvk.kind,
                     "path": f"artifacts/{unit}/{name}.json",
                     "digest": "sha256:" + "0" * 64,
-                    "mediaType": f"{cli.require_artifact_api(artifact_kind).media_type}+json",
+                    "mediaType": f"{controller_module.require_artifact_api(artifact_kind).media_type}+json",
                 }
                 for name, artifact_kind in plugin.artifact_outputs.items()
             }
-    return cli.RESOURCE_CATALOG.parse_receipt(
+    return controller_module.RESOURCE_CATALOG.parse_receipt(
         receipt_document(
             driver,
             unit,
@@ -121,4 +123,4 @@ def receipt_resource(
 @pytest.fixture(autouse=True)
 def repository_root(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep controller tests independent from the gitopsctr source checkout."""
-    monkeypatch.setattr(cli, "REPOSITORY_ROOT", FIXTURE_REPOSITORY)
+    monkeypatch.setattr(controller_module, "REPOSITORY_ROOT", FIXTURE_REPOSITORY)

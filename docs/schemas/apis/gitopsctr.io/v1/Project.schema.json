@@ -30,6 +30,52 @@
     "spec": {
       "additionalProperties": false,
       "properties": {
+        "effectLease": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "store": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "branch": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "ref": {
+                              "minLength": 1,
+                              "pattern": "^(?:[^{}]|\\{environment\\}|\\{unit\\})+$",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "ref"
+                          ],
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "branch"
+                      ],
+                      "type": "object"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "store"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "environmentDefaults": {
           "additionalProperties": false,
           "properties": {
@@ -100,6 +146,12 @@
           },
           "type": "object"
         },
+        "stackTemplatesPath": {
+          "description": "Repository-relative directory containing authored StackTemplates.",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$",
+          "type": "string"
+        },
         "writeFormat": {
           "enum": [
             "yaml",
@@ -107,6 +159,9 @@
           ]
         }
       },
+      "required": [
+        "effectLease"
+      ],
       "type": "object"
     }
   },

@@ -1,7 +1,7 @@
-"""Unit driver contracts and entry-point discovery.
+"""Unit driver contracts and entry-point loading.
 
-A unit is a resource instance; a :class:`UnitDriver` implements the resource
-kind and advertises the capabilities it supports.
+A unit is a resource instance. A :class:`UnitDriver` implements its kind and
+declares its capabilities.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from gitopsctr.api import GVK, ApiKind, api_kinds
 from gitopsctr.artifacts import ArtifactApi, require_artifact_api
 from gitopsctr.contracts import DesiredSource, MaterializationDocument, ResolvedInputs, StrictModel
-from gitopsctr.document import JsonObject, TypedDocumentContract
+from gitopsctr.document import JsonObject, JsonObjectValue, TypedDocumentContract
 from gitopsctr.execution import DriverExecution, default_driver_execution
 from gitopsctr.resolution import TemplateResolution
 
@@ -40,7 +40,7 @@ class ReconciliationOutput[ResultT: StrictModel]:
 
 @dataclass(frozen=True)
 class UnitResolutionContext:
-    """Controller-owned facts and the intentionally open template boundary."""
+    """Controller facts and the template resolver."""
 
     source: DesiredSource | None
     resolve_template: Callable[[object, str], TemplateResolution]
@@ -60,16 +60,24 @@ def reference_fingerprints(*resolutions: TemplateResolution) -> ResolvedInputs |
     promotions: dict[str, str] = {}
     receipts: dict[str, str] = {}
     artifacts: dict[str, str] = {}
+    imported_artifacts: dict[str, str] = {}
+    imported_artifact_evidence: dict[str, JsonObjectValue] = {}
     for resolution in resolutions:
         promotions.update(resolution.promotions)
         receipts.update(resolution.receipts)
         artifacts.update(resolution.artifacts)
-    if not (promotions or receipts or artifacts):
+        imported_artifacts.update(resolution.imported_artifacts)
+        imported_artifact_evidence.update(
+            {key: JsonObjectValue(value) for key, value in resolution.imported_artifact_evidence.items()}
+        )
+    if not (promotions or receipts or artifacts or imported_artifacts or imported_artifact_evidence):
         return None
     return ResolvedInputs(
         promotions=promotions or None,
         receipts=receipts or None,
         artifacts=artifacts or None,
+        importedArtifacts=imported_artifacts or None,
+        importedArtifactEvidence=imported_artifact_evidence or None,
     )
 
 
@@ -154,6 +162,38 @@ class UnitExecutionContext[DesiredT: StrictModel]:
 
 
 @dataclass(frozen=True)
+class TeardownContext[DesiredT: StrictModel]:
+    """Fenced inputs for idempotently removing one retained desired Unit."""
+
+    environment: str
+    desired_root: Path
+    desired_revision: str
+    source_root: Path | None
+    source_revision: str | None
+    source_path: str | None
+    unit_name: str
+    unit: DesiredT
+    resource_uid: str
+    deletion_generation: int
+    previous_receipt: ReceiptResource[Any] | None = None
+    report: Path | None = None
+    execution: DriverExecution = field(default_factory=default_driver_execution)
+
+
+@dataclass(frozen=True)
+class TeardownResult:
+    """Optional evidence persisted with terminal observed teardown state.
+
+    The details become durable only after the controller publishes that
+    observed state. A crash before publication causes a retry, so teardown
+    implementations must remain idempotent and must not rely on these details
+    being available during a later attempt.
+    """
+
+    details: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class PlanningContext[DesiredT: StrictModel](UnitExecutionContext[DesiredT]):
     pass
 
@@ -178,7 +218,7 @@ class VerificationContext[DesiredT: StrictModel]:
 
 
 class MaterializationCapability[ResolvedT: StrictModel, DesiredT: StrictModel](ABC):
-    """Produce immutable files while desired state is advanced."""
+    """Produce immutable files while desired state advances."""
 
     @abstractmethod
     def materialize(self, context: MaterializationContext[ResolvedT]) -> MaterializationResult:
@@ -198,15 +238,23 @@ class MaterializationCapability[ResolvedT: StrictModel, DesiredT: StrictModel](A
 
 
 class PlanningCapability[DesiredT: StrictModel](ABC):
-    """Perform speculative, non-publishing work for a deployment unit."""
+    """Plan a unit without publishing or changing external state."""
 
     @abstractmethod
     def plan(self, context: PlanningContext[DesiredT]) -> None:
         """Validate and plan the unit without changing remote deployment state."""
 
 
+class TeardownCapability[DesiredT: StrictModel](ABC):
+    """Remove external state for a retained unit."""
+
+    @abstractmethod
+    def teardown(self, context: TeardownContext[DesiredT]) -> TeardownResult | None:
+        """Idempotently remove external state, honoring the UID and generation fence."""
+
+
 class ReconciliationCapability[DesiredT: StrictModel, ResultT: StrictModel](ABC):
-    """Converge external state for a fully materialized unit."""
+    """Converge external state for a materialized unit."""
 
     def reconciliation_required(self, unit: DesiredT) -> bool:
         return True
@@ -231,7 +279,7 @@ class VerificationResult:
 
 
 class VerificationCapability[DesiredT: StrictModel](ABC):
-    """Compare external state with desired state without writing a receipt."""
+    """Compare external state with desired state without a receipt."""
 
     def verification_supported(self, unit: DesiredT) -> bool:
         return True

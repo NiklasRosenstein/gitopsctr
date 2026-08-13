@@ -1,0 +1,711 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Stack/desired.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "apiVersion": {
+      "const": "gitopsctr.io/v1"
+    },
+    "kind": {
+      "const": "Stack"
+    },
+    "metadata": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "not": {
+            "required": [
+              "ownerReferences"
+            ]
+          },
+          "required": [
+            "lifecycle"
+          ]
+        },
+        {
+          "not": {
+            "required": [
+              "lifecycle"
+            ]
+          },
+          "required": [
+            "ownerReferences"
+          ]
+        }
+      ],
+      "properties": {
+        "deletion": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "resourceDigest": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "resourceDigest"
+          ],
+          "title": "DeletionMetadata",
+          "type": "object"
+        },
+        "lifecycle": {
+          "additionalProperties": false,
+          "properties": {
+            "management": {
+              "additionalProperties": false,
+              "properties": {
+                "mode": {
+                  "enum": [
+                    "sourceTracked",
+                    "direct"
+                  ]
+                }
+              },
+              "required": [
+                "mode"
+              ],
+              "title": "LifecycleManagement",
+              "type": "object"
+            }
+          },
+          "required": [
+            "management"
+          ],
+          "title": "DesiredLifecycle",
+          "type": "object"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "ownerReferences": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "apiVersion": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "kind": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "name": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "uid": {
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "apiVersion",
+              "kind",
+              "name",
+              "uid"
+            ],
+            "title": "DesiredOwnerReference",
+            "type": "object"
+          },
+          "maxItems": 1,
+          "minItems": 1,
+          "type": "array"
+        },
+        "uid": {
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "uid"
+      ],
+      "type": "object"
+    },
+    "spec": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactImports": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "apiVersion": {
+                "pattern": "^[^/]+/[^/]+$",
+                "type": "string"
+              },
+              "fromPromotion": {
+                "additionalProperties": false,
+                "properties": {
+                  "stack": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "stack"
+                ],
+                "title": "StackTemplatePromotionReference",
+                "type": "object"
+              },
+              "kind": {
+                "pattern": "^[A-Z][A-Za-z0-9]*$",
+                "type": "string"
+              },
+              "name": {
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                "type": "string"
+              },
+              "unit": {
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "unit",
+              "name",
+              "apiVersion",
+              "kind",
+              "fromPromotion"
+            ],
+            "title": "ArtifactImport",
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "parameters": {
+          "type": "object"
+        },
+        "provenance": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "requestIdentity": {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/#!-]{0,127}$",
+                  "type": "string"
+                },
+                "templateDigest": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "templatePath": {
+                  "pattern": "^[^/].*",
+                  "type": "string"
+                },
+                "templateRevision": {
+                  "pattern": "^[0-9a-f]{40}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "templateRevision",
+                "templatePath",
+                "templateDigest",
+                "requestIdentity"
+              ],
+              "title": "StackInstantiationProvenance",
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "requestedSource": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromResource": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "name": {
+                          "anyOf": [
+                            {
+                              "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        },
+                        "uid": {
+                          "anyOf": [
+                            {
+                              "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        }
+                      },
+                      "title": "StackTemplateResourceReference",
+                      "type": "object"
+                    }
+                  },
+                  "title": "StackTemplateFromResource",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromGit": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "commit": {
+                          "anyOf": [
+                            {
+                              "pattern": "^[0-9a-f]{40}$",
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        },
+                        "path": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        },
+                        "ref": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        },
+                        "remote": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        }
+                      },
+                      "title": "GitSourceRequest",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromGit"
+                  ],
+                  "title": "StackTemplateFromGit",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromPromotion": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "stack": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "stack"
+                      ],
+                      "title": "StackTemplatePromotionReference",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromPromotion"
+                  ],
+                  "title": "StackTemplateFromPromotion",
+                  "type": "object"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "resolvedArtifactImports": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "additionalProperties": false,
+                "properties": {
+                  "apiVersion": {
+                    "pattern": "^[^/]+/[^/]+$",
+                    "type": "string"
+                  },
+                  "artifactDigest": {
+                    "pattern": "^[a-z0-9]+:[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "artifactDocument": {
+                    "type": "object"
+                  },
+                  "artifactName": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "pattern": "^[A-Z][A-Za-z0-9]*$",
+                    "type": "string"
+                  },
+                  "receiptUnitBlob": {
+                    "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+                    "type": "string"
+                  },
+                  "sourceDesiredRevision": {
+                    "pattern": "^[0-9a-f]{40}$",
+                    "type": "string"
+                  },
+                  "sourceObservedRevision": {
+                    "pattern": "^[0-9a-f]{40}$",
+                    "type": "string"
+                  },
+                  "sourceStack": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  },
+                  "sourceStackUid": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  },
+                  "sourceUnit": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  },
+                  "sourceUnitUid": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  },
+                  "targetStackUid": {
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "sourceStack",
+                  "sourceStackUid",
+                  "sourceUnit",
+                  "sourceUnitUid",
+                  "sourceDesiredRevision",
+                  "sourceObservedRevision",
+                  "receiptUnitBlob",
+                  "artifactName",
+                  "apiVersion",
+                  "kind",
+                  "artifactDigest",
+                  "targetStackUid",
+                  "artifactDocument"
+                ],
+                "title": "ResolvedArtifactImport",
+                "type": "object"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "resolvedProjection": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "resolvedSource": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "fromGit": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "commit": {
+                      "pattern": "^[0-9a-f]{40}$",
+                      "type": "string"
+                    },
+                    "digest": {
+                      "pattern": "^[0-9a-f]{64}$",
+                      "type": "string"
+                    },
+                    "path": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "ref": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "remote": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "resourcePath": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "commit",
+                    "resourcePath",
+                    "digest"
+                  ],
+                  "title": "ResolvedGitSource",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "fromGit"
+              ],
+              "title": "ResolvedStackTemplateSource",
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "template": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                  "type": "string"
+                },
+                "source": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "fromResource": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "name": {
+                              "anyOf": [
+                                {
+                                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "default": null
+                            },
+                            "uid": {
+                              "anyOf": [
+                                {
+                                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "default": null
+                            }
+                          },
+                          "title": "StackTemplateResourceReference",
+                          "type": "object"
+                        }
+                      },
+                      "title": "StackTemplateFromResource",
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "fromGit": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "commit": {
+                              "anyOf": [
+                                {
+                                  "pattern": "^[0-9a-f]{40}$",
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "default": null
+                            },
+                            "path": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "default": null
+                            },
+                            "ref": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "default": null
+                            },
+                            "remote": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "default": null
+                            }
+                          },
+                          "title": "GitSourceRequest",
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "fromGit"
+                      ],
+                      "title": "StackTemplateFromGit",
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "fromPromotion": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "stack": {
+                              "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "stack"
+                          ],
+                          "title": "StackTemplatePromotionReference",
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "fromPromotion"
+                      ],
+                      "title": "StackTemplateFromPromotion",
+                      "type": "object"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "name"
+              ],
+              "title": "StackTemplateReference",
+              "type": "object"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "units": {
+          "anyOf": [
+            {
+              "items": {
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "template"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "title": "Stack (gitopsctr.io/v1)",
+  "type": "object"
+}

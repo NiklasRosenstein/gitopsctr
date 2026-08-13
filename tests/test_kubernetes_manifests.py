@@ -13,6 +13,7 @@ from gitopsctr.driver import (
     MaterializationContext,
     PlanningContext,
     ReconciliationContext,
+    TeardownContext,
     VerificationContext,
     VerificationStatus,
 )
@@ -452,3 +453,58 @@ def test_argo_verification_reports_status_mismatch_as_drift(tmp_path, monkeypatc
         kubernetes.DRIVER.verify(verification_context(tmp_path, desired_unit, runner)).status
         is VerificationStatus.DRIFT
     )
+
+
+@pytest.mark.parametrize("access", ["api", "kubernetes"])
+def test_argo_teardown_waits_for_application_absence(access, tmp_path, monkeypatch):
+    desired_unit = argo_unit(access)
+    responses = iter([application(), subprocess.CalledProcessError(1, "get", stderr="application not found")])
+    calls = []
+
+    def runner(*args, **kwargs):
+        calls.append((args, kwargs))
+        response = next(responses)
+        if isinstance(response, BaseException):
+            raise response
+        return completed(args, stdout=json.dumps(response))
+
+    monotonic = iter([0, 1, 31])
+    monkeypatch.setattr(kubernetes.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(kubernetes.time, "sleep", lambda _seconds: None)
+    context = TeardownContext(
+        environment="dev",
+        desired_root=tmp_path / "desired",
+        desired_revision=REVISION,
+        source_root=tmp_path / "source",
+        source_revision=REVISION,
+        source_path="charts/web",
+        unit_name="web",
+        unit=desired_unit,
+        resource_uid="d1-web",
+        deletion_generation=1,
+        execution=execution_for(runner),
+    )
+
+    result = kubernetes.DRIVER.teardown(context)
+
+    assert result.details == {"application": "web", "status": "absent"}
+    assert len(calls) == 2
+
+
+def test_direct_kubernetes_teardown_fails_closed(tmp_path):
+    desired_unit = unit(delivery={"mode": "direct", "kubeContext": "dev"})
+    context = TeardownContext(
+        environment="dev",
+        desired_root=tmp_path / "desired",
+        desired_revision=REVISION,
+        source_root=tmp_path / "source",
+        source_revision=REVISION,
+        source_path="charts/web",
+        unit_name="web",
+        unit=desired_unit,
+        resource_uid="d1-web",
+        deletion_generation=1,
+    )
+
+    with pytest.raises(DriverError, match="no controller-owned teardown"):
+        kubernetes.DRIVER.teardown(context)

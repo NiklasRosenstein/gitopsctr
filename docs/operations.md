@@ -1,12 +1,12 @@
 # Operations
 
-The CLI is the operational interface used both locally and in CI. This page shows the normal workflows; use
-`gitopsctr COMMAND --help` for every flag.
+The CLI is the operational interface for local use and CI. This page shows
+common workflows. Use `gitopsctr COMMAND --help` for all flags.
 
-gitopsctr discovers the Git repository containing the current directory. Use `--repository PATH` or
-`GITOPSCTR_REPOSITORY` when operating on another checkout. Human output is colored on terminals and remains plain when
-redirected; `NO_COLOR=1` disables styling and `FORCE_COLOR=1` enables it explicitly. Machine-readable output is never
-colored.
+gitopsctr finds the Git repository that contains the current directory. Use
+`--repository PATH` or `GITOPSCTR_REPOSITORY` for another checkout. Terminal
+output uses color. Redirected output is plain. `NO_COLOR=1` disables color and
+`FORCE_COLOR=1` enables it. Machine-readable output is always plain.
 
 ## Inspect and validate
 
@@ -36,13 +36,14 @@ gitopsctr reconcile --environment dev --unit application --plan --source-revisio
 gitopsctr reconcile --environment dev --unit application
 ```
 
-When a source revision is selected, advance-desired, reconcile, and converge use its committed snapshot. If the working
-tree has staged, unstaged, or untracked changes, gitopsctr warns that they are excluded; commit and select the resulting
-commit if they should affect the operation.
+When you select a source revision, `advance-desired`, `reconcile`, and
+`converge` use its committed snapshot. If the working tree has changes,
+gitopsctr warns that it will exclude them. Commit the changes and select that
+commit if they must affect the operation.
 
-The dry advance previews controller-owned Git changes. A reconciliation plan lets the selected driver inspect its
-prospective work without applying or publishing a receipt. Real reconciliation publishes a receipt only after the
-driver succeeds.
+Dry advance shows the controller-owned Git changes. A reconciliation plan lets
+the driver inspect its work without applying changes or publishing a receipt.
+Normal reconciliation publishes a receipt only after the driver succeeds.
 
 For local orchestration, converge a unit and its dependencies until clean:
 
@@ -50,8 +51,9 @@ For local orchestration, converge a unit and its dependencies until clean:
 gitopsctr converge --environment dev --source-revision HEAD --unit application --yes
 ```
 
-Without `--unit`, `converge` targets the full environment. It advances desired state, reconciles ready units in
-dependency order, and repeats until no work remains or progress is blocked.
+Without `--unit`, `converge` targets the full environment. It advances desired
+state, reconciles ready units in dependency order, and repeats until all units
+are clean or progress is blocked.
 
 ## Promote and verify
 
@@ -82,3 +84,33 @@ Repeat `--unit` for a targeted rollback; omit it for the full desired tree. `--d
 the Environment's change gate controls direct publication versus a reviewed candidate.
 
 For CI orchestration, see the [GitHub Action](github-action.md).
+
+## CI-driven preview cleanup
+
+Forge identity is provenance only. `gitopsctr` does not decide whether a pull
+request or merge request is eligible, and normal desired-state operations do not
+call GitHub or GitLab.
+
+Trusted PR CI may create, update, delete, and finalize a preview Stack with the
+normal CLI primitives. A scheduled CI job may enumerate preview refs or
+resources by lineage, consult the forge for missed events, and request cleanup.
+Cleanup still uses UID-/revision-fenced Stack finalization. The deployment-owned
+scheduled job is responsible for lineage enumeration and forge API calls; this
+repository does not provide a forge-aware recovery command or watcher.
+
+## Verify GitHub merge policy
+
+After configuring branch protection or a merge queue, run the read-only verifier:
+
+```console
+python tools/verify_github_policy.py \
+  --repository OWNER/REPOSITORY \
+  --branch main
+```
+
+It prints versioned JSON and returns non-zero if the branch is unprotected, the
+GitHub API fails, or the policy is malformed. Deployment repositories that use
+gated candidates may add `--required-check` to verify a specific required status
+context. This repository does not require the candidate-freshness check because
+its CI does not publish deployed desired state. The verifier does not inspect or
+change GitHub rulesets or merge-queue settings.

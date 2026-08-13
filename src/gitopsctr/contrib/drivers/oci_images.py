@@ -32,6 +32,9 @@ from gitopsctr.driver import (
     ReconciliationContext,
     ReconciliationOutput,
     ReconciliationResult,
+    TeardownCapability,
+    TeardownContext,
+    TeardownResult,
     UnitDriver,
     UnitResolution,
     UnitResolutionContext,
@@ -156,6 +159,7 @@ def oci_digest(
 class OciImagesDriver(
     UnitDriver[OciImagesUnit, OciImagesDesiredUnit, OciImagesDesiredUnit, EmptyResultModel],
     PlanningCapability[OciImagesDesiredUnit],
+    TeardownCapability[OciImagesDesiredUnit],
     ReconciliationCapability[OciImagesDesiredUnit, EmptyResultModel],
 ):
     api_version = "unit.gitopsctr.io/v1"
@@ -285,6 +289,11 @@ class OciImagesDriver(
 
     def plan(self, context: PlanningContext[OciImagesDesiredUnit]) -> None:
         self._build_image(context, self._runtime(context))
+
+    def teardown(self, context: TeardownContext[OciImagesDesiredUnit]) -> TeardownResult:
+        """Retain immutable registry artifacts; they are not managed resources."""
+
+        return TeardownResult(details={"artifactsRetained": True})
 
     def reconcile(
         self,

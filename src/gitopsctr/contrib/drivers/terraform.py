@@ -29,6 +29,9 @@ from gitopsctr.driver import (
     ReconciliationContext,
     ReconciliationOutput,
     ReconciliationResult,
+    TeardownCapability,
+    TeardownContext,
+    TeardownResult,
     UnitDriver,
     UnitResolution,
     UnitResolutionContext,
@@ -146,6 +149,7 @@ def terraform_runtime(
     context: (
         PlanningContext[TerraformDesiredUnit]
         | ReconciliationContext[TerraformDesiredUnit]
+        | TeardownContext[TerraformDesiredUnit]
         | VerificationContext[TerraformDesiredUnit]
     ),
 ) -> TerraformRuntime:
@@ -208,6 +212,7 @@ class TerraformDriver(
     UnitDriver[TerraformUnit, TerraformDesiredUnit, TerraformDesiredUnit, TerraformResultModel],
     PlanningCapability[TerraformDesiredUnit],
     ReconciliationCapability[TerraformDesiredUnit, TerraformResultModel],
+    TeardownCapability[TerraformDesiredUnit],
     VerificationCapability[TerraformDesiredUnit],
 ):
     api_version = "unit.gitopsctr.io/v1"
@@ -473,6 +478,30 @@ class TerraformDriver(
         if result.returncode == 2:
             return VerificationResult(VerificationStatus.DRIFT)
         raise DriverError(output.strip() or f"Terraform verification failed with exit code {result.returncode}")
+
+    def teardown(self, context: TeardownContext[TerraformDesiredUnit]) -> TeardownResult:
+        runtime = terraform_runtime(context)
+        with terraform_variable_file(runtime) as variable_file:
+            context.execution.run(
+                "terraform",
+                "init",
+                *runtime.init_args,
+                cwd=runtime.working_directory,
+                env=runtime.environment,
+            )
+            context.execution.run(
+                "terraform",
+                "destroy",
+                *terraform_variable_file_args(variable_file),
+                "-auto-approve",
+                "-input=false",
+                "-no-color",
+                cwd=runtime.working_directory,
+                env=runtime.environment,
+            )
+        return TeardownResult(
+            details={"resourceUid": context.resource_uid, "deletionGeneration": context.deletion_generation}
+        )
 
     def semantic_result(self, result: object) -> ReconciliationResult:
         return self._select_semantic_result(result)

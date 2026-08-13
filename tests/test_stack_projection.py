@@ -1,0 +1,498 @@
+from __future__ import annotations
+
+import json
+import shutil
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from gitopsctr import controller
+from gitopsctr.contracts import (
+    DesiredLifecycle,
+    DesiredOwnerReference,
+    DesiredStackSpec,
+    LifecycleManagement,
+    StackInstantiationProvenance,
+)
+from gitopsctr.errors import OperationError
+from gitopsctr.resources import ResourceMetadata, StackResource, validate_desired_resource_graph
+from gitopsctr.state import ControllerPin, ControllerPinClaim
+from tests.stack_support import project_repository, write_projected_units, write_stack_source
+
+
+def test_stack_projection_is_deterministic_and_templates_are_inert(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = project_repository(source)
+    write_stack_source(environment)
+
+    first = controller.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate-a", source)
+    second = controller.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate-b", source)
+
+    assert sorted(first.generated_units) == ["web--preview-app"]
+    assert first.owners == second.owners
+    assert first.generated_units["web--preview-app"].spec == second.generated_units["web--preview-app"].spec
+    assert list((tmp_path / "candidate-a/stack-templates").glob("preview.*"))
+    assert not list((tmp_path / "candidate-a/units").glob("*"))
+
+
+def test_existing_stack_root_uids_are_preserved_across_source_revisions(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = project_repository(source)
+    write_stack_source(environment)
+    initial = tmp_path / "initial"
+    controller.project_stack_resources(source, "dev", "a" * 40, initial, source)
+    current = tmp_path / "current"
+    shutil.copytree(initial, current)
+
+    next_candidate = tmp_path / "next"
+    controller.project_stack_resources(source, "dev", "b" * 40, next_candidate, source, current)
+
+    for kind, directory in (("StackTemplate", "stack-templates"), ("Stack", "stacks")):
+        old_path = next(
+            path for path in (current / directory).glob("preview.*" if kind == "StackTemplate" else "web.*")
+        )
+        new_path = next(
+            path for path in (next_candidate / directory).glob("preview.*" if kind == "StackTemplate" else "web.*")
+        )
+        old = (
+            controller.RESOURCE_CATALOG.parse_stack_template(
+                controller.RESOURCE_CATALOG.load_document(old_path), profile="desired"
+            )
+            if kind == "StackTemplate"
+            else controller.RESOURCE_CATALOG.parse_stack(
+                controller.RESOURCE_CATALOG.load_document(old_path), profile="desired"
+            )
+        )
+        new = (
+            controller.RESOURCE_CATALOG.parse_stack_template(
+                controller.RESOURCE_CATALOG.load_document(new_path), profile="desired"
+            )
+            if kind == "StackTemplate"
+            else controller.RESOURCE_CATALOG.parse_stack(
+                controller.RESOURCE_CATALOG.load_document(new_path), profile="desired"
+            )
+        )
+        assert old.metadata.uid == new.metadata.uid
+
+
+def test_recreated_source_stack_does_not_reuse_finalized_uid(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = project_repository(source)
+    write_stack_source(environment)
+    initial = tmp_path / "initial"
+    controller.project_stack_resources(source, "dev", "a" * 40, initial, source)
+    old_path = next((initial / "stacks").glob("web.*"))
+    old_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(old_path), profile="desired", expected_name="web"
+    )
+    assert old_stack.metadata.uid is not None
+
+    current = tmp_path / "current"
+    shutil.copytree(initial, current)
+    for path in (current / "stacks").glob("web.*"):
+        path.unlink()
+    controller.write_resource_incarnation_tombstone(
+        current,
+        controller.ResourceIncarnationTombstone(
+            api_version=controller.CORE_API_VERSION,
+            kind="Stack",
+            name="web",
+            uid=old_stack.metadata.uid,
+            deletion_generation=1,
+        ),
+    )
+
+    candidate = tmp_path / "candidate"
+    controller.project_stack_resources(source, "dev", "a" * 40, candidate, source, current)
+    new_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((candidate / "stacks").glob("web.*"))),
+        profile="desired",
+        expected_name="web",
+    )
+    assert new_stack.metadata.uid != old_stack.metadata.uid
+
+
+def test_resource_incarnation_lookup_uses_full_gvk(tmp_path: Path):
+    root = tmp_path / "desired"
+    terraform = controller.ResourceIncarnationTombstone(
+        api_version=controller.UNIT_API_VERSION,
+        kind="Terraform",
+        name="application",
+        uid="d1-terraform",
+        deletion_generation=1,
+    )
+    stack = controller.ResourceIncarnationTombstone(
+        api_version=controller.CORE_API_VERSION,
+        kind="Stack",
+        name="application",
+        uid="d1-stack",
+        deletion_generation=1,
+    )
+    controller.write_resource_incarnation_tombstone(root, terraform)
+    controller.write_resource_incarnation_tombstone(root, stack)
+    tombstones = controller.load_resource_incarnation_tombstones(root)
+
+    assert (
+        controller.finalized_incarnation_for_resource(
+            tombstones,
+            controller.UNIT_API_VERSION,
+            "Terraform",
+            "application",
+        )
+        == terraform
+    )
+    assert (
+        controller.finalized_incarnation_for_resource(
+            tombstones,
+            controller.CORE_API_VERSION,
+            "Stack",
+            "application",
+        )
+        == stack
+    )
+
+
+def test_source_absent_stack_root_is_retained_for_owned_unit_cleanup(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = project_repository(source)
+    write_stack_source(environment)
+    initial = tmp_path / "initial"
+    controller.project_stack_resources(source, "dev", "a" * 40, initial, source)
+    initial_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((initial / "stacks").glob("web.*"))),
+        profile="desired",
+        expected_name="web",
+    )
+    current = tmp_path / "current"
+    shutil.copytree(initial, current)
+
+    (environment / "stacks/web.json").unlink()
+    next_candidate = tmp_path / "next"
+    projection = controller.project_stack_resources(source, "dev", "b" * 40, next_candidate, source, current)
+
+    assert not projection.generated_units
+    retained_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((next_candidate / "stacks").glob("web.*"))),
+        profile="desired",
+        expected_name="web",
+    )
+    assert retained_stack.metadata.uid == initial_stack.metadata.uid
+    assert retained_stack.metadata.deletion is not None
+    assert list((next_candidate / "stack-templates").glob("preview.*"))
+
+
+def test_source_absent_stack_template_is_retained_for_finalization(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = project_repository(source)
+    write_stack_source(environment)
+    initial = tmp_path / "initial"
+    controller.project_stack_resources(source, "dev", "a" * 40, initial, source)
+    initial_template_path = next((initial / "stack-templates").glob("preview.*"))
+    initial_template = controller.RESOURCE_CATALOG.parse_stack_template(
+        controller.RESOURCE_CATALOG.load_document(initial_template_path),
+        profile="desired",
+        expected_name="preview",
+    )
+    current = tmp_path / "current"
+    shutil.copytree(initial, current)
+
+    (environment / "stacks/web.json").unlink()
+    (environment / "stack-templates/preview.json").unlink()
+    candidate = tmp_path / "candidate"
+    controller.project_stack_resources(source, "dev", "b" * 40, candidate, source, current)
+
+    retained_path = next((candidate / "stack-templates").glob("preview.*"))
+    retained = controller.RESOURCE_CATALOG.parse_stack_template(
+        controller.RESOURCE_CATALOG.load_document(retained_path),
+        profile="desired",
+        expected_name="preview",
+    )
+    assert retained.metadata.uid == initial_template.metadata.uid
+    assert retained.metadata.deletion is not None
+
+
+def test_expanded_stack_dependencies_are_retained_and_validated(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = project_repository(source)
+    write_stack_source(environment)
+    template_path = environment / "stack-templates/preview.json"
+    template = json.loads(template_path.read_text())
+    template["spec"]["unitTemplates"]["preview-db"] = {
+        "apiVersion": "unit.gitopsctr.io/v1",
+        "kind": "Terraform",
+        "spec": {"source": {"path": "."}},
+    }
+    template["spec"]["unitTemplates"]["preview-app"]["dependsOn"] = ["preview-db"]
+    template_path.write_text(json.dumps(template))
+
+    candidate = tmp_path / "candidate"
+    projection = controller.project_stack_resources(source, "dev", "a" * 40, candidate, source)
+    assert projection.dependencies["web--preview-app"] == ("web--preview-db",)
+    write_projected_units(candidate, projection, source, uid_prefix="d1-generated-")
+    controller.load_desired_resource_graph(candidate)
+    current_desired = tmp_path / "empty-desired"
+    current_desired.mkdir()
+    specifications, dependencies = controller.load_convergence_specifications(
+        source,
+        "dev",
+        current_desired,
+        "a" * 40,
+        tmp_path / "convergence-projection",
+    )
+    selection = controller.convergence_scope(specifications, ["web--preview-app"], additional_dependencies=dependencies)
+    assert selection.scope == ("web--preview-app", "web--preview-db")
+    assert controller.convergence_order(specifications, selection.scope, dependencies) == (
+        "web--preview-db",
+        "web--preview-app",
+    )
+    next(path for path in (candidate / "units").glob("web--preview-db.*")).unlink()
+    with pytest.raises(OperationError, match="dependency 'web--preview-db' is absent"):
+        controller.load_desired_resource_graph(candidate)
+
+
+def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = project_repository(source)
+    write_stack_source(environment)
+    candidate = tmp_path / "candidate"
+    projection = controller.project_stack_resources(source, "dev", "a" * 40, candidate, source)
+    owner = projection.owners["web--preview-app"]
+    unit = projection.generated_units["web--preview-app"].with_metadata(
+        ResourceMetadata(
+            name="web--preview-app",
+            uid="d1-generated-preview-app",
+            ownerReferences=[owner],
+        )
+    )
+    controller.write_desired_candidate_unit(candidate / "units/web--preview-app.json", unit, source)
+
+    graph = controller.load_desired_resource_graph(candidate)
+    assert controller.desired_unit_names(candidate) == ("web--preview-app",)
+    assert ("gitopsctr.io/v1", "StackTemplate", "preview") in graph
+    assert ("gitopsctr.io/v1", "Stack", "web") in graph
+    assert graph[("unit.gitopsctr.io/v1", "Terraform", "web--preview-app")].metadata.ownerReferences is not None
+
+    bad_owner = DesiredOwnerReference(
+        apiVersion=owner.apiVersion,
+        kind=owner.kind,
+        name=owner.name,
+        uid="d1-wrong-owner",
+    )
+    with pytest.raises(ValueError, match="different UID"):
+        validate_desired_resource_graph(
+            {
+                key: value.with_metadata(
+                    ResourceMetadata(
+                        name=value.name,
+                        uid=value.metadata.uid,
+                        ownerReferences=[bad_owner],
+                    )
+                )
+                if key[2] == "web--preview-app"
+                else value
+                for key, value in graph.items()
+                if not isinstance(value, StackResource) or value.gvk.kind != "StackTemplate"
+            }
+        )
+
+
+def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = project_repository(source)
+    write_stack_source(environment)
+    authored_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(environment / "stacks/web.json"),
+        profile="authored",
+        expected_name="web",
+    )
+    desired = tmp_path / "desired"
+    projection = controller.project_stack_resources(source, "dev", "a" * 40, desired, source)
+    (environment / "stacks/web.json").unlink()
+    stack = StackResource(
+        controller.GVK(controller.CORE_API_VERSION, "Stack"),
+        ResourceMetadata(
+            name="web",
+            uid="d1-stack-web",
+            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
+        ),
+        DesiredStackSpec(
+            template="preview",
+            parameters=authored_stack.spec.parameters,  # type: ignore[union-attr]
+            provenance=StackInstantiationProvenance(
+                templateRevision="a" * 40,
+                templatePath="deployment/environments/dev/stack-templates/preview.json",
+                templateDigest="b" * 64,
+                requestIdentity="pull-123",
+            ),
+        ),
+    )
+    for path in controller.document_candidates(desired / "stacks", "web"):
+        path.unlink()
+    (desired / "stacks/web.json").write_text(
+        json.dumps(controller.RESOURCE_CATALOG.serialize_stack_resource(stack, profile="desired"))
+    )
+    unit = projection.generated_units["web--preview-app"].with_metadata(
+        ResourceMetadata(
+            name="web--preview-app",
+            uid="d1-unit-preview-app",
+            ownerReferences=[
+                DesiredOwnerReference(
+                    apiVersion=controller.CORE_API_VERSION,
+                    kind="Stack",
+                    name="web",
+                    uid="d1-stack-web",
+                )
+            ],
+        )
+    )
+    controller.write_desired_candidate_unit(desired / "units/web--preview-app.json", unit, source)
+
+    specifications, dependencies = controller.load_convergence_specifications(
+        source,
+        "dev",
+        desired,
+        "a" * 40,
+        tmp_path / "projection",
+    )
+    assert specifications["web--preview-app"].metadata.lifecycle is None
+    assert specifications["web--preview-app"].metadata.ownerReferences is not None
+    assert dependencies == {"web--preview-app": ()}
+
+
+def test_stack_rejects_missing_template_during_projection(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = project_repository(source)
+    stacks = environment / "stacks"
+    stacks.mkdir()
+    (stacks / "web.json").write_text(
+        json.dumps(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "Stack",
+                "metadata": {"name": "web"},
+                "spec": {"template": "missing", "parameters": {}},
+            }
+        )
+    )
+
+    with pytest.raises(OperationError, match="missing StackTemplate"):
+        controller.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate", source)
+
+
+def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    environment = project_repository(source)
+    write_stack_source(environment)
+    (environment / "stacks/web.json").unlink()
+    current = tmp_path / "current"
+    current.mkdir()
+    published: list[Path] = []
+    events: list[str] = []
+    source_revision = "a" * 40
+
+    def materialize(revision: str, output: Path) -> None:
+        shutil.copytree(source if revision == source_revision else current, output)
+
+    def fake_build(_environment, source_root, revision, _current, _observed, _observed_revision, candidate, **_kwargs):
+        projection = controller.project_stack_resources(source_root, "dev", revision, candidate, source_root)
+        for name in projection.generated_units:
+            unit_document = {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "Terraform",
+                "metadata": {
+                    "name": name,
+                    "uid": "d1-generated-unit",
+                    "lifecycle": {"management": {"mode": "sourceTracked"}},
+                },
+                "spec": {
+                    "source": {
+                        "path": ".",
+                        "revision": source_revision,
+                        "inputHash": "sha256:" + "0" * 64,
+                        "driverVersion": controller.DRIVER_VERSIONS["terraform"],
+                    },
+                    "terraform": {"backend": {}, "variables": {}, "observeOutputs": []},
+                },
+            }
+            unit = controller.RESOURCE_CATALOG.parse_unit(unit_document, profile="desired", expected_name=name)
+            controller.write_desired_candidate_unit(candidate / "units" / f"{name}.json", unit, source_root)
+
+    def publish(_environment, candidate, *_args, **kwargs):
+        assert kwargs["request_change"] is False
+        events.append("publish")
+        snapshot = tmp_path / "published"
+        shutil.copytree(candidate, snapshot)
+        published.append(snapshot)
+        return "c" * 40, None
+
+    monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(controller, "fetch_ref", lambda ref: "b" * 40 if ref == "deploy/dev" else None)
+    monkeypatch.setattr(controller, "materialize_revision", materialize)
+    monkeypatch.setattr(controller, "observed_tree", lambda _ref, output: output.mkdir(parents=True) or None)
+    monkeypatch.setattr(
+        controller, "git", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=source_revision + "\n")
+    )
+    monkeypatch.setattr(controller, "build_desired_candidate", fake_build)
+    monkeypatch.setattr(controller, "publish_desired_change", publish)
+    monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+
+    def create_claim(claim: ControllerPinClaim) -> ControllerPinClaim:
+        events.append("claim")
+        return replace(claim, revision="d" * 40)
+
+    def create_pin(name: str, revision: str) -> ControllerPin:
+        events.append("pin")
+        return ControllerPin(name, f"refs/heads/gitopsctr/pins/{name}", revision)
+
+    def update_claim(claim: ControllerPinClaim, expected_revision: str) -> ControllerPinClaim:
+        assert expected_revision == "d" * 40
+        assert claim.state == "active"
+        events.append("activate")
+        return replace(claim, revision="e" * 40)
+
+    store = SimpleNamespace(
+        create_controller_pin_claim=create_claim,
+        create_controller_pin=create_pin,
+        update_controller_pin_claim=update_claim,
+    )
+    monkeypatch.setattr(
+        controller,
+        "state_store",
+        lambda: store,
+    )
+
+    args = controller.build_parser().parse_args(
+        [
+            "instantiate-stack",
+            "--environment",
+            "dev",
+            "--stack",
+            "web",
+            "--template",
+            "preview",
+            "--source-revision",
+            source_revision,
+            "--parameters",
+            '{"source-path":"."}',
+            "--request-id",
+            "pull-123",
+        ]
+    )
+    assert controller.command_instantiate_stack(args) is True
+    assert events == ["claim", "pin", "publish", "activate"]
+    candidate = published[0]
+    stack_path = next((candidate / "stacks").glob("web.*"))
+    stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name="web"
+    )
+    assert stack.metadata.lifecycle is not None
+    assert stack.metadata.lifecycle.management is not None
+    assert stack.metadata.lifecycle.management.mode == "direct"
+    assert isinstance(stack.spec, controller.DesiredStackSpec)
+    assert stack.spec.provenance is not None
+    unit = controller.load_desired_unit(next((candidate / "units").glob("web--preview-app.*")), "web--preview-app")
+    assert unit.metadata.ownerReferences is not None
+    assert unit.metadata.ownerReferences[0].uid == stack.metadata.uid

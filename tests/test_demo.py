@@ -9,7 +9,7 @@ import yaml
 from demo.docker import run as demo
 from demo.kubernetes import run as kubernetes_demo
 from demo.utils import RefHeads
-from gitopsctr import cli
+from gitopsctr import controller
 
 
 def test_kubernetes_controller_preserves_terminal_color_when_capturing(monkeypatch, tmp_path):
@@ -33,14 +33,14 @@ def test_kubernetes_controller_preserves_terminal_color_when_capturing(monkeypat
 
 
 def test_demo_repository_exercises_observation_driven_convergence():
-    specifications = cli.load_environment_specifications(demo.TEMPLATE, "dev")
+    specifications = controller.load_environment_specifications(demo.TEMPLATE, "dev")
 
-    selection = cli.convergence_scope(specifications, ["demo-service"])
+    selection = controller.convergence_scope(specifications, ["demo-service"])
     targets, scope = selection.targets, selection.scope
 
     assert targets == ("demo-service",)
     assert scope == ("demo-image", "demo-service")
-    assert cli.convergence_order(specifications, scope) == ("demo-image", "demo-service")
+    assert controller.convergence_order(specifications, scope) == ("demo-image", "demo-service")
 
 
 def test_demo_runner_materializes_local_runtime_configuration(tmp_path, monkeypatch):
@@ -64,6 +64,149 @@ def test_demo_runner_materializes_local_runtime_configuration(tmp_path, monkeypa
     assert service["spec"]["terraform"]["variables"]["host_port"] == 18081
 
 
+def test_demo_stack_source_projects_parameterized_terraform_unit(tmp_path, monkeypatch):
+    worktree = tmp_path / "repository"
+    stack_state = tmp_path / "stack-terraform.tfstate"
+    shutil.copytree(demo.TEMPLATE, worktree)
+    monkeypatch.setattr(demo, "WORKTREE", worktree)
+    monkeypatch.setattr(demo, "STACK_TERRAFORM_STATE", stack_state)
+    monkeypatch.setattr(demo, "_commit_source", lambda _message: "a" * 40)
+    demo.add_stack_source(18082)
+
+    projection = controller.project_stack_resources(
+        worktree,
+        "dev",
+        "a" * 40,
+        tmp_path / "candidate",
+        worktree,
+    )
+
+    generated_name = "preview--demo-service"
+    assert tuple(projection.generated_units) == (generated_name,)
+    assert projection.dependencies == {generated_name: ()}
+    generated = projection.generated_units[generated_name]
+    assert generated.driver_name == "terraform"
+    specification = generated.driver.unit_contract.dump(generated.spec)
+    assert specification["terraform"]["backend"]["path"] == str(stack_state)
+    assert specification["terraform"]["variables"]["container_name"] == "gitopsctr-demo-stack-app"
+    assert specification["terraform"]["variables"]["host_port"] == 18082
+    assert specification["terraform"]["variables"]["image"]["fromArtifact"]["unit"] == "demo-image"
+
+
+def _planned_stack_teardown_commands(stack_name, stack_uid, owned_units):
+    """Describe the smallest CLI sequence for UID-fenced Stack cleanup."""
+
+    commands = [("advance-desired", "--environment", "dev", "--source-revision", "HEAD")]
+    for unit_name, unit_uid in reversed(owned_units):
+        commands.append(
+            (
+                "finalize",
+                "unit",
+                "--environment",
+                "dev",
+                "--name",
+                unit_name,
+                "--uid",
+                unit_uid,
+                "--deletion-generation",
+                "1",
+            )
+        )
+    commands.append(
+        (
+            "finalize",
+            "stack",
+            "--environment",
+            "dev",
+            "--name",
+            stack_name,
+            "--uid",
+            stack_uid,
+            "--deletion-generation",
+            "1",
+        )
+    )
+    return commands
+
+
+def test_demo_stack_cleanup_commands_match_planned_cli_contract():
+    commands = _planned_stack_teardown_commands(
+        "demo-preview",
+        "stack-uid",
+        (("demo-preview--database", "database-uid"), ("demo-preview--service", "service-uid")),
+    )
+
+    assert commands == [
+        ("advance-desired", "--environment", "dev", "--source-revision", "HEAD"),
+        (
+            "finalize",
+            "unit",
+            "--environment",
+            "dev",
+            "--name",
+            "demo-preview--service",
+            "--uid",
+            "service-uid",
+            "--deletion-generation",
+            "1",
+        ),
+        (
+            "finalize",
+            "unit",
+            "--environment",
+            "dev",
+            "--name",
+            "demo-preview--database",
+            "--uid",
+            "database-uid",
+            "--deletion-generation",
+            "1",
+        ),
+        (
+            "finalize",
+            "stack",
+            "--environment",
+            "dev",
+            "--name",
+            "demo-preview",
+            "--uid",
+            "stack-uid",
+            "--deletion-generation",
+            "1",
+        ),
+    ]
+
+
+def test_demo_acceptance_delegates_stack_cleanup_after_clean_direct_convergence(monkeypatch):
+    events: list[object] = []
+    heads = iter((RefHeads("desired", "observed"), RefHeads("desired", "observed")))
+    monkeypatch.setattr(demo, "clean", lambda registry: events.append(("clean", registry)))
+    monkeypatch.setattr(
+        demo,
+        "converge",
+        lambda registry_port, app_port, **kwargs: events.append(("converge", registry_port, app_port, kwargs)),
+    )
+    monkeypatch.setattr(demo, "deployment_heads", lambda: next(heads))
+    monkeypatch.setattr(
+        demo,
+        "stack_acceptance",
+        lambda registry_port, app_port: (
+            events.append(("stack_acceptance", registry_port, app_port)),
+            RefHeads("final-desired", "final-observed"),
+        )[1],
+    )
+
+    demo.acceptance(5001, 18081)
+
+    assert events == [
+        ("clean", "localhost:5001"),
+        ("converge", 5001, 18081, {}),
+        ("converge", 5001, 18081, {"expect_clean": True}),
+        ("stack_acceptance", 5001, 18081),
+        ("clean", "localhost:5001"),
+    ]
+
+
 def test_demo_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):
     events: list[object] = []
     heads = iter((RefHeads("desired", "observed"), RefHeads("desired", "observed")))
@@ -74,6 +217,7 @@ def test_demo_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):
         lambda registry_port, app_port, **kwargs: events.append(("converge", registry_port, app_port, kwargs)),
     )
     monkeypatch.setattr(demo, "deployment_heads", lambda: next(heads))
+    monkeypatch.setattr(demo, "stack_acceptance", lambda *_args: RefHeads("final-desired", "final-observed"))
 
     demo.acceptance(5001, 18081)
 
@@ -91,6 +235,7 @@ def test_demo_acceptance_cleans_after_a_failed_invariant(monkeypatch):
     monkeypatch.setattr(demo, "clean", cleaned.append)
     monkeypatch.setattr(demo, "converge", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(demo, "deployment_heads", lambda: next(heads))
+    monkeypatch.setattr(demo, "stack_acceptance", lambda *_args: None)
 
     with pytest.raises(RuntimeError, match="moved desired or observed refs"):
         demo.acceptance(5001, 18081)
@@ -104,10 +249,10 @@ def test_kubernetes_demo_is_a_real_image_and_helm_delivery(tmp_path, monkeypatch
     shutil.copytree(kubernetes_demo.TEMPLATE, worktree)
     monkeypatch.setattr(kubernetes_demo, "docker_platform", lambda: "linux/amd64")
     kubernetes_demo.configure_template(provider, worktree)
-    specifications = cli.load_environment_specifications(worktree, "dev")
+    specifications = controller.load_environment_specifications(worktree, "dev")
     specification = specifications["web"]
 
-    assert cli.convergence_order(specifications, ["demo-image", "web"]) == ("demo-image", "web")
+    assert controller.convergence_order(specifications, ["demo-image", "web"]) == ("demo-image", "web")
     assert specification.spec.source.inputs == ["**/*"]
     assert specification.spec.materialize.type == "helm"
     assert specification.spec.materialize.values._serialize()["image"]["fromArtifact"] == {
@@ -179,7 +324,7 @@ def test_argocd_demo_uses_the_external_observer_and_materialized_payload(tmp_pat
 
     kubernetes_demo.configure_template(provider, worktree, "argocd")
 
-    specification = cli.load_environment_specifications(worktree, "dev")["web"]
+    specification = controller.load_environment_specifications(worktree, "dev")["web"]
     assert specification.driver.unit_contract.dump(specification.spec)["delivery"] == {
         "mode": "external",
         "observer": {

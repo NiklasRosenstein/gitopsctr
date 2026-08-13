@@ -20,6 +20,7 @@ CANDIDATE_REF_TEMPLATE_PATTERN = (
     r"^(?:[^{}]|\{id\}|\{operation\})*\{environment\}"
     r"(?:[^{}]|\{environment\}|\{id\}|\{operation\})*$"
 )
+EFFECT_LEASE_REF_TEMPLATE_PATTERN = r"^(?:[^{}]|\{environment\}|\{unit\})+$"
 
 PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -52,6 +53,12 @@ PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
                     "minLength": 1,
                     "pattern": r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+$",
                     "description": "Repository-relative directory containing authored environments.",
+                },
+                "stackTemplatesPath": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+$",
+                    "description": "Repository-relative directory containing authored StackTemplates.",
                 },
                 "environmentDefaults": {
                     "type": "object",
@@ -118,7 +125,44 @@ PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
                     },
                     "additionalProperties": False,
                 },
+                "effectLease": {
+                    "oneOf": [
+                        {"type": "null"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "store": {
+                                    "oneOf": [
+                                        {"type": "null"},
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "branch": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "ref": {
+                                                            "type": "string",
+                                                            "minLength": 1,
+                                                            "pattern": EFFECT_LEASE_REF_TEMPLATE_PATTERN,
+                                                        }
+                                                    },
+                                                    "required": ["ref"],
+                                                    "additionalProperties": False,
+                                                }
+                                            },
+                                            "required": ["branch"],
+                                            "additionalProperties": False,
+                                        },
+                                    ]
+                                }
+                            },
+                            "required": ["store"],
+                            "additionalProperties": False,
+                        },
+                    ]
+                },
             },
+            "required": ["effectLease"],
             "additionalProperties": False,
         },
     },
@@ -165,6 +209,11 @@ class SourceRevisionAction(StrEnum):
 
 
 @dataclass(frozen=True)
+class EffectLeaseBranch:
+    ref: str
+
+
+@dataclass(frozen=True)
 class SourceRevisionPolicy:
     unavailable_when: SourceRevisionUnavailableWhen = SourceRevisionUnavailableWhen.OUTSIDE_CANDIDATE_HISTORY
     when_unavailable_during_advance: SourceRevisionAction = SourceRevisionAction.REFRESH
@@ -176,8 +225,10 @@ class Project:
     name: str
     write_format: DocumentFormat = DocumentFormat.YAML
     environments_path: PurePosixPath = PurePosixPath("deployment/environments")
+    stack_templates_path: PurePosixPath = PurePosixPath("deployment/stack-templates")
     environment_defaults: EnvironmentDefaults = EnvironmentDefaults()
     source_revision_policy: SourceRevisionPolicy = SourceRevisionPolicy()
+    effect_lease_store: EffectLeaseBranch | None = None
 
 
 def project_config_path(root: Path) -> Path:
@@ -214,13 +265,28 @@ def validate_project_document(value: object, path: Path) -> Project:
     environments_path = PurePosixPath(cast(str, specification.get("environmentsPath", "deployment/environments")))
     if environments_path.is_absolute() or ".." in environments_path.parts:
         raise DocumentFormatError(f"invalid project config {path}: environmentsPath must stay inside the source tree")
+    stack_templates_path = PurePosixPath(
+        cast(str, specification.get("stackTemplatesPath", "deployment/stack-templates"))
+    )
+    if stack_templates_path.is_absolute() or ".." in stack_templates_path.parts:
+        raise DocumentFormatError(f"invalid project config {path}: stackTemplatesPath must stay inside the source tree")
     environment_defaults_document = cast(dict[str, Any], specification.get("environmentDefaults", {}))
     refs_document = cast(dict[str, Any], environment_defaults_document.get("refs", {}))
     source_revision_policy_document = cast(dict[str, Any], specification.get("sourceRevisionPolicy", {}))
+    effect_lease_document = specification["effectLease"]
+    effect_lease_store: EffectLeaseBranch | None = None
+    if effect_lease_document is not None:
+        store = cast(dict[str, Any], effect_lease_document)["store"]
+        if store is not None:
+            branch = cast(dict[str, Any], store)["branch"]
+            effect_lease_store = EffectLeaseBranch(
+                ref=cast(str, branch["ref"]),
+            )
     return Project(
         name=project_name,
         write_format=DocumentFormat.JSON if selected == "json" else DocumentFormat.YAML,
         environments_path=environments_path,
+        stack_templates_path=stack_templates_path,
         environment_defaults=EnvironmentDefaults(
             refs=EnvironmentRefTemplates(
                 desired=cast(str, refs_document.get("desired", DEFAULT_DESIRED_REF_TEMPLATE)),
@@ -241,6 +307,7 @@ def validate_project_document(value: object, path: Path) -> Project:
                 source_revision_policy_document.get("whenUnavailableDuringPlan", SourceRevisionAction.ERROR)
             ),
         ),
+        effect_lease_store=effect_lease_store,
     )
 
 

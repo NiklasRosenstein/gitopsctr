@@ -21,7 +21,7 @@ from typing import Literal, cast
 import yaml
 
 from demo.utils import DemoRepository, RefHeads, docker_platform, remove_docker_images, require_commands, run
-from gitopsctr.cli import color_enabled
+from gitopsctr.controller import color_enabled
 
 Provider = Literal["kind", "minikube"]
 Delivery = Literal["direct", "argocd"]
@@ -76,7 +76,7 @@ def configure_template(provider: Provider, worktree: Path, delivery: Delivery = 
         "__KUBE_CONTEXT__": kube_context(provider, delivery),
     }
     for path in worktree.rglob("*"):
-        if not path.is_file():
+        if not path.is_file() or path.suffix in {".pyc", ".pyo"}:
             continue
         content = path.read_text()
         if provider == "minikube":

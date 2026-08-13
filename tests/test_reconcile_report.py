@@ -8,10 +8,46 @@ from types import SimpleNamespace
 
 import pytest
 
-from gitopsctr import cli as deploy_release
+from gitopsctr import controller as deploy_release
 from gitopsctr.contrib.drivers.terraform import AppliedTerraformModel, TerraformResultModel
 from gitopsctr.driver import ReconciliationOutput
+from gitopsctr.resources import ResourceMetadata
 from tests.conftest import receipt_document, write_test_document
+
+
+@pytest.fixture(autouse=True)
+def _local_effect_lease(monkeypatch):
+    def acquire(_ref, revision, unit_name, uid, **_kwargs):
+        lease = deploy_release.EffectLease(
+            unit_name=unit_name,
+            uid=uid,
+            token="lease-test",
+            owner="test-runner",
+            desired_revision=revision,
+            expires_at=2_000_000_000,
+        )
+        return deploy_release.EffectLeaseAcquisition(lease=lease, revision=revision)
+
+    monkeypatch.setattr(deploy_release, "acquire_effect_lease", acquire)
+    monkeypatch.setattr(deploy_release, "release_effect_lease", lambda *_args, **_kwargs: None)
+
+    class NoopHeartbeat:
+        def __init__(self, acquisition):
+            self.acquisition = acquisition
+
+        def stop(self):
+            return self.acquisition
+
+    monkeypatch.setattr(
+        deploy_release,
+        "start_effect_lease_heartbeat",
+        lambda _ref, acquisition, **_kwargs: NoopHeartbeat(acquisition),
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "rebase_effect_completion",
+        lambda _ref, acquisition, _unit_name, _uid, _root, **_kwargs: acquisition,
+    )
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
@@ -35,8 +71,61 @@ def test_reconcile_parser_exposes_plan_without_a_dry_alias():
 
     args = parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--plan"])
     assert args.plan is True
+    assert args.verbose is False
+    verbose_args = parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--verbose"])
+    assert verbose_args.verbose is True
     with pytest.raises(SystemExit):
         parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--dry"])
+
+
+def test_reconciliation_artifact_effects_distinguish_added_updated_and_unchanged(monkeypatch, tmp_path):
+    previous = SimpleNamespace(
+        status=SimpleNamespace(
+            artifacts={"same": object(), "updated": object()},
+        )
+    )
+    driver = SimpleNamespace(
+        driver_name="example",
+        artifact_outputs={"added": object(), "same": object(), "updated": object()},
+    )
+    unit = SimpleNamespace(driver=driver, driver_name="example")
+    previous_documents = {
+        "same": {"value": "same"},
+        "updated": {"value": "before"},
+    }
+
+    monkeypatch.setattr(
+        deploy_release,
+        "load_artifact_document",
+        lambda _observed, _unit, _receipt, name, **_kwargs: (previous_documents[name], "sha256:previous"),
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "require_artifact_api",
+        lambda _kind: SimpleNamespace(dump=lambda document: document),
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "parse_artifact_document",
+        lambda _api, document, _description: document,
+    )
+
+    effects = deploy_release.reconciliation_artifact_effects(
+        tmp_path,
+        unit,
+        previous,
+        {
+            "added": {"value": "new"},
+            "same": {"value": "same"},
+            "updated": {"value": "after"},
+        },
+    )
+
+    assert effects == [
+        ("ADDED", "Artifact added"),
+        ("UNCHANGED", "Artifact same"),
+        ("UPDATED", "Artifact updated"),
+    ]
 
 
 def test_dry_plan_uses_artifact_fallback_when_observation_is_unavailable(tmp_path):
@@ -210,7 +299,7 @@ def test_promotion_reference_reads_typed_resource_spec_before_applying_pointer(t
                         },
                     },
                     "aws-application",
-                )
+                ).with_metadata(ResourceMetadata.new_source_tracked("aws-application"))
             )
         )
     )
@@ -357,7 +446,109 @@ def test_known_unmaterialized_unit_remains_a_successful_wait(monkeypatch):
     assert outputs == [(False, "")]
 
 
-def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monkeypatch):
+def test_reconcile_reports_persisted_transition_reason_before_unit_materialization(monkeypatch, capsys):
+    outputs = []
+
+    def fake_observed_tree(_ref: str, output: Path):
+        output.mkdir(parents=True, exist_ok=True)
+        return "b" * 40
+
+    def fake_materialize(_revision: str, output: Path):
+        output.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            output / ".gitopsctr/transition-blocks.json",
+            {"schema": 1, "blocks": {"frontend": "persisted opaque cleanup reason"}},
+        )
+
+    monkeypatch.setattr(deploy_release, "observed_tree", fake_observed_tree)
+    monkeypatch.setattr(
+        deploy_release,
+        "git",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(args, 0, "a" * 40 + "\n", ""),
+    )
+    monkeypatch.setattr(deploy_release, "resolve_ref", lambda *_args: "c" * 40)
+    monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
+    monkeypatch.setattr(
+        deploy_release,
+        "write_reconcile_outputs",
+        lambda reconciled, desired="": outputs.append((reconciled, desired)),
+    )
+
+    deploy_release.command_reconcile(
+        Namespace(
+            unit="frontend",
+            environment="dev",
+            desired_ref="deploy/dev",
+            desired_revision=None,
+            observed_ref="observed/dev",
+            plan=False,
+            report=None,
+            source_revision=None,
+            advance=False,
+            require_source_ref=None,
+        )
+    )
+
+    assert outputs == [(False, "")]
+    assert "WAIT     persisted opaque cleanup reason" in capsys.readouterr().err
+
+
+def test_reconcile_legacy_unit_without_advance_blocks_before_effect(monkeypatch, capsys):
+    desired_files = {
+        "units/frontend.json": json.dumps(
+            {
+                "schema": 1,
+                "name": "frontend",
+                "driver": "frontend-s3-cloudfront",
+                "source": {"path": "frontend"},
+            }
+        ).encode()
+    }
+    outputs = []
+
+    def fake_materialize(_revision: str, output: Path):
+        output.mkdir(parents=True, exist_ok=True)
+        for relative, content in desired_files.items():
+            target = output / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+
+    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(deploy_release, "resolve_ref", lambda *_args: "c" * 40)
+    monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
+    monkeypatch.setattr(deploy_release, "observed_tree", lambda _ref, output: output.mkdir(parents=True) or None)
+    monkeypatch.setattr(
+        deploy_release,
+        "write_reconcile_outputs",
+        lambda reconciled, desired="": outputs.append((reconciled, desired)),
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "acquire_effect_lease",
+        lambda *_args, **_kwargs: pytest.fail("legacy reconciliation acquired an effect lease"),
+    )
+
+    deploy_release.command_reconcile(
+        Namespace(
+            unit="frontend",
+            environment="dev",
+            desired_ref="deploy/dev",
+            desired_revision=None,
+            observed_ref="observed/dev",
+            plan=False,
+            report=None,
+            source_revision=None,
+            advance=False,
+            require_source_ref=None,
+            reapply=False,
+        )
+    )
+
+    assert outputs == [(False, "")]
+    assert "run advance-desired" in capsys.readouterr().err
+
+
+def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monkeypatch, capsys):
     report = tmp_path / "report"
     calls = []
 
@@ -381,10 +572,12 @@ def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monke
             _write_json(
                 output / "units/aws-application.json",
                 {
-                    "schema": 1,
-                    "name": "aws-application",
-                    "driver": "terraform",
-                    "source": {"path": "infra/deploy", "revision": "a" * 40},
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "metadata": ResourceMetadata.source_tracked_from_provenance(
+                        "aws-application", "reconcile-plan-test"
+                    ).document(profile="desired"),
+                    "spec": {"source": {"path": "infra/deploy", "revision": "a" * 40}},
                 },
             )
 
@@ -419,6 +612,10 @@ def test_planned_reconcile_executes_clean_unit_and_passes_report(tmp_path, monke
     materializations = 0
     with pytest.raises(deploy_release.OperationError, match="does not support planning"):
         deploy_release.command_reconcile(args)
+    output = capsys.readouterr().err
+    assert "PLAN     SUCCEEDED" in output
+    assert "PLAN     FAILED" in output
+    assert "UNCHANGED Observation observed/dev at bbbbbbbbbbbb" in output
 
 
 @pytest.mark.parametrize("plan_action", [None, "refresh"])
@@ -472,7 +669,7 @@ def test_planned_reconcile_applies_plan_source_policy(tmp_path, monkeypatch, cap
                     "apiVersion": "gitopsctr.io/v1",
                     "kind": "Project",
                     "metadata": {"name": "example"},
-                    "spec": project_spec,
+                    "spec": {**project_spec, "effectLease": None},
                 },
             )
             _write_json(output / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
@@ -531,10 +728,11 @@ def test_planned_reconcile_applies_plan_source_policy(tmp_path, monkeypatch, cap
         "REFRESH  aws-application: retained source aaaaaaaaaaaa is unavailable; use bbbbbbbbbbbb "
         "in the dry candidate only"
     ) in output
-    assert "PLAN     terraform planning succeeded" in output
+    assert "PLAN     SUCCEEDED" in output
+    assert "EFFECTS  None; planning does not change remote state" in output
 
 
-def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_path, monkeypatch):
+def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_path, monkeypatch, capsys):
     advances = []
     outputs = []
 
@@ -552,10 +750,12 @@ def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_p
         _write_json(
             output / "units/application-images.json",
             {
-                "schema": 1,
-                "name": "application-images",
-                "driver": "terraform",
-                "source": {"path": ".", "revision": "a" * 40},
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "Terraform",
+                "metadata": ResourceMetadata.source_tracked_from_provenance(
+                    "application-images", "reconcile-clean-test"
+                ).document(profile="desired"),
+                "spec": {"source": {"path": ".", "revision": "a" * 40}},
             },
         )
 
@@ -571,6 +771,7 @@ def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_p
     )
     monkeypatch.setattr(deploy_release, "resolve_ref", lambda *_args: "c" * 40)
     monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: "c" * 40)
     monkeypatch.setattr(deploy_release, "file_blob", lambda _path: "same-unit")
     monkeypatch.setattr(deploy_release, "advance_desired", fake_advance)
     monkeypatch.setattr(
@@ -604,9 +805,15 @@ def test_clean_reconcile_with_advance_finishes_pending_desired_convergence(tmp_p
     assert advances[0][1] == deploy_release.git("rev-parse", "HEAD^{commit}").stdout.strip()
     assert advances[0][2:] == ("deploy/dev", "observed/dev", None)
     assert outputs == [(False, "d" * 40)]
+    output = capsys.readouterr().err
+    assert "==> application-images · dev" in output
+    assert "UP TO DATE Observation matches desired state" in output
+    assert "ACTION   No reconciliation needed" in output
+    assert "UPDATED  Desired state deploy/dev to dddddddddddd" in output
+    assert "Advance desired state" not in output
 
 
-def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, monkeypatch):
+def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, monkeypatch, capsys):
     events = []
     advance_results = iter([("d" * 40, True), ("d" * 40, False)])
 
@@ -627,10 +834,12 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
             _write_json(
                 output / "units/aws-application.json",
                 {
-                    "schema": 1,
-                    "name": "aws-application",
-                    "driver": "terraform",
-                    "source": {"path": "infra/deploy", "revision": "e" * 40},
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "metadata": ResourceMetadata.source_tracked_from_provenance(
+                        "aws-application", "reconcile-advance-test"
+                    ).document(profile="desired"),
+                    "spec": {"source": {"path": "infra/deploy", "revision": "e" * 40}},
                 },
             )
 
@@ -652,7 +861,7 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
             )
         )
 
-    def fake_publish(*_args):
+    def fake_publish(*_args, **_kwargs):
         events.append(("receipt",))
         return "f" * 40
 
@@ -663,6 +872,7 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
     monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
     monkeypatch.setattr(deploy_release, "advance_desired", fake_advance)
     monkeypatch.setattr(deploy_release, "observed_tree", fake_observed_tree)
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: "d" * 40)
     monkeypatch.setattr(deploy_release, "resolve_ref", unexpected_resolve)
     monkeypatch.setattr(deploy_release, "file_blob", lambda _path: "unit-blob")
     monkeypatch.setattr(deploy_release, "publish_observation_cas", fake_publish)
@@ -696,6 +906,13 @@ def test_unpinned_reconcile_advances_and_pins_before_running_driver(tmp_path, mo
     ]
     assert events[0][1] == ("dev", "a" * 40, "deploy/dev", "observed/dev", None)
     assert events[2] == ("driver", "e" * 40)
+    output = capsys.readouterr().err
+    assert "==> aws-application · dev" in output
+    assert "CHANGED  No observation exists" in output
+    assert "ACTION   Run terraform reconciliation" in output
+    assert "RECONCILE SUCCEEDED" in output
+    assert "UPDATED  Observation observed/dev bbbbbbbbbbbb → ffffffffffff" in output
+    assert "UPDATED  Desired state deploy/dev to dddddddddddd" in output
 
 
 def test_superseded_source_stops_before_reconciliation(monkeypatch):

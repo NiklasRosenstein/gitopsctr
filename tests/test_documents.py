@@ -11,17 +11,23 @@ import yaml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
-from gitopsctr import cli, schemas
+from gitopsctr import controller, schemas
 from gitopsctr.formats import DocumentFormat, DocumentFormatError, load_project_config, write_document
 
 
 def project_document(*, name: str = "test-project", spec: str = "{}") -> str:
-    return f"""apiVersion: gitopsctr.io/v1
-kind: Project
-metadata:
-  name: {name}
-spec: {spec}
-"""
+    specification = yaml.safe_load(spec) or {}
+    if isinstance(specification, dict):
+        specification.setdefault("effectLease", None)
+    return yaml.safe_dump(
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Project",
+            "metadata": {"name": name},
+            "spec": specification,
+        },
+        sort_keys=False,
+    )
 
 
 def test_yaml_is_the_default_and_project_config_can_select_json(tmp_path: Path):
@@ -37,7 +43,7 @@ def test_yaml_is_the_default_and_project_config_can_select_json(tmp_path: Path):
     assert config.environment_defaults.refs.observed == "gitopsctr/observed/{environment}"
     assert config.environment_defaults.refs.candidate == "gitopsctr/candidates/{environment}/{id}"
     write_document(tmp_path / "configured.json", value, format=DocumentFormat.JSON)
-    assert cli.load_json(tmp_path / "configured.json") == value
+    assert controller.load_json(tmp_path / "configured.json") == value
 
 
 def test_yaml_uses_language_server_schema_directive_while_json_keeps_schema_property(tmp_path: Path):
@@ -190,8 +196,8 @@ spec:
     checks: []
 """
     )
-    assert cli.load_environment(tmp_path, "dev")["name"] == "dev"
-    assert list(cli.load_environment_specifications(tmp_path, "dev")) == ["infrastructure"]
+    assert controller.load_environment(tmp_path, "dev")["name"] == "dev"
+    assert list(controller.load_environment_specifications(tmp_path, "dev")) == ["infrastructure"]
 
 
 def test_new_yaml_resource_envelopes_are_loaded_as_typed_resources(tmp_path: Path):
@@ -225,8 +231,8 @@ spec:
 """
     )
 
-    environment = cli.load_environment(tmp_path, "dev")
-    specifications = cli.load_environment_specifications(tmp_path, "dev")
+    environment = controller.load_environment(tmp_path, "dev")
+    specifications = controller.load_environment_specifications(tmp_path, "dev")
 
     assert environment["name"] == "dev"
     assert specifications["infrastructure"].driver_name == "terraform"
@@ -258,8 +264,8 @@ def test_yaml_demo_documents_validate_against_published_resource_schemas():
 
 
 def test_receipt_result_cannot_override_envelope_identity():
-    with pytest.raises(cli.OperationError, match="Additional properties"):
-        cli.RESOURCE_CATALOG.parse_receipt(
+    with pytest.raises(controller.OperationError, match="Additional properties"):
+        controller.RESOURCE_CATALOG.parse_receipt(
             {
                 "apiVersion": "gitopsctr.io/v1",
                 "kind": "Receipt",
@@ -342,6 +348,116 @@ def test_migration_script_converts_a_source_branch_in_one_forward_commit(tmp_pat
     assert (environment_root / "environment.yaml").exists()
     assert not (units_root / "infrastructure.json").exists()
     assert (units_root / "infrastructure.yaml").exists()
+
+
+def test_migration_script_canonicalizes_legacy_desired_units_and_uses_configured_refs(tmp_path: Path):
+    project = {
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "Project",
+        "metadata": {"name": "test-project"},
+        "spec": {
+            "writeFormat": "yaml",
+            "environmentsPath": "config/environments",
+            "environmentDefaults": {
+                "refs": {
+                    "desired": "release/{environment}",
+                    "observed": "state/{environment}",
+                    "candidate": "changes/{environment}/{id}",
+                }
+            },
+            "effectLease": None,
+        },
+    }
+    environment_root = tmp_path / "config/environments/dev"
+    units_root = environment_root / "units"
+    units_root.mkdir(parents=True)
+    (tmp_path / "gitopsctr.yaml").write_text(yaml.safe_dump(project, sort_keys=False))
+    (environment_root / "environment.json").write_text(json.dumps({"schema": 1, "name": "dev"}))
+    (units_root / "application.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "name": "application",
+                "driver": "terraform",
+                "source": {"path": "infrastructure"},
+                "terraform": {
+                    "backend": {"key": "example/dev.tfstate"},
+                    "variables": {"environment": "dev"},
+                    "observeOutputs": [],
+                    "checks": [],
+                },
+            }
+        )
+    )
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "legacy source"], cwd=tmp_path, check=True, capture_output=True)
+
+    subprocess.run(["git", "branch", "release/dev"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "checkout", "release/dev"], cwd=tmp_path, check=True, capture_output=True)
+    desired_units = tmp_path / "units"
+    desired_units.mkdir()
+    desired_units.joinpath("application.json").write_text(
+        json.dumps(
+            {
+                "name": "application",
+                "driver": "terraform",
+                "source": {
+                    "path": "infrastructure",
+                    "revision": "a" * 40,
+                    "inputHash": "sha256:inputs",
+                    "driverVersion": controller.DRIVER_VERSIONS["terraform"],
+                },
+                "terraform": {
+                    "backend": {"key": "example/dev.tfstate"},
+                    "variables": {"environment": "dev"},
+                    "observeOutputs": [],
+                    "checks": [],
+                },
+            }
+        )
+    )
+    subprocess.run(["git", "add", "units/application.json"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "legacy desired"], cwd=tmp_path, check=True, capture_output=True)
+    old_desired = subprocess.run(
+        ["git", "rev-parse", "release/dev"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path, check=True, capture_output=True)
+
+    script = Path(__file__).parents[1] / "tools/migrate_documents.py"
+    subprocess.run(
+        [sys.executable, str(script), "--project-name", "test-project", "--apply"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    new_desired = subprocess.run(
+        ["git", "rev-parse", "release/dev"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    source_revision = subprocess.run(
+        ["git", "rev-parse", "main"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert new_desired != old_desired
+    migrated = yaml.safe_load(
+        subprocess.run(
+            ["git", "show", "release/dev:units/application.yaml"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    assert migrated["apiVersion"] == "unit.gitopsctr.io/v1"
+    assert migrated["kind"] == "Terraform"
+    assert migrated["metadata"]["uid"].startswith("d1-")
+    assert migrated["metadata"]["lifecycle"] == {"management": {"mode": "sourceTracked"}}
+    assert migrated["spec"]["source"]["revision"] == source_revision
+    with pytest.raises(subprocess.CalledProcessError):
+        subprocess.run(["git", "show", "release/dev:units/application.json"], cwd=tmp_path, check=True)
 
 
 def test_migration_script_rejects_stale_local_refs_before_applying(tmp_path: Path):

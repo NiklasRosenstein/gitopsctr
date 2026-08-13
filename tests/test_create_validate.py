@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 
 import pytest
 import yaml
 
-from gitopsctr import cli
+from gitopsctr import controller
 from gitopsctr.driver import UnitDriver
 from gitopsctr.registry import UNIT_DRIVERS
 
@@ -23,7 +24,11 @@ def project_document(
         "apiVersion": "gitopsctr.io/v1",
         "kind": "Project",
         "metadata": {"name": name},
-        "spec": {"writeFormat": write_format, "environmentsPath": environments_path},
+        "spec": {
+            "writeFormat": write_format,
+            "environmentsPath": environments_path,
+            "effectLease": None,
+        },
     }
 
 
@@ -33,8 +38,8 @@ def write_yaml(path: Path, value: object) -> None:
 
 
 def run_command(root: Path, arguments: list[str]) -> None:
-    cli.REPOSITORY_ROOT = root
-    args = cli.build_parser().parse_args(arguments)
+    controller.REPOSITORY_ROOT = root
+    args = controller.build_parser().parse_args(arguments)
     args.handler(args)
 
 
@@ -80,6 +85,13 @@ def test_create_project_writes_a_valid_canonical_resource(tmp_path: Path, capsys
                     "candidate": "gitopsctr/candidates/{environment}/{id}",
                 }
             },
+            "effectLease": {
+                "store": {
+                    "branch": {
+                        "ref": "gitopsctr/leases",
+                    }
+                }
+            },
         },
     }
     assert text.startswith(
@@ -89,28 +101,129 @@ def test_create_project_writes_a_valid_canonical_resource(tmp_path: Path, capsys
     assert capsys.readouterr().out == "gitopsctr.yaml\n"
 
 
+def test_create_stack_and_stacktemplate_write_source_resources(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    create_project(tmp_path)
+    create_environment(tmp_path)
+    template_path = tmp_path / "template.json"
+    template_path.write_text(
+        json.dumps(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "StackTemplate",
+                "metadata": {"name": "application"},
+                "spec": {
+                    "unitTemplates": {
+                        "deploy": {
+                            "apiVersion": "unit.gitopsctr.io/v1",
+                            "kind": "Terraform",
+                            "spec": {"source": {"path": "."}},
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    run_command(
+        tmp_path,
+        [
+            "create",
+            "stacktemplate",
+            "--name",
+            "application",
+            "--file",
+            str(template_path),
+        ],
+    )
+    run_command(
+        tmp_path,
+        [
+            "create",
+            "stack",
+            "--environment",
+            "dev",
+            "--name",
+            "application",
+            "--template",
+            "application",
+            "--units",
+            "deploy",
+            "--parameters",
+            "{}",
+        ],
+    )
+
+    assert (tmp_path / "deployment/stack-templates/application.yaml").is_file()
+    stack = yaml.safe_load((tmp_path / "deployment/environments/dev/stacks/application.yaml").read_text())
+    assert stack["spec"]["template"]["name"] == "application"
+    assert stack["spec"]["parameters"] == {}
+    assert stack["spec"]["units"] == ["deploy"]
+    assert capsys.readouterr().out.splitlines()[-1].endswith("application.yaml")
+
+
+def test_create_unit_state_uses_the_desired_document(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    create_project(tmp_path)
+    controller.REPOSITORY_ROOT = tmp_path
+    desired = tmp_path / "unit.json"
+    desired.write_text(
+        json.dumps(
+            {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "Terraform",
+                "metadata": {
+                    "name": "preview",
+                    "uid": "d1-preview",
+                    "lifecycle": {"management": {"mode": "direct"}},
+                },
+                "spec": {
+                    "source": {"path": ".", "revision": "a" * 40},
+                    "terraform": {"backend": {}, "variables": {}, "observeOutputs": []},
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("desired/dev", "observed/dev"))
+    monkeypatch.setattr(controller, "fetch_ref", lambda _ref: "b" * 40)
+    monkeypatch.setattr(controller, "materialize_revision", lambda _revision, output: output.mkdir(parents=True))
+    published: list[Path] = []
+
+    def publish(_environment, candidate, *_args, **_kwargs):
+        snapshot = tmp_path / f"published-{len(published)}"
+        shutil.copytree(candidate, snapshot)
+        published.append(snapshot)
+        return "c" * 40, None
+
+    monkeypatch.setattr(controller, "publish_desired_change", publish)
+    monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+
+    run_command(tmp_path, ["create", "unit", "--in=state", "--environment", "dev", "--file", str(desired)])
+
+    preview_path = next((published[0] / "units").glob("preview.*"))
+    assert controller.load_desired_unit(preview_path, "preview").metadata.uid == "d1-preview"
+
+
 def test_create_project_validates_before_writing_and_requires_force(tmp_path: Path):
-    with pytest.raises(cli.OperationError, match="does not match"):
+    with pytest.raises(controller.OperationError, match="does not match"):
         create_project(tmp_path, name="Not_Valid")
     assert not (tmp_path / "gitopsctr.yaml").exists()
 
     create_project(tmp_path, name="first")
-    with pytest.raises(cli.OperationError, match="already exists"):
+    with pytest.raises(controller.OperationError, match="already exists"):
         create_project(tmp_path, name="second")
     run_command(tmp_path, ["create", "project", "--name", "second", "--force"])
     assert yaml.safe_load((tmp_path / "gitopsctr.yaml").read_text())["metadata"]["name"] == "second"
 
-    with pytest.raises(cli.OperationError, match="environmentsPath"):
+    with pytest.raises(controller.OperationError, match="environmentsPath"):
         run_command(
             tmp_path,
             ["create", "project", "--name", "second", "--environments-path", "../outside", "--force"],
         )
-    with pytest.raises(cli.OperationError, match="desired"):
+    with pytest.raises(controller.OperationError, match="desired"):
         run_command(
             tmp_path,
             ["create", "project", "--name", "second", "--desired-ref-template", "deploy/main", "--force"],
         )
-    with pytest.raises(cli.OperationError, match="candidate"):
+    with pytest.raises(controller.OperationError, match="candidate"):
         run_command(
             tmp_path,
             [
@@ -143,7 +256,7 @@ def test_create_project_accepts_environment_ref_templates(tmp_path: Path):
 
 def test_project_source_revision_policy_defaults_and_parses(tmp_path: Path):
     write_yaml(tmp_path / "gitopsctr.yaml", project_document())
-    policy = cli.load_project_config(tmp_path).source_revision_policy
+    policy = controller.load_project_config(tmp_path).source_revision_policy
     assert policy.unavailable_when.value == "outside-candidate-history"
     assert policy.when_unavailable_during_advance.value == "refresh"
     assert policy.when_unavailable_during_plan.value == "error"
@@ -155,23 +268,47 @@ def test_project_source_revision_policy_defaults_and_parses(tmp_path: Path):
         "whenUnavailableDuringPlan": "refresh",
     }
     write_yaml(tmp_path / "gitopsctr.yaml", document)
-    policy = cli.load_project_config(tmp_path).source_revision_policy
+    policy = controller.load_project_config(tmp_path).source_revision_policy
     assert policy.unavailable_when.value == "missing"
     assert policy.when_unavailable_during_advance.value == "error"
     assert policy.when_unavailable_during_plan.value == "refresh"
 
     document["spec"]["sourceRevisionPolicy"] = {"whenUnavailableDuringPlan": "refresh"}
     write_yaml(tmp_path / "gitopsctr.yaml", document)
-    policy = cli.load_project_config(tmp_path).source_revision_policy
+    policy = controller.load_project_config(tmp_path).source_revision_policy
     assert policy.unavailable_when.value == "outside-candidate-history"
     assert policy.when_unavailable_during_advance.value == "refresh"
     assert policy.when_unavailable_during_plan.value == "refresh"
 
 
+def test_project_effect_lease_store_supports_disabled_and_branch_modes(tmp_path: Path):
+    document = project_document()
+    write_yaml(tmp_path / "gitopsctr.yaml", document)
+    assert controller.load_project_config(tmp_path).effect_lease_store is None
+
+    document["spec"]["effectLease"] = {"store": None}
+    write_yaml(tmp_path / "gitopsctr.yaml", document)
+    assert controller.load_project_config(tmp_path).effect_lease_store is None
+
+    document["spec"]["effectLease"] = {"store": {"branch": {"ref": "leases/{environment}"}}}
+    write_yaml(tmp_path / "gitopsctr.yaml", document)
+    store = controller.load_project_config(tmp_path).effect_lease_store
+    assert store is not None
+    assert store.ref == "leases/{environment}"
+
+
+def test_project_requires_effect_lease_policy(tmp_path: Path):
+    document = project_document()
+    del document["spec"]["effectLease"]
+    write_yaml(tmp_path / "gitopsctr.yaml", document)
+    with pytest.raises(controller.DocumentFormatError, match="effectLease"):
+        controller.load_project_config(tmp_path)
+
+
 def test_create_project_rejects_ambiguous_configuration_even_with_force(tmp_path: Path):
     write_yaml(tmp_path / "gitopsctr.yaml", project_document())
     write_yaml(tmp_path / ".gitopsctr.yml", project_document())
-    with pytest.raises(cli.OperationError, match="multiple Project configuration"):
+    with pytest.raises(controller.OperationError, match="multiple Project configuration"):
         run_command(tmp_path, ["create", "project", "--name", "replacement", "--force"])
 
 
@@ -189,11 +326,11 @@ def test_create_environment_uses_the_project_path_format_and_gate(tmp_path: Path
 
 
 def test_create_environment_requires_a_project_and_handles_force_and_duplicates(tmp_path: Path):
-    with pytest.raises(cli.OperationError, match="no Project configuration"):
+    with pytest.raises(controller.OperationError, match="no Project configuration"):
         create_environment(tmp_path)
     create_project(tmp_path)
     create_environment(tmp_path)
-    with pytest.raises(cli.OperationError, match="already exists"):
+    with pytest.raises(controller.OperationError, match="already exists"):
         create_environment(tmp_path)
     run_command(
         tmp_path,
@@ -202,7 +339,7 @@ def test_create_environment_requires_a_project_and_handles_force_and_duplicates(
     environment_root = tmp_path / "deployment/environments/dev"
     assert yaml.safe_load((environment_root / "environment.yaml").read_text())["spec"]["changeGate"] == "pullRequest"
     (environment_root / "environment.json").write_text("{}")
-    with pytest.raises(cli.OperationError, match="multiple document formats"):
+    with pytest.raises(controller.OperationError, match="multiple document formats"):
         run_command(tmp_path, ["create", "environment", "--name", "dev", "--force"])
 
 
@@ -229,7 +366,7 @@ def test_create_unit_generates_a_valid_builtin_scaffold(tmp_path: Path, driver_n
     path = tmp_path / f"deployment/environments/dev/units/{driver_name}.yaml"
     text = path.read_text()
     document = yaml.safe_load(text)
-    unit = cli.parse_authored_unit_document(document, driver_name)
+    unit = controller.parse_authored_unit_document(document, driver_name)
     UNIT_DRIVERS[driver_name].unit_contract.validate(unit.driver.unit_contract.dump(unit.spec))
     assert unit.spec.source.path == f"services/{driver_name}"
     assert not hasattr(unit.spec, "artifacts")
@@ -245,7 +382,7 @@ def test_create_unit_rejects_unsafe_source_paths_and_unsupported_scaffolding(
 ):
     create_project(tmp_path)
     create_environment(tmp_path)
-    with pytest.raises(cli.OperationError, match="stay inside"):
+    with pytest.raises(controller.OperationError, match="stay inside"):
         run_command(
             tmp_path,
             [
@@ -263,7 +400,7 @@ def test_create_unit_rejects_unsafe_source_paths_and_unsupported_scaffolding(
         )
 
     unsupported = UnitDriver()
-    monkeypatch.setitem(cli.UNIT_DRIVERS, "unsupported", unsupported)
+    monkeypatch.setitem(controller.UNIT_DRIVERS, "unsupported", unsupported)
     args = argparse.Namespace(
         environment="dev",
         name="unsupported",
@@ -271,8 +408,8 @@ def test_create_unit_rejects_unsafe_source_paths_and_unsupported_scaffolding(
         source_path=".",
         force=False,
     )
-    with pytest.raises(cli.OperationError, match="does not support scaffolding"):
-        cli.command_create_unit(args)
+    with pytest.raises(controller.OperationError, match="does not support scaffolding"):
+        controller.command_create_unit(args)
 
 
 def test_force_replaces_one_existing_representation_without_creating_a_duplicate(tmp_path: Path):
@@ -282,7 +419,7 @@ def test_force_replaces_one_existing_representation_without_creating_a_duplicate
         tmp_path,
         ["create", "unit", "--environment", "dev", "--name", "infra", "--driver", "terraform"],
     )
-    with pytest.raises(cli.OperationError, match="already exists"):
+    with pytest.raises(controller.OperationError, match="already exists"):
         run_command(
             tmp_path,
             ["create", "unit", "--environment", "dev", "--name", "infra", "--driver", "oci-images"],
@@ -335,11 +472,11 @@ def test_validate_collects_errors_and_can_fail_fast(tmp_path: Path, capsys: pyte
     write_yaml(units / "two.yaml", {"apiVersion": "unit.gitopsctr.io/v1", "kind": "AlsoMissing"})
     capsys.readouterr()
 
-    with pytest.raises(cli.OperationError, match="2 errors"):
+    with pytest.raises(controller.OperationError, match="2 errors"):
         run_command(tmp_path, ["validate", "--environment", "dev"])
     output = capsys.readouterr().err
     assert output.count("INVALID") == 2
-    with pytest.raises(cli.OperationError, match="one.yaml"):
+    with pytest.raises(controller.OperationError, match="one.yaml"):
         run_command(tmp_path, ["validate", "--environment", "dev", "--fail-fast"])
 
 
@@ -347,8 +484,8 @@ def test_validate_rejects_duplicate_unit_representations(tmp_path: Path):
     create_project(tmp_path)
     create_environment(tmp_path)
     units = tmp_path / "deployment/environments/dev/units"
-    document = cli.serialize_unit_document(
-        cli.parse_authored_unit_document(
+    document = controller.serialize_unit_document(
+        controller.parse_authored_unit_document(
             {"name": "infra", "driver": "terraform", **UNIT_DRIVERS["terraform"].scaffold_unit_spec("infra", ".")},
             "infra",
         ),
@@ -357,9 +494,9 @@ def test_validate_rejects_duplicate_unit_representations(tmp_path: Path):
     write_yaml(units / "infra.yaml", document)
     (units / "infra.json").write_text(json.dumps(document))
 
-    with pytest.raises(cli.OperationError, match="1 error"):
+    with pytest.raises(controller.OperationError, match="1 error"):
         run_command(tmp_path, ["validate", "--environment", "dev"])
-    with pytest.raises(cli.OperationError, match="1 error"):
+    with pytest.raises(controller.OperationError, match="1 error"):
         run_command(tmp_path, ["validate", "deployment/environments/dev/units/infra.yaml"])
 
 
@@ -380,20 +517,24 @@ def test_validate_applies_cross_unit_observation_rules(tmp_path: Path, capsys: p
     }
     write_yaml(
         units / "manifests.yaml",
-        cli.serialize_unit_document(cli.parse_authored_unit_document(producer, "manifests"), profile="authored"),
+        controller.serialize_unit_document(
+            controller.parse_authored_unit_document(producer, "manifests"), profile="authored"
+        ),
     )
     write_yaml(
         units / "consumer.yaml",
-        cli.serialize_unit_document(cli.parse_authored_unit_document(consumer, "consumer"), profile="authored"),
+        controller.serialize_unit_document(
+            controller.parse_authored_unit_document(consumer, "consumer"), profile="authored"
+        ),
     )
     capsys.readouterr()
 
-    with pytest.raises(cli.OperationError, match="1 error"):
+    with pytest.raises(controller.OperationError, match="1 error"):
         run_command(tmp_path, ["validate", "--environment", "dev"])
     assert "cannot observe materialization-only unit" in capsys.readouterr().err
 
 
 def test_validate_rejects_an_invalid_environment_target_before_path_resolution(tmp_path: Path):
     create_project(tmp_path)
-    with pytest.raises(cli.OperationError, match="invalid environment name"):
+    with pytest.raises(controller.OperationError, match="invalid environment name"):
         run_command(tmp_path, ["validate", "--environment", "../outside", "--fail-fast"])

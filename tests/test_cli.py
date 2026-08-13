@@ -2,18 +2,24 @@
 
 import io
 import json
+import shutil
 import subprocess
 import sys
+import threading
+import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
-from gitopsctr import cli as deploy_release
+from gitopsctr import controller as deploy_release
 from gitopsctr.contracts import DesiredSource, ResolvedInputs
 from gitopsctr.contrib.drivers.frontend_s3_cloudfront import FrontendDesiredUnit
 from gitopsctr.driver import UnitResolution
 from gitopsctr.errors import ReferenceUnavailable
+from gitopsctr.resources import ResourceMetadata
 from tests.conftest import receipt_document, receipt_resource, write_test_document
 
 
@@ -34,7 +40,7 @@ def _promotion_context(root: Path) -> deploy_release.PromotionContext:
 
 
 def _terraform_desired_resource(name: str = "aws-application"):
-    return deploy_release.RESOURCE_CATALOG.parse_unit(
+    resource = deploy_release.RESOURCE_CATALOG.parse_unit(
         {
             "name": name,
             "driver": "terraform",
@@ -43,6 +49,7 @@ def _terraform_desired_resource(name: str = "aws-application"):
         profile="desired",
         expected_name=name,
     )
+    return resource.with_metadata(ResourceMetadata.new_source_tracked(name))
 
 
 def test_root_help_groups_commands_and_describes_each_command():
@@ -57,6 +64,113 @@ def test_root_help_groups_commands_and_describes_each_command():
     assert "Git data:\n" in help_text
     assert "    promote             promote reviewed desired state" in help_text
     assert "    reconcile           reconcile one deployment unit" in help_text
+
+
+def test_delete_and_finalize_use_generic_resource_commands():
+    parser = deploy_release.build_parser()
+
+    delete = parser.parse_args(
+        [
+            "delete",
+            "unit",
+            "--in=state",
+            "--environment",
+            "preview",
+            "--name",
+            "application",
+            "--uid",
+            "d1-application",
+        ]
+    )
+    assert delete.handler is deploy_release.command_delete_resource
+    assert delete.kind == "Unit"
+    assert delete.input_location == "state"
+    assert delete.name == "application"
+    assert delete.uid == "d1-application"
+
+    finalize = parser.parse_args(
+        [
+            "finalize",
+            "unit",
+            "--environment",
+            "preview",
+            "--name",
+            "application",
+            "--uid",
+            "d1-application",
+            "--deletion-generation",
+            "1",
+        ]
+    )
+    assert finalize.handler is deploy_release.command_finalize
+    assert finalize.kind == "unit"
+    assert finalize.name == "application"
+    assert finalize.uid == "d1-application"
+    assert finalize.deletion_generation == 1
+
+
+def test_lifecycle_candidate_publication_delegates_change_request_to_ci(tmp_path, monkeypatch):
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(deploy_release, "load_desired_resource_graph", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(deploy_release, "validate_effect_leases_preserved", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(deploy_release, "change_gate", lambda *_args, **_kwargs: "pullRequest")
+    monkeypatch.setattr(
+        deploy_release,
+        "git",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(deploy_release, "publish_tree", lambda *_args, **_kwargs: "d" * 40)
+    monkeypatch.setattr(deploy_release, "verify_gated_candidate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        deploy_release,
+        "ensure_change_request",
+        lambda *_args, **_kwargs: pytest.fail("lifecycle publication must not call a forge adapter"),
+    )
+
+    revision, outcome = deploy_release.publish_desired_change(
+        "dev",
+        tmp_path / "candidate",
+        "deploy/dev",
+        "b" * 40,
+        "candidate/dev/0123456789ab",
+        "Finalize deletion",
+        "Finalize deletion",
+        "Finalize a UID-fenced deletion.",
+        False,
+        request_change=False,
+    )
+
+    assert revision == "d" * 40
+    assert isinstance(outcome, deploy_release.ManualChangeRequest)
+    assert "delegated" in outcome.reason
+
+
+def test_write_change_outputs_handles_delegated_change_request(tmp_path, monkeypatch):
+    output = tmp_path / "github-output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+
+    deploy_release.write_change_outputs(
+        "d" * 40,
+        "deploy/dev",
+        "candidate/dev/0123456789ab",
+        deploy_release.ManualChangeRequest(
+            reason="delegated",
+            head="candidate/dev/0123456789ab",
+            base="deploy/dev",
+            title="Delete preview",
+            body="Delete preview Stack.",
+            remote_url=None,
+        ),
+    )
+
+    assert output.read_text() == (
+        "change_revision=" + "d" * 40 + "\n"
+        "target_ref=deploy/dev\n"
+        "candidate_ref=candidate/dev/0123456789ab\n"
+        "change_status=manual\n"
+        "change_url=\n"
+    )
 
 
 def test_desired_resolution_logs_unit_and_observation_decision(tmp_path, monkeypatch, capsys):
@@ -243,12 +357,713 @@ def test_blocked_driver_transition_omits_previous_unit_and_reports_wait(tmp_path
     deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate)
 
     assert not (candidate / "units/frontend.json").exists()
+    cleanup = deploy_release.load_json(candidate / ".gitopsctr/cleanup/units/frontend.json")
+    assert cleanup["metadata"]["lifecycle"] == {"management": {"mode": "sourceTracked"}}
+    assert cleanup["payload"] == deploy_release.load_json(current / "units/frontend.json")
+    assert deploy_release.load_desired_transition_blocks(candidate)["frontend"] == (
+        "previous desired unit is unavailable; opaque cleanup root retained"
+    )
+    assert deploy_release.load_desired_transition_blocks(candidate) == {
+        "frontend": "previous desired unit is unavailable; opaque cleanup root retained"
+    }
     assert deploy_release.reconciliation_statuses(["frontend"], candidate, observed) == [
-        ("frontend", "WAIT", "desired inputs are not materialized")
+        ("frontend", "WAIT", "previous desired unit is unavailable; opaque cleanup root retained")
     ]
+    assert "retain opaque cleanup root" in capsys.readouterr().err
+
+
+def test_parseable_driver_transition_retains_fenced_deletion_metadata(tmp_path):
+    source = tmp_path / "source"
+    current = tmp_path / "current"
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    repeated = tmp_path / "repeated"
+    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
+    _write_json(
+        source / "deployment/environments/dev/units/application.json",
+        {
+            "schema": 1,
+            "name": "application",
+            "driver": "vite-oci-bundle",
+            "source": {"path": "frontend"},
+            "build": {"nodeVersion": "24"},
+            "publish": {"repository": "registry.example/application"},
+        },
+    )
+    current_unit = _terraform_desired_resource("application")
+    _write_json(current / "units/application.json", deploy_release.serialize_unit_document(current_unit))
+    observed.mkdir()
+
+    deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate, verbose=False)
+
+    retained = deploy_release.load_desired_unit(candidate / "units/application.json", "application")
+    deletion = retained.metadata.deletion
+    assert retained.metadata.uid == current_unit.metadata.uid
+    assert deletion is not None
+    assert deletion.generation == 1
+    assert deletion.resourceDigest == deploy_release.resource_content_digest(current_unit)
+    assert deploy_release.reconciliation_statuses(["application"], candidate, observed) == [
+        ("application", "WAIT", deploy_release.deletion_reason(retained))
+    ]
+
+    deploy_release.build_desired_candidate("dev", source, "c" * 40, candidate, observed, None, repeated, verbose=False)
+    repeated_resource = deploy_release.load_desired_unit(repeated / "units/application.json", "application")
+    assert repeated_resource.metadata.uid == current_unit.metadata.uid
+    assert repeated_resource.metadata.deletion == deletion
+
+
+def test_finalized_same_name_recreation_gets_new_uid_from_tombstone(tmp_path):
+    source = tmp_path / "source"
+    current = tmp_path / "current"
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    repeated = tmp_path / "repeated"
+    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
+    _write_json(
+        source / "deployment/environments/dev/units/application.json",
+        {
+            "schema": 1,
+            "name": "application",
+            "driver": "terraform",
+            "source": {"path": "infra/deploy"},
+            "terraform": {"backend": {}, "variables": {}, "observeOutputs": []},
+        },
+    )
+    (source / "infra/deploy").mkdir(parents=True)
+    (source / "infra/deploy/main.tf").write_text("terraform {}\n")
+    current.mkdir()
+    observed.mkdir()
+    old_uid = "d1-finalized-application"
+    deploy_release.write_resource_incarnation_tombstone(
+        current,
+        deploy_release.ResourceIncarnationTombstone(
+            api_version="unit.gitopsctr.io/v1",
+            kind="Terraform",
+            name="application",
+            uid=old_uid,
+            deletion_generation=1,
+        ),
+    )
+
+    deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate, verbose=False)
+    recreated = deploy_release.load_desired_unit(candidate / "units/application.json", "application")
+    assert recreated.metadata.uid != old_uid
     assert (
-        "omit previous vite-s3-cloudfront desired state while transitioning to frontend-s3-cloudfront"
-    ) in capsys.readouterr().err
+        deploy_release.load_resource_incarnation_tombstones(candidate)[
+            ("unit.gitopsctr.io/v1", "Terraform", "application")
+        ].uid
+        == old_uid
+    )
+
+    deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, repeated, verbose=False)
+    assert deploy_release.load_desired_unit(repeated / "units/application.json", "application").metadata.uid == (
+        recreated.metadata.uid
+    )
+
+
+def test_unparseable_previous_unit_uses_opaque_cleanup_root(tmp_path):
+    source = tmp_path / "source"
+    current = tmp_path / "current"
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
+    _write_json(
+        source / "deployment/environments/dev/units/frontend.json",
+        {"schema": 1, "name": "frontend", "driver": "terraform", "source": {"path": "."}},
+    )
+    raw = {
+        "name": "frontend",
+        "driver": "terraform",
+        "metadata": {
+            "name": "frontend",
+            "uid": "old-frontend-uid",
+            "lifecycle": {"management": {"mode": "sourceTracked"}},
+        },
+        "source": {"path": ".", "revision": "a" * 40},
+        "terraform": {"variables": []},
+    }
+    _write_json(current / "units/frontend.json", raw)
+    observed.mkdir()
+
+    result = deploy_release.build_desired_candidate(
+        "dev", source, "b" * 40, current, observed, None, candidate, verbose=False
+    )
+
+    assert "frontend" in result.blocked
+    assert not (candidate / "units/frontend.json").exists()
+    cleanup = deploy_release.load_json(candidate / ".gitopsctr/cleanup/units/frontend.json")
+    assert cleanup["payload"] == raw
+    assert cleanup["metadata"]["uid"] == "old-frontend-uid"
+    assert cleanup["metadata"]["lifecycle"] == {"management": {"mode": "sourceTracked"}}
+
+    repeated = tmp_path / "repeated"
+    deploy_release.build_desired_candidate("dev", source, "b" * 40, candidate, observed, None, repeated, verbose=False)
+    assert not (repeated / "units/frontend.json").exists()
+    assert deploy_release.load_json(repeated / ".gitopsctr/cleanup/units/frontend.json") == cleanup
+    assert deploy_release.load_desired_transition_blocks(repeated) == deploy_release.load_desired_transition_blocks(
+        candidate
+    )
+
+
+def test_source_absent_unparseable_unit_is_retained_only_as_cleanup_payload(tmp_path):
+    source = tmp_path / "source"
+    current = tmp_path / "current"
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
+    _write_json(
+        source / "deployment/environments/dev/units/active.json",
+        {"schema": 1, "name": "active", "driver": "terraform", "source": {"path": "."}},
+    )
+    raw = {"name": "orphan", "driver": "missing-driver", "source": {"path": "."}}
+    _write_json(current / "units/orphan.json", raw)
+    observed.mkdir()
+
+    result = deploy_release.build_desired_candidate(
+        "dev", source, "b" * 40, current, observed, None, candidate, verbose=False
+    )
+
+    assert "orphan" in result.blocked
+    assert not (candidate / "units/orphan.json").exists()
+    cleanup = deploy_release.load_json(candidate / ".gitopsctr/cleanup/units/orphan.json")
+    assert cleanup["payload"] == raw
+    assert cleanup["metadata"]["deletion"]["generation"] == 1
+    opaque = deploy_release.load_desired_cleanup_roots(candidate)["orphan"]
+    assert opaque.metadata.deletion is not None
+    assert opaque.metadata.deletion.resourceDigest == deploy_release.opaque_cleanup_content_digest(opaque)
+    assert deploy_release.load_desired_transition_blocks(candidate)["orphan"] == (
+        "source absent; opaque cleanup root retained"
+    )
+    assert deploy_release.reconciliation_statuses(["active"], candidate, observed)[-1] == (
+        "orphan",
+        "WAIT",
+        "source absent; opaque cleanup root retained",
+    )
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".yml"])
+def test_cleanup_root_loader_reads_yaml_and_write_preserves_suffix(tmp_path, suffix):
+    root = tmp_path / "desired"
+    metadata = ResourceMetadata.source_tracked_from_provenance("frontend", "yaml-cleanup:v1")
+    opaque = deploy_release.OpaqueCleanupRoot(
+        path=Path(f"frontend{suffix}"),
+        payload={"name": "frontend", "driver": "missing-driver"},
+        metadata=metadata,
+        source=None,
+    )
+
+    path = deploy_release.write_opaque_cleanup_root(root, "frontend", opaque)
+
+    assert path == root / f".gitopsctr/cleanup/units/frontend{suffix}"
+    loaded = deploy_release.load_desired_cleanup_roots(root)
+    assert loaded["frontend"].path == path
+    assert loaded["frontend"].payload == opaque.payload
+    assert loaded["frontend"].metadata.uid == metadata.uid
+
+
+def test_cleanup_root_loader_rejects_duplicate_document_formats(tmp_path):
+    root = tmp_path / "desired"
+    metadata = ResourceMetadata.source_tracked_from_provenance("frontend", "duplicate-cleanup:v1")
+    envelope = {
+        "schema": 1,
+        "kind": "OpaqueCleanupRoot",
+        "metadata": metadata.document(profile="desired"),
+        "payload": {"name": "frontend", "driver": "missing-driver"},
+    }
+    deploy_release.write_document(
+        root / ".gitopsctr/cleanup/units/frontend.json", envelope, format=deploy_release.DocumentFormat.JSON
+    )
+    deploy_release.write_document(
+        root / ".gitopsctr/cleanup/units/frontend.yaml", envelope, format=deploy_release.DocumentFormat.YAML
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="multiple cleanup document formats"):
+        deploy_release.load_desired_cleanup_roots(root)
+
+
+def test_effect_lease_is_cas_published_and_blocks_a_second_runner(tmp_path, monkeypatch):
+    desired = tmp_path / "desired"
+    desired.mkdir()
+    revisions = {"value": "a" * 40}
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: revisions["value"])
+    monkeypatch.setattr(deploy_release, "effect_lease_owner", lambda: "runner-a")
+    monkeypatch.setattr(deploy_release, "effect_lease_token", lambda: "lease-runner-a")
+
+    def materialize(_revision, output):
+        shutil.copytree(desired, output)
+
+    def publish(_ref, directory, _parent, _message):
+        shutil.rmtree(desired)
+        shutil.copytree(directory, desired)
+        revisions["value"] = "b" * 40
+        return revisions["value"]
+
+    monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
+    monkeypatch.setattr(deploy_release, "publish_tree", publish)
+
+    acquired = deploy_release.acquire_effect_lease("deploy/dev", "a" * 40, "application", "d1-application")
+    assert acquired.revision == "b" * 40
+    persisted = deploy_release.load_desired_effect_leases(desired)["application"]
+    assert persisted.token == "lease-runner-a"
+    assert persisted.expires_at is None
+
+    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="explicit UID/token recovery"):
+        deploy_release.acquire_effect_lease("deploy/dev", "b" * 40, "application", "d1-application")
+
+    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="recovery fence"):
+        deploy_release.recover_effect_lease("deploy/dev", "application", "d1-application", "wrong-token")
+    assert deploy_release.load_desired_effect_leases(desired)["application"].token == "lease-runner-a"
+
+    recovered = deploy_release.recover_effect_lease("deploy/dev", "application", "d1-application", "lease-runner-a")
+    assert recovered == "b" * 40
+    assert deploy_release.load_desired_effect_leases(desired) == {}
+
+
+def test_effect_lease_precondition_rechecks_after_publish_race(tmp_path, monkeypatch):
+    desired = tmp_path / "desired"
+    unit = _terraform_desired_resource("application")
+    unit_path = desired / "units/application.json"
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    unit_path.write_text(json.dumps(deploy_release.serialize_unit_document(unit)))
+    revisions = {"value": "a" * 40}
+    publish_attempts = 0
+    precondition_calls: list[Path] = []
+
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: revisions["value"])
+    monkeypatch.setattr(deploy_release, "effect_lease_owner", lambda: "runner-a")
+    monkeypatch.setattr(deploy_release, "effect_lease_token", lambda: "lease-runner-a")
+
+    def materialize(_revision, output):
+        shutil.copytree(desired, output)
+
+    def publish(_ref, _directory, _parent, _message):
+        nonlocal publish_attempts
+        publish_attempts += 1
+        raise subprocess.CalledProcessError(1, "git push", stderr="non-fast-forward")
+
+    def precondition(root: Path) -> None:
+        precondition_calls.append(root)
+        if len(precondition_calls) == 2:
+            raise deploy_release.EffectLeaseUnavailable("new dependent appeared")
+
+    monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
+    monkeypatch.setattr(deploy_release, "publish_tree", publish)
+
+    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="new dependent appeared"):
+        deploy_release.acquire_effect_lease(
+            "deploy/dev",
+            "a" * 40,
+            "application",
+            unit.metadata.uid,
+            precondition=precondition,
+        )
+
+    assert publish_attempts == 1
+    assert len(precondition_calls) == 2
+    assert deploy_release.load_desired_effect_leases(desired) == {}
+
+
+def test_effect_lease_heartbeat_renews_before_expiry_during_long_effect(monkeypatch):
+    lease = deploy_release.EffectLease(
+        unit_name="application",
+        uid="d1-application",
+        token="lease-runner-a",
+        owner="runner-a",
+        desired_revision="a" * 40,
+        expires_at=None,
+    )
+    acquisition = deploy_release.EffectLeaseAcquisition(lease=lease, revision="a" * 40)
+    renewals = []
+
+    def renew(_ref, current):
+        renewals.append(current)
+        return deploy_release.EffectLeaseAcquisition(
+            lease=replace(current.lease, expires_at=None),
+            revision="a" * 40,
+        )
+
+    monkeypatch.setattr(deploy_release, "renew_effect_lease", renew)
+    heartbeat = deploy_release.start_effect_lease_heartbeat("deploy/dev", acquisition, interval_seconds=0.01)
+    time.sleep(0.04)
+    renewed = heartbeat.stop()
+
+    assert renewals
+    assert renewed.lease.token == lease.token
+    assert renewed.lease.expires_at is None
+
+
+def test_different_unit_heartbeats_rebase_and_preserve_each_other(monkeypatch, tmp_path):
+    desired = tmp_path / "desired"
+    state_lock = threading.Lock()
+    revision = {"value": "a" * 40}
+    next_revisions = iter(["b" * 40, "c" * 40] + [f"{value:040x}" for value in range(4, 30)])
+    tokens = iter(["lease-a", "lease-b"])
+    units = {name: _terraform_desired_resource(name) for name in ("application", "worker")}
+    for name, unit in units.items():
+        path = desired / f"units/{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(deploy_release.serialize_unit_document(unit)))
+
+    monkeypatch.setattr(deploy_release, "effect_lease_token", lambda: next(tokens))
+    monkeypatch.setattr(deploy_release, "effect_lease_owner", lambda: "runner")
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: revision["value"])
+
+    def materialize(_revision, output):
+        with state_lock:
+            shutil.copytree(desired, output)
+
+    def publish(_ref, directory, parent, _message):
+        with state_lock:
+            if parent != revision["value"]:
+                raise subprocess.CalledProcessError(1, "git push", stderr="non-fast-forward")
+            shutil.rmtree(desired)
+            shutil.copytree(directory, desired)
+            revision["value"] = next(next_revisions)
+            return revision["value"]
+
+    monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
+    monkeypatch.setattr(deploy_release, "publish_tree", publish)
+
+    application = deploy_release.acquire_effect_lease(
+        "deploy/dev", "a" * 40, "application", units["application"].metadata.uid
+    )
+    worker = deploy_release.acquire_effect_lease("deploy/dev", "b" * 40, "worker", units["worker"].metadata.uid)
+    results = {}
+    errors = []
+
+    def renew(name, acquisition):
+        try:
+            heartbeat = deploy_release.start_effect_lease_heartbeat("deploy/dev", acquisition, interval_seconds=0.01)
+            time.sleep(0.03)
+            results[name] = heartbeat.stop()
+        except Exception as exc:  # pragma: no cover - assertion below reports the error
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=renew, args=("application", application)),
+        threading.Thread(target=renew, args=("worker", worker)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert set(results) == {"application", "worker"}
+    leases = deploy_release.load_desired_effect_leases(desired)
+    assert leases["application"].token == "lease-a"
+    assert leases["worker"].token == "lease-b"
+
+
+def test_completion_rebases_after_unrelated_unit_renewal(tmp_path, monkeypatch):
+    desired = tmp_path / "desired"
+    local = tmp_path / "local"
+    revisions = {"value": "a" * 40}
+    units = {name: _terraform_desired_resource(name) for name in ("application", "worker")}
+    for name, unit in units.items():
+        path = desired / f"units/{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(deploy_release.serialize_unit_document(unit)))
+    deploy_release.write_effect_lease(
+        desired,
+        deploy_release.EffectLease(
+            unit_name="application",
+            uid=units["application"].metadata.uid,
+            token="lease-a",
+            owner="runner-a",
+            desired_revision="a" * 40,
+            expires_at=None,
+        ),
+    )
+    deploy_release.write_effect_lease(
+        desired,
+        deploy_release.EffectLease(
+            unit_name="worker",
+            uid=units["worker"].metadata.uid,
+            token="lease-b",
+            owner="runner-b",
+            desired_revision="a" * 40,
+            expires_at=None,
+        ),
+    )
+    shutil.copytree(desired, local)
+    application = deploy_release.load_desired_effect_leases(desired)["application"]
+    worker = deploy_release.load_desired_effect_leases(desired)["worker"]
+    deploy_release.write_effect_lease(desired, replace(worker, desired_revision="b" * 40))
+    revisions["value"] = "b" * 40
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: revisions["value"])
+    monkeypatch.setattr(
+        deploy_release, "materialize_revision", lambda _revision, output: shutil.copytree(desired, output)
+    )
+
+    rebased = deploy_release.rebase_effect_completion(
+        "deploy/dev",
+        deploy_release.EffectLeaseAcquisition(lease=application, revision="a" * 40),
+        "application",
+        units["application"].metadata.uid,
+        local,
+    )
+
+    assert rebased.revision == "b" * 40
+    assert deploy_release.load_desired_effect_leases(local)["application"].token == "lease-a"
+    assert deploy_release.load_desired_effect_leases(local)["worker"].desired_revision == "b" * 40
+
+
+def test_observation_publication_rebases_after_unrelated_lease_renewal(tmp_path, monkeypatch):
+    desired = tmp_path / "desired"
+    observed_publication: dict[str, bytes] = {}
+    revision = {"value": "a" * 40}
+    units = {name: _terraform_desired_resource(name) for name in ("application", "worker")}
+    for name, unit in units.items():
+        path = desired / f"units/{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(deploy_release.serialize_unit_document(unit)))
+    deploy_release.write_effect_lease(
+        desired,
+        deploy_release.EffectLease(
+            unit_name="application",
+            uid=units["application"].metadata.uid,
+            token="lease-a",
+            owner="runner-a",
+            desired_revision="a" * 40,
+            expires_at=None,
+        ),
+    )
+    deploy_release.write_effect_lease(
+        desired,
+        deploy_release.EffectLease(
+            unit_name="worker",
+            uid=units["worker"].metadata.uid,
+            token="lease-b",
+            owner="runner-b",
+            desired_revision="a" * 40,
+            expires_at=None,
+        ),
+    )
+    application_lease = deploy_release.load_desired_effect_leases(desired)["application"]
+    worker_lease = deploy_release.load_desired_effect_leases(desired)["worker"]
+    calls = 0
+
+    original_validate = deploy_release.validate_effect_lease_head
+
+    def validate_with_worker_renewal(_ref, unit_name, uid, token, snapshot):
+        nonlocal calls
+        calls += 1
+        result = original_validate(_ref, unit_name, uid, token, snapshot)
+        if calls == 1:
+            deploy_release.write_effect_lease(desired, replace(worker_lease, desired_revision="b" * 40))
+            revision["value"] = "b" * 40
+        elif calls == 4:
+            deploy_release.write_effect_lease(desired, replace(worker_lease, desired_revision="c" * 40))
+            revision["value"] = "c" * 40
+        return result
+
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: revision["value"])
+    monkeypatch.setattr(
+        deploy_release,
+        "materialize_revision",
+        lambda _revision, output: shutil.copytree(desired, output),
+    )
+    monkeypatch.setattr(deploy_release, "validate_effect_lease_head", validate_with_worker_renewal)
+    monkeypatch.setattr(deploy_release, "observed_tree", lambda _ref, output: output.mkdir(parents=True) or None)
+
+    def publish(_ref, directory, _parent, _message):
+        observed_publication.update(deploy_release.directory_files(directory))
+        return "c" * 40
+
+    monkeypatch.setattr(deploy_release, "publish_tree", publish)
+    receipt = receipt_resource(
+        "terraform",
+        "application",
+        {"revision": "a" * 40, "unitBlob": "application-blob"},
+    )
+    result = deploy_release.publish_observation_cas(
+        "observed/dev",
+        "application",
+        receipt,
+        units["application"],
+        {},
+        "a" * 40,
+        desired_ref="deploy/dev",
+        expected_uid=units["application"].metadata.uid,
+        lease_token=application_lease.token,
+        lease_snapshot=application_lease.snapshot,
+    )
+
+    assert result == "c" * 40
+    assert calls >= 3
+    receipt_path = next(path for path in observed_publication if path.startswith("units/application."))
+    assert yaml.safe_load(observed_publication[receipt_path])["spec"]["desired"]["revision"] == "b" * 40
+    assert deploy_release.load_desired_effect_leases(desired)["worker"].token == worker_lease.token
+    deploy_release.publish_teardown_observation_cas(
+        "observed/dev",
+        "application",
+        units["application"].metadata.uid,
+        1,
+        "b" * 40,
+        desired_ref="deploy/dev",
+        lease_token=application_lease.token,
+        lease_snapshot=application_lease.snapshot,
+    )
+    evidence = json.loads(
+        observed_publication[f".gitopsctr/teardowns/units/application.{units['application'].metadata.uid}.1.json"]
+    )
+    assert evidence["desiredRevision"] == "c" * 40
+
+
+def test_desired_mutation_cannot_drop_active_effect_lease(tmp_path, monkeypatch):
+    current = tmp_path / "current"
+    candidate = tmp_path / "candidate"
+    lease = deploy_release.EffectLease(
+        unit_name="application",
+        uid="d1-application",
+        token="lease-runner-a",
+        owner="runner-a",
+        desired_revision="a" * 40,
+        expires_at=100,
+    )
+    deploy_release.write_effect_lease(current, lease)
+    candidate.mkdir()
+    monkeypatch.setattr(deploy_release, "effect_lease_now", lambda: 1)
+    monkeypatch.setattr(
+        deploy_release, "materialize_revision", lambda _revision, output: shutil.copytree(current, output)
+    )
+
+    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="drop or alter"):
+        deploy_release.validate_effect_leases_preserved("deploy/dev", "a" * 40, candidate)
+
+    deploy_release.write_effect_lease(candidate, lease)
+    deploy_release.validate_effect_leases_preserved("deploy/dev", "a" * 40, candidate)
+
+
+def test_desired_mutation_cannot_change_leased_unit_payload(tmp_path):
+    current = tmp_path / "current"
+    candidate = tmp_path / "candidate"
+    unit_path = current / "units/application.json"
+    unit_path.parent.mkdir(parents=True)
+    unit = _terraform_desired_resource("application")
+    unit_path.write_text(json.dumps(deploy_release.serialize_unit_document(unit)))
+    deploy_release.write_opaque_cleanup_root(
+        current,
+        "application",
+        deploy_release.OpaqueCleanupRoot(
+            path=Path("application.json"),
+            payload={"cleanup": "original"},
+            metadata=ResourceMetadata(
+                name="application",
+                uid=unit.metadata.uid,
+                lifecycle=deploy_release.DesiredLifecycle(
+                    management=deploy_release.LifecycleManagement(mode="sourceTracked")
+                ),
+            ),
+            source=None,
+        ),
+    )
+    lease = deploy_release.EffectLease(
+        unit_name="application",
+        uid=unit.metadata.uid,
+        token="lease-runner-a",
+        owner="runner-a",
+        desired_revision="a" * 40,
+        expires_at=None,
+    )
+    deploy_release.write_effect_lease(current, lease)
+    shutil.copytree(current, candidate)
+    changed = json.loads((candidate / "units/application.json").read_text())
+    changed["spec"]["source"]["path"] = "different-source"
+    (candidate / "units/application.json").write_text(json.dumps(changed))
+
+    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="immutable leased resource"):
+        deploy_release.validate_effect_leases_preserved("deploy/dev", "a" * 40, candidate, current_root=current)
+
+    cleanup_candidate = tmp_path / "cleanup-candidate"
+    shutil.copytree(current, cleanup_candidate)
+    cleanup_path = cleanup_candidate / ".gitopsctr/cleanup/units/application.json"
+    changed_cleanup = json.loads(cleanup_path.read_text())
+    changed_cleanup["payload"]["cleanup"] = "changed"
+    cleanup_path.write_text(json.dumps(changed_cleanup))
+    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="immutable leased resource"):
+        deploy_release.validate_effect_leases_preserved("deploy/dev", "a" * 40, cleanup_candidate, current_root=current)
+
+
+@pytest.mark.parametrize("change", ["schema", "kind", "metadata", "payload"])
+def test_cleanup_root_loader_rejects_noncanonical_envelopes(tmp_path, change):
+    root = tmp_path / "desired"
+    metadata = ResourceMetadata.source_tracked_from_provenance("frontend", "cleanup-envelope:v1")
+    envelope = {
+        "schema": 1,
+        "kind": "OpaqueCleanupRoot",
+        "metadata": metadata.document(profile="desired"),
+        "payload": {"name": "frontend", "driver": "missing-driver"},
+    }
+    if change == "schema":
+        envelope["schema"] = 2
+    elif change == "kind":
+        envelope["kind"] = "Other"
+    elif change == "metadata":
+        envelope["metadata"] = {**envelope["metadata"], "name": "other"}
+    else:
+        del envelope["payload"]
+    _write_json(root / ".gitopsctr/cleanup/units/frontend.json", envelope)
+
+    with pytest.raises(deploy_release.OperationError, match="opaque cleanup"):
+        deploy_release.load_desired_cleanup_roots(root)
+
+
+def test_cleanup_root_loader_rejects_legacy_metadata_envelope(tmp_path):
+    root = tmp_path / "desired"
+    _write_json(
+        root / ".gitopsctr/cleanup/units/frontend.json",
+        {
+            "schema": 1,
+            "kind": "OpaqueCleanupRoot",
+            "metadata": {"name": "frontend"},
+            "payload": {"name": "frontend", "driver": "missing-driver"},
+        },
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="must be sourceTracked"):
+        deploy_release.load_desired_cleanup_roots(root)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"name": "other"},
+        {
+            "name": "other",
+            "uid": "uid-1",
+            "lifecycle": {"management": {"mode": "sourceTracked"}},
+        },
+    ],
+)
+def test_opaque_cleanup_metadata_rejects_explicit_name_mismatch(metadata):
+    with pytest.raises(deploy_release.OperationError, match="mismatched name"):
+        deploy_release.opaque_cleanup_metadata(
+            "frontend",
+            {"metadata": metadata, "payload": {"name": "frontend"}},
+            "b" * 40,
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"name": "frontend", "uid": "uid-1", "lifecycle": {"management": {"mode": "invalid"}}},
+        {
+            "name": "frontend",
+            "uid": "uid-1",
+            "ownerReferences": [{"apiVersion": "unit.gitopsctr.io/v1", "kind": "Terraform", "name": "owner"}],
+        },
+    ],
+)
+def test_opaque_cleanup_metadata_fails_closed_for_malformed_authority(metadata):
+    with pytest.raises(deploy_release.OperationError, match="opaque cleanup metadata"):
+        deploy_release.opaque_cleanup_metadata(
+            "frontend",
+            {"metadata": metadata, "payload": {"name": "frontend"}},
+            "b" * 40,
+        )
 
 
 def test_blocked_unit_with_same_driver_retains_previous_desired_state(tmp_path, monkeypatch):
@@ -308,7 +1123,10 @@ def test_blocked_unit_with_same_driver_retains_previous_desired_state(tmp_path, 
 
     result = deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate)
 
-    assert (candidate / "units/frontend.json").read_bytes() == previous.read_bytes()
+    retained = deploy_release.load_desired_unit(candidate / "units/frontend.json", "frontend")
+    assert retained.is_legacy_compatibility is False
+    assert retained.metadata.uid
+    assert retained.metadata.lifecycle is not None
     assert "frontend" in result.blocked
 
 
@@ -609,30 +1427,42 @@ def test_revision_refresh_carries_last_resolved_dependencies_when_upstream_is_st
     _write_json(
         current / "units/application-images.json",
         {
-            "schema": 1,
-            "name": "application-images",
-            "driver": "frontend-s3-cloudfront",
-            "source": {
-                "path": ".",
-                "revision": "a" * 40,
-                "inputHash": "sha256:old",
-                "driverVersion": driver_version,
+            "apiVersion": "unit.gitopsctr.io/v1",
+            "kind": "FrontendS3Cloudfront",
+            "metadata": {
+                "name": "application-images",
+                "uid": "uid-application-images",
+                "lifecycle": {"management": {"mode": "sourceTracked"}},
+            },
+            "spec": {
+                "source": {
+                    "path": ".",
+                    "revision": "a" * 40,
+                    "inputHash": "sha256:old",
+                    "driverVersion": driver_version,
+                },
             },
         },
     )
     _write_json(
         current / "units/aws-application.json",
         {
-            "schema": 1,
-            "name": "aws-application",
-            "driver": "frontend-s3-cloudfront",
-            "source": {
-                "path": ".",
-                "revision": "a" * 40,
-                "inputHash": "sha256:same",
-                "driverVersion": driver_version,
+            "apiVersion": "unit.gitopsctr.io/v1",
+            "kind": "FrontendS3Cloudfront",
+            "metadata": {
+                "name": "aws-application",
+                "uid": "uid-aws-application",
+                "lifecycle": {"management": {"mode": "sourceTracked"}},
             },
-            "resolvedInputs": {"receipts": {"application-images": "old-receipt"}},
+            "spec": {
+                "source": {
+                    "path": ".",
+                    "revision": "a" * 40,
+                    "inputHash": "sha256:same",
+                    "driverVersion": driver_version,
+                },
+                "resolvedInputs": {"receipts": {"application-images": "old-receipt"}},
+            },
         },
     )
     observed.mkdir()
@@ -1114,7 +1944,10 @@ def test_promoted_advance_uses_reviewed_specification_revision(tmp_path, monkeyp
     def fake_build(environment, source_root, source_revision, *_args, **kwargs):
         built.append(source_revision)
         candidate = _args[3]
-        _write_json(candidate / "units/aws-application.json", {"name": environment})
+        _write_json(
+            candidate / "units/aws-application.json",
+            deploy_release.serialize_unit_document(_terraform_desired_resource("aws-application")),
+        )
         _write_json(candidate / "promotion.json", kwargs["promotion"].document())
 
     monkeypatch.setattr(deploy_release, "build_desired_candidate", fake_build)
@@ -1220,7 +2053,10 @@ def _install_promotion_simulation(monkeypatch, gate: str):
     monkeypatch.setattr(
         deploy_release,
         "build_desired_candidate",
-        lambda *_args, **_kwargs: _write_json(_args[6] / "units/application.json", {"candidate": True}),
+        lambda *_args, **_kwargs: _write_json(
+            _args[6] / "units/application.json",
+            deploy_release.serialize_unit_document(_terraform_desired_resource("application")),
+        ),
     )
     monkeypatch.setattr(deploy_release, "publish_tree", publish)
     monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: None)
@@ -1248,6 +2084,13 @@ def test_promotion_without_a_change_gate_publishes_target_directly(monkeypatch, 
 def test_promotion_with_a_change_gate_creates_a_pull_request(monkeypatch):
     publications = _install_promotion_simulation(monkeypatch, "pullRequest")
     requests = []
+    monkeypatch.setattr(
+        deploy_release,
+        "verify_gated_candidate",
+        lambda _candidate_revision, target_revision: deploy_release.GatedCandidate(
+            "e" * 40, target_revision, target_revision
+        ),
+    )
 
     def ensure(specification, **_kwargs):
         requests.append(specification)
@@ -1769,7 +2612,8 @@ def test_environment_refs_use_project_defaults_and_allow_environment_and_cli_ove
                         "desired": "deployments/{environment}",
                         "observed": "observations/{environment}",
                     }
-                }
+                },
+                "effectLease": None,
             },
         },
     )
@@ -1816,7 +2660,8 @@ def test_environment_refs_must_differ_after_project_template_expansion(tmp_path)
                         "desired": "state/{environment}",
                         "observed": "state/{environment}",
                     }
-                }
+                },
+                "effectLease": None,
             },
         },
     )
@@ -1840,7 +2685,10 @@ def test_candidate_ref_templates_use_project_and_environment_configuration(tmp_p
             "apiVersion": "gitopsctr.io/v1",
             "kind": "Project",
             "metadata": {"name": "test-project"},
-            "spec": {"environmentDefaults": {"refs": {"candidate": "changes/{environment}/{operation}/{id}"}}},
+            "spec": {
+                "environmentDefaults": {"refs": {"candidate": "changes/{environment}/{operation}/{id}"}},
+                "effectLease": None,
+            },
         },
     )
     assert deploy_release.resolve_candidate_ref(tmp_path, "staging", "rollback", "def456") == (
@@ -1900,7 +2748,8 @@ def test_candidate_identifier_covers_operation_target_context_and_tree(tmp_path)
 
 def test_occupied_candidate_slot_reuses_only_the_same_proposal(tmp_path, monkeypatch):
     candidate = tmp_path / "candidate"
-    _write_json(candidate / "units/application.json", {"value": "one"})
+    desired_document = deploy_release.serialize_unit_document(_terraform_desired_resource("application"))
+    _write_json(candidate / "units/application.json", desired_document)
     target_revision = "b" * 40
     existing_revision = "c" * 40
     outcome = deploy_release.ChangeRequestResult(status="existing", url="https://github.example/pull/1")
@@ -1908,7 +2757,7 @@ def test_occupied_candidate_slot_reuses_only_the_same_proposal(tmp_path, monkeyp
     monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: existing_revision)
 
     def materialize(_revision, output):
-        _write_json(output / "units/application.json", {"value": "one"})
+        _write_json(output / "units/application.json", desired_document)
 
     monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
 
@@ -1923,6 +2772,13 @@ def test_occupied_candidate_slot_reuses_only_the_same_proposal(tmp_path, monkeyp
 
     monkeypatch.setattr(deploy_release, "git", fake_git)
     monkeypatch.setattr(deploy_release, "ensure_change_request", lambda *_args, **_kwargs: outcome)
+    monkeypatch.setattr(
+        deploy_release,
+        "verify_gated_candidate",
+        lambda _candidate_revision, _target_revision: deploy_release.GatedCandidate(
+            existing_revision, target_revision, target_revision
+        ),
+    )
     monkeypatch.setattr(
         deploy_release,
         "publish_tree",

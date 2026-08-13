@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from typing import cast
 
@@ -16,7 +17,11 @@ REFERENCE_KEYS = frozenset(("fromReceipt", "fromArtifact", "fromPromotion"))
 def require_json_value(value: object) -> JsonValue:
     """Validate an arbitrary Python value as JSON without coercing it."""
 
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("expected a finite JSON number")
         return value
     if isinstance(value, list):
         return [require_json_value(item) for item in value]

@@ -6,3 +6,4 @@ metadata:
 spec:
   writeFormat: yaml
   environmentsPath: deployment/environments
+  effectLease: null

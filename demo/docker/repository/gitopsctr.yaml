@@ -6,3 +6,7 @@ metadata:
 spec:
   writeFormat: yaml
   environmentsPath: deployment/environments
+  effectLease:
+    store:
+      branch:
+        ref: gitopsctr/leases

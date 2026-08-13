@@ -12,8 +12,12 @@ from gitopsctr.artifacts import ArtifactApi, require_artifact_api
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
     SCHEMA_ROOT,
+    DesiredResourceMetadata,
+    DesiredStackSpec,
     MashumaroContract,
     ResolvedInputs,
+    StackSpec,
+    StackTemplateSpec,
     artifact_descriptors_schema,
 )
 from gitopsctr.document import DocumentContract, JsonObject
@@ -58,12 +62,57 @@ def _resolved_inputs_schema() -> JsonObject:
     return schema
 
 
+def _model_specification_schema(model: type[Any], schema_name: str) -> JsonObject:
+    schema = MashumaroContract(model, f"{SCHEMA_ROOT}/core/v1/{schema_name}.schema.json").json_schema()
+    schema.pop("$schema", None)
+    schema.pop("$id", None)
+    schema.pop("title", None)
+    return schema
+
+
+def _desired_metadata_schema() -> JsonObject:
+    schema = MashumaroContract(
+        DesiredResourceMetadata,
+        f"{SCHEMA_ROOT}/core/v1/desired-resource-metadata.schema.json",
+    ).json_schema()
+    schema.pop("$schema", None)
+    schema.pop("$id", None)
+    schema.pop("title", None)
+    metadata_properties = cast(dict[str, Any], schema["properties"])
+    metadata_properties["name"]["minLength"] = 1
+    for key in ("lifecycle", "ownerReferences", "deletion"):
+        property_schema = cast(dict[str, Any], metadata_properties[key])
+        metadata_properties[key] = cast(list[dict[str, Any]], property_schema["anyOf"])[0]
+
+    lifecycle = cast(dict[str, Any], metadata_properties["lifecycle"])
+    lifecycle_properties = cast(dict[str, Any], lifecycle["properties"])
+    management_schema = cast(dict[str, Any], lifecycle_properties["management"])
+    lifecycle_properties["management"] = cast(list[dict[str, Any]], management_schema["anyOf"])[0]
+    lifecycle["required"] = ["management"]
+
+    owner_references = cast(dict[str, Any], metadata_properties["ownerReferences"])
+    owner_references["minItems"] = 1
+    owner_references["maxItems"] = 1
+    owner_properties = cast(dict[str, Any], cast(dict[str, Any], owner_references["items"])["properties"])
+    for key in ("apiVersion", "kind", "name"):
+        owner_properties[key]["minLength"] = 1
+
+    deletion = cast(dict[str, Any], metadata_properties["deletion"])
+    cast(dict[str, Any], deletion["properties"])["generation"]["minimum"] = 1
+    schema["oneOf"] = [
+        {"required": ["lifecycle"], "not": {"required": ["ownerReferences"]}},
+        {"required": ["ownerReferences"], "not": {"required": ["lifecycle"]}},
+    ]
+    return schema
+
+
 def _resource_schema(
     *,
     schema_id: str,
     api_version: str,
     kind: str,
     spec: JsonObject,
+    profile: str = "authored",
 ) -> JsonObject:
     definitions = spec.pop("$defs", None)
     resource: JsonObject = {
@@ -75,7 +124,9 @@ def _resource_schema(
             "$schema": {"type": "string"},
             "apiVersion": {"const": api_version},
             "kind": {"const": kind},
-            "metadata": {
+            "metadata": _desired_metadata_schema()
+            if profile == "desired"
+            else {
                 "type": "object",
                 "properties": {"name": {"type": "string", "minLength": 1}},
                 "required": ["name"],
@@ -103,6 +154,7 @@ def unit_resource_schema(driver: str, profile: str = "authored") -> JsonObject:
         api_version=driver_instance.api_version,
         kind=kind,
         spec=_specification_schema(contract),
+        profile=profile,
     )
 
 
@@ -178,7 +230,7 @@ def receipt_resource_schema(driver: str) -> JsonObject:
     }
 
 
-def core_resource_schema(kind: str) -> JsonObject:
+def core_resource_schema(kind: str, profile: str = "authored") -> JsonObject:
     if kind == "Environment":
         specification = _specification_schema(CORE_CONTRACTS["environment"])
     elif kind == "Promotion":
@@ -187,13 +239,21 @@ def core_resource_schema(kind: str) -> JsonObject:
         schema = deepcopy(CORE_CONTRACTS["receipt"].json_schema())
         schema["$id"] = resource_schema_url("gitopsctr.io/v1", kind)
         return schema
+    elif kind == "StackTemplate":
+        specification = _model_specification_schema(StackTemplateSpec, "stack-template-spec")
+    elif kind == "Stack":
+        specification = _model_specification_schema(
+            DesiredStackSpec if profile == "desired" and kind == "Stack" else StackSpec,
+            "stack-spec",
+        )
     else:
         raise ValueError(f"unknown core resource kind: {kind}")
     return _resource_schema(
-        schema_id=resource_schema_url("gitopsctr.io/v1", kind),
+        schema_id=resource_schema_url("gitopsctr.io/v1", kind, profile if kind in {"StackTemplate", "Stack"} else None),
         api_version="gitopsctr.io/v1",
         kind=kind,
         spec=specification,
+        profile=profile,
     )
 
 
@@ -229,6 +289,11 @@ def show_schema(scope: str, kind: str) -> JsonObject:
     if scope == "gitopsctr.io/v1":
         if kind == "Project":
             return project_resource_schema()
+        if kind.startswith(("StackTemplate/", "Stack/")):
+            resource_kind, profile = kind.split("/", 1)
+            if profile not in {"authored", "desired"}:
+                raise ValueError(f"unknown core schema profile: {profile}")
+            return core_resource_schema(resource_kind, profile)
         return core_resource_schema(kind)
     api_kind = API_KINDS.get(GVK(scope, kind)) if "/" in scope else None
     if api_kind is not None and isinstance(api_kind.spec, ArtifactApi):
@@ -260,6 +325,11 @@ def schema_documents() -> dict[Path, JsonObject]:
         path = Path("apis/gitopsctr.io/v1") / f"{kind}.schema.json"
         documents[path] = project_resource_schema() if kind == "Project" else core_resource_schema(kind)
         index["apis"][f"gitopsctr.io/v1/{kind}"] = path.as_posix()
+    for kind in ("StackTemplate", "Stack"):
+        for profile in ("authored", "desired"):
+            path = Path("apis/gitopsctr.io/v1") / kind / f"{profile}.schema.json"
+            documents[path] = core_resource_schema(kind, profile)
+            index["apis"][f"gitopsctr.io/v1/{kind}/{profile}"] = path.as_posix()
     for gvk, api_kind in sorted(API_KINDS.items()):
         if not isinstance(api_kind.spec, ArtifactApi):
             continue

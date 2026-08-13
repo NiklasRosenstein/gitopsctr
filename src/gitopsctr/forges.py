@@ -1,7 +1,9 @@
-"""Create or find forge-hosted review requests for deployment changes.
+"""Create or find forge review requests and verify CI candidates.
 
-The deployment controller publishes candidate refs before calling this module. This module never
-updates a target ref: it only opens (or finds) the change request that reviews candidate changes.
+The controller publishes candidate refs before it calls this module. This
+module does not update target refs. It creates or finds review requests and
+checks candidate heads from CI. Forge state and preview eligibility are outside
+the lifecycle core.
 """
 
 from __future__ import annotations
@@ -15,10 +17,83 @@ from pathlib import Path
 from typing import Literal, Protocol
 from urllib.parse import urlsplit
 
+from gitopsctr.errors import OperationError
+
+GitHubCandidateEventName = Literal["pull_request", "merge_group"]
+
+
+@dataclass(frozen=True)
+class GitHubCandidateHeads:
+    """Candidate and target heads from a GitHub event."""
+
+    event: GitHubCandidateEventName
+    candidate_revision: str
+    target_revision: str
+
+
+def _github_revision(value: object, field: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value):
+        raise OperationError(f"GitHub event is missing a valid {field}")
+    return value.lower()
+
+
+def github_candidate_heads(payload: object, event: str) -> GitHubCandidateHeads:
+    """Extract candidate and target heads from a supported GitHub event.
+
+    This validates forge identity data only. It does not check branch protection
+    or merge rules. Callers must run the local commit-graph verifier.
+    """
+
+    if event == "pull_request":
+        if not isinstance(payload, dict):
+            raise OperationError("GitHub pull_request event payload is missing")
+        pull_request = payload.get("pull_request")
+        if not isinstance(pull_request, dict):
+            raise OperationError("GitHub pull_request event is missing pull_request data")
+        head = pull_request.get("head")
+        base = pull_request.get("base")
+        if not isinstance(head, dict) or not isinstance(base, dict):
+            raise OperationError("GitHub pull_request event is missing head or base data")
+        return GitHubCandidateHeads(
+            event="pull_request",
+            candidate_revision=_github_revision(head.get("sha"), "pull_request.head.sha"),
+            target_revision=_github_revision(base.get("sha"), "pull_request.base.sha"),
+        )
+
+    if event == "merge_group":
+        if not isinstance(payload, dict):
+            raise OperationError("GitHub merge_group event payload is missing")
+        return GitHubCandidateHeads(
+            event="merge_group",
+            candidate_revision=_github_revision(payload.get("head_sha"), "merge_group.head_sha"),
+            target_revision=_github_revision(payload.get("base_sha"), "merge_group.base_sha"),
+        )
+
+    raise OperationError(f"unsupported GitHub gated-candidate event: {event!r}")
+
+
+def verify_github_candidate_heads(
+    payload: object,
+    event: str,
+    *,
+    candidate_revision: str | None,
+    target_revision: str | None,
+) -> GitHubCandidateHeads:
+    """Fail closed unless a GitHub event names the exact candidate and target heads."""
+
+    heads = github_candidate_heads(payload, event)
+    expected_candidate = _github_revision(candidate_revision, "expected candidate head")
+    expected_target = _github_revision(target_revision, "expected target head")
+    if heads.candidate_revision != expected_candidate:
+        raise OperationError("GitHub event candidate head does not match the published candidate")
+    if heads.target_revision != expected_target:
+        raise OperationError("GitHub event target head does not match the current target head")
+    return heads
+
 
 @dataclass(frozen=True)
 class ChangeRequestSpec:
-    """All forge-neutral information needed to request a reviewed ref change."""
+    """Forge-neutral data for a reviewed ref change."""
 
     head: str
     base: str
@@ -36,7 +111,7 @@ class ChangeRequestResult:
 
 @dataclass(frozen=True)
 class ManualChangeRequest:
-    """Exact instructions for creating a change request outside the controller."""
+    """Instructions for creating a change request outside the controller."""
 
     reason: str
     head: str
@@ -63,7 +138,7 @@ ChangeRequestOutcome = ChangeRequestResult | ManualChangeRequest
 class ForgeLocation:
     """A supported forge and repository parsed from a Git remote URL."""
 
-    forge: Literal["github"]
+    forge: Literal["github", "gitlab"]
     repository: str
 
 
@@ -109,14 +184,20 @@ def detect_forge(remote_url: str) -> ForgeLocation | None:
     if remote is None:
         return None
     host, path = remote
-    if host not in {"github.com", "www.github.com"}:
+    if host in {"github.com", "www.github.com"}:
+        forge: Literal["github", "gitlab"] = "github"
+    elif host in {"gitlab.com", "www.gitlab.com"}:
+        forge = "gitlab"
+    else:
         return None
 
     repository_path = path.removesuffix(".git").rstrip("/")
     parts = repository_path.split("/")
-    if len(parts) != 2 or not all(parts):
+    if len(parts) < 2 or not all(parts):
         return None
-    return ForgeLocation(forge="github", repository="/".join(parts))
+    if forge == "github" and len(parts) != 2:
+        return None
+    return ForgeLocation(forge=forge, repository="/".join(parts))
 
 
 def _manual(

@@ -7,7 +7,7 @@ contract and never fetches the document's `$schema` editor hint.
 !!! warning "Alpha API"
 
     gitopsctr is under active development. APIs may change before the project reaches production. The kinds below are
-    the current built-ins, not an exhaustive ecosystem: plugins can register additional unit and artifact kinds by
+    the current built-ins, not a complete ecosystem: plugins can register additional unit and artifact kinds by
     full group/version/kind.
 
 ## Repository layout
@@ -82,7 +82,7 @@ Receipts describe every artifact's GVK, path, media type, and serialized-byte di
 
 ## Schemas and extensibility
 
-The [schema catalog](schemas.md) is the exhaustive structural reference for the built-ins. Extensible API kinds are
+The [schema catalog](schemas.md) is the complete structural reference for the built-ins. Extensible API kinds are
 discovered through full-GVK `gitopsctr.apis` Python entry points. Unit API registrations provide a `UnitDriver`;
 artifact API registrations provide typed parsing, media type, and schema generation. Driver capabilities such as
 planning, materialization, reconciliation, and verification remain independent.
