@@ -4,11 +4,7 @@ kind: Stack
 metadata:
   name: application
 spec:
-  template:
-    name: application
-    source:
-      fromPromotion:
-        stack: application
+  template: application
   parameters:
     workload-name: gitopsctr-k8s-staging
     workload-resource: deployment/gitopsctr-k8s-staging

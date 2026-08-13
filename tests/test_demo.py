@@ -142,10 +142,15 @@ def test_k8s_demo_projects_source_tracked_stack_for_provider(tmp_path, monkeypat
     }
 
 
-def test_k8s_staging_stack_is_promotion_backed():
-    stack = yaml.safe_load((k8s_demo.TEMPLATE / "deployment/environments/staging/stacks/application.yaml").read_text())
+def test_k8s_staging_stack_uses_local_template_with_promoted_image(tmp_path, monkeypatch):
+    worktree = tmp_path / "repository"
+    shutil.copytree(k8s_demo.TEMPLATE, worktree)
+    monkeypatch.setattr(k8s_demo, "docker_platform", lambda: "linux/amd64")
+    k8s_demo.configure_template("kind", worktree)
 
-    assert stack["spec"]["template"]["source"] == {"fromPromotion": {"stack": "application"}}
+    stack = yaml.safe_load((worktree / "deployment/environments/staging/stacks/application.yaml").read_text())
+
+    assert stack["spec"]["template"] == "application"
     assert stack["spec"]["units"] == ["deploy"]
     assert stack["spec"]["artifactImports"] == [
         {
@@ -156,6 +161,30 @@ def test_k8s_staging_stack_is_promotion_backed():
             "fromPromotion": {"stack": "application"},
         }
     ]
+
+    dev_desired = tmp_path / "dev-desired"
+    controller.project_stack_resources(worktree, "dev", "a" * 40, dev_desired, worktree)
+    staging = controller.project_stack_resources(
+        worktree,
+        "staging",
+        "a" * 40,
+        tmp_path / "staging-desired",
+        worktree,
+        promotion=controller.PromotionContext(
+            source_environment="dev",
+            desired_ref="gitopsctr/desired/dev",
+            desired_revision="b" * 40,
+            observed_ref="gitopsctr/observed/dev",
+            observed_revision="c" * 40,
+            specification_revision="a" * 40,
+            desired_root=dev_desired,
+        ),
+    )
+
+    assert set(staging.generated_units) == {"application--deploy"}
+    deploy = staging.generated_units["application--deploy"]
+    assert deploy.spec.materialize.releaseName == "gitopsctr-k8s-staging"
+    assert deploy.spec.materialize.values._serialize()["message"] == "promoted from dev to staging"
 
 
 @pytest.mark.parametrize("provider", ("kind", "minikube"))
