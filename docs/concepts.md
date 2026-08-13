@@ -62,20 +62,37 @@ ref advances before convergence becomes clean.
 
 ## Promotion and rollback
 
-A **source-tracked environment** resolves authored units from an explicit source revision. A **promotion-tracked
-environment** instead accepts reviewed desired state from one of its configured source environments. Promotion records
-the exact source desired, observed, and specification revisions in a controller-owned `Promotion` resource.
+A **source-tracked environment** resolves authored resources from an explicit source revision. A **promotion-tracked
+environment** can advance only from a permitted source environment. It builds target desired state from a pinned
+target specification plus explicitly selected inputs from that source; it does not implicitly copy the source desired
+tree. Promotion records the exact source desired, source observed, and target specification revisions in a
+controller-owned `Promotion` resource.
 
 ```mermaid
 flowchart LR
-  desired["Source desired ref"] --> promotion["Promotion candidate"]
-  observed["Source observed ref<br/>fresh evidence"] --> promotion
-  specification["Target specification<br/>allowed source and policy"] --> promotion
-  promotion --> gate{"Target change gate"}
+  specification["Pinned specification revision<br/>target Environment, Stack, and StackTemplate"] --> promotion["Promotion record<br/>pins three revisions"]
+  desired["Pinned source desired revision<br/>resolved source Units and Stacks"] --> promotion
+  observed["Pinned source observed revision<br/>fresh receipts and artifacts"] --> promotion
+  promotion --> resolution["Resolve target desired state"]
+  resolution --> gate{"Target change gate"}
   gate -->|none| target["Target desired ref"]
   gate -->|pullRequest| review["Candidate ref<br/>pull request"]
   review -->|merge| target
 ```
+
+In compact form:
+
+```text
+target desired state = target specification at specificationRevision
+                     + selected inputs from source desiredRevision and observedRevision
+```
+
+For example, a target Stack may expand a local StackTemplate from the pinned specification revision while importing
+an exact image artifact evidenced by the pinned source desired and observed revisions. By contrast,
+`template.source.fromPromotion` asks to reuse a source Stack's already-expanded template projection. It is not the
+switch that makes an operation a promotion, and that projection has no unbound parameters left. See
+[Stacks and StackTemplates](apis/stacks.md#promotion-and-template-selection) for the resource forms and
+[Promotion](apis/promotion.md) for the complete lineage record.
 
 `changeGate: pullRequest` publishes promotion and rollback candidates for review; `changeGate: none` publishes them
 directly. Promotion normally requires every source unit to have a current receipt. Environments that contain only

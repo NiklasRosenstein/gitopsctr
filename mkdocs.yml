@@ -18,6 +18,7 @@ nav:
   - Controller APIs:
       - Project: project-configuration.md
       - Environment: apis/environment.md
+      - Stacks and templates: apis/stacks.md
       - Promotion: apis/promotion.md
       - Receipt: apis/receipt.md
   - Artifact APIs:

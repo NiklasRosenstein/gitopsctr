@@ -57,13 +57,22 @@ are clean or progress is blocked.
 
 ## Promote and verify
 
-Promotion requires a clean permitted source environment and resolves the target from the reviewed source desired
-state:
+Promotion requires a clean permitted source environment. It combines the target specification with explicitly
+selected values or artifacts from the reviewed source state:
 
 ```console
-gitopsctr promote --from-environment dev --to-environment staging
+gitopsctr promote \
+  --from-environment dev \
+  --to-environment staging \
+  --specification-revision SOURCE_SHA
 gitopsctr verify --environment staging
 ```
+
+The Promotion resource pins three independently selected revisions: the source desired revision, its matching source
+observed revision, and `--specification-revision`, which contains the target Environment and authored resources.
+`--source-desired-revision` defaults to the source desired-ref head; `--specification-revision` defaults to `HEAD`.
+Pass the latter explicitly when `HEAD` might have advanced beyond the source revision reviewed in the source
+environment.
 
 The target Environment decides whether promotion is published directly or through a pull-request candidate. After a
 gated candidate is merged, reconcile or converge the target without a source revision because its specification and

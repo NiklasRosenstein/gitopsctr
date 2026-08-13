@@ -20,9 +20,73 @@ spec:
 ```
 
 The source block pins the exact desired and observed histories reviewed for promotion. `specificationRevision` pins
-the source commit containing the target Environment and authored unit specifications. This prevents later branch
-movement from silently changing the promoted input. `observedRevision` may be `null` when the source Environment uses
-materialized promotion evidence.
+the source commit containing the target Environment and authored resources. This prevents later branch movement from
+silently changing either the target specification or promoted inputs. `observedRevision` may be `null` when the source
+Environment uses materialized promotion evidence.
+
+| Revision | Supplies |
+| --- | --- |
+| `spec.source.desiredRevision` | Resolved source Units and Stacks from which promoted values and lineage are selected |
+| `spec.source.observedRevision` | Matching receipts and immutable artifacts proving what was reconciled |
+| `spec.specificationRevision` | Target Environment, Stack, StackTemplate, and other authored target configuration |
+
+These revisions are independent. `gitopsctr promote` defaults the source desired revision to the source desired-ref
+head and the specification revision to `HEAD`. Use `--specification-revision` when the target must be built from a
+specific reviewed commit.
+
+## How target desired state is built
+
+Promotion is a resolution context, not an instruction to copy the source desired tree:
+
+```text
+target desired state = target specification at specificationRevision
+                     + selected inputs from source desiredRevision and observedRevision
+```
+
+The target Environment opts into promotion and permits the source:
+
+```yaml
+apiVersion: gitopsctr.io/v1
+kind: Environment
+metadata:
+  name: staging
+spec:
+  promotion:
+    allowedSources: [dev]
+  promotionPolicy:
+    minimumEvidence: reconciled
+```
+
+A target Stack can use its parameterized StackTemplate from `specificationRevision` and import only the exact artifact
+that dev produced:
+
+```yaml
+apiVersion: gitopsctr.io/v1
+kind: Stack
+metadata:
+  name: application
+spec:
+  template: application
+  parameters:
+    workload-name: application-staging
+    message: promoted from dev to staging
+  units: [deploy]
+  artifactImports:
+    - unit: image
+      name: containers
+      apiVersion: artifact.gitopsctr.io/v1
+      kind: ContainerImages
+      fromPromotion:
+        stack: application
+```
+
+Here, `template: application` resolves the template from the pinned specification tree. The artifact import resolves
+`image/containers` from the source Stack using the pinned source desired and observed trees, validates its receipt and
+digest, and records immutable import lineage in the target desired Stack.
+
+This differs from `template.source.fromPromotion`, which reuses the source Stack's already-expanded template
+projection. That form has no unbound parameters left and is appropriate only when the target wants the source
+projection as-is. See [Promotion and template selection](stacks.md#promotion-and-template-selection).
 
 During desired-state resolution, [`fromPromotion`](../references.md#promotion-selectors) reads public unit `spec`
 values from the pinned source desired revision. Broken selectors in an active Promotion are errors. They do not make

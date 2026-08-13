@@ -7,6 +7,23 @@ This demo uses one `StackTemplate` to contrast two lifecycle models:
 - `--preview` directly instantiates the same template in the `preview` environment. Acceptance also updates the pinned
   template revision and requests UID-fenced deletion.
 
+Normal mode combines three pinned inputs rather than copying dev's entire desired tree:
+
+```mermaid
+flowchart LR
+  specification["Specification revision<br/>staging Stack and StackTemplate"] --> staging["Staging desired state"]
+  desired["Dev desired revision<br/>source Stack and image Unit"] --> import["Promoted image import"]
+  observed["Dev observed revision<br/>receipt and image artifact"] --> import
+  import --> staging
+```
+
+The staging Stack uses `template: application`, so its staging parameters are expanded against the StackTemplate in
+the pinned specification revision. Its `artifactImports[].fromPromotion` selects the exact `image/containers` artifact
+proven in dev. It deliberately does not use `template.source.fromPromotion`, which would reuse dev's already-expanded
+projection and therefore could not accept staging parameters. See
+[Promotion](../../docs/apis/promotion.md#how-target-desired-state-is-built) and
+[Stacks and StackTemplates](../../docs/apis/stacks.md#promotion-and-template-selection).
+
 The provider comes from `GITOPSCTR_K8S_PROVIDER` and defaults to `kind`:
 
 ```console

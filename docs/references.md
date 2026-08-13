@@ -3,6 +3,13 @@
 Reference expressions let one authored value read immutable state produced elsewhere. They are self-contained objects
 and can appear in template-bearing fields supported by a unit kind.
 
+!!! note "Three uses of promotion"
+
+    This page describes the field-level `fromPromotion` reference expression, which reads a source Unit's public
+    `spec`. A Stack's `artifactImports[].fromPromotion` instead imports a validated artifact from source desired and
+    observed state. `template.source.fromPromotion` instead reuses a source Stack's already-expanded template
+    projection. See [Stacks and StackTemplates](apis/stacks.md#promotion-and-template-selection).
+
 | Expression | Reads | Pointer scope | Required selectors |
 | --- | --- | --- | --- |
 | `fromReceipt` | Current producer receipt result | Typed driver result | `unit`; `pointer` defaults to `""` |

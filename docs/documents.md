@@ -46,6 +46,8 @@ Controller resources use `gitopsctr.io/v1`.
 | --- | --- | --- |
 | [Project](project-configuration.md) | User-authored repository identity, document format, environment path, and ref defaults | `gitopsctr.yaml` |
 | [Environment](apis/environment.md) | User-authored refs, change gate, promotion sources, and evidence policy | `<environmentsPath>/<name>/environment.*` |
+| [StackTemplate](apis/stacks.md) | User-authored, parameterized collection of Unit templates | `<stackTemplatesPath>/<name>.*`; resolved copy on the desired ref |
+| [Stack](apis/stacks.md) | Source-authored or directly managed instance of a StackTemplate | `<environment>/stacks/<name>.*`; resolved copy on the desired ref |
 | [Promotion](apis/promotion.md) | Controller-owned lineage pinning source desired, observed, and specification revisions | `promotion.*` on the target desired ref |
 | [Receipt](apis/receipt.md) | Controller- and driver-owned evidence for one exact desired unit | `units/<name>.*` on the observed ref |
 
