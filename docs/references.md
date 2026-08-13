@@ -7,8 +7,9 @@ and can appear in template-bearing fields supported by a unit kind.
 
     This page describes the field-level `fromPromotion` reference expression, which reads a source Unit's public
     `spec`. A Stack's `artifactImports[].fromPromotion` instead imports a validated artifact from source desired and
-    observed state. `template.source.fromPromotion` instead reuses a source Stack's already-expanded template
-    projection. See [Stacks and StackTemplates](apis/stacks.md#promotion-and-template-selection).
+    observed state. `template.source.fromPromotion` instead reuses a source Stack's exact parameterized-template
+    source pin and expands it with target parameters. See [Stacks and
+    StackTemplates](apis/stacks.md#promotion-and-template-selection).
 
 | Expression | Reads | Pointer scope | Required selectors |
 | --- | --- | --- | --- |

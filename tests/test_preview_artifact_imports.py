@@ -13,6 +13,7 @@ from gitopsctr import controller
 from gitopsctr.contracts import ArtifactImport, DesiredOwnerReference, DesiredSource, StackTemplatePromotionReference
 from gitopsctr.resources import ResourceMetadata
 from tests.conftest import receipt_resource
+from tests.stack_support import commit, git
 
 
 @dataclass(frozen=True)
@@ -168,7 +169,7 @@ def _write_source_observation(
     )
 
 
-def _setup_import_fixture(tmp_path: Path, monkeypatch) -> ImportFixture:
+def _setup_import_fixture(tmp_path: Path, monkeypatch, *, promoted_template: bool = True) -> ImportFixture:
     source = tmp_path / "source"
     _repository(source)
     _write_stack(
@@ -189,7 +190,11 @@ def _setup_import_fixture(tmp_path: Path, monkeypatch) -> ImportFixture:
             "kind": "Stack",
             "metadata": {"name": "application"},
             "spec": {
-                "template": {"name": "application", "source": {"fromPromotion": {"stack": "application"}}},
+                "template": (
+                    {"name": "application", "source": {"fromPromotion": {"stack": "application"}}}
+                    if promoted_template
+                    else "application"
+                ),
                 "units": ["deploy"],
                 "artifactImports": [
                     {
@@ -203,11 +208,13 @@ def _setup_import_fixture(tmp_path: Path, monkeypatch) -> ImportFixture:
             },
         },
     )
-    source_revision = "a" * 40
+    git(source, "init", "-b", "main")
+    source_revision = commit(source, "promotion fixture")
+    monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
+    controller._state_store.cache_clear()
     desired = tmp_path / "dev-desired"
     projection = controller.project_stack_resources(source, "dev", source_revision, desired, source)
     observed = tmp_path / "dev-observed"
-    monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
     monkeypatch.setattr(controller, "file_blob", lambda path: hashlib.sha256(path.read_bytes()).hexdigest())
     _write_source_observation(source, desired, observed, projection, source_revision)
     current = tmp_path / "empty-current"
@@ -340,6 +347,22 @@ def test_promoted_artifact_import_records_lineage_and_reconciles_from_desired(
         fixture.source, "staging", staging, "f" * 40, tmp_path / "staging-reconcile"
     )
     assert specifications["application--deploy"].spec.terraform.variables["image"].endswith("c" * 64)
+
+
+def test_target_owned_template_can_import_promoted_artifact(tmp_path: Path, monkeypatch):
+    fixture = _setup_import_fixture(tmp_path, monkeypatch, promoted_template=False)
+    staging = tmp_path / "target-owned-staging"
+    result = _advance_import_fixture(fixture, staging)
+
+    assert result.blocked == {}
+    stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(controller.document_candidates(staging / "stacks", "application")[0]),
+        profile="desired",
+        expected_name="application",
+    )
+    assert isinstance(stack.spec, controller.DesiredStackSpec)
+    assert type(stack.spec.requestedSource).__name__ == "StackTemplateFromResource"
+    assert stack.spec.resolvedArtifactImports["image/containers"].sourceStack == "application"
 
 
 def test_promoted_artifact_import_chains_from_staging_to_production(tmp_path: Path, monkeypatch):

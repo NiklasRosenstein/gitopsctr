@@ -74,6 +74,12 @@ observed revision, and `--specification-revision`, which contains the target Env
 Pass the latter explicitly when `HEAD` might have advanced beyond the source revision reviewed in the source
 environment.
 
+Within the target specification, each Stack still chooses its own template mode. `template: application` reads the
+target template at `--specification-revision`; `fromGit` resolves the target-authored Git request; and
+`template.source.fromPromotion` follows the source Stack's already-recorded template commit and digest before applying
+the target Stack's parameters. Promoted field values and artifact imports are separate selectors, so a target-owned
+Stack can use either without promoting its template.
+
 The target Environment decides whether promotion is published directly or through a pull-request candidate. After a
 gated candidate is merged, reconcile or converge the target without a source revision because its specification and
 inputs are pinned by the merged promotion.

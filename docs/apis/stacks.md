@@ -103,6 +103,18 @@ promotion-tracked through `Environment.spec.promotion.allowedSources`; `gitopsct
 desired revision, source observed revision, and target specification revision in a
 [`Promotion`](promotion.md) resource.
 
+The target Stack chooses its template source explicitly:
+
+| Template source | Selection during promotion |
+| --- | --- |
+| `template: application` or `fromResource` | Load `application` from the Promotion's pinned target `specificationRevision`. |
+| `fromGit` | Resolve the target-authored Git request independently and record the selected commit and digest. |
+| `fromPromotion` | Read the selected source Stack from the pinned source desired revision and load its exact recorded template commit, path, and digest. |
+
+A moving `fromGit.ref` is pinned when target desired state is resolved. Use an explicit commit when repeated attempts
+must select the same source even if a ref moves. `fromPromotion` never resolves the source Stack's recorded ref again
+and never substitutes `HEAD`; if its recorded repository, commit, path, or digest is unavailable, promotion fails.
+
 The common pattern is to expand the target's parameterized template from the pinned specification revision and import
 an exact artifact produced by the source Stack:
 
@@ -135,7 +147,7 @@ This has two independent effects:
 
 The target can therefore use staging-specific parameters without rebuilding the image.
 
-### Reusing an expanded source projection
+### Reusing a source Stack's template pin
 
 The following is a different operation:
 
@@ -146,22 +158,29 @@ spec:
     source:
       fromPromotion:
         stack: application
+  parameters:
+    workload-name: application-staging
+    message: promoted from dev to staging
+  units: [deploy]
 ```
 
-It reconstructs a template from the source desired Stack's `resolvedProjection`. The source Stack's parameters have
-already been substituted, so the reconstructed template declares no parameters. The target must use that projection
-as-is and cannot supply a new set of parameter values.
+The controller loads `application` from the exact source pin recorded in the promoted source Stack's
+`resolvedSource`, verifies the raw document digest and template identity, and expands the original parameterized
+StackTemplate with the target parameters. In this example, the template code is exactly what dev pinned, while the
+expanded workload name and message are staging-specific.
 
-Use this form when the exact expanded Unit specifications are the promoted object. Use a local or Git-backed template
-plus `artifactImports` when the target needs its own parameters while consuming exact artifacts proven by the source
-environment.
+This source choice is independent of promoted artifacts. A Stack can combine `template.source.fromPromotion` with
+`artifactImports[].fromPromotion`, selecting template lineage and artifact lineage separately. It may instead use a
+target-owned `fromResource` or `fromGit` template and consume promoted fields or artifacts. A target-only companion
+Stack may participate in the same promotion transaction without consuming any source value at all.
 
 !!! note "Similar names, different scopes"
 
     - A field-level [`fromPromotion`](../references.md#promotion-selectors) expression reads public `spec` data from a
       source desired Unit.
     - `artifactImports[].fromPromotion` imports and validates an artifact using source desired and observed evidence.
-    - `template.source.fromPromotion` reuses a source Stack's already-expanded template projection.
+    - `template.source.fromPromotion` reuses a source Stack's exact StackTemplate source pin, then applies target
+      parameters and Unit selection.
 
 ## Desired-state records
 
@@ -169,6 +188,9 @@ Desired StackTemplate and Stack documents are controller-owned projections. Thei
 authority and stable identity. A desired Stack additionally records its requested and resolved template source,
 expanded Unit projection, and resolved promoted-artifact lineage. Generated Units carry a UID-fenced owner reference
 to the Stack so updates and child-first deletion cannot cross Stack incarnations.
+
+`resolvedProjection` is the immutable expanded record used for reconciliation, dependency and graph validation, and
+teardown. Template selection never reconstructs a parameterized StackTemplate from another Stack's projection.
 
 Do not author or edit desired Stack resources manually. The complete structural contracts are the StackTemplate
 [authored](../schemas/apis/gitopsctr.io/v1/StackTemplate/authored.schema.json) and

@@ -88,10 +88,11 @@ target desired state = target specification at specificationRevision
 ```
 
 For example, a target Stack may expand a local StackTemplate from the pinned specification revision while importing
-an exact image artifact evidenced by the pinned source desired and observed revisions. By contrast,
-`template.source.fromPromotion` asks to reuse a source Stack's already-expanded template projection. It is not the
-switch that makes an operation a promotion, and that projection has no unbound parameters left. See
-[Stacks and StackTemplates](apis/stacks.md#promotion-and-template-selection) for the resource forms and
+an exact image artifact evidenced by the pinned source desired and observed revisions. Alternatively,
+`template.source.fromPromotion` follows the source Stack's recorded StackTemplate commit, path, and digest, then
+expands that parameterized template with the target Stack's parameters. It does not copy the source Stack's expanded
+Units, and it is not the switch that makes an operation a promotion. See [Stacks and
+StackTemplates](apis/stacks.md#promotion-and-template-selection) for the source-mode matrix and
 [Promotion](apis/promotion.md) for the complete lineage record.
 
 `changeGate: pullRequest` publishes promotion and rollback candidates for review; `changeGate: none` publishes them

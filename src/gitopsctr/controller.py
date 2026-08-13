@@ -56,10 +56,10 @@ from gitopsctr.contracts import (
     StackSpec,
     StackTemplateFromGit,
     StackTemplateFromPromotion,
+    StackTemplateFromResource,
     StackTemplateReference,
     StackTemplateResource,
     StackTemplateSpec,
-    StackTemplateUnitTemplate,
     StrictModel,
     scope_stack_template_resources,
     stack_generated_unit_name,
@@ -758,6 +758,10 @@ def load_desired_resource_graph(
                 )
                 if isinstance(stack_resource, StackResource)
                 and isinstance(stack_resource.spec, (StackSpec, DesiredStackSpec))
+                and (
+                    isinstance(stack_resource.spec.template, str)
+                    or isinstance(stack_resource.spec.template.source, StackTemplateFromResource)
+                )
                 else None
             )
             if (
@@ -844,7 +848,10 @@ def stack_dependency_edges(
         if not isinstance(stack.spec, (StackSpec, DesiredStackSpec)):
             continue
         template_name = stack.spec.template if isinstance(stack.spec.template, str) else stack.spec.template.name
-        template = templates.get(template_name)
+        uses_resource_template = isinstance(stack.spec.template, str) or isinstance(
+            stack.spec.template.source, StackTemplateFromResource
+        )
+        template = templates.get(template_name) if uses_resource_template else None
         if template is None or not isinstance(template.spec, StackTemplateSpec):
             projection = stack.spec.resolvedProjection if isinstance(stack.spec, DesiredStackSpec) else None
             units = projection.get("units") if isinstance(projection, dict) else None
@@ -2243,22 +2250,91 @@ def _stack_template_reference(spec: StackSpec) -> StackTemplateReference:
     return template if isinstance(template, StackTemplateReference) else StackTemplateReference(name=template)
 
 
+def _clone_stack_template_repository(remote: str, checkout: Path) -> None:
+    clone = subprocess.run(
+        ("git", "clone", "--no-checkout", "--quiet", remote, str(checkout)),
+        text=True,
+        capture_output=True,
+    )
+    if clone.returncode != 0:
+        raise OperationError(f"could not fetch StackTemplate source {remote!r}: {clone.stderr.strip()}")
+
+
+def _checkout_stack_template_commit(checkout: Path, commit: str, location: str) -> None:
+    checkout_result = subprocess.run(
+        ("git", "-C", str(checkout), "checkout", "--quiet", "--detach", commit),
+        text=True,
+        capture_output=True,
+    )
+    if checkout_result.returncode != 0:
+        raise OperationError(f"Git commit {commit!r} is not available in {location!r}")
+
+
+def _load_exact_stack_template_document(
+    root: Path,
+    resource_path: str,
+    template_name: str,
+    *,
+    expected_digest: str | None = None,
+) -> StackResource:
+    """Load and validate one exact, repository-relative StackTemplate document."""
+
+    path = root.joinpath(*PurePosixPath(resource_path).parts)
+    if not path.is_file():
+        raise OperationError(f"pinned StackTemplate document {resource_path!r} is not available")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if expected_digest is not None and digest != expected_digest:
+        raise OperationError(
+            f"pinned StackTemplate document {resource_path!r} has digest {digest}, expected {expected_digest}"
+        )
+    try:
+        document = RESOURCE_CATALOG.load_document(path)
+        return RESOURCE_CATALOG.parse_stack_template(document, profile="authored", expected_name=template_name)
+    except (ContractError, OperationError, ValueError) as error:
+        raise OperationError(f"pinned StackTemplate document {resource_path!r} is invalid: {error}") from error
+
+
+def _load_pinned_stack_template(source: ResolvedStackTemplateSource, template_name: str) -> StackResource:
+    """Load a StackTemplate from its authoritative immutable source pin."""
+
+    pin = source.fromGit
+    with tempfile.TemporaryDirectory(prefix="gitopsctr-pinned-stack-template-") as temporary_directory:
+        checkout = Path(temporary_directory) / "repo"
+        if pin.remote is not None:
+            _clone_stack_template_repository(pin.remote, checkout)
+            _checkout_stack_template_commit(checkout, pin.commit, pin.remote)
+            template_root = checkout
+        else:
+            try:
+                materialize_revision(pin.commit, checkout)
+            except (OperationError, subprocess.CalledProcessError) as error:
+                raise OperationError(
+                    f"Git commit {pin.commit!r} is not available for pinned StackTemplate source"
+                ) from error
+            assert pin.path is not None
+            template_root = checkout.joinpath(*PurePosixPath(pin.path).parts)
+        return _load_exact_stack_template_document(
+            template_root,
+            pin.resourcePath,
+            template_name,
+            expected_digest=pin.digest,
+        )
+
+
 def _resolve_stack_template(
     source_root: Path,
     template_ref: StackTemplateReference,
     templates: Mapping[str, StackResource],
     source_revision: str,
-    current_desired: Path | None = None,
     promotion: PromotionContext | None = None,
 ) -> tuple[StackResource, ResolvedStackTemplateSource]:
     """Resolve one StackTemplate source for desired-state projection."""
 
     source = template_ref.source
     if isinstance(source, StackTemplateFromPromotion):
-        source_desired = promotion.desired_root if promotion is not None else current_desired
-        if source_desired is None:
-            raise OperationError("fromPromotion StackTemplate source requires a pinned source Stack")
-        source_path = document_candidates(source_desired / "stacks", source.fromPromotion.stack)
+        if promotion is None:
+            raise OperationError("fromPromotion StackTemplate source requires an active Promotion")
+        source_path = document_candidates(promotion.desired_root / "stacks", source.fromPromotion.stack)
         if len(source_path) != 1:
             raise OperationError(f"promoted source Stack {source.fromPromotion.stack!r} is not available")
         source_stack = RESOURCE_CATALOG.parse_stack(
@@ -2266,43 +2342,26 @@ def _resolve_stack_template(
             profile="desired",
             expected_name=source.fromPromotion.stack,
         )
-        if not isinstance(source_stack.spec, DesiredStackSpec) or source_stack.spec.resolvedProjection is None:
-            raise OperationError("promoted source Stack has no resolved projection")
-        projection_units = source_stack.spec.resolvedProjection.get("units")
-        if not isinstance(projection_units, dict):
-            raise OperationError("promoted source Stack projection is invalid")
-        unit_templates = {
-            logical_name: StackTemplateUnitTemplate(
-                apiVersion=cast(str, value["apiVersion"]),
-                kind=cast(str, value["kind"]),
-                spec=cast(Any, value.get("spec", {})),
-                dependsOn=[cast(str, item) for item in cast(list[Any], value.get("dependsOn", []))],
+        if not isinstance(source_stack.spec, DesiredStackSpec):
+            raise OperationError("promoted source Stack is not a desired Stack")
+        source_template = cast(StackTemplateReference, source_stack.spec.template)
+        if source_template.name != template_ref.name:
+            raise OperationError(
+                f"promoted source Stack uses StackTemplate {source_template.name!r}, "
+                f"but target Stack references {template_ref.name!r}"
             )
-            for logical_name, value in projection_units.items()
-            if isinstance(logical_name, str) and isinstance(value, dict)
-        }
-        promoted_template = StackResource(
-            GVK(CORE_API_VERSION, "StackTemplate"),
-            ResourceMetadata(name=template_ref.name),
-            StackTemplateSpec(parameters=[], unitTemplates=unit_templates),
-        )
         if source_stack.spec.resolvedSource is None:
             raise OperationError("promoted source Stack has no resolved source")
-        return promoted_template, source_stack.spec.resolvedSource
+        return (
+            _load_pinned_stack_template(source_stack.spec.resolvedSource, template_ref.name),
+            source_stack.spec.resolvedSource,
+        )
     if isinstance(source, StackTemplateFromGit):
         request = source.fromGit
         if request.remote is not None:
             with tempfile.TemporaryDirectory(prefix="gitopsctr-stack-template-") as temporary_directory:
                 checkout = Path(temporary_directory) / "repo"
-                clone = subprocess.run(
-                    ("git", "clone", "--no-checkout", "--quiet", request.remote, str(checkout)),
-                    text=True,
-                    capture_output=True,
-                )
-                if clone.returncode != 0:
-                    raise OperationError(
-                        f"could not fetch StackTemplate source {request.remote!r}: {clone.stderr.strip()}"
-                    )
+                _clone_stack_template_repository(request.remote, checkout)
                 selected = request.commit
                 if selected is None:
                     assert request.ref is not None
@@ -2314,53 +2373,64 @@ def _resolve_stack_template(
                     if revision.returncode != 0:
                         raise OperationError(f"Git ref {request.ref!r} does not exist in {request.remote!r}")
                     selected = revision.stdout.strip()
-                checkout_result = subprocess.run(
-                    ("git", "-C", str(checkout), "checkout", "--quiet", "--detach", selected),
-                    text=True,
-                    capture_output=True,
-                )
-                if checkout_result.returncode != 0:
-                    raise OperationError(f"Git commit {selected!r} is not available in {request.remote!r}")
+                _checkout_stack_template_commit(checkout, selected, request.remote)
                 project = load_project_config(checkout)
                 catalog_root = checkout.joinpath(*project.stack_templates_path.parts)
                 paths = document_candidates(catalog_root, template_ref.name)
                 if len(paths) != 1:
                     raise OperationError(f"expected exactly one StackTemplate document for {template_ref.name!r}")
                 template_path = paths[0]
-                template = RESOURCE_CATALOG.parse_stack_template(
-                    RESOURCE_CATALOG.load_document(template_path),
-                    profile="authored",
-                    expected_name=template_ref.name,
+                resource_path = template_path.relative_to(checkout).as_posix()
+                template = _load_exact_stack_template_document(
+                    checkout,
+                    resource_path,
+                    template_ref.name,
                 )
                 return template, ResolvedStackTemplateSource(
                     fromGit=ResolvedGitSource(
                         remote=request.remote,
                         commit=selected,
-                        resourcePath=template_path.relative_to(checkout).as_posix(),
+                        resourcePath=resource_path,
                         digest=hashlib.sha256(template_path.read_bytes()).hexdigest(),
                         ref=request.ref,
                     )
                 )
-        template_root = source_root
-        if request.path != ".":
-            template_root = source_root.joinpath(*PurePosixPath(cast(str, request.path)).parts)
-        project = load_project_config(template_root)
-        catalog_root = template_root.joinpath(*project.stack_templates_path.parts)
-        path = document_candidates(catalog_root, template_ref.name)
-        if len(path) != 1:
-            raise OperationError(f"expected exactly one StackTemplate document for {template_ref.name!r}")
-        template = RESOURCE_CATALOG.parse_stack_template(
-            RESOURCE_CATALOG.load_document(path[0]), profile="authored", expected_name=template_ref.name
-        )
-        return template, ResolvedStackTemplateSource(
-            fromGit=ResolvedGitSource(
-                path=request.path,
-                commit=source_revision,
-                resourcePath=path[0].relative_to(template_root).as_posix(),
-                digest=hashlib.sha256(path[0].read_bytes()).hexdigest(),
-                ref=request.ref,
+        selected = request.commit
+        if selected is None and request.ref is not None:
+            revision = git("rev-parse", "--verify", f"{request.ref}^{{commit}}", check=False)
+            if revision.returncode != 0:
+                raise OperationError(f"Git ref {request.ref!r} does not exist in the source repository")
+            selected = revision.stdout.strip()
+        selected = selected or source_revision
+        with tempfile.TemporaryDirectory(prefix="gitopsctr-stack-template-") as temporary_directory:
+            if selected == source_revision:
+                checkout = source_root
+            else:
+                checkout = Path(temporary_directory) / "repo"
+                try:
+                    materialize_revision(selected, checkout)
+                except (OperationError, subprocess.CalledProcessError) as error:
+                    raise OperationError(
+                        f"Git commit {selected!r} is not available in the source repository"
+                    ) from error
+            assert request.path is not None
+            template_root = checkout.joinpath(*PurePosixPath(request.path).parts)
+            project = load_project_config(template_root)
+            catalog_root = template_root.joinpath(*project.stack_templates_path.parts)
+            paths = document_candidates(catalog_root, template_ref.name)
+            if len(paths) != 1:
+                raise OperationError(f"expected exactly one StackTemplate document for {template_ref.name!r}")
+            resource_path = paths[0].relative_to(template_root).as_posix()
+            template = _load_exact_stack_template_document(template_root, resource_path, template_ref.name)
+            return template, ResolvedStackTemplateSource(
+                fromGit=ResolvedGitSource(
+                    path=request.path,
+                    commit=selected,
+                    resourcePath=resource_path,
+                    digest=hashlib.sha256(paths[0].read_bytes()).hexdigest(),
+                    ref=request.ref,
+                )
             )
-        )
     template = templates.get(template_ref.name)
     if template is None:
         raise OperationError(f"Stack {template_ref.name!r} references missing StackTemplate")
@@ -2503,7 +2573,7 @@ def project_stack_resources(
         assert isinstance(authored_stack.spec, StackSpec)
         template_ref = _stack_template_reference(authored_stack.spec)
         template, resolved_source = _resolve_stack_template(
-            source_root, template_ref, templates, source_revision, current_desired, promotion
+            source_root, template_ref, templates, source_revision, promotion
         )
         stack = StackResource(
             authored_stack.gvk,

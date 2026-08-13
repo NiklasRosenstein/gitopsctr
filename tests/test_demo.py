@@ -10,6 +10,7 @@ from demo.docker import run as docker_demo
 from demo.k8s import run as k8s_demo
 from demo.utils import RefHeads
 from gitopsctr import controller
+from tests.stack_support import commit, git
 
 
 def test_k8s_controller_preserves_terminal_color_when_capturing(monkeypatch, tmp_path):
@@ -142,7 +143,7 @@ def test_k8s_demo_projects_source_tracked_stack_for_provider(tmp_path, monkeypat
     }
 
 
-def test_k8s_staging_stack_uses_local_template_with_promoted_image(tmp_path, monkeypatch):
+def test_k8s_staging_stack_uses_promoted_template_pin_with_target_parameters(tmp_path, monkeypatch):
     worktree = tmp_path / "repository"
     shutil.copytree(k8s_demo.TEMPLATE, worktree)
     monkeypatch.setattr(k8s_demo, "docker_platform", lambda: "linux/amd64")
@@ -150,7 +151,10 @@ def test_k8s_staging_stack_uses_local_template_with_promoted_image(tmp_path, mon
 
     stack = yaml.safe_load((worktree / "deployment/environments/staging/stacks/application.yaml").read_text())
 
-    assert stack["spec"]["template"] == "application"
+    assert stack["spec"]["template"] == {
+        "name": "application",
+        "source": {"fromPromotion": {"stack": "application"}},
+    }
     assert stack["spec"]["units"] == ["deploy"]
     assert stack["spec"]["artifactImports"] == [
         {
@@ -162,12 +166,16 @@ def test_k8s_staging_stack_uses_local_template_with_promoted_image(tmp_path, mon
         }
     ]
 
+    git(worktree, "init", "-b", "main")
+    source_revision = commit(worktree, "configured demo")
+    monkeypatch.setattr(controller, "REPOSITORY_ROOT", worktree)
+    controller._state_store.cache_clear()
     dev_desired = tmp_path / "dev-desired"
-    controller.project_stack_resources(worktree, "dev", "a" * 40, dev_desired, worktree)
+    controller.project_stack_resources(worktree, "dev", source_revision, dev_desired, worktree)
     staging = controller.project_stack_resources(
         worktree,
         "staging",
-        "a" * 40,
+        source_revision,
         tmp_path / "staging-desired",
         worktree,
         promotion=controller.PromotionContext(
@@ -176,7 +184,7 @@ def test_k8s_staging_stack_uses_local_template_with_promoted_image(tmp_path, mon
             desired_revision="b" * 40,
             observed_ref="gitopsctr/observed/dev",
             observed_revision="c" * 40,
-            specification_revision="a" * 40,
+            specification_revision=source_revision,
             desired_root=dev_desired,
         ),
     )

@@ -17,7 +17,7 @@ from gitopsctr.state import ControllerPin, ControllerPinClaim
 from tests.stack_deletion_support import deletion_args as _args
 from tests.stack_deletion_support import fake_git as _fake_git
 from tests.stack_deletion_support import stack_tree as _stack_tree
-from tests.stack_support import project_repository, write_projected_units, write_stack_source
+from tests.stack_support import commit, git, project_repository, write_projected_units, write_stack_source
 
 
 def _write_project_template(root: Path, environment_name: str, stack: dict[str, object]) -> Path:
@@ -113,7 +113,9 @@ def test_stack_source_variants_pin_and_reconcile_from_desired_projection(tmp_pat
     assert dependencies["application--deploy"] == ()
 
 
-def test_from_git_stack_source_does_not_create_catalog_or_read_source_during_reconcile(tmp_path: Path):
+def test_from_git_stack_source_does_not_create_catalog_or_read_source_during_reconcile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     source = tmp_path / "source"
     project_repository(source)
     external = source / "external"
@@ -155,8 +157,12 @@ def test_from_git_stack_source_does_not_create_catalog_or_read_source_during_rec
             }
         )
     )
+    git(source, "init", "-b", "main")
+    source_revision = commit(source, "external StackTemplate")
+    monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
+    controller._state_store.cache_clear()
     desired = tmp_path / "desired"
-    projection = controller.project_stack_resources(source, "dev", "c" * 40, desired, source)
+    projection = controller.project_stack_resources(source, "dev", source_revision, desired, source)
     assert not list((desired / "stack-templates").glob("*"))
     assert projection.generated_units
     stack = controller.RESOURCE_CATALOG.parse_stack(
@@ -176,7 +182,7 @@ def test_from_git_stack_source_does_not_create_catalog_or_read_source_during_rec
     assert "application--image" in specifications
 
 
-def test_from_promotion_copies_exact_source_and_projects_subset(tmp_path: Path):
+def test_from_promotion_loads_exact_source_and_projects_subset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     source = tmp_path / "source"
     project_repository(source)
     _write_project_template(
@@ -189,8 +195,12 @@ def test_from_promotion_copies_exact_source_and_projects_subset(tmp_path: Path):
             "spec": {"template": "application"},
         },
     )
+    git(source, "init", "-b", "main")
+    source_revision = commit(source, "template A and dev Stack")
+    monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
+    controller._state_store.cache_clear()
     dev_desired = tmp_path / "dev-desired"
-    dev_projection = controller.project_stack_resources(source, "dev", "e" * 40, dev_desired, source)
+    dev_projection = controller.project_stack_resources(source, "dev", source_revision, dev_desired, source)
     write_projected_units(dev_desired, dev_projection, source)
     _write_project_template(
         source,
@@ -212,13 +222,15 @@ def test_from_promotion_copies_exact_source_and_projects_subset(tmp_path: Path):
     promotion = controller.PromotionContext(
         source_environment="dev",
         desired_ref="deploy/dev",
-        desired_revision="e" * 40,
+        desired_revision="d" * 40,
         observed_ref="observed/dev",
         observed_revision=None,
-        specification_revision="e" * 40,
+        specification_revision=source_revision,
         desired_root=dev_desired,
     )
-    projection = controller.project_stack_resources(source, "staging", "f" * 40, staging, source, promotion=promotion)
+    projection = controller.project_stack_resources(
+        source, "staging", source_revision, staging, source, promotion=promotion
+    )
     assert sorted(projection.generated_units) == ["staging--deploy"]
     stack = controller.RESOURCE_CATALOG.parse_stack(
         controller.RESOURCE_CATALOG.load_document(next((staging / "stacks").glob("staging.*"))),
@@ -227,7 +239,7 @@ def test_from_promotion_copies_exact_source_and_projects_subset(tmp_path: Path):
     )
     assert isinstance(stack.spec, controller.DesiredStackSpec)
     assert stack.spec.resolvedSource is not None
-    assert stack.spec.resolvedSource.fromGit.commit == "e" * 40
+    assert stack.spec.resolvedSource.fromGit.commit == source_revision
     dev_stack = controller.RESOURCE_CATALOG.parse_stack(
         controller.RESOURCE_CATALOG.load_document(next((dev_desired / "stacks").glob("application.*"))),
         profile="desired",

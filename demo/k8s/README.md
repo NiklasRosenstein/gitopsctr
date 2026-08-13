@@ -11,16 +11,18 @@ Normal mode combines three pinned inputs rather than copying dev's entire desire
 
 ```mermaid
 flowchart LR
-  specification["Specification revision<br/>staging Stack and StackTemplate"] --> staging["Staging desired state"]
-  desired["Dev desired revision<br/>source Stack and image Unit"] --> import["Promoted image import"]
+  specification["Specification revision<br/>staging Stack and parameters"] --> staging["Staging desired state"]
+  desired["Dev desired revision<br/>source Stack and template pin"] --> template["Load exact parameterized template"]
+  template --> staging
+  desired --> import["Promoted image import"]
   observed["Dev observed revision<br/>receipt and image artifact"] --> import
   import --> staging
 ```
 
-The staging Stack uses `template: application`, so its staging parameters are expanded against the StackTemplate in
-the pinned specification revision. Its `artifactImports[].fromPromotion` selects the exact `image/containers` artifact
-proven in dev. It deliberately does not use `template.source.fromPromotion`, which would reuse dev's already-expanded
-projection and therefore could not accept staging parameters. See
+The staging Stack uses `template.source.fromPromotion`, so the controller loads the exact StackTemplate commit and
+digest recorded by dev, then expands that original parameterized template with staging's workload name, message, and
+cluster settings. Its separate `artifactImports[].fromPromotion` selects the exact `image/containers` artifact proven
+in dev. Template lineage and image lineage are therefore explicit and independently inspectable. See
 [Promotion](../../docs/apis/promotion.md#how-target-desired-state-is-built) and
 [Stacks and StackTemplates](../../docs/apis/stacks.md#promotion-and-template-selection).
 

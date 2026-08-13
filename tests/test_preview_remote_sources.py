@@ -67,7 +67,9 @@ def _git_daemon(base: Path, repository: Path) -> Iterator[GitDaemon]:
         daemon.stop()
 
 
-def _remote_repository(tmp_path: Path, *, include_template: bool = True) -> tuple[Path, Path, str]:
+def _remote_repository(
+    tmp_path: Path, *, include_template: bool = True, parameterized: bool = False
+) -> tuple[Path, Path, str]:
     remote = tmp_path / "stack-templates.git"
     working = tmp_path / "stack-templates-working"
     working.mkdir()
@@ -87,15 +89,15 @@ def _remote_repository(tmp_path: Path, *, include_template: bool = True) -> tupl
     templates = working / "deployment/stack-templates"
     templates.mkdir(parents=True)
     if include_template:
-        (templates / "application.json").write_text(json.dumps(_template("A")))
+        (templates / "application.json").write_text(json.dumps(_template("A", parameterized=parameterized)))
     revision_a = commit(working, "template A")
     git(working, "push", "-u", "origin", "main")
     git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
     return remote, working, revision_a
 
 
-def _template(marker: str) -> dict[str, object]:
-    return {
+def _template(marker: str, *, parameterized: bool = False) -> dict[str, object]:
+    template: dict[str, object] = {
         "apiVersion": "gitopsctr.io/v1",
         "kind": "StackTemplate",
         "metadata": {"name": "application"},
@@ -112,6 +114,12 @@ def _template(marker: str) -> dict[str, object]:
             }
         },
     }
+    if parameterized:
+        template["spec"]["parameters"] = [{"name": "target", "type": "string"}]
+        template["spec"]["unitTemplates"]["deploy"]["spec"]["terraform"]["variables"]["target"] = {
+            "fromParameter": {"name": "target"}
+        }
+    return template
 
 
 def _target_repository(tmp_path: Path, source: dict[str, object]) -> tuple[Path, str]:
@@ -213,6 +221,85 @@ def test_fixed_remote_commit_stays_pinned_after_main_moves(tmp_path: Path, monke
         target, "dev", materialized_b, target_revision, tmp_path / "reconcile-fixed"
     )
     assert specifications["application--deploy"].spec.terraform.variables["marker"] == "A"
+
+
+def test_promoted_remote_source_uses_exact_commit_with_target_parameters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    remote, working, revision_a = _remote_repository(tmp_path, parameterized=True)
+    with _git_daemon(tmp_path, remote) as daemon:
+        source_stack = _stack_source(daemon.url)
+        source_stack["spec"]["parameters"] = {"target": "dev"}
+        target, target_revision_a = _target_repository(tmp_path, source_stack)
+        monkeypatch.setattr(controller, "REPOSITORY_ROOT", target)
+        controller._state_store.cache_clear()
+        dev_desired = tmp_path / "dev-desired"
+        controller.project_stack_resources(target, "dev", target_revision_a, dev_desired, target)
+
+        (working / "deployment/stack-templates/application.json").write_text(
+            json.dumps(_template("B", parameterized=True))
+        )
+        revision_b = commit(working, "template B")
+        git(working, "push", "origin", "main")
+        assert revision_b != revision_a
+
+        staging = target / "deployment/environments/staging"
+        (staging / "stacks").mkdir(parents=True)
+        (staging / "environment.json").write_text(
+            json.dumps(
+                {
+                    "apiVersion": "gitopsctr.io/v1",
+                    "kind": "Environment",
+                    "metadata": {"name": "staging"},
+                    "spec": {},
+                }
+            )
+        )
+        promoted_stack = _stack_source(daemon.url)
+        promoted_stack["spec"] = {
+            "template": {
+                "name": "application",
+                "source": {"fromPromotion": {"stack": "application"}},
+            },
+            "parameters": {"target": "staging"},
+        }
+        (staging / "stacks/application.json").write_text(json.dumps(promoted_stack))
+        target_revision_b = commit(target, "staging promotion")
+        promotion = controller.PromotionContext(
+            source_environment="dev",
+            desired_ref="deploy/dev",
+            desired_revision="d" * 40,
+            observed_ref="observed/dev",
+            observed_revision=None,
+            specification_revision=target_revision_b,
+            desired_root=dev_desired,
+        )
+
+        output = tmp_path / "staging-desired"
+        projection = controller.project_stack_resources(
+            target,
+            "staging",
+            target_revision_b,
+            output,
+            target,
+            promotion=promotion,
+        )
+        variables = projection.generated_units["application--deploy"].spec.terraform.variables
+        assert variables == {"marker": "A", "target": "staging"}
+        resolved = _stack(output).spec.resolvedSource.fromGit
+        assert resolved.remote == daemon.url
+        assert resolved.commit == revision_a
+
+        daemon.stop()
+        with pytest.raises(OperationError, match="could not fetch"):
+            controller.project_stack_resources(
+                target,
+                "staging",
+                target_revision_b,
+                tmp_path / "unavailable-remote",
+                target,
+                promotion=promotion,
+            )
 
 
 @pytest.mark.parametrize(

@@ -84,9 +84,11 @@ Here, `template: application` resolves the template from the pinned specificatio
 `image/containers` from the source Stack using the pinned source desired and observed trees, validates its receipt and
 digest, and records immutable import lineage in the target desired Stack.
 
-This differs from `template.source.fromPromotion`, which reuses the source Stack's already-expanded template
-projection. That form has no unbound parameters left and is appropriate only when the target wants the source
-projection as-is. See [Promotion and template selection](stacks.md#promotion-and-template-selection).
+`template.source.fromPromotion` makes a different, independent selection: it follows the source Stack's recorded
+StackTemplate commit, path, and digest, verifies that exact parameterized document, and expands it with the target
+Stack's parameters and Unit selection. It does not reuse the source Stack's expanded projection. A target Stack is not
+required to choose this mode merely because its Environment is promotion-tracked. See [Promotion and template
+selection](stacks.md#promotion-and-template-selection).
 
 During desired-state resolution, [`fromPromotion`](../references.md#promotion-selectors) reads public unit `spec`
 values from the pinned source desired revision. Broken selectors in an active Promotion are errors. They do not make

@@ -719,7 +719,7 @@ type StackTemplateSource = StackTemplateFromResource | StackTemplateFromGit | St
 
 @dataclass(frozen=True, kw_only=True)
 class ResolvedStackTemplateSource(StrictModel):
-    """The exact Git source used by a Stack, including promoted copies."""
+    """The exact parameterized StackTemplate source pin selected for a Stack."""
 
     fromGit: ResolvedGitSource
 
