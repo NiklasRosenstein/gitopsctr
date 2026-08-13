@@ -17,7 +17,7 @@ Source and desired state have different workflows:
 | --- | --- | --- |
 | `create <kind> --in=source` | Project files | Scaffold an authored resource. |
 | `create stack --in=state` | Desired ref | Create a direct Stack from a trusted template revision. |
-| `apply <kind> --in=state` | Desired ref | Create or update a direct resource. |
+| `apply stack|unit --in=state` | Desired ref | Create or update a direct resource. |
 | `delete <kind> --in=source` | Project files | Remove an authored resource; Git records the change. |
 | `delete <kind> --in=state` | Desired ref | Request UID-fenced lifecycle deletion. |
 
@@ -125,9 +125,9 @@ resolved and pinned during instantiation.
 Instantiation creates a CAS-fenced controller claim and pins the exact template
 revision on a controller-owned ref. The pin remains available while the Stack
 and its Units are being torn down and is released only after successful
-target finalization. A gated finalization retains a cleanup intent until the
-candidate is applied; a later `finalize-stack` retry releases the pin and claim
-under their UID-/revision fences. Unclaimed legacy pins remain retained.
+target finalization. A gated finalization retains the deletion-marked resource
+until the candidate is applied; a later `finalize` retry releases the pin and
+claim under their UID-/revision fences. Unclaimed legacy pins remain retained.
 
 When a pull request closes, loses its required label, or expires, trusted CI may
 request deletion immediately with `delete stack --in=state`. A scheduled CI
@@ -135,7 +135,7 @@ job owned by the deployment may recover missed events by enumerating preview
 lineage, consulting the forge, and invoking the same UID-fenced deletion and
 finalization commands. The core CLI does not inspect forge state, decide
 eligibility, detect orphaned previews, or release pins through an out-of-band
-path. The Unit finalization commands must complete the owned closure before the
+path. The finalization commands must complete the owned closure before the
 Stack root can be finalized.
 
 ### Update and deletion
@@ -160,6 +160,29 @@ If an input artifact is not observed yet, advance and reconcile the producer,
 then retry the update with a new request ID. The update preserves the Stack and
 child Unit UIDs.
 
+### Deletion metadata
+
+Deletion is recorded on the retained desired resource:
+
+```yaml
+metadata:
+  ownerReferences:
+    - apiVersion: gitopsctr.io/v1
+      kind: Stack
+      name: pr-123
+      uid: <stack-uid>
+  deletion:
+    generation: 1
+    resourceDigest: sha256:<digest>
+```
+
+`ownerReferences` identifies the UID-fenced owner. `deletion` marks the
+resource for terminal deletion and protects its contents while cleanup runs.
+Children are found from their owner references and finalized before the owner.
+The deletion generation and resource digest are required finalization fences.
+A root keeps `metadata.lifecycle.management` and does not use
+`ownerReferences`.
+
 When the preview is no longer eligible, request deletion with the current Stack
 UID:
 
@@ -175,9 +198,17 @@ Reconcile and finalize each owned Unit in reverse dependency order. Then
 finalize the Stack root with its deletion generation:
 
 ```console
-gitopsctr finalize-stack \
+gitopsctr finalize unit \
   --environment preview \
-  --stack pr-123 \
+  --name pr-123--deploy \
+  --uid "$UNIT_UID" \
+  --deletion-generation "$UNIT_DELETION_GENERATION"
+```
+
+```console
+gitopsctr finalize stack \
+  --environment preview \
+  --name pr-123 \
   --uid "$STACK_UID" \
   --deletion-generation "$STACK_DELETION_GENERATION"
 ```
@@ -252,14 +283,15 @@ to the controller.
 - Verify desired state and the UID before every deletion request. A stale UID
   must stop cleanup; forge eligibility is the responsibility of the external CI
   orchestrator.
-- Keep controller pin refs and desired deletion intents observable until the
-  Stack closure is finalized; do not manually delete either as a cleanup
-  shortcut.
+- Keep controller pin refs and deletion-marked desired resources observable
+  until the Stack closure is finalized; do not manually delete either as a
+  cleanup shortcut.
 - For an unparseable cleanup root, restore the matching driver and use
   `recover-opaque-unit` when possible. If the external resource was cleaned up
-  outside gitopsctr, use `resolve-opaque-unit --uid ... --reason ...
-  --confirm-external-cleanup`. The command is UID-fenced and rejects parseable
-  roots, active leases, and roots with deletion intents.
+  outside gitopsctr, use `resolve-opaque-unit --uid ...
+  --deletion-generation ... --reason ... --confirm-external-cleanup`. The command
+  is UID- and deletion-generation-fenced and rejects parseable roots, active
+  leases, and roots that are not marked for deletion.
 
 ## Compatibility audit
 

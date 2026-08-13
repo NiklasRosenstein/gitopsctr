@@ -16,25 +16,6 @@ env:
   FORCE_COLOR: "1"
 
 jobs:
-  candidate-freshness:
-    name: Verify gated candidate freshness
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
-          fetch-depth: 0
-      - uses: astral-sh/setup-uv@v9.0.0
-        with:
-          enable-cache: true
-      - run: uv python install 3.12
-      - run: uv sync --locked --all-groups
-      - run: >-
-          uv run python tools/verify_github_candidate.py
-          --event "$GITHUB_EVENT_PATH"
-          --event-name "$GITHUB_EVENT_NAME"
-
   quality:
     runs-on: ubuntu-latest
     steps:

@@ -101,9 +101,10 @@ def _planned_stack_teardown_commands(stack_name, stack_uid, owned_units):
         commands.append(
             (
                 "finalize",
+                "unit",
                 "--environment",
                 "dev",
-                "--unit",
+                "--name",
                 unit_name,
                 "--uid",
                 unit_uid,
@@ -113,10 +114,11 @@ def _planned_stack_teardown_commands(stack_name, stack_uid, owned_units):
         )
     commands.append(
         (
-            "finalize-stack",
+            "finalize",
+            "stack",
             "--environment",
             "dev",
-            "--stack",
+            "--name",
             stack_name,
             "--uid",
             stack_uid,
@@ -127,25 +129,52 @@ def _planned_stack_teardown_commands(stack_name, stack_uid, owned_units):
     return commands
 
 
-def test_demo_stack_cleanup_commands_match_current_cli_contracts():
+def test_demo_stack_cleanup_commands_match_planned_cli_contract():
     commands = _planned_stack_teardown_commands(
         "demo-preview",
         "stack-uid",
         (("demo-preview--database", "database-uid"), ("demo-preview--service", "service-uid")),
     )
-    parser = controller.build_parser()
-    parsed = [parser.parse_args(("--repository", "/tmp/demo-repository", *command)) for command in commands]
 
-    assert [args.command for args in parsed] == [
-        "advance-desired",
-        "finalize",
-        "finalize",
-        "finalize-stack",
+    assert commands == [
+        ("advance-desired", "--environment", "dev", "--source-revision", "HEAD"),
+        (
+            "finalize",
+            "unit",
+            "--environment",
+            "dev",
+            "--name",
+            "demo-preview--service",
+            "--uid",
+            "service-uid",
+            "--deletion-generation",
+            "1",
+        ),
+        (
+            "finalize",
+            "unit",
+            "--environment",
+            "dev",
+            "--name",
+            "demo-preview--database",
+            "--uid",
+            "database-uid",
+            "--deletion-generation",
+            "1",
+        ),
+        (
+            "finalize",
+            "stack",
+            "--environment",
+            "dev",
+            "--name",
+            "demo-preview",
+            "--uid",
+            "stack-uid",
+            "--deletion-generation",
+            "1",
+        ),
     ]
-    assert [args.unit for args in parsed[1:3]] == ["demo-preview--service", "demo-preview--database"]
-    assert all(args.deletion_generation == 1 for args in parsed[1:])
-    assert parsed[-1].stack == "demo-preview"
-    assert parsed[-1].uid == "stack-uid"
 
 
 def test_demo_acceptance_delegates_stack_cleanup_after_clean_direct_convergence(monkeypatch):

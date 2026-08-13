@@ -12,6 +12,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
 
 import yaml
@@ -305,6 +306,59 @@ def _preview_desired_tree(environment: str, label: str) -> Path:
     return output
 
 
+def _desired_metadata(desired: Path, directory: str, name: str) -> Mapping[str, object]:
+    paths = controller.document_candidates(desired / directory, name)
+    if len(paths) != 1:
+        raise RuntimeError(f"expected one desired {directory[:-1]} resource named {name}")
+    document = controller.RESOURCE_CATALOG.load_document(paths[0])
+    metadata = document.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"desired {directory[:-1]} resource {name} has no metadata")
+    return metadata
+
+
+def _deletion_generation(metadata: Mapping[str, object], resource_name: str) -> int:
+    deletion = metadata.get("deletion")
+    if not isinstance(deletion, dict) or not isinstance(deletion.get("generation"), int):
+        raise RuntimeError(f"desired resource {resource_name} has no deletion metadata")
+    return deletion["generation"]
+
+
+def _owned_unit_records(desired: Path, owner_name: str, owner_uid: str) -> list[tuple[str, str, int]]:
+    records: list[tuple[str, str, int]] = []
+    units_directory = desired / "units"
+    for path in sorted(units_directory.iterdir()):
+        if not path.is_file():
+            continue
+        document = controller.RESOURCE_CATALOG.load_document(path)
+        metadata = document.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        references = metadata.get("ownerReferences")
+        if not isinstance(references, list):
+            continue
+        owned = any(
+            isinstance(reference, dict)
+            and reference.get("apiVersion") == "gitopsctr.io/v1"
+            and reference.get("kind") == "Stack"
+            and reference.get("name") == owner_name
+            and reference.get("uid") == owner_uid
+            for reference in references
+        )
+        if not owned:
+            continue
+        name = metadata.get("name")
+        uid = metadata.get("uid")
+        if not isinstance(name, str) or not isinstance(uid, str):
+            raise RuntimeError(f"owned desired Unit in {path} has no name or UID")
+        records.append((name, uid, _deletion_generation(metadata, name)))
+    return records
+
+
+def _reverse_demo_unit_order(records: list[tuple[str, str, int]]) -> list[tuple[str, str, int]]:
+    return sorted(records, key=lambda record: (not record[0].endswith("--deploy"), record[0]))
+
+
 def _preview_artifact_uri(environment: str, unit_name: str, label: str) -> str:
     store = GitStateStore(PREVIEW_WORKTREE)
     revision = store.fetch(f"gitopsctr/observed/{environment}").revision
@@ -485,46 +539,52 @@ def _delete_direct_preview() -> None:
         raise RuntimeError("direct preview Stack has no UID")
     _run_controller_at(
         PREVIEW_WORKTREE,
-        "request-delete-direct-stack",
+        "delete",
+        "stack",
+        "--in=state",
         "--environment",
         "preview",
-        "--stack",
+        "--name",
         "preview",
         "--uid",
         stack.metadata.uid,
     )
     desired = _preview_desired_tree("preview", "delete-request")
-    stack_intent = controller.load_desired_stack_deletion_intents(desired).get("preview")
-    if stack_intent is None:
-        raise RuntimeError("direct preview deletion did not create a Stack intent")
-    for identity in ("preview--deploy", "preview--image"):
-        unit_intent = controller.load_desired_deletion_intents(desired).get(identity)
-        if unit_intent is None:
-            raise RuntimeError(f"direct preview deletion did not create a Unit intent for {identity}")
+    stack_metadata = _desired_metadata(desired, "stacks", "preview")
+    stack_deletion_generation = _deletion_generation(stack_metadata, "preview")
+    stack_uid = stack_metadata.get("uid")
+    if stack_uid != stack.metadata.uid:
+        raise RuntimeError("direct preview deletion changed the Stack UID")
+    owned_units = _reverse_demo_unit_order(_owned_unit_records(desired, "preview", stack.metadata.uid))
+    if not owned_units:
+        raise RuntimeError("direct preview deletion did not retain owned Units")
+    for unit_name, unit_uid, deletion_generation in owned_units:
         _run_controller_at(
             PREVIEW_WORKTREE,
             "finalize",
+            "unit",
             "--environment",
             "preview",
-            "--unit",
-            identity,
+            "--name",
+            unit_name,
             "--uid",
-            unit_intent.uid,
+            unit_uid,
             "--deletion-generation",
-            str(unit_intent.deletion_generation),
+            str(deletion_generation),
         )
-        desired = _preview_desired_tree("preview", f"finalize-{identity}")
+        desired = _preview_desired_tree("preview", f"finalize-{unit_name}")
     _run_controller_at(
         PREVIEW_WORKTREE,
-        "finalize-stack",
+        "finalize",
+        "stack",
         "--environment",
         "preview",
-        "--stack",
+        "--name",
         "preview",
         "--uid",
-        stack_intent.uid,
+        stack.metadata.uid,
         "--deletion-generation",
-        str(stack_intent.deletion_generation),
+        str(stack_deletion_generation),
     )
     if run("docker", "container", "inspect", PREVIEW_APP_NAMES["preview"], check=False, capture=True).returncode == 0:
         raise RuntimeError("direct preview finalization left its Docker container running")
@@ -829,35 +889,39 @@ def stack_acceptance(registry_port: int, app_port: int) -> None:
         remove_stack_source()
         _run_controller("advance-desired", "--environment", "dev", "--source-revision", "HEAD")
         desired = _desired_tree()
-        stack_intent = controller.load_desired_stack_deletion_intents(desired).get("preview")
-        if stack_intent is None:
-            raise RuntimeError("Stack removal did not create a deletion intent")
-        for identity in reversed(stack_intent.owned_unit_closure):
-            unit_intent = controller.load_desired_deletion_intents(desired).get(identity.unit_name)
-            if unit_intent is None:
-                raise RuntimeError(f"Stack removal did not create a Unit deletion intent for {identity.unit_name}")
+        stack_metadata = _desired_metadata(desired, "stacks", "preview")
+        stack_uid = stack_metadata.get("uid")
+        if not isinstance(stack_uid, str):
+            raise RuntimeError("Stack removal did not retain the Stack UID")
+        stack_deletion_generation = _deletion_generation(stack_metadata, "preview")
+        owned_units = _reverse_demo_unit_order(_owned_unit_records(desired, "preview", stack_uid))
+        if not owned_units:
+            raise RuntimeError("Stack removal did not retain its owned Units")
+        for unit_name, unit_uid, deletion_generation in owned_units:
             _run_controller(
                 "finalize",
+                "unit",
                 "--environment",
                 "dev",
-                "--unit",
-                identity.unit_name,
+                "--name",
+                unit_name,
                 "--uid",
-                unit_intent.uid,
+                unit_uid,
                 "--deletion-generation",
-                str(unit_intent.deletion_generation),
+                str(deletion_generation),
             )
             desired = _desired_tree()
         _run_controller(
-            "finalize-stack",
+            "finalize",
+            "stack",
             "--environment",
             "dev",
-            "--stack",
+            "--name",
             "preview",
             "--uid",
-            stack_intent.uid,
+            stack_uid,
             "--deletion-generation",
-            str(stack_intent.deletion_generation),
+            str(stack_deletion_generation),
         )
         absent = run("docker", "container", "inspect", STACK_APP_NAME, check=False, capture=True)
         if absent.returncode == 0:

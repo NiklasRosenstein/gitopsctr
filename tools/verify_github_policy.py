@@ -1,4 +1,4 @@
-"""Verify GitHub branch protection requires the candidate freshness check."""
+"""Verify GitHub branch protection and, when requested, required checks."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def _required_checks(policy: object) -> list[str]:
 def verify_policy(
     repository: str,
     branch: str,
-    required_check: str,
+    required_check: str | None = None,
     *,
     runner: CommandRunner = run_command,
 ) -> dict[str, Any]:
@@ -92,8 +92,8 @@ def verify_policy(
         return report
     report["protected"] = True
     report["requiredChecks"] = checks
-    if required_check not in checks:
-        report["error"] = "required candidate freshness check is not configured"
+    if required_check is not None and required_check not in checks:
+        report["error"] = f"required check is not configured: {required_check}"
         return report
     report["clean"] = True
     return report
@@ -103,7 +103,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", required=True, help="GitHub repository in owner/name form")
     parser.add_argument("--branch", required=True)
-    parser.add_argument("--required-check", required=True)
+    parser.add_argument(
+        "--required-check",
+        help="Optional required status check to verify (use for deployment repositories)",
+    )
     args = parser.parse_args()
     if not re.fullmatch(r"[^/\s]+/[^/\s]+", args.repository):
         parser.error("--repository must use owner/name form")

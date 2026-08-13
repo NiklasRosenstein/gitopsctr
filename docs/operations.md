@@ -22,20 +22,6 @@ gitopsctr dependencies --environment dev --unit application
 gitopsctr validate
 ```
 
-Check that the GitHub branch protects the candidate-freshness status check:
-
-```console
-uv run python tools/verify_github_policy.py \
-  --repository NiklasRosenstein/gitopsctr \
-  --branch main \
-  --required-check "CI / Verify gated candidate freshness"
-```
-
-The command makes a read-only `gh api` request and emits stable JSON. It exits
-with a non-zero status when the branch is unprotected, the policy is invalid,
-the API fails, or the check is absent. The check name must match the GitHub
-status context exactly.
-
 `show receipt --artifact NAME` prints one typed artifact and `--artifacts` prints all artifacts. Add `--json` or
 `--yaml` to the `show` commands to override the Project's preferred output format.
 
@@ -119,11 +105,12 @@ After configuring branch protection or a merge queue, run the read-only verifier
 ```console
 python tools/verify_github_policy.py \
   --repository OWNER/REPOSITORY \
-  --branch main \
-  --required-check 'CI / Verify gated candidate freshness'
+  --branch main
 ```
 
 It prints versioned JSON and returns non-zero if the branch is unprotected, the
-GitHub API fails, the policy is malformed, or the candidate-freshness check is
-not required. It verifies branch protection only; it does not inspect or change
-GitHub rulesets or merge-queue settings.
+GitHub API fails, or the policy is malformed. Deployment repositories that use
+gated candidates may add `--required-check` to verify a specific required status
+context. This repository does not require the candidate-freshness check because
+its CI does not publish deployed desired state. The verifier does not inspect or
+change GitHub rulesets or merge-queue settings.

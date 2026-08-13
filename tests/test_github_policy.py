@@ -40,6 +40,19 @@ def test_policy_accepts_contexts_and_checks_shapes():
     assert report["requiredChecks"] == ["CI / Verify gated candidate freshness", "lint"]
 
 
+def test_policy_accepts_protected_branch_without_candidate_check():
+    report = verify_policy(
+        "example/project",
+        "main",
+        runner=_runner({"required_status_checks": {"contexts": ["lint"]}}),
+    )
+
+    assert report["clean"] is True
+    assert report["protected"] is True
+    assert report["requiredCheck"] is None
+    assert report["requiredChecks"] == ["lint"]
+
+
 def test_policy_rejects_unprotected_branch():
     report = verify_policy(
         "example/project",
@@ -63,7 +76,7 @@ def test_policy_rejects_missing_required_check():
 
     assert report["clean"] is False
     assert report["protected"] is True
-    assert report["error"] == "required candidate freshness check is not configured"
+    assert report["error"] == "required check is not configured: CI / Verify gated candidate freshness"
 
 
 def test_policy_encodes_branch_names_and_uses_read_only_get():
