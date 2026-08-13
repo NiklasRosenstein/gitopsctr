@@ -5,14 +5,34 @@ from __future__ import annotations
 import json
 import shutil
 from argparse import Namespace
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from gitopsctr import controller
 from gitopsctr.errors import OperationError
-from tests.test_finalization import _terraform_unit
+
+
+def _terraform_unit(name: str, uid: str) -> dict[str, object]:
+    metadata = controller.ResourceMetadata(
+        name=name,
+        uid=uid,
+        lifecycle=controller.DesiredLifecycle(management=controller.LifecycleManagement(mode="sourceTracked")),
+    )
+    return {
+        "apiVersion": "unit.gitopsctr.io/v1",
+        "kind": "Terraform",
+        "metadata": metadata.document(profile="desired"),
+        "spec": {
+            "source": {
+                "path": "infra/deploy",
+                "revision": "a" * 40,
+                "inputHash": "sha256:" + "1" * 64,
+                "driverVersion": controller.DRIVER_VERSIONS["terraform"],
+            },
+            "terraform": {"backend": {}, "variables": {}, "observeOutputs": []},
+        },
+    }
 
 
 def _install_tree(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -129,17 +149,11 @@ def test_compatibility_audit_reports_legacy_unit(tmp_path: Path, monkeypatch, ca
     ]
 
 
-def test_compatibility_audit_reports_opaque_and_unverified_cleanup_state(tmp_path: Path, monkeypatch, capsys):
+def test_compatibility_audit_reports_opaque_cleanup_state(tmp_path: Path, monkeypatch, capsys):
     root = tmp_path / "desired"
     unit_path = root / "units/application.json"
     unit_path.parent.mkdir(parents=True)
     unit_path.write_text(json.dumps(_terraform_unit("application", "d1-application")))
-    unit = controller.load_desired_unit(unit_path, "application")
-    intent = replace(
-        controller.UnitDeletionIntent.from_unit(unit, unit_path, root),
-        retained_identity_known=False,
-    )
-    controller.write_deletion_intent(root, intent)
     controller.write_opaque_cleanup_root(
         root,
         "orphan",
@@ -152,15 +166,12 @@ def test_compatibility_audit_reports_opaque_and_unverified_cleanup_state(tmp_pat
     )
 
     _install_tree(root, monkeypatch)
-    with pytest.raises(OperationError, match="2 finding"):
+    with pytest.raises(OperationError, match="1 finding"):
         controller.command_audit_desired_compatibility(Namespace(environment="dev", desired_ref="deploy/dev"))
     result = json.loads(capsys.readouterr().out)
     codes = {(finding["code"], finding["unit"]) for finding in result["findings"]}
 
-    assert codes == {
-        ("opaque-cleanup-root", "orphan"),
-        ("unverified-deletion-identity", "application"),
-    }
+    assert codes == {("opaque-cleanup-root", "orphan")}
 
 
 def test_aggregate_compatibility_audit_covers_multiple_environments(tmp_path: Path, monkeypatch, capsys):

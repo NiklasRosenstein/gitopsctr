@@ -279,31 +279,50 @@
     },
     "metadata": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "not": {
+            "required": [
+              "ownerReferences"
+            ]
+          },
+          "required": [
+            "lifecycle"
+          ]
+        },
+        {
+          "not": {
+            "required": [
+              "lifecycle"
+            ]
+          },
+          "required": [
+            "ownerReferences"
+          ]
+        }
+      ],
       "properties": {
+        "deletion": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "resourceDigest": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "generation",
+            "resourceDigest"
+          ],
+          "title": "DeletionMetadata",
+          "type": "object"
+        },
         "lifecycle": {
           "additionalProperties": false,
-          "oneOf": [
-            {
-              "not": {
-                "required": [
-                  "owner"
-                ]
-              },
-              "required": [
-                "management"
-              ]
-            },
-            {
-              "not": {
-                "required": [
-                  "management"
-                ]
-              },
-              "required": [
-                "owner"
-              ]
-            }
-          ],
           "properties": {
             "management": {
               "additionalProperties": false,
@@ -320,43 +339,51 @@
               ],
               "title": "LifecycleManagement",
               "type": "object"
-            },
-            "owner": {
-              "additionalProperties": false,
-              "properties": {
-                "apiVersion": {
-                  "minLength": 1,
-                  "type": "string"
-                },
-                "kind": {
-                  "minLength": 1,
-                  "type": "string"
-                },
-                "name": {
-                  "minLength": 1,
-                  "type": "string"
-                },
-                "uid": {
-                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "apiVersion",
-                "kind",
-                "name",
-                "uid"
-              ],
-              "title": "DesiredOwnerReference",
-              "type": "object"
             }
           },
+          "required": [
+            "management"
+          ],
           "title": "DesiredLifecycle",
           "type": "object"
         },
         "name": {
           "minLength": 1,
           "type": "string"
+        },
+        "ownerReferences": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "apiVersion": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "kind": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "name": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "uid": {
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "apiVersion",
+              "kind",
+              "name",
+              "uid"
+            ],
+            "title": "DesiredOwnerReference",
+            "type": "object"
+          },
+          "maxItems": 1,
+          "minItems": 1,
+          "type": "array"
         },
         "uid": {
           "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
@@ -365,8 +392,7 @@
       },
       "required": [
         "name",
-        "uid",
-        "lifecycle"
+        "uid"
       ],
       "type": "object"
     },

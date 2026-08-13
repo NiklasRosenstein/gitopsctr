@@ -93,9 +93,15 @@ def test_recreated_source_stack_does_not_reuse_finalized_uid(tmp_path: Path):
     shutil.copytree(initial, current)
     for path in (current / "stacks").glob("web.*"):
         path.unlink()
-    controller.write_stack_incarnation_tombstone(
+    controller.write_resource_incarnation_tombstone(
         current,
-        controller.StackIncarnationTombstone(stack_name="web", uid=old_stack.metadata.uid),
+        controller.ResourceIncarnationTombstone(
+            api_version=controller.CORE_API_VERSION,
+            kind="Stack",
+            name="web",
+            uid=old_stack.metadata.uid,
+            deletion_generation=1,
+        ),
     )
 
     candidate = tmp_path / "candidate"
@@ -106,6 +112,46 @@ def test_recreated_source_stack_does_not_reuse_finalized_uid(tmp_path: Path):
         expected_name="web",
     )
     assert new_stack.metadata.uid != old_stack.metadata.uid
+
+
+def test_resource_incarnation_lookup_uses_full_gvk(tmp_path: Path):
+    root = tmp_path / "desired"
+    terraform = controller.ResourceIncarnationTombstone(
+        api_version=controller.UNIT_API_VERSION,
+        kind="Terraform",
+        name="application",
+        uid="d1-terraform",
+        deletion_generation=1,
+    )
+    stack = controller.ResourceIncarnationTombstone(
+        api_version=controller.CORE_API_VERSION,
+        kind="Stack",
+        name="application",
+        uid="d1-stack",
+        deletion_generation=1,
+    )
+    controller.write_resource_incarnation_tombstone(root, terraform)
+    controller.write_resource_incarnation_tombstone(root, stack)
+    tombstones = controller.load_resource_incarnation_tombstones(root)
+
+    assert (
+        controller.finalized_incarnation_for_resource(
+            tombstones,
+            controller.UNIT_API_VERSION,
+            "Terraform",
+            "application",
+        )
+        == terraform
+    )
+    assert (
+        controller.finalized_incarnation_for_resource(
+            tombstones,
+            controller.CORE_API_VERSION,
+            "Stack",
+            "application",
+        )
+        == stack
+    )
 
 
 def test_source_absent_stack_root_is_retained_for_owned_unit_cleanup(tmp_path: Path):
@@ -133,7 +179,38 @@ def test_source_absent_stack_root_is_retained_for_owned_unit_cleanup(tmp_path: P
         expected_name="web",
     )
     assert retained_stack.metadata.uid == initial_stack.metadata.uid
+    assert retained_stack.metadata.deletion is not None
     assert list((next_candidate / "stack-templates").glob("preview.*"))
+
+
+def test_source_absent_stack_template_is_retained_for_finalization(tmp_path: Path):
+    source = tmp_path / "source"
+    environment = project_repository(source)
+    write_stack_source(environment)
+    initial = tmp_path / "initial"
+    controller.project_stack_resources(source, "dev", "a" * 40, initial, source)
+    initial_template_path = next((initial / "stack-templates").glob("preview.*"))
+    initial_template = controller.RESOURCE_CATALOG.parse_stack_template(
+        controller.RESOURCE_CATALOG.load_document(initial_template_path),
+        profile="desired",
+        expected_name="preview",
+    )
+    current = tmp_path / "current"
+    shutil.copytree(initial, current)
+
+    (environment / "stacks/web.json").unlink()
+    (environment / "stack-templates/preview.json").unlink()
+    candidate = tmp_path / "candidate"
+    controller.project_stack_resources(source, "dev", "b" * 40, candidate, source, current)
+
+    retained_path = next((candidate / "stack-templates").glob("preview.*"))
+    retained = controller.RESOURCE_CATALOG.parse_stack_template(
+        controller.RESOURCE_CATALOG.load_document(retained_path),
+        profile="desired",
+        expected_name="preview",
+    )
+    assert retained.metadata.uid == initial_template.metadata.uid
+    assert retained.metadata.deletion is not None
 
 
 def test_expanded_stack_dependencies_are_retained_and_validated(tmp_path: Path):
@@ -186,7 +263,7 @@ def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path:
         ResourceMetadata(
             name="web--preview-app",
             uid="d1-generated-preview-app",
-            lifecycle=DesiredLifecycle(owner=owner),
+            ownerReferences=[owner],
         )
     )
     controller.write_desired_candidate_unit(candidate / "units/web--preview-app.json", unit, source)
@@ -195,7 +272,7 @@ def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path:
     assert controller.desired_unit_names(candidate) == ("web--preview-app",)
     assert ("gitopsctr.io/v1", "StackTemplate", "preview") in graph
     assert ("gitopsctr.io/v1", "Stack", "web") in graph
-    assert graph[("unit.gitopsctr.io/v1", "Terraform", "web--preview-app")].metadata.lifecycle is not None
+    assert graph[("unit.gitopsctr.io/v1", "Terraform", "web--preview-app")].metadata.ownerReferences is not None
 
     bad_owner = DesiredOwnerReference(
         apiVersion=owner.apiVersion,
@@ -210,7 +287,7 @@ def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path:
                     ResourceMetadata(
                         name=value.name,
                         uid=value.metadata.uid,
-                        lifecycle=DesiredLifecycle(owner=bad_owner),
+                        ownerReferences=[bad_owner],
                     )
                 )
                 if key[2] == "web--preview-app"
@@ -260,14 +337,14 @@ def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
         ResourceMetadata(
             name="web--preview-app",
             uid="d1-unit-preview-app",
-            lifecycle=DesiredLifecycle(
-                owner=DesiredOwnerReference(
+            ownerReferences=[
+                DesiredOwnerReference(
                     apiVersion=controller.CORE_API_VERSION,
                     kind="Stack",
                     name="web",
                     uid="d1-stack-web",
                 )
-            ),
+            ],
         )
     )
     controller.write_desired_candidate_unit(desired / "units/web--preview-app.json", unit, source)
@@ -279,8 +356,8 @@ def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
         "a" * 40,
         tmp_path / "projection",
     )
-    assert specifications["web--preview-app"].metadata.lifecycle is not None
-    assert specifications["web--preview-app"].metadata.lifecycle.owner is not None
+    assert specifications["web--preview-app"].metadata.lifecycle is None
+    assert specifications["web--preview-app"].metadata.ownerReferences is not None
     assert dependencies == {"web--preview-app": ()}
 
 
@@ -417,6 +494,5 @@ def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Pat
     assert isinstance(stack.spec, controller.DesiredStackSpec)
     assert stack.spec.provenance is not None
     unit = controller.load_desired_unit(next((candidate / "units").glob("web--preview-app.*")), "web--preview-app")
-    assert unit.metadata.lifecycle is not None
-    assert unit.metadata.lifecycle.owner is not None
-    assert unit.metadata.lifecycle.owner.uid == stack.metadata.uid
+    assert unit.metadata.ownerReferences is not None
+    assert unit.metadata.ownerReferences[0].uid == stack.metadata.uid

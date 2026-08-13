@@ -27,6 +27,7 @@ from gitopsctr.driver import (
     PlanningContext,
     ReconciliationCapability,
     ReconciliationContext,
+    TeardownContext,
     UnitDriver,
     VerificationCapability,
     VerificationContext,
@@ -710,6 +711,42 @@ def test_terraform_plan_saves_binary_plan_and_rendered_report(tmp_path, monkeypa
     assert "-lock=false" in plan_command
     assert "-input=false" in plan_command
     assert "-no-color" in plan_command
+    assert not variable_file.exists()
+
+
+def test_terraform_teardown_uses_resolved_variables(tmp_path):
+    commands: list[tuple[str, ...]] = []
+    variable_file: Path | None = None
+
+    def fake_run(*args, **_kwargs):
+        nonlocal variable_file
+        commands.append(args)
+        if args[1] == "destroy":
+            variable_file = Path(next(value for value in args if value.startswith("-var-file=")).split("=", 1)[1])
+            assert json.loads(variable_file.read_text()) == {"environment": "dev"}
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    reconciliation = _terraform_context(tmp_path, tmp_path / "report")
+    result = terraform.DRIVER.teardown(
+        TeardownContext(
+            environment=reconciliation.environment,
+            desired_root=reconciliation.desired_root,
+            desired_revision=reconciliation.desired_revision,
+            source_root=reconciliation.source_root,
+            source_revision=reconciliation.source_revision,
+            source_path=reconciliation.source_path,
+            unit_name=reconciliation.unit_name,
+            unit=reconciliation.unit,
+            resource_uid="d1-terraform",
+            deletion_generation=1,
+            execution=execution_for(fake_run),
+        )
+    )
+
+    assert result.details == {"resourceUid": "d1-terraform", "deletionGeneration": 1}
+    assert variable_file is not None
+    destroy = next(command for command in commands if command[1] == "destroy")
+    assert f"-var-file={variable_file}" in destroy
     assert not variable_file.exists()
 
 

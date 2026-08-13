@@ -345,14 +345,26 @@ class DesiredOwnerReference(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class DesiredLifecycle(StrictModel):
-    """Exactly one root-management or owner authority for a desired resource."""
+    """Root lifecycle settings for a desired resource."""
 
     management: LifecycleManagement | None = None
-    owner: DesiredOwnerReference | None = None
+
+
+DELETION_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
+
+
+@dataclass(frozen=True, kw_only=True)
+class DeletionMetadata(StrictModel):
+    """Deletion state for one desired resource."""
+
+    generation: int
+    resourceDigest: Annotated[str, Pattern(DELETION_DIGEST_PATTERN)]
 
     def __post_init__(self) -> None:
-        if (self.management is None) == (self.owner is None):
-            raise ValueError("desired lifecycle requires exactly one of management or owner")
+        if self.generation < 1:
+            raise ValueError("deletion generation must be at least 1")
+        if not re.fullmatch(DELETION_DIGEST_PATTERN, self.resourceDigest):
+            raise ValueError("deletion resourceDigest must use sha256 and 64 lowercase hex characters")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -361,13 +373,23 @@ class DesiredResourceMetadata(StrictModel):
 
     name: str
     uid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
-    lifecycle: DesiredLifecycle
+    lifecycle: DesiredLifecycle | None = None
+    ownerReferences: list[DesiredOwnerReference] | None = None
+    deletion: DeletionMetadata | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("desired resource metadata.name must not be empty")
         if not re.fullmatch(DESIRED_UID_PATTERN, self.uid):
             raise ValueError("desired resource metadata.uid has an invalid format")
+        has_management = self.lifecycle is not None and self.lifecycle.management is not None
+        has_owner = self.ownerReferences is not None
+        if has_management == has_owner:
+            raise ValueError(
+                "desired resource metadata requires exactly one of lifecycle.management or ownerReferences"
+            )
+        if self.ownerReferences is not None and len(self.ownerReferences) != 1:
+            raise ValueError("desired resource metadata.ownerReferences must contain exactly one reference")
 
 
 @dataclass(frozen=True, kw_only=True)

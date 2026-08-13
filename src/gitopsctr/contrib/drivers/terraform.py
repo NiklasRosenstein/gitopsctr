@@ -481,22 +481,24 @@ class TerraformDriver(
 
     def teardown(self, context: TeardownContext[TerraformDesiredUnit]) -> TeardownResult:
         runtime = terraform_runtime(context)
-        context.execution.run(
-            "terraform",
-            "init",
-            *runtime.init_args,
-            cwd=runtime.working_directory,
-            env=runtime.environment,
-        )
-        context.execution.run(
-            "terraform",
-            "destroy",
-            "-auto-approve",
-            "-input=false",
-            "-no-color",
-            cwd=runtime.working_directory,
-            env=runtime.environment,
-        )
+        with terraform_variable_file(runtime) as variable_file:
+            context.execution.run(
+                "terraform",
+                "init",
+                *runtime.init_args,
+                cwd=runtime.working_directory,
+                env=runtime.environment,
+            )
+            context.execution.run(
+                "terraform",
+                "destroy",
+                *terraform_variable_file_args(variable_file),
+                "-auto-approve",
+                "-input=false",
+                "-no-color",
+                cwd=runtime.working_directory,
+                env=runtime.environment,
+            )
         return TeardownResult(
             details={"resourceUid": context.resource_uid, "deletionGeneration": context.deletion_generation}
         )

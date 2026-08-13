@@ -267,15 +267,20 @@ def test_source_tracked_stack_cleanup_is_durable_across_restart(tmp_path: Path):
         verbose=False,
     )
 
-    first_intent = controller.load_desired_stack_deletion_intents(candidate)["web"]
     assert first.blocked == {}
     assert initial_stack.metadata.uid is not None
-    assert first_intent.uid == initial_stack.metadata.uid
-    assert [identity.unit_name for identity in first_intent.owned_unit_closure] == ["web--preview-app"]
-    assert (
-        controller.load_desired_unit(candidate / "units/web--preview-app.json", "web--preview-app").metadata.uid
-        == "d1-web--preview-app"
+    deleting_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((candidate / "stacks").glob("web.*"))),
+        profile="desired",
+        expected_name="web",
     )
+    deleting_unit = controller.load_desired_unit(candidate / "units/web--preview-app.json", "web--preview-app")
+    assert deleting_stack.metadata.deletion is not None
+    assert deleting_stack.metadata.deletion.generation == 1
+    assert deleting_stack.metadata.uid == initial_stack.metadata.uid
+    assert deleting_unit.metadata.deletion is not None
+    assert deleting_unit.metadata.ownerReferences is not None
+    assert deleting_unit.metadata.ownerReferences[0].uid == initial_stack.metadata.uid
 
     restarted = tmp_path / "restarted"
     second = controller.build_desired_candidate(
@@ -289,14 +294,17 @@ def test_source_tracked_stack_cleanup_is_durable_across_restart(tmp_path: Path):
         verbose=False,
     )
 
-    second_intent = controller.load_desired_stack_deletion_intents(restarted)["web"]
     assert second.blocked == {}
-    assert second_intent == first_intent
+    second_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((restarted / "stacks").glob("web.*"))),
+        profile="desired",
+        expected_name="web",
+    )
+    assert second_stack.metadata.deletion == deleting_stack.metadata.deletion
     retained_unit = controller.load_desired_unit(restarted / "units/web--preview-app.json", "web--preview-app")
     assert retained_unit.metadata.uid == "d1-web--preview-app"
-    assert retained_unit.metadata.lifecycle is not None
-    assert retained_unit.metadata.lifecycle.owner is not None
-    assert retained_unit.metadata.lifecycle.owner.uid == initial_stack.metadata.uid
+    assert retained_unit.metadata.ownerReferences is not None
+    assert retained_unit.metadata.ownerReferences[0].uid == initial_stack.metadata.uid
     assert controller.load_desired_resource_graph(restarted)
 
 
@@ -373,14 +381,12 @@ def test_direct_stack_finalization_retries_after_injected_publication_failure(tm
         return "d" * 40, None
 
     monkeypatch.setattr(controller, "publish_desired_change", publish)
-    assert controller.command_request_delete_direct_stack(_args()) is True
+    assert controller.command_delete_resource(_args()) is None
 
     requested = published[0]
     retryable = tmp_path / "retryable"
     shutil.copytree(requested, retryable)
     (retryable / "units" / f"{unit_name}.json").unlink()
-    for path in controller.document_candidates(retryable / ".gitopsctr/deletion-intents/units", unit_name):
-        path.unlink()
 
     monkeypatch.setattr(
         controller, "materialize_revision", lambda _revision, output: shutil.copytree(retryable, output)
@@ -391,14 +397,20 @@ def test_direct_stack_finalization_retries_after_injected_publication_failure(tm
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OperationError("injected publication failure")),
     )
     with pytest.raises(OperationError, match="injected publication failure"):
-        controller.command_finalize_stack(_args())
+        controller.command_finalize(_args())
 
-    assert controller.load_desired_stack_deletion_intents(retryable)["preview"].uid == stack_uid
+    assert (
+        controller.RESOURCE_CATALOG.parse_stack(
+            controller.RESOURCE_CATALOG.load_document(retryable / "stacks/preview.json"),
+            profile="desired",
+            expected_name="preview",
+        ).metadata.uid
+        == stack_uid
+    )
     assert released == []
 
     monkeypatch.setattr(controller, "publish_desired_change", publish)
-    assert controller.command_finalize_stack(_args()) is True
-    assert controller.load_desired_stack_deletion_intents(published[-1]) == {}
+    assert controller.command_finalize(_args()) is True
     assert not list((published[-1] / "stacks").glob("preview.*"))
     assert released == [("stacks/dev/preview/d1-stack-direct", "a" * 40)]
     assert deleted_claims == [("stacks/dev/preview/d1-stack-direct", "e" * 40)]

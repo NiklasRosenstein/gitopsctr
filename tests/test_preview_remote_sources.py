@@ -198,11 +198,12 @@ def test_fixed_remote_commit_stays_pinned_after_main_moves(tmp_path: Path, monke
         git(working, "push", "origin", "main")
         desired_b, changed_b = _advance(target, target_revision, monkeypatch)
         desired_c, changed_c = _advance(target, target_revision, monkeypatch)
+        assert not changed_b
         assert not changed_c
+        assert desired_b == desired_a
         assert desired_c == desired_b
 
     assert revision_b != revision_a
-    assert changed_b
     materialized_b = tmp_path / "current-b"
     controller.materialize_revision(desired_c, materialized_b)
     resolved_source = _stack(materialized_b).spec.resolvedSource

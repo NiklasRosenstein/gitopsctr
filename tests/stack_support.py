@@ -99,7 +99,7 @@ def write_projected_units(
                 ResourceMetadata(
                     name=name,
                     uid=f"{uid_prefix}{name}",
-                    lifecycle=controller.DesiredLifecycle(owner=projection.owners[name]),
+                    ownerReferences=[projection.owners[name]],
                 )
             ),
             source_root,

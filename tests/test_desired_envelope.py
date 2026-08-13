@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import controller
-from gitopsctr.contracts import DesiredLifecycle, DesiredOwnerReference, LifecycleManagement
+from gitopsctr.contracts import (
+    DesiredLifecycle,
+    DesiredOwnerReference,
+    DesiredResourceMetadata,
+    LifecycleManagement,
+)
 from gitopsctr.errors import OperationError
 from gitopsctr.resources import ResourceMetadata, validate_desired_resource_graph
 
@@ -84,16 +89,20 @@ def test_desired_metadata_rejects_explicit_null_lifecycle_fields(field):
 
 def test_lifecycle_model_requires_exactly_one_authority():
     with pytest.raises(ValueError, match="exactly one"):
-        DesiredLifecycle()
+        DesiredResourceMetadata(name="resource", uid="uid-resource", lifecycle=DesiredLifecycle())
     with pytest.raises(ValueError, match="exactly one"):
-        DesiredLifecycle(
-            management=LifecycleManagement(mode="direct"),
-            owner=DesiredOwnerReference(
-                apiVersion="unit.gitopsctr.io/v1",
-                kind="Terraform",
-                name="owner",
-                uid="uid-owner",
-            ),
+        DesiredResourceMetadata(
+            name="resource",
+            uid="uid-resource",
+            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
+            ownerReferences=[
+                DesiredOwnerReference(
+                    apiVersion="unit.gitopsctr.io/v1",
+                    kind="Terraform",
+                    name="owner",
+                    uid="uid-owner",
+                )
+            ],
         )
 
 
@@ -110,14 +119,14 @@ def test_owner_uid_fencing_and_cycles_are_validated():
         "metadata": {
             "name": "child",
             "uid": "uid-child",
-            "lifecycle": {
-                "owner": {
+            "ownerReferences": [
+                {
                     "apiVersion": "unit.gitopsctr.io/v1",
                     "kind": "Terraform",
                     "name": "owner",
                     "uid": owner_uid,
                 }
-            },
+            ],
         },
         "spec": {"source": {"path": ".", "revision": "a" * 40, "driverVersion": 2}},
     }
@@ -133,12 +142,12 @@ def test_owner_uid_fencing_and_cycles_are_validated():
     bad_child = dict(child_document)
     bad_child["metadata"] = {
         **child_document["metadata"],
-        "lifecycle": {
-            "owner": {
-                **child_document["metadata"]["lifecycle"]["owner"],
+        "ownerReferences": [
+            {
+                **child_document["metadata"]["ownerReferences"][0],
                 "uid": "uid-wrong",
             }
-        },
+        ],
     }
     with pytest.raises(ValueError, match="different UID"):
         validate_desired_resource_graph(
@@ -153,13 +162,13 @@ def test_owner_uid_fencing_and_cycles_are_validated():
     cycle_document = dict(child_document)
     cycle_document["metadata"] = {
         **child_document["metadata"],
-        "lifecycle": {
-            "owner": {
-                **child_document["metadata"]["lifecycle"]["owner"],
+        "ownerReferences": [
+            {
+                **child_document["metadata"]["ownerReferences"][0],
                 "name": "child",
                 "uid": "uid-child",
             }
-        },
+        ],
     }
     with pytest.raises(ValueError, match="acyclic"):
         validate_desired_resource_graph(
@@ -194,14 +203,14 @@ def test_legacy_resources_are_compatibility_roots_but_not_owner_targets():
     child_document["metadata"] = {
         "name": "child",
         "uid": "uid-child",
-        "lifecycle": {
-            "owner": {
+        "ownerReferences": [
+            {
                 "apiVersion": "unit.gitopsctr.io/v1",
                 "kind": "Terraform",
                 "name": "owner",
                 "uid": "uid-legacy-owner",
             }
-        },
+        ],
     }
     child = controller.parse_desired_unit_document(child_document, "child")
     with pytest.raises(ValueError, match="legacy compatibility root"):

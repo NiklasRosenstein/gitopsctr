@@ -74,14 +74,14 @@ def stack_tree(root: Path) -> tuple[str, str]:
             "metadata": {
                 "name": "preview--preview-app",
                 "uid": "d1-preview-app",
-                "lifecycle": {
-                    "owner": {
+                "ownerReferences": [
+                    {
                         "apiVersion": controller.CORE_API_VERSION,
                         "kind": "Stack",
                         "name": "preview",
                         "uid": stack_uid,
                     }
-                },
+                ],
             },
             "spec": {
                 "source": {
@@ -105,6 +105,9 @@ def deletion_args(**overrides: object) -> Namespace:
     values = {
         "environment": "dev",
         "stack": "preview",
+        "name": "preview",
+        "kind": "Stack",
+        "input_location": "state",
         "uid": "d1-stack-direct",
         "desired_ref": "deploy/dev",
         "observed_ref": None,

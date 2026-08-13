@@ -15,7 +15,9 @@ from gitopsctr.contracts import (
     CORE_CONTRACTS,
     ArtifactDescriptor,
     AuthoredResourceMetadata,
+    DeletionMetadata,
     DesiredLifecycle,
+    DesiredOwnerReference,
     DesiredResourceMetadata,
     DesiredStackDocument,
     DesiredStackSpec,
@@ -54,25 +56,38 @@ class ResourceMetadata(StrictModel):
     name: str
     uid: str | None = None
     lifecycle: DesiredLifecycle | None = None
+    ownerReferences: list[DesiredOwnerReference] | None = None
+    deletion: DeletionMetadata | None = None
 
     @property
     def is_legacy_compatibility(self) -> bool:
-        return self.uid is None and self.lifecycle is None
+        return self.uid is None and self.lifecycle is None and self.ownerReferences is None and self.deletion is None
 
     def validate_desired(self) -> None:
         if self.is_legacy_compatibility:
             return
-        if self.uid is None or self.lifecycle is None:
-            raise ValueError("desired metadata requires both uid and lifecycle")
-        DesiredResourceMetadata(name=self.name, uid=self.uid, lifecycle=self.lifecycle)
+        if self.uid is None:
+            raise ValueError("desired metadata requires uid")
+        DesiredResourceMetadata(
+            name=self.name,
+            uid=self.uid,
+            lifecycle=self.lifecycle,
+            ownerReferences=self.ownerReferences,
+            deletion=self.deletion,
+        )
 
     def as_desired(self) -> DesiredResourceMetadata:
         self.validate_desired()
         if self.is_legacy_compatibility:
             raise ValueError("legacy metadata has no desired identity")
         assert self.uid is not None
-        assert self.lifecycle is not None
-        return DesiredResourceMetadata(name=self.name, uid=self.uid, lifecycle=self.lifecycle)
+        return DesiredResourceMetadata(
+            name=self.name,
+            uid=self.uid,
+            lifecycle=self.lifecycle,
+            ownerReferences=self.ownerReferences,
+            deletion=self.deletion,
+        )
 
     @classmethod
     def new_source_tracked(cls, name: str) -> ResourceMetadata:
@@ -95,15 +110,22 @@ class ResourceMetadata(StrictModel):
 
     def document(self, *, profile: Literal["authored", "desired"]) -> JsonObject:
         if profile == "authored":
-            if self.uid is not None or self.lifecycle is not None:
+            if (
+                self.uid is not None
+                or self.lifecycle is not None
+                or self.ownerReferences is not None
+                or self.deletion is not None
+            ):
                 raise ValueError("authored metadata may contain only name")
             return {"name": self.name}
         if self.is_legacy_compatibility:
             raise ValueError("desired metadata must be canonical; adopt legacy identity before serialization")
-        document = self.as_desired().to_dict()
+        document = {key: value for key, value in self.as_desired().to_dict().items() if value is not None}
         lifecycle = document.get("lifecycle")
         if isinstance(lifecycle, dict):
             document["lifecycle"] = {key: value for key, value in lifecycle.items() if value is not None}
+            if not document["lifecycle"]:
+                del document["lifecycle"]
         return document
 
 
@@ -151,6 +173,9 @@ class StackResource:
     def is_legacy_compatibility(self) -> bool:
         return self.metadata.is_legacy_compatibility
 
+    def with_metadata(self, metadata: ResourceMetadata) -> StackResource:
+        return StackResource(self.gvk, metadata, self.spec)
+
 
 DesiredGraphResource = UnitResource[Any] | StackResource
 
@@ -196,11 +221,10 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
         if key in legacy_keys:
             continue
         unit.metadata.validate_desired()
-        lifecycle = unit.metadata.lifecycle
-        assert lifecycle is not None
-        owner = lifecycle.owner
-        if owner is None:
+        owner_references = unit.metadata.ownerReferences
+        if owner_references is None:
             continue
+        owner = owner_references[0]
         owner_key = (owner.apiVersion, owner.kind, owner.name)
         if owner_key in legacy_keys:
             raise ValueError(f"desired owner reference for {key[2]!r} cannot target a legacy compatibility root")
@@ -209,6 +233,8 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
             raise ValueError(f"desired owner reference for {key[2]!r} does not identify a resource in this ref")
         if owner_resource.metadata.uid != owner.uid:
             raise ValueError(f"desired owner reference for {key[2]!r} is fenced by a different UID")
+        if owner_resource.metadata.deletion is not None and unit.metadata.deletion is None:
+            raise ValueError(f"desired resource {key[2]!r} must be deleting with its owner")
         edges[key] = owner_key
 
     visiting: set[tuple[str, str, str]] = set()
@@ -279,15 +305,23 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
                 raise ValueError(f"Stack {stack.name!r} expansion is missing generated Unit {generated.name!r}")
             if not isinstance(generated_resource, UnitResource):
                 raise ValueError(f"Stack {stack.name!r} expansion {generated.name!r} is not a Unit")
-            generated_lifecycle = generated_resource.metadata.lifecycle
-            owner = generated_lifecycle.owner if generated_lifecycle is not None else None
+            generated_owner_references = generated_resource.metadata.ownerReferences
             expected_owner = (
                 stack.gvk.api_version,
                 stack.gvk.kind,
                 stack.name,
                 stack.metadata.uid,
             )
-            actual_owner = (owner.apiVersion, owner.kind, owner.name, owner.uid) if owner is not None else None
+            actual_owner = (
+                (
+                    generated_owner_references[0].apiVersion,
+                    generated_owner_references[0].kind,
+                    generated_owner_references[0].name,
+                    generated_owner_references[0].uid,
+                )
+                if generated_owner_references is not None
+                else None
+            )
             if actual_owner != expected_owner:
                 raise ValueError(
                     f"Stack {stack.name!r} generated Unit {generated.name!r} has an invalid owner reference"
@@ -476,7 +510,13 @@ class ResourceCatalog:
     def _stack_metadata(document: AuthoredResourceMetadata | DesiredResourceMetadata) -> ResourceMetadata:
         if isinstance(document, AuthoredResourceMetadata):
             return ResourceMetadata(name=document.name)
-        return ResourceMetadata(name=document.name, uid=document.uid, lifecycle=document.lifecycle)
+        return ResourceMetadata(
+            name=document.name,
+            uid=document.uid,
+            lifecycle=document.lifecycle,
+            ownerReferences=document.ownerReferences,
+            deletion=document.deletion,
+        )
 
     def parse_stack_template(
         self,
@@ -567,6 +607,7 @@ class ResourceCatalog:
         else:
             raise OperationError(f"unsupported Stack resource kind: {resource.gvk.kind!r}")
         value = contract.dump(document)
+        value["metadata"] = resource.metadata.document(profile=profile)
         value["$schema"] = resource_schema_url(CORE_API_VERSION, resource.gvk.kind, profile)
         return value
 

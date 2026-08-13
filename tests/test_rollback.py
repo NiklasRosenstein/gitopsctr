@@ -552,17 +552,25 @@ def test_rollback_restores_historical_payload_with_new_uid_after_finalization(tm
     historical_path = candidate / "units/application.json"
     current.mkdir()
     _write_json(historical_path, _desired_unit("application", "b" * 40, "historical"))
-    finalized = deploy_release.UnitIncarnationTombstone(
-        unit_name="application",
+    finalized = deploy_release.ResourceIncarnationTombstone(
+        api_version="unit.gitopsctr.io/v1",
+        kind="Test",
+        name="application",
         uid="d1-finalized-application",
+        deletion_generation=1,
     )
-    deploy_release.write_unit_incarnation_tombstone(current, finalized)
+    deploy_release.write_resource_incarnation_tombstone(current, finalized)
 
     deploy_release.merge_current_cleanup_state(current, candidate)
     deploy_release.canonicalize_rollback_unit(
         historical_path,
         current / "units/application.json",
-        deploy_release.load_desired_unit_incarnation_tombstones(candidate)["application"],
+        deploy_release.finalized_incarnation_for_resource(
+            deploy_release.load_resource_incarnation_tombstones(candidate),
+            "unit.gitopsctr.io/v1",
+            "Test",
+            "application",
+        ),
     )
 
     restored = deploy_release.load_desired_unit(historical_path, "application")
@@ -570,7 +578,10 @@ def test_rollback_restores_historical_payload_with_new_uid_after_finalization(tm
     assert restored.metadata.lifecycle is not None
     assert restored.metadata.lifecycle.management is not None
     assert restored.metadata.lifecycle.management.mode == "sourceTracked"
-    assert deploy_release.load_desired_unit_incarnation_tombstones(candidate)["application"] == finalized
+    assert (
+        deploy_release.load_resource_incarnation_tombstones(candidate)[("unit.gitopsctr.io/v1", "Test", "application")]
+        == finalized
+    )
 
 
 def test_full_rollback_preserves_current_opaque_cleanup_root(monkeypatch, capsys):

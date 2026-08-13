@@ -140,9 +140,8 @@ def test_direct_stack_instantiation_from_template_only_source_is_replay_safe(tmp
     )
     assert template.metadata.uid is not None
     unit = controller.load_desired_unit(next((instantiated / "units").glob("web--preview-app.*")), "web--preview-app")
-    assert unit.metadata.lifecycle is not None
-    assert unit.metadata.lifecycle.owner is not None
-    assert unit.metadata.lifecycle.owner.uid == stack.metadata.uid
+    assert unit.metadata.ownerReferences is not None
+    assert unit.metadata.ownerReferences[0].uid == stack.metadata.uid
     assert not list((environment / "stacks").glob("web.*"))
     assert git(source, "rev-parse", "HEAD") == source_head
 
@@ -193,14 +192,29 @@ def test_stack_lifecycle_survives_git_restart_and_tears_down_in_reverse_order(tm
         verbose=False,
     )
     assert result.blocked == {}
-    intent = controller.load_desired_stack_deletion_intents(candidate)["web"]
-    assert intent.uid == initial_stack.metadata.uid
-    assert {item.unit_name for item in intent.owned_unit_closure} == set(order)
+    deleting_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((candidate / "stacks").glob("web.*"))),
+        profile="desired",
+        expected_name="web",
+    )
+    assert deleting_stack.metadata.uid == initial_stack.metadata.uid
+    assert deleting_stack.metadata.deletion is not None
+    deleting_units = [controller.load_desired_unit(candidate / "units" / f"{name}.json", name) for name in order]
+    assert all(unit.metadata.deletion is not None for unit in deleting_units)
+    assert all(
+        unit.metadata.ownerReferences and unit.metadata.ownerReferences[0].uid == initial_stack.metadata.uid
+        for unit in deleting_units
+    )
 
-    deleted = store.publish("deploy/dev", candidate, desired.revision, "retain Stack deletion intent")
+    deleted = store.publish("deploy/dev", candidate, desired.revision, "mark Stack and Units for deletion")
     restarted = tmp_path / "restarted"
     GitStateStore(source).materialize(deleted.revision, restarted)
-    assert controller.load_desired_stack_deletion_intents(restarted)["web"] == intent
+    restarted_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((restarted / "stacks").glob("web.*"))),
+        profile="desired",
+        expected_name="web",
+    )
+    assert restarted_stack.metadata.deletion == deleting_stack.metadata.deletion
 
     inventory.destroy(tuple(reversed(order)))
     assert inventory.active == set()
@@ -208,13 +222,7 @@ def test_stack_lifecycle_survives_git_restart_and_tears_down_in_reverse_order(tm
 
     finalized = tmp_path / "finalized"
     shutil.copytree(restarted, finalized)
-    controller.write_stack_incarnation_tombstone(
-        finalized,
-        controller.StackIncarnationTombstone(stack_name="web", uid=initial_stack.metadata.uid),
-    )
     for path in controller.document_candidates(finalized / "stacks", "web"):
-        path.unlink()
-    for path in controller.document_candidates(finalized / controller.DESIRED_STACK_DELETION_INTENTS_PATH, "web"):
         path.unlink()
 
     (environment / "stacks/web.json").write_text(

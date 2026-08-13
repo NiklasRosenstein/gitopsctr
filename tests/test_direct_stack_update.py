@@ -109,7 +109,7 @@ def _direct_stack(tmp_path: Path, monkeypatch) -> tuple[Path, GitStateStore, str
     return source, store, desired_revision, stack.metadata.uid, second_source_revision
 
 
-def test_update_direct_stack_preserves_uid_owner_and_updates_pin_provenance(tmp_path: Path, monkeypatch):
+def test_update_direct_stack_preserves_uid_owner_reference_and_updates_pin_provenance(tmp_path: Path, monkeypatch):
     source, store, desired_revision, uid, source_revision = _direct_stack(tmp_path, monkeypatch)
     args = _args(source, uid=uid, desired_revision=desired_revision, source_revision=source_revision)
 
@@ -128,9 +128,8 @@ def test_update_direct_stack_preserves_uid_owner_and_updates_pin_provenance(tmp_
     assert stack.spec.provenance is not None
     assert stack.spec.provenance.templateRevision == source_revision
     unit = controller.load_desired_unit(next((updated / "units").glob("web--preview-app.*")), "web--preview-app")
-    assert unit.metadata.lifecycle is not None
-    assert unit.metadata.lifecycle.owner is not None
-    assert unit.metadata.lifecycle.owner.uid == uid
+    assert unit.metadata.ownerReferences is not None
+    assert unit.metadata.ownerReferences[0].uid == uid
     pin = next(pin for pin in store.list_controller_pins() if pin.name == f"stacks/dev/web/{uid}")
     assert pin.revision == source_revision
 
@@ -237,10 +236,12 @@ def test_update_direct_stack_deletion_uses_new_cleanup_source(tmp_path: Path, mo
     assert updated_revision is not None
     delete_args = controller.build_parser().parse_args(
         [
-            "request-delete-direct-stack",
+            "delete",
+            "stack",
+            "--in=state",
             "--environment",
             "dev",
-            "--stack",
+            "--name",
             "web",
             "--uid",
             uid,
@@ -248,14 +249,21 @@ def test_update_direct_stack_deletion_uses_new_cleanup_source(tmp_path: Path, mo
             "deploy/dev",
         ]
     )
-    assert controller.command_request_delete_direct_stack(delete_args)
+    assert controller.command_delete_resource(delete_args) is None
     deletion_revision = store.fetch("deploy/dev").revision
     assert deletion_revision is not None
     deletion = tmp_path / "deletion"
     store.materialize(deletion_revision, deletion)
-    intent = controller.load_desired_stack_deletion_intents(deletion)["web"]
-    assert intent.retained_provenance is not None
-    assert intent.retained_provenance.templateRevision == source_revision
+    stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(next((deletion / "stacks").glob("web.*"))),
+        profile="desired",
+        expected_name="web",
+    )
+    assert stack.metadata.deletion is not None
+    assert stack.metadata.deletion.resourceDigest == controller.resource_content_digest(stack)
+    assert isinstance(stack.spec, controller.DesiredStackSpec)
+    assert stack.spec.provenance is not None
+    assert stack.spec.provenance.templateRevision == source_revision
 
 
 def test_update_direct_stack_publication_failure_restores_old_pin(tmp_path: Path, monkeypatch):

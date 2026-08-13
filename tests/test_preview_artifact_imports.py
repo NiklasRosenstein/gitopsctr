@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import controller
-from gitopsctr.contracts import ArtifactImport, DesiredSource, StackTemplatePromotionReference
-from gitopsctr.resources import DesiredLifecycle, ResourceMetadata
+from gitopsctr.contracts import ArtifactImport, DesiredOwnerReference, DesiredSource, StackTemplatePromotionReference
+from gitopsctr.resources import ResourceMetadata
 from tests.conftest import receipt_resource
 
 
@@ -143,7 +143,7 @@ def _write_source_observation(
             ResourceMetadata(
                 name="application--image",
                 uid="source-image-unit",
-                lifecycle=DesiredLifecycle(owner=projection.owners["application--image"]),
+                ownerReferences=[DesiredOwnerReference.from_dict(projection.owners["application--image"].to_dict())],
             )
         ),
         source_root,
@@ -270,7 +270,7 @@ def test_promoted_artifact_import_rejects_invalid_lineage(tmp_path: Path, monkey
     elif failure == "unit-owner-uid":
         path = controller.unit_document_path(fixture.desired, "application--image")
         document = controller.RESOURCE_CATALOG.load_document(path)
-        document["metadata"]["lifecycle"]["owner"]["uid"] = "different-stack-uid"
+        document["metadata"]["ownerReferences"][0]["uid"] = "different-stack-uid"
         path.write_text(json.dumps(document))
     elif failure == "missing-unit":
         controller.unit_document_path(fixture.desired, "application--image").unlink()

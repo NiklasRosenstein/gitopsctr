@@ -78,19 +78,30 @@ def _desired_metadata_schema() -> JsonObject:
     schema.pop("$schema", None)
     schema.pop("$id", None)
     schema.pop("title", None)
-    lifecycle = cast(dict[str, Any], cast(dict[str, Any], schema["properties"])["lifecycle"])
-    lifecycle_properties = cast(dict[str, Any], lifecycle["properties"])
     metadata_properties = cast(dict[str, Any], schema["properties"])
     metadata_properties["name"]["minLength"] = 1
-    for key in ("management", "owner"):
-        property_schema = cast(dict[str, Any], lifecycle_properties[key])
-        lifecycle_properties[key] = cast(list[dict[str, Any]], property_schema["anyOf"])[0]
-    owner_properties = cast(dict[str, Any], lifecycle_properties["owner"]["properties"])
+    for key in ("lifecycle", "ownerReferences", "deletion"):
+        property_schema = cast(dict[str, Any], metadata_properties[key])
+        metadata_properties[key] = cast(list[dict[str, Any]], property_schema["anyOf"])[0]
+
+    lifecycle = cast(dict[str, Any], metadata_properties["lifecycle"])
+    lifecycle_properties = cast(dict[str, Any], lifecycle["properties"])
+    management_schema = cast(dict[str, Any], lifecycle_properties["management"])
+    lifecycle_properties["management"] = cast(list[dict[str, Any]], management_schema["anyOf"])[0]
+    lifecycle["required"] = ["management"]
+
+    owner_references = cast(dict[str, Any], metadata_properties["ownerReferences"])
+    owner_references["minItems"] = 1
+    owner_references["maxItems"] = 1
+    owner_properties = cast(dict[str, Any], cast(dict[str, Any], owner_references["items"])["properties"])
     for key in ("apiVersion", "kind", "name"):
         owner_properties[key]["minLength"] = 1
-    lifecycle["oneOf"] = [
-        {"required": ["management"], "not": {"required": ["owner"]}},
-        {"required": ["owner"], "not": {"required": ["management"]}},
+
+    deletion = cast(dict[str, Any], metadata_properties["deletion"])
+    cast(dict[str, Any], deletion["properties"])["generation"]["minimum"] = 1
+    schema["oneOf"] = [
+        {"required": ["lifecycle"], "not": {"required": ["ownerReferences"]}},
+        {"required": ["ownerReferences"], "not": {"required": ["lifecycle"]}},
     ]
     return schema
 

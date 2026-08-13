@@ -341,6 +341,9 @@ def _command_args(**values: Any) -> Namespace:
     arguments = {
         "environment": "preview",
         "stack": "application",
+        "name": "application",
+        "kind": "Stack",
+        "input_location": "state",
         "template": "application",
         "source_revision": None,
         "parameters": "{}",
@@ -441,7 +444,7 @@ def test_multi_environment_stack_story_in_temporary_repository(
     assert isinstance(dev_stack.spec, controller.DesiredStackSpec)
     assert set(dev_stack.spec.resolvedProjection["units"]) == {"image", "deploy"}
     assert {
-        _desired_unit(dev_r1, name).metadata.lifecycle.owner.uid
+        _desired_unit(dev_r1, name).metadata.ownerReferences[0].uid
         for name in ("application--image", "application--deploy")
     } == {dev_stack.metadata.uid}
     assert _desired_unit(dev_r1, "application--image").spec.source.revision == r1
@@ -536,7 +539,7 @@ def test_multi_environment_stack_story_in_temporary_repository(
     preview_stack = _stack(preview_r1_resolved)
     assert controller.desired_unit_names(preview_r1_resolved) == ("application--deploy", "application--image")
     assert {
-        _desired_unit(preview_r1_resolved, name).metadata.lifecycle.owner.uid
+        _desired_unit(preview_r1_resolved, name).metadata.ownerReferences[0].uid
         for name in ("application--image", "application--deploy")
     } == {preview_stack.metadata.uid}
     _publish_observations(
@@ -651,26 +654,25 @@ def test_multi_environment_stack_story_in_temporary_repository(
     assert inventory.artifacts[("preview", "application--image")].endswith("4" * 64)
     assert update(update_args) is False
 
-    # Deletion request retains the direct root and UID-fenced owned closure for cleanup.
-    assert controller.command_request_delete_direct_stack(
-        _command_args(uid=updated_preview_stack.metadata.uid, source_revision=None)
+    # Deletion marks the direct root and its UID-owned closure in resource metadata.
+    assert (
+        controller.command_delete_resource(_command_args(uid=updated_preview_stack.metadata.uid, source_revision=None))
+        is None
     )
     deleting = tmp_path / "preview-deleting"
     deleting_revision = _materialize(store, DESIRED_PREVIEW, deleting)
-    intent = controller.load_desired_stack_deletion_intents(deleting)["application"]
-    assert intent.uid == updated_preview_stack.metadata.uid
-    assert intent.deletion_generation == 1
-    assert {item.unit_name for item in intent.owned_unit_closure} == {
-        "application--image",
-        "application--deploy",
-    }
-    assert all(item.uid for item in intent.owned_unit_closure)
-    assert _stack(deleting).metadata.uid == updated_preview_stack.metadata.uid
+    deleting_stack = _stack(deleting)
+    assert deleting_stack.metadata.uid == updated_preview_stack.metadata.uid
+    assert deleting_stack.metadata.deletion is not None
+    assert deleting_stack.metadata.deletion.generation == 1
     assert {
-        _desired_unit(deleting, name).metadata.lifecycle.owner.uid
+        _desired_unit(deleting, name).metadata.ownerReferences[0].uid
         for name in ("application--image", "application--deploy")
     } == {updated_preview_stack.metadata.uid}
-    assert controller.load_desired_transition_blocks(deleting)["application"]
+    assert all(
+        _desired_unit(deleting, name).metadata.deletion is not None
+        for name in ("application--image", "application--deploy")
+    )
     retained = tmp_path / "preview-retained"
     controller.build_desired_candidate(
         "preview",
@@ -682,12 +684,11 @@ def test_multi_environment_stack_story_in_temporary_repository(
         retained,
         verbose=False,
     )
-    assert controller.load_desired_transition_blocks(retained)["application"]
-    assert controller.load_desired_stack_deletion_intents(retained)["application"] == intent
+    assert _stack(retained).metadata.deletion == deleting_stack.metadata.deletion
     assert _stack(retained).metadata.uid == updated_preview_stack.metadata.uid
     assert controller.desired_unit_names(retained) == ("application--deploy", "application--image")
-    with pytest.raises(controller.OperationError, match="active owned Units"):
-        controller.command_finalize_stack(_command_args(uid=updated_preview_stack.metadata.uid, deletion_generation=1))
+    with pytest.raises(controller.OperationError, match="owned resources must be finalized first"):
+        controller.command_finalize(_command_args(uid=updated_preview_stack.metadata.uid, deletion_generation=1))
     assert store.fetch(DESIRED_PREVIEW).revision == deleting_revision
     counts = _print_ref_histories(store)
     assert counts["desired"] >= 3

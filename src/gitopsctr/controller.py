@@ -39,6 +39,7 @@ from gitopsctr.contracts import (
     ArtifactDescriptor,
     ArtifactImport,
     AuthoredSource,
+    DeletionMetadata,
     DesiredLifecycle,
     DesiredOwnerReference,
     DesiredSource,
@@ -176,11 +177,8 @@ GIT_AUTHOR_EMAIL = os.environ.get(
 REPOSITORY_ROOT = Path.cwd().resolve()
 DESIRED_TRANSITION_BLOCKS_PATH = PurePosixPath(".gitopsctr/transition-blocks.json")
 DESIRED_CLEANUP_UNITS_PATH = PurePosixPath(".gitopsctr/cleanup/units")
-DESIRED_DELETION_INTENTS_PATH = PurePosixPath(".gitopsctr/deletion-intents/units")
-DESIRED_STACK_DELETION_INTENTS_PATH = PurePosixPath(".gitopsctr/deletion-intents/stacks")
 DESIRED_EFFECT_LEASES_PATH = PurePosixPath(".gitopsctr/effect-leases/units")
-DESIRED_UNIT_INCARNATIONS_PATH = PurePosixPath(".gitopsctr/incarnations/units")
-DESIRED_STACK_INCARNATIONS_PATH = PurePosixPath(".gitopsctr/incarnations/stacks")
+DESIRED_RESOURCE_INCARNATIONS_PATH = PurePosixPath(".gitopsctr/incarnations/resources")
 OBSERVED_TEARDOWN_EVIDENCE_PATH = PurePosixPath(".gitopsctr/teardowns/units")
 EFFECT_LEASE_TTL_SECONDS = 300
 
@@ -739,16 +737,13 @@ def load_desired_resource_graph(
     try:
         validate_desired_resource_graph(resources)
     except ValueError as exc:
-        # A Stack root remains in desired state while its owned Units are
-        # finalized in reverse dependency order. During that interval the
-        # contract's normal expansion completeness check sees the intentionally
-        # removed child. Admit only those exact missing children recorded by an
-        # active StackDeletionIntent; all other graph failures remain fatal.
+        # A deleting Stack remains in desired state while its owned Units are
+        # finalized in reverse dependency order. Admit only missing generated
+        # children of that deleting Stack; all other graph failures remain fatal.
         message = str(exc)
         missing = re.fullmatch(r"Stack '([^']+)' expansion is missing generated Unit '([^']+)'", message)
         if missing is not None:
             stack_name, unit_name = missing.groups()
-            stack_intent = load_desired_stack_deletion_intents(root).get(stack_name)
             stack_key = (CORE_API_VERSION, "Stack", stack_name)
             stack_resource = resources.get(stack_key)
             template_resource = (
@@ -766,22 +761,26 @@ def load_desired_resource_graph(
                 else None
             )
             if (
-                stack_intent is not None
-                and isinstance(stack_resource, StackResource)
+                isinstance(stack_resource, StackResource)
+                and resource_deletion(stack_resource) is not None
                 and isinstance(template_resource, StackResource)
                 and isinstance(template_resource.spec, StackTemplateSpec)
                 and isinstance(stack_resource.spec, (StackSpec, DesiredStackSpec))
             ):
-                missing_units = {
-                    resource.name
+                missing_resources = {
+                    (resource.apiVersion, resource.kind, resource.name)
                     for resource in scope_stack_template_resources(
                         stack_name,
                         template_resource.spec.expand(stack_resource.spec.parameters),
                     )
                     if (resource.apiVersion, resource.kind, resource.name) not in resources
                 }
-                closure_names = {identity.unit_name for identity in stack_intent.owned_unit_closure}
-                if missing_units and missing_units <= closure_names and unit_name in missing_units:
+                tombstones = load_resource_incarnation_tombstones(root)
+                if (
+                    missing_resources
+                    and any(name == unit_name for _api_version, _kind, name in missing_resources)
+                    and all(key in tombstones for key in missing_resources)
+                ):
                     return resources
             transition_blocks = load_desired_transition_blocks(root)
             if (
@@ -791,7 +790,7 @@ def load_desired_resource_graph(
                 and stack_resource.spec.resolvedProjection is not None
                 and stack_resource.metadata.lifecycle is not None
                 and stack_resource.metadata.lifecycle.management is not None
-                and stack_resource.metadata.lifecycle.owner is None
+                and resource_owner_reference(stack_resource) is None
                 and unit_name not in _current_desired_unit_paths(root)
             ):
                 projected_units = stack_resource.spec.resolvedProjection.get("units")
@@ -885,8 +884,7 @@ def stack_dependency_edges(
         for generated in expanded_by_name.values():
             generated_key = (generated.apiVersion, generated.kind, generated.name)
             if not include_missing and generated_key not in resources:
-                # An active deletion intent may intentionally omit a child;
-                # its deletion intent and closure fence remain authoritative.
+                # A deleting Stack may intentionally omit a finalized child.
                 continue
             edges.setdefault(generated.name, set()).update(
                 dependency
@@ -1155,6 +1153,209 @@ def file_blob(path: Path) -> str:
 
 def sha256_file(path: Path) -> str:
     return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+
+def resource_owner_reference(resource: UnitResource[Any] | StackResource) -> DesiredOwnerReference | None:
+    """Return the single Kubernetes-shaped owner reference of a desired resource."""
+
+    references = getattr(resource.metadata, "ownerReferences", None)
+    if references is None:
+        return None
+    if not isinstance(references, (list, tuple)):
+        raise OperationError(f"desired resource {resource.name!r} has invalid ownerReferences")
+    if len(references) > 1:
+        raise OperationError(f"desired resource {resource.name!r} has more than one ownerReference")
+    return references[0] if references else None
+
+
+def resource_deletion(resource: UnitResource[Any] | StackResource) -> DeletionMetadata | None:
+    return getattr(resource.metadata, "deletion", None)
+
+
+def _resource_document(resource: UnitResource[Any] | StackResource) -> JsonObject:
+    if isinstance(resource, UnitResource):
+        return serialize_unit_document(resource, profile="desired")
+    return RESOURCE_CATALOG.serialize_stack_resource(resource, profile="desired")
+
+
+def resource_content_digest(resource: UnitResource[Any] | StackResource) -> str:
+    """Hash the retained resource without its deletion marker."""
+
+    document = _resource_document(resource)
+    metadata = document.get("metadata")
+    if isinstance(metadata, dict):
+        metadata = dict(metadata)
+        metadata.pop("deletion", None)
+        document = dict(document)
+        document["metadata"] = metadata
+    return f"sha256:{hashlib.sha256(canonical_json(document)).hexdigest()}"
+
+
+@dataclass(frozen=True)
+class ResourceFinalizationFence:
+    api_version: str
+    kind: str
+    name: str
+    uid: str
+    deletion_generation: int
+
+
+def _load_transition_resources(
+    root: Path,
+) -> tuple[
+    dict[tuple[str, str, str], UnitResource[Any] | StackResource],
+    dict[str, object],
+]:
+    """Load canonical resources and retain unparseable Unit payloads separately."""
+
+    resources: dict[tuple[str, str, str], UnitResource[Any] | StackResource] = {}
+    opaque_units: dict[str, object] = {}
+    for name, path in _current_desired_unit_paths(root).items():
+        try:
+            resource = load_desired_unit(path, name)
+        except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError):
+            opaque_units[name] = opaque_document_payload(path)
+            continue
+        resources[(resource.gvk.api_version, resource.gvk.kind, resource.name)] = resource
+    for kind in ("StackTemplate", "Stack"):
+        for name, path in _current_desired_stack_paths(root, kind).items():
+            resource = (
+                RESOURCE_CATALOG.parse_stack_template(
+                    RESOURCE_CATALOG.load_document(path), profile="desired", expected_name=name
+                )
+                if kind == "StackTemplate"
+                else RESOURCE_CATALOG.parse_stack(
+                    RESOURCE_CATALOG.load_document(path), profile="desired", expected_name=name
+                )
+            )
+            key = (resource.gvk.api_version, resource.gvk.kind, resource.name)
+            if key in resources:
+                raise OperationError(f"duplicate desired resource identity: {key!r}")
+            resources[key] = resource
+    return resources, opaque_units
+
+
+def validate_desired_resource_transition(
+    current_root: Path,
+    candidate_root: Path,
+    finalized_resources: frozenset[ResourceFinalizationFence] = frozenset(),
+) -> None:
+    """Validate terminal deletion transitions between two desired trees."""
+
+    current, raw_opaque_units = _load_transition_resources(current_root)
+    candidate = load_desired_resource_graph(candidate_root, validate=False)
+    for key, previous in current.items():
+        if previous.is_legacy_compatibility:
+            continue
+        next_resource = candidate.get(key)
+        previous_deletion = resource_deletion(previous)
+        if next_resource is None:
+            if previous_deletion is None or previous.metadata.uid is None:
+                raise OperationError(f"desired resource {previous.name!r} cannot be removed before deletion")
+            fence = ResourceFinalizationFence(
+                previous.gvk.api_version,
+                previous.gvk.kind,
+                previous.name,
+                previous.metadata.uid,
+                previous_deletion.generation,
+            )
+            if fence not in finalized_resources:
+                raise OperationError(f"desired resource {previous.name!r} can be removed only by finalization")
+            continue
+        if next_resource.metadata.uid != previous.metadata.uid:
+            raise OperationError(f"desired resource {previous.name!r} changed UID without finalization")
+        next_deletion = resource_deletion(next_resource)
+        if previous_deletion is None:
+            if next_deletion is not None:
+                digest = resource_content_digest(previous)
+                if next_deletion.resourceDigest != digest or resource_content_digest(next_resource) != digest:
+                    raise OperationError(f"desired resource {previous.name!r} changed when deletion started")
+            continue
+        if (
+            next_deletion != previous_deletion
+            or resource_content_digest(next_resource) != previous_deletion.resourceDigest
+        ):
+            raise OperationError(f"desired resource {previous.name!r} changed after deletion started")
+
+    current_opaque = load_desired_cleanup_roots(current_root)
+    candidate_opaque = load_desired_cleanup_roots(candidate_root)
+    for name, payload in raw_opaque_units.items():
+        adopted = candidate_opaque.get(name)
+        if adopted is None or adopted.payload != payload:
+            raise OperationError(f"unparseable desired Unit {name!r} must be retained as an opaque cleanup root")
+    for name, previous in current_opaque.items():
+        next_opaque = candidate_opaque.get(name)
+        next_resource = next((resource for resource in candidate.values() if resource.name == name), None)
+        previous_deletion = previous.metadata.deletion
+        if next_opaque is not None:
+            if next_opaque.metadata.uid != previous.metadata.uid:
+                raise OperationError(f"opaque cleanup root {name!r} changed UID")
+            next_deletion = next_opaque.metadata.deletion
+            if previous_deletion is None:
+                if next_deletion is not None:
+                    digest = opaque_cleanup_content_digest(previous)
+                    if next_deletion.resourceDigest != digest or opaque_cleanup_content_digest(next_opaque) != digest:
+                        raise OperationError(f"opaque cleanup root {name!r} changed when deletion started")
+            elif (
+                next_deletion != previous_deletion
+                or opaque_cleanup_content_digest(next_opaque) != previous_deletion.resourceDigest
+            ):
+                raise OperationError(f"opaque cleanup root {name!r} changed after deletion started")
+            continue
+        if next_resource is not None:
+            if next_resource.metadata.uid != previous.metadata.uid:
+                raise OperationError(f"opaque cleanup recovery for {name!r} changed UID")
+            next_deletion = resource_deletion(next_resource)
+            if previous_deletion is None:
+                if next_deletion is not None:
+                    raise OperationError(f"opaque cleanup recovery for {name!r} added deletion unexpectedly")
+            elif next_deletion is None or next_deletion.generation != previous_deletion.generation:
+                raise OperationError(f"opaque cleanup recovery for {name!r} changed deletion generation")
+            elif resource_content_digest(next_resource) != next_deletion.resourceDigest:
+                raise OperationError(f"opaque cleanup recovery for {name!r} has an invalid deletion digest")
+            continue
+        if previous_deletion is None or previous.metadata.uid is None:
+            raise OperationError(f"opaque cleanup root {name!r} cannot be removed before deletion")
+        api_version, kind = opaque_resource_gvk(previous.payload)
+        fence = ResourceFinalizationFence(
+            api_version,
+            kind,
+            name,
+            previous.metadata.uid,
+            previous_deletion.generation,
+        )
+        if fence not in finalized_resources:
+            raise OperationError(f"opaque cleanup root {name!r} can be removed only by finalization")
+
+
+def mark_resource_for_deletion(
+    resource: UnitResource[Any] | StackResource,
+    *,
+    generation: int | None = None,
+) -> UnitResource[Any] | StackResource:
+    """Return a retained resource with a deterministic deletion fence."""
+
+    if resource.metadata.uid is None:
+        raise OperationError(f"desired resource {resource.name!r} has no UID")
+    current = resource_deletion(resource)
+    if current is not None:
+        return resource
+    deletion = DeletionMetadata(
+        generation=generation or 1,
+        resourceDigest=resource_content_digest(resource),
+    )
+    return resource.with_metadata(replace(resource.metadata, deletion=deletion))
+
+
+def deletion_reason(resource: UnitResource[Any] | StackResource) -> str:
+    deletion = resource_deletion(resource)
+    if deletion is None:
+        raise OperationError(f"desired resource {resource.name!r} is not marked for deletion")
+    return (
+        f"deletion pending finalization (UID {resource.metadata.uid}, generation {deletion.generation}); "
+        f"run finalize {resource.gvk.kind} --name {resource.name} --uid {resource.metadata.uid} "
+        f"--deletion-generation {deletion.generation}"
+    )
 
 
 def artifact_document_path(root: Path, unit_name: str, artifact_name: str) -> Path:
@@ -1516,8 +1717,7 @@ def resolve_template(
                     raise ReferenceUnavailable("promoted artifact observed state is unavailable")
                 raise ReferenceUnavailable(f"promoted source Unit is unavailable: {reference.unit}")
             source_unit = load_desired_unit(source_unit_path, source_unit_path.stem)
-            source_lifecycle = source_unit.metadata.lifecycle
-            source_owner = source_lifecycle.owner if source_lifecycle is not None else None
+            source_owner = resource_owner_reference(source_unit)
             source_uid = source_stack.metadata.uid
             if source_owner is None or source_uid is None or source_owner.uid != source_uid:
                 raise ReferenceUnavailable("promoted artifact producer has an invalid Stack owner fence")
@@ -1855,12 +2055,10 @@ def candidate_identifier(
         "promotion",
         "rollback",
         "finalize",
-        "finalize-stack",
-        "request-delete-direct-unit",
-        "request-delete-direct-stack",
         "instantiate-stack",
         "update-direct-stack",
         "apply-unit",
+        "delete",
         "resolve-opaque-unit",
     ],
     environment_name: str,
@@ -1892,12 +2090,10 @@ def resolve_candidate_ref(
         "promotion",
         "rollback",
         "finalize",
-        "finalize-stack",
-        "request-delete-direct-unit",
-        "request-delete-direct-stack",
         "instantiate-stack",
         "update-direct-stack",
         "apply-unit",
+        "delete",
         "resolve-opaque-unit",
     ],
     candidate_id: str,
@@ -2215,8 +2411,8 @@ def _stack_root_metadata(
         separators=(",", ":"),
     )
     metadata = ResourceMetadata.source_tracked_from_provenance(name, provenance)
-    if kind == "Stack" and current_desired is not None:
-        previous_tombstone = load_desired_stack_incarnation_tombstones(current_desired).get(name)
+    if current_desired is not None:
+        previous_tombstone = load_resource_incarnation_tombstones(current_desired).get((CORE_API_VERSION, kind, name))
         if previous_tombstone is not None and metadata.uid == previous_tombstone.uid:
             metadata = ResourceMetadata.source_tracked_from_provenance(
                 name,
@@ -2243,14 +2439,15 @@ def _stack_owned_metadata(name: str, owner: DesiredOwnerReference) -> ResourceMe
     return ResourceMetadata(
         name=name,
         uid=root.uid,
-        lifecycle=DesiredLifecycle(
-            owner=DesiredOwnerReference(
+        lifecycle=None,
+        ownerReferences=[
+            DesiredOwnerReference(
                 apiVersion=owner.apiVersion,
                 kind=owner.kind,
                 name=owner.name,
                 uid=owner.uid,
-            )
-        ),
+            ),
+        ],
     )
 
 
@@ -2412,10 +2609,8 @@ def project_stack_resources(
                 uid=stack.metadata.uid,
             )
     # Keep desired Stack roots available while their owned Units are being
-    # finalized.  The generic Unit deletion path can retain the generated
-    # children today; dropping their UID-fenced owner in the same candidate
-    # would make the desired graph invalid.  Stack deletion intents will make
-    # this retention durable and removable in the next lifecycle milestone.
+    # finalized.  Deletion metadata keeps the UID-fenced graph intact until
+    # child-first finalization removes the resources.
     if current_desired is not None:
         for kind in ("StackTemplate", "Stack"):
             source_names = set(templates if kind == "StackTemplate" else stacks)
@@ -2423,8 +2618,23 @@ def project_stack_resources(
                 if name in source_names:
                     continue
                 target = candidate / ("stack-templates" if kind == "StackTemplate" else "stacks") / previous_path.name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(previous_path, target)
+                previous = (
+                    RESOURCE_CATALOG.parse_stack_template(
+                        RESOURCE_CATALOG.load_document(previous_path), profile="desired", expected_name=name
+                    )
+                    if kind == "StackTemplate"
+                    else RESOURCE_CATALOG.parse_stack(
+                        RESOURCE_CATALOG.load_document(previous_path), profile="desired", expected_name=name
+                    )
+                )
+                lifecycle = previous.metadata.lifecycle
+                if (
+                    lifecycle is not None
+                    and lifecycle.management is not None
+                    and lifecycle.management.mode == "sourceTracked"
+                ):
+                    previous = cast(StackResource, mark_resource_for_deletion(previous))
+                _write_desired_stack_resource(target, previous, project_root)
     return StackProjection(generated, owners, dependencies, artifact_imports)
 
 
@@ -2450,19 +2660,20 @@ def load_convergence_specifications(
         # rebuild it from a mutable source branch or remote repository.
         resources = load_desired_resource_graph(current_desired)
         dependency_edges.update(stack_dependency_edges(resources))
-        deletion_intents = load_desired_deletion_intents(current_desired)
         transition_blocks = load_desired_transition_blocks(current_desired)
         for resource in resources.values():
-            if not isinstance(resource, UnitResource) or resource.name in deletion_intents:
+            if not isinstance(resource, UnitResource) or resource_deletion(resource) is not None:
                 continue
             if resource.name in transition_blocks:
                 continue
             lifecycle = resource.metadata.lifecycle
-            if lifecycle is None:
-                continue
-            is_stack_owned = lifecycle.owner is not None and lifecycle.owner.kind == "Stack"
+            owner = resource_owner_reference(resource)
+            is_stack_owned = owner is not None and owner.kind == "Stack"
             is_direct_root = (
-                lifecycle.owner is None and lifecycle.management is not None and lifecycle.management.mode == "direct"
+                owner is None
+                and lifecycle is not None
+                and lifecycle.management is not None
+                and lifecycle.management.mode == "direct"
             )
             if not (is_stack_owned or is_direct_root):
                 continue
@@ -2499,18 +2710,23 @@ def require_environment_unit(source_root: Path, environment_name: str, unit_name
 
 def reconciliation_statuses(unit_names: Sequence[str], desired: Path, observed: Path) -> list[tuple[str, str, str]]:
     transition_blocks = load_desired_transition_blocks(desired)
-    deletion_intents = load_desired_deletion_intents(desired)
+    resources = load_desired_resource_graph(desired, validate=False)
+    deleting = {
+        resource.name: resource
+        for resource in resources.values()
+        if isinstance(resource, UnitResource) and resource_deletion(resource) is not None
+    }
     cleanup_names = {path.stem for path in desired_cleanup_root_paths(desired)}
-    unit_names = tuple(dict.fromkeys((*unit_names, *sorted(cleanup_names), *sorted(deletion_intents))))
+    unit_names = tuple(dict.fromkeys((*unit_names, *sorted(cleanup_names), *sorted(deleting))))
     statuses = []
     for unit_name in unit_names:
         unit_path = unit_document_path(desired, unit_name)
         receipt_path = unit_document_path(observed, unit_name)
+        if unit_name in deleting:
+            statuses.append((unit_name, "WAIT", deletion_reason(deleting[unit_name])))
+            continue
         if unit_name in transition_blocks:
             statuses.append((unit_name, "WAIT", transition_blocks[unit_name]))
-            continue
-        if unit_name in deletion_intents:
-            statuses.append((unit_name, "WAIT", deletion_intent_reason(deletion_intents[unit_name])))
             continue
         if not unit_path.is_file():
             statuses.append((unit_name, "WAIT", "desired inputs are not materialized"))
@@ -3060,332 +3276,68 @@ class OpaqueCleanupRoot:
     source: DesiredSource | None
 
 
-@dataclass(frozen=True)
-class RetainedCleanupIdentity:
-    path: str
-    uid: str
+@dataclass(frozen=True, kw_only=True)
+class ResourceIncarnationTombstone:
+    """Durable fence for one finalized desired resource incarnation."""
 
-
-@dataclass(frozen=True)
-class StackOwnedUnitIdentity:
-    """The UID and deletion generation of one Unit in a Stack closure."""
-
-    unit_name: str
+    api_version: str
+    kind: str
+    name: str
     uid: str
     deletion_generation: int
-
-    def document(self) -> JsonObject:
-        return {
-            "unitName": self.unit_name,
-            "uid": self.uid,
-            "deletionGeneration": self.deletion_generation,
-        }
-
-
-@dataclass(frozen=True)
-class StackCleanupIdentity:
-    """The retained desired Stack blob used to fence finalization."""
-
-    path: str
-    uid: str
-    blob: str
-
-    def document(self) -> JsonObject:
-        return {"path": self.path, "uid": self.uid, "blob": self.blob}
-
-
-@dataclass(frozen=True)
-class StackDeletionIntent:
-    """A durable, UID-fenced two-phase deletion intent for one direct Stack."""
-
-    stack_name: str
-    uid: str
-    deletion_generation: int
-    management_mode: Literal["sourceTracked", "direct"]
-    cleanup_identity: StackCleanupIdentity
-    retained_template: str
-    retained_parameters: JsonObjectValue
-    retained_provenance: StackInstantiationProvenance | None
-    owned_unit_closure: tuple[StackOwnedUnitIdentity, ...]
-    controller_pin: ControllerPin | None
 
     def document(self) -> JsonObject:
         return {
             "schema": 1,
-            "kind": "StackDeletionIntent",
-            "stackName": self.stack_name,
-            "uid": self.uid,
-            "deletionGeneration": self.deletion_generation,
-            "managementMode": self.management_mode,
-            "cleanupIdentity": self.cleanup_identity.document(),
-            "retainedStack": {
-                "template": self.retained_template,
-                "parameters": self.retained_parameters,
-                "provenance": self.retained_provenance.to_dict() if self.retained_provenance is not None else None,
+            "kind": "ResourceIncarnationTombstone",
+            "resource": {
+                "apiVersion": self.api_version,
+                "kind": self.kind,
+                "name": self.name,
+                "uid": self.uid,
+                "deletionGeneration": self.deletion_generation,
             },
-            "ownedUnitClosure": [identity.document() for identity in self.owned_unit_closure],
-            "controllerPin": (
-                {
-                    "name": self.controller_pin.name,
-                    "ref": self.controller_pin.ref,
-                    "revision": self.controller_pin.revision,
-                }
-                if self.controller_pin is not None
-                else None
-            ),
         }
 
     @classmethod
-    def from_document(cls, document: object, expected_name: str) -> StackDeletionIntent:
-        expected_keys = {
-            "schema",
+    def from_document(cls, document: object) -> ResourceIncarnationTombstone:
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"schema", "kind", "resource"}
+            or document.get("schema") != 1
+            or document.get("kind") != "ResourceIncarnationTombstone"
+        ):
+            raise ValueError("invalid resource incarnation tombstone")
+        resource = document.get("resource")
+        if not isinstance(resource, dict) or set(resource) != {
+            "apiVersion",
             "kind",
-            "stackName",
+            "name",
             "uid",
             "deletionGeneration",
-            "managementMode",
-            "cleanupIdentity",
-            "retainedStack",
-            "ownedUnitClosure",
-            "controllerPin",
-        }
-        if not isinstance(document, dict) or set(document) != expected_keys:
-            raise ValueError("invalid Stack deletion intent envelope")
-        if (
-            type(document.get("schema")) is not int
-            or document.get("schema") != 1
-            or document.get("kind") != "StackDeletionIntent"
-            or document.get("stackName") != expected_name
-        ):
-            raise ValueError("invalid Stack deletion intent envelope")
-        management_mode = document.get("managementMode")
-        if management_mode not in {"sourceTracked", "direct"}:
-            raise ValueError("invalid Stack deletion intent management mode")
-        uid = document.get("uid")
-        generation = document.get("deletionGeneration")
-        if (
-            not isinstance(uid, str)
-            or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", uid)
-            or type(generation) is not int
-            or generation < 1
-        ):
-            raise ValueError("invalid Stack deletion intent fence")
-
-        raw_cleanup = document.get("cleanupIdentity")
-        if not isinstance(raw_cleanup, dict) or set(raw_cleanup) != {"path", "uid", "blob"}:
-            raise ValueError("invalid Stack cleanup identity")
-        cleanup_path = raw_cleanup.get("path")
-        cleanup_uid = raw_cleanup.get("uid")
-        cleanup_blob = raw_cleanup.get("blob")
-        relative = PurePosixPath(cleanup_path) if isinstance(cleanup_path, str) else PurePosixPath(".")
-        if (
-            not isinstance(cleanup_path, str)
-            or not isinstance(cleanup_uid, str)
-            or cleanup_uid != uid
-            or not isinstance(cleanup_blob, str)
-            or not re.fullmatch(r"[0-9a-f]{40}", cleanup_blob)
-            or relative.is_absolute()
-            or len(relative.parts) != 2
-            or relative.parts[0] != "stacks"
-            or relative.stem != expected_name
-            or relative.suffix not in {".json", ".yaml", ".yml"}
-        ):
-            raise ValueError("cleanup identity must retain a desired Stack path")
-
-        raw_stack = document.get("retainedStack")
-        if not isinstance(raw_stack, dict) or set(raw_stack) != {"template", "parameters", "provenance"}:
-            raise ValueError("invalid retained Stack identity")
-        template = raw_stack.get("template")
-        parameters = raw_stack.get("parameters")
-        if not isinstance(template, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", template):
-            raise ValueError("invalid retained Stack template identity")
-        if not isinstance(parameters, dict):
-            raise ValueError("retained Stack parameters must be an object")
-        try:
-            parsed_parameters = require_json_value(parameters)
-            if not isinstance(parsed_parameters, dict):
-                raise ValueError("retained Stack parameters must be an object")
-            retained_parameters = JsonObjectValue(cast(dict[str, Any], parsed_parameters))
-            raw_provenance = raw_stack.get("provenance")
-            provenance = StackInstantiationProvenance.from_dict(raw_provenance) if raw_provenance is not None else None
-            if (management_mode == "direct") != (provenance is not None):
-                raise ValueError("Stack deletion intent provenance does not match management mode")
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("invalid retained Stack provenance or parameters") from exc
-
-        raw_closure = document.get("ownedUnitClosure")
-        if not isinstance(raw_closure, list):
-            raise ValueError("owned Unit closure must be a list")
-        closure: list[StackOwnedUnitIdentity] = []
-        seen: set[str] = set()
-        for raw_identity in raw_closure:
-            if not isinstance(raw_identity, dict) or set(raw_identity) != {"unitName", "uid", "deletionGeneration"}:
-                raise ValueError("invalid owned Unit closure identity")
-            unit_name = raw_identity.get("unitName")
-            unit_uid = raw_identity.get("uid")
-            unit_generation = raw_identity.get("deletionGeneration")
-            if (
-                not isinstance(unit_name, str)
-                or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name)
-                or unit_name in seen
-                or not isinstance(unit_uid, str)
-                or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", unit_uid)
-                or type(unit_generation) is not int
-                or unit_generation < 1
-            ):
-                raise ValueError("invalid owned Unit closure identity")
-            seen.add(unit_name)
-            closure.append(StackOwnedUnitIdentity(unit_name, unit_uid, unit_generation))
-
-        raw_pin = document.get("controllerPin")
-        if raw_pin is None:
-            if management_mode == "direct":
-                raise ValueError("direct Stack deletion intent requires a controller pin")
-            pin = None
-        else:
-            if not isinstance(raw_pin, dict) or set(raw_pin) != {"name", "ref", "revision"}:
-                raise ValueError("invalid Stack controller pin identity")
-            pin_name = raw_pin.get("name")
-            pin_ref = raw_pin.get("ref")
-            pin_revision = raw_pin.get("revision")
-            if (
-                not isinstance(pin_name, str)
-                or not pin_name
-                or not isinstance(pin_ref, str)
-                or pin_ref != f"refs/heads/gitopsctr/pins/{pin_name}"
-                or not isinstance(pin_revision, str)
-                or not re.fullmatch(r"[0-9a-f]{40}", pin_revision)
-            ):
-                raise ValueError("invalid Stack controller pin identity")
-            if management_mode != "direct":
-                raise ValueError("source-tracked Stack deletion intent cannot own a controller pin")
-            pin = ControllerPin(pin_name, pin_ref, pin_revision)
+        }:
+            raise ValueError("invalid resource incarnation identity")
+        api_version = resource.get("apiVersion")
+        kind = resource.get("kind")
+        name = resource.get("name")
+        uid = resource.get("uid")
+        deletion_generation = resource.get("deletionGeneration")
+        if not all(isinstance(value, str) and value for value in (api_version, kind, name, uid)):
+            raise ValueError("invalid resource incarnation identity")
+        GVK(cast(str, api_version), cast(str, kind))
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", cast(str, name)):
+            raise ValueError("invalid resource incarnation name")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", cast(str, uid)):
+            raise ValueError("invalid resource incarnation UID")
+        if type(deletion_generation) is not int or deletion_generation < 1:
+            raise ValueError("invalid resource incarnation deletion generation")
         return cls(
-            stack_name=expected_name,
-            uid=uid,
-            deletion_generation=generation,
-            management_mode=cast(Literal["sourceTracked", "direct"], management_mode),
-            cleanup_identity=StackCleanupIdentity(cleanup_path, cleanup_uid, cleanup_blob),
-            retained_template=template,
-            retained_parameters=retained_parameters,
-            retained_provenance=provenance,
-            owned_unit_closure=tuple(closure),
-            controller_pin=pin,
+            api_version=cast(str, api_version),
+            kind=cast(str, kind),
+            name=cast(str, name),
+            uid=cast(str, uid),
+            deletion_generation=deletion_generation,
         )
-
-
-@dataclass(frozen=True)
-class UnitIncarnationTombstone:
-    """An internal Unit incarnation fence, including compatibility adoptions."""
-
-    unit_name: str
-    uid: str
-    state: Literal["active", "finalized"] = "finalized"
-    next_deletion_generation: int = 1
-
-    def document(self) -> JsonObject:
-        if self.state == "active":
-            return {
-                "schema": 1,
-                "kind": "UnitIncarnationFence",
-                "unitName": self.unit_name,
-                "uid": self.uid,
-                "state": "active",
-                "nextDeletionGeneration": self.next_deletion_generation,
-            }
-        return {
-            "schema": 1,
-            "kind": "UnitIncarnationTombstone",
-            "unitName": self.unit_name,
-            "uid": self.uid,
-        }
-
-    @classmethod
-    def from_document(cls, document: object, expected_name: str) -> UnitIncarnationTombstone:
-        if (
-            isinstance(document, dict)
-            and set(document) == {"schema", "kind", "unitName", "uid", "state", "nextDeletionGeneration"}
-            and document.get("kind") == "UnitIncarnationFence"
-        ):
-            uid = document.get("uid")
-            generation = document.get("nextDeletionGeneration")
-            if (
-                type(document.get("schema")) is not int
-                or document.get("schema") != 1
-                or document.get("unitName") != expected_name
-                or document.get("state") != "active"
-                or not isinstance(uid, str)
-                or not isinstance(generation, int)
-                or isinstance(generation, bool)
-                or generation < 2
-            ):
-                raise ValueError("invalid active Unit incarnation fence")
-            ResourceMetadata(
-                name=expected_name,
-                uid=uid,
-                lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
-            ).validate_desired()
-            return cls(
-                unit_name=expected_name,
-                uid=uid,
-                state="active",
-                next_deletion_generation=generation,
-            )
-        if (
-            not isinstance(document, dict)
-            or set(document) != {"schema", "kind", "unitName", "uid"}
-            or type(document.get("schema")) is not int
-            or document.get("schema") != 1
-            or document.get("kind") != "UnitIncarnationTombstone"
-            or document.get("unitName") != expected_name
-        ):
-            raise ValueError("invalid Unit incarnation tombstone")
-        uid = document.get("uid")
-        if not isinstance(uid, str):
-            raise ValueError("invalid Unit incarnation tombstone UID")
-        ResourceMetadata(
-            name=expected_name,
-            uid=uid,
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
-        ).validate_desired()
-        return cls(unit_name=expected_name, uid=uid, state="finalized")
-
-
-@dataclass(frozen=True)
-class StackIncarnationTombstone:
-    """Durable fence preventing a finalized Stack name from reusing its UID."""
-
-    stack_name: str
-    uid: str
-
-    def document(self) -> JsonObject:
-        return {
-            "schema": 1,
-            "kind": "StackIncarnationTombstone",
-            "stackName": self.stack_name,
-            "uid": self.uid,
-        }
-
-    @classmethod
-    def from_document(cls, document: object, expected_name: str) -> StackIncarnationTombstone:
-        if (
-            not isinstance(document, dict)
-            or set(document) != {"schema", "kind", "stackName", "uid"}
-            or type(document.get("schema")) is not int
-            or document.get("schema") != 1
-            or document.get("kind") != "StackIncarnationTombstone"
-            or document.get("stackName") != expected_name
-        ):
-            raise ValueError("invalid Stack incarnation tombstone")
-        uid = document.get("uid")
-        if not isinstance(uid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", uid):
-            raise ValueError("invalid Stack incarnation tombstone UID")
-        ResourceMetadata(
-            name=expected_name,
-            uid=uid,
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
-        ).validate_desired()
-        return cls(stack_name=expected_name, uid=uid)
 
 
 class EffectLeaseUnavailable(OperationError):
@@ -3402,8 +3354,6 @@ class EffectLeaseSnapshot:
     kind: str | None
     driver: str | None
     source_revision: str | None
-    deletion_intent_path: str | None
-    deletion_intent_blob: str | None
     cleanup_path: str | None
     cleanup_blob: str | None
 
@@ -3415,8 +3365,6 @@ class EffectLeaseSnapshot:
             "kind": self.kind,
             "driver": self.driver,
             "sourceRevision": self.source_revision,
-            "deletionIntentPath": self.deletion_intent_path,
-            "deletionIntentBlob": self.deletion_intent_blob,
             "cleanupPath": self.cleanup_path,
             "cleanupBlob": self.cleanup_blob,
         }
@@ -3430,8 +3378,6 @@ class EffectLeaseSnapshot:
             "kind",
             "driver",
             "sourceRevision",
-            "deletionIntentPath",
-            "deletionIntentBlob",
             "cleanupPath",
             "cleanupBlob",
         }
@@ -3444,14 +3390,12 @@ class EffectLeaseSnapshot:
             "kind": document.get("kind"),
             "driver": document.get("driver"),
             "source_revision": document.get("sourceRevision"),
-            "deletion_intent_path": document.get("deletionIntentPath"),
-            "deletion_intent_blob": document.get("deletionIntentBlob"),
             "cleanup_path": document.get("cleanupPath"),
             "cleanup_blob": document.get("cleanupBlob"),
         }
         if not all(value is None or isinstance(value, str) for value in values.values()):
             raise ValueError("invalid effect lease snapshot values")
-        for key in ("unit_blob", "deletion_intent_blob", "cleanup_blob"):
+        for key in ("unit_blob", "cleanup_blob"):
             value = values[key]
             if value is not None and not re.fullmatch(r"[0-9a-f]{40}", value):
                 raise ValueError("invalid effect lease snapshot blob")
@@ -3465,8 +3409,6 @@ class EffectLeaseSnapshot:
             kind=values["kind"],
             driver=values["driver"],
             source_revision=source_revision,
-            deletion_intent_path=values["deletion_intent_path"],
-            deletion_intent_blob=values["deletion_intent_blob"],
             cleanup_path=values["cleanup_path"],
             cleanup_blob=values["cleanup_blob"],
         )
@@ -3723,240 +3665,6 @@ def start_effect_lease_heartbeat(
 
 
 @dataclass(frozen=True)
-class UnitDeletionIntent:
-    """Durable, UID-fenced intent to finalize one desired Unit."""
-
-    unit_name: str
-    uid: str
-    deletion_generation: int
-    retained_source: DesiredSource | None
-    cleanup_identity: RetainedCleanupIdentity
-    retained_unit_blob: str
-    retained_api_version: str
-    retained_kind: str
-    retained_driver: str
-    retained_source_revision: str | None
-    retained_owner: DesiredOwnerReference | None
-    retained_dependencies: tuple[str, ...]
-    management_mode: Literal["sourceTracked", "direct"] = "sourceTracked"
-    retained_identity_known: bool = True
-
-    @classmethod
-    def from_unit(
-        cls,
-        unit: UnitResource[Any],
-        path: Path,
-        root: Path,
-        deletion_generation: int = 1,
-    ) -> UnitDeletionIntent:
-        if deletion_generation < 1:
-            raise OperationError("deletion generation must be positive")
-        unit.metadata.validate_desired()
-        lifecycle = unit.metadata.lifecycle
-        if lifecycle is None:
-            raise OperationError(f"{unit.name} cannot receive a source-tracked deletion intent")
-        if lifecycle.owner is None and lifecycle.management is not None and lifecycle.management.mode == "direct":
-            management_mode: Literal["sourceTracked", "direct"] = "direct"
-        elif lifecycle.owner is not None or (
-            lifecycle.management is not None and lifecycle.management.mode == "sourceTracked"
-        ):
-            management_mode = "sourceTracked"
-        else:
-            raise OperationError(f"{unit.name} cannot receive a deletion intent")
-        source = getattr(unit.spec, "source", None)
-        if source is not None and not isinstance(source, DesiredSource):
-            raise OperationError(f"{unit.name} has an invalid retained source identity")
-        require_unit(unit, unit.name)
-        retained_dependencies = tuple(sorted(desired_observation_reference_units(unit)))
-        assert unit.metadata.uid is not None
-        return cls(
-            unit_name=unit.name,
-            uid=unit.metadata.uid,
-            deletion_generation=deletion_generation,
-            retained_source=source,
-            cleanup_identity=RetainedCleanupIdentity(
-                path=path.relative_to(root).as_posix(),
-                uid=unit.metadata.uid,
-            ),
-            retained_unit_blob=file_blob(path),
-            retained_api_version=unit.gvk.api_version,
-            retained_kind=unit.gvk.kind,
-            retained_driver=unit.driver_name,
-            retained_source_revision=source.revision if source is not None else None,
-            retained_owner=lifecycle.owner,
-            retained_dependencies=retained_dependencies,
-            management_mode=management_mode,
-        )
-
-    def document(self) -> JsonObject:
-        return {
-            "schema": 2,
-            "kind": "UnitDeletionIntent",
-            "unitName": self.unit_name,
-            "uid": self.uid,
-            "deletionGeneration": self.deletion_generation,
-            **({"managementMode": self.management_mode} if self.management_mode == "direct" else {}),
-            "retainedSource": self.retained_source.to_dict() if self.retained_source is not None else None,
-            "cleanupIdentity": {
-                "path": self.cleanup_identity.path,
-                "uid": self.cleanup_identity.uid,
-            },
-            "retainedIdentity": {
-                "unitBlob": self.retained_unit_blob,
-                "apiVersion": self.retained_api_version,
-                "kind": self.retained_kind,
-                "driver": self.retained_driver,
-                "sourceRevision": self.retained_source_revision,
-                "owner": self.retained_owner.to_dict() if self.retained_owner is not None else None,
-                "dependencies": list(self.retained_dependencies),
-                **({"identityKnown": False} if not self.retained_identity_known else {}),
-            },
-        }
-
-    @classmethod
-    def from_document(
-        cls,
-        document: object,
-        expected_name: str,
-        retained_unit: UnitResource[Any] | None = None,
-    ) -> UnitDeletionIntent:
-        if not isinstance(document, dict):
-            raise ValueError("deletion intent must be a mapping")
-        expected_keys = {
-            "schema",
-            "kind",
-            "unitName",
-            "uid",
-            "deletionGeneration",
-            "retainedSource",
-            "cleanupIdentity",
-            "retainedIdentity",
-        }
-        if not isinstance(document, dict) or set(document) not in (expected_keys, expected_keys | {"managementMode"}):
-            raise ValueError("invalid deletion intent envelope")
-        raw_management_mode = document.get("managementMode", "sourceTracked")
-        if not isinstance(raw_management_mode, str) or raw_management_mode not in {"sourceTracked", "direct"}:
-            raise ValueError("invalid deletion intent management mode")
-        if (
-            type(document.get("schema")) is not int
-            or document.get("schema") != 2
-            or document.get("kind") != "UnitDeletionIntent"
-            or document.get("unitName") != expected_name
-        ):
-            raise ValueError("invalid deletion intent envelope")
-        uid = document.get("uid")
-        generation = document.get("deletionGeneration")
-        if (
-            not isinstance(uid, str)
-            or not isinstance(generation, int)
-            or isinstance(generation, bool)
-            or generation < 1
-        ):
-            raise ValueError("invalid deletion intent fence")
-        ResourceMetadata(
-            name=expected_name,
-            uid=uid,
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
-        ).validate_desired()
-        raw_source = document.get("retainedSource")
-        if raw_source is not None and not isinstance(raw_source, dict):
-            raise ValueError("invalid retained source identity")
-        source = DesiredSource.from_dict(raw_source) if isinstance(raw_source, dict) else None
-        raw_cleanup = document.get("cleanupIdentity")
-        if not isinstance(raw_cleanup, dict) or set(raw_cleanup) != {"path", "uid"}:
-            raise ValueError("invalid cleanup identity")
-        cleanup_path = raw_cleanup.get("path")
-        cleanup_uid = raw_cleanup.get("uid")
-        if not isinstance(cleanup_path, str) or not isinstance(cleanup_uid, str) or cleanup_uid != uid:
-            raise ValueError("invalid cleanup identity")
-        relative = PurePosixPath(cleanup_path)
-        if (
-            relative.is_absolute()
-            or len(relative.parts) != 2
-            or relative.parts[0] != "units"
-            or relative.stem != expected_name
-            or relative.suffix not in {".json", ".yaml", ".yml"}
-        ):
-            raise ValueError("cleanup identity must retain a desired Unit path")
-        raw_identity = document.get("retainedIdentity")
-        legacy_identity_keys = {"unitBlob", "apiVersion", "kind", "driver", "sourceRevision"}
-        canonical_identity_keys = legacy_identity_keys | {"owner", "dependencies"}
-        marked_identity_keys = canonical_identity_keys | {"identityKnown"}
-        if not isinstance(raw_identity, dict) or set(raw_identity) not in (
-            legacy_identity_keys,
-            canonical_identity_keys,
-            marked_identity_keys,
-        ):
-            raise ValueError("invalid retained unit identity")
-        retained_blob = raw_identity.get("unitBlob")
-        retained_api_version = raw_identity.get("apiVersion")
-        retained_kind = raw_identity.get("kind")
-        retained_driver = raw_identity.get("driver")
-        retained_source_revision = raw_identity.get("sourceRevision")
-        raw_owner = raw_identity.get("owner")
-        raw_dependencies = raw_identity.get("dependencies")
-        identity_known = True
-        if set(raw_identity) == legacy_identity_keys:
-            identity_known = False
-            if (
-                retained_unit is not None
-                and retained_unit.metadata.uid == uid
-                and retained_unit.gvk.api_version == retained_api_version
-                and retained_unit.gvk.kind == retained_kind
-                and retained_unit.driver_name == retained_driver
-            ):
-                retained_lifecycle = retained_unit.metadata.lifecycle
-                raw_owner = (
-                    retained_lifecycle.owner.to_dict()
-                    if retained_lifecycle is not None and retained_lifecycle.owner is not None
-                    else None
-                )
-                raw_dependencies = list(desired_observation_reference_units(retained_unit))
-                identity_known = True
-            else:
-                raw_owner = None
-                raw_dependencies = []
-        elif "identityKnown" in raw_identity:
-            if type(raw_identity["identityKnown"]) is not bool:
-                raise ValueError("invalid retained unit identity marker")
-            identity_known = raw_identity["identityKnown"]
-        if (
-            not isinstance(retained_blob, str)
-            or not re.fullmatch(r"[0-9a-f]{40}", retained_blob)
-            or not isinstance(retained_api_version, str)
-            or not isinstance(retained_kind, str)
-            or not isinstance(retained_driver, str)
-            or (retained_source_revision is not None and not isinstance(retained_source_revision, str))
-            or (raw_owner is not None and not isinstance(raw_owner, dict))
-            or not isinstance(raw_dependencies, list)
-            or not all(isinstance(dependency, str) and dependency for dependency in raw_dependencies)
-        ):
-            raise ValueError("invalid retained unit identity")
-        try:
-            retained_owner = DesiredOwnerReference.from_dict(raw_owner) if raw_owner is not None else None
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("invalid retained owner identity") from exc
-        if raw_management_mode == "direct" and retained_owner is not None:
-            raise ValueError("direct deletion intent cannot retain an owner")
-        return cls(
-            unit_name=expected_name,
-            uid=uid,
-            deletion_generation=generation,
-            retained_source=source,
-            cleanup_identity=RetainedCleanupIdentity(path=cleanup_path, uid=cleanup_uid),
-            retained_unit_blob=retained_blob,
-            retained_api_version=retained_api_version,
-            retained_kind=retained_kind,
-            retained_driver=retained_driver,
-            retained_source_revision=retained_source_revision,
-            retained_owner=retained_owner,
-            retained_dependencies=tuple(sorted(set(raw_dependencies))),
-            management_mode=cast(Literal["sourceTracked", "direct"], raw_management_mode),
-            retained_identity_known=identity_known,
-        )
-
-
-@dataclass(frozen=True)
 class TeardownEvidence:
     """Observed-state proof that one UID-fenced teardown completed."""
 
@@ -4029,56 +3737,6 @@ class TeardownEvidence:
         )
 
 
-def desired_deletion_intent_paths(root: Path) -> tuple[Path, ...]:
-    directory = root / DESIRED_DELETION_INTENTS_PATH
-    if not directory.is_dir():
-        return ()
-    paths = sorted(path for path in directory.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"})
-    names: dict[str, Path] = {}
-    for path in paths:
-        if path.stem in names:
-            raise OperationError(f"multiple deletion intent formats exist for {path.stem!r}")
-        names[path.stem] = path
-    return tuple(paths)
-
-
-def desired_stack_deletion_intent_paths(root: Path) -> tuple[Path, ...]:
-    directory = root / DESIRED_STACK_DELETION_INTENTS_PATH
-    if not directory.is_dir():
-        return ()
-    paths = sorted(path for path in directory.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"})
-    names: dict[str, Path] = {}
-    for path in paths:
-        if path.stem in names:
-            raise OperationError(f"multiple Stack deletion intent formats exist for {path.stem!r}")
-        names[path.stem] = path
-    return tuple(paths)
-
-
-def load_desired_stack_deletion_intents(root: Path) -> dict[str, StackDeletionIntent]:
-    intents: dict[str, StackDeletionIntent] = {}
-    for path in desired_stack_deletion_intent_paths(root):
-        name = path.stem
-        try:
-            intent = StackDeletionIntent.from_document(load_json(path), name)
-        except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
-            raise OperationError(f"invalid Stack deletion intent for {name!r}") from exc
-        intents[name] = intent
-    return intents
-
-
-def write_stack_deletion_intent(root: Path, intent: StackDeletionIntent) -> Path:
-    directory = root / DESIRED_STACK_DELETION_INTENTS_PATH
-    for path in document_candidates(directory, intent.stack_name):
-        path.unlink()
-    return write_document(directory / f"{intent.stack_name}.json", intent.document(), format=DocumentFormat.JSON)
-
-
-def copy_stack_deletion_intents(current: Path, candidate: Path) -> None:
-    for intent in load_desired_stack_deletion_intents(current).values():
-        write_stack_deletion_intent(candidate, intent)
-
-
 def desired_effect_lease_paths(root: Path) -> tuple[Path, ...]:
     directory = root / DESIRED_EFFECT_LEASES_PATH
     if not directory.is_dir():
@@ -4092,94 +3750,55 @@ def desired_effect_lease_paths(root: Path) -> tuple[Path, ...]:
     return tuple(paths)
 
 
-def desired_unit_incarnation_paths(root: Path) -> tuple[Path, ...]:
-    directory = root / DESIRED_UNIT_INCARNATIONS_PATH
-    if not directory.is_dir():
-        return ()
-    paths = sorted(path for path in directory.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"})
-    names: dict[str, Path] = {}
-    for path in paths:
-        if path.stem in names:
-            raise OperationError(f"multiple Unit incarnation formats exist for {path.stem!r}")
-        names[path.stem] = path
-    return tuple(paths)
-
-
-def load_desired_unit_incarnation_tombstones(root: Path) -> dict[str, UnitIncarnationTombstone]:
-    tombstones: dict[str, UnitIncarnationTombstone] = {}
-    for path in desired_unit_incarnation_paths(root):
-        name = path.stem
-        try:
-            tombstones[name] = UnitIncarnationTombstone.from_document(load_json(path), name)
-        except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
-            raise OperationError(f"invalid Unit incarnation tombstone for {name!r}") from exc
-    return tombstones
-
-
-def write_unit_incarnation_tombstone(root: Path, tombstone: UnitIncarnationTombstone) -> Path:
-    directory = root / DESIRED_UNIT_INCARNATIONS_PATH
-    for path in document_candidates(directory, tombstone.unit_name):
-        path.unlink()
-    return write_document(
-        directory / f"{tombstone.unit_name}.json",
-        tombstone.document(),
-        format=DocumentFormat.JSON,
+def resource_incarnation_path(root: Path, tombstone: ResourceIncarnationTombstone) -> Path:
+    return (
+        root
+        / DESIRED_RESOURCE_INCARNATIONS_PATH
+        / PurePosixPath(tombstone.api_version)
+        / tombstone.kind
+        / f"{tombstone.name}.json"
     )
 
 
-def copy_unit_incarnation_tombstones(current: Path, candidate: Path) -> None:
-    for tombstone in load_desired_unit_incarnation_tombstones(current).values():
-        source_paths = document_candidates(current / DESIRED_UNIT_INCARNATIONS_PATH, tombstone.unit_name)
-        if len(source_paths) != 1:
-            raise OperationError(f"Unit incarnation tombstone for {tombstone.unit_name!r} is unavailable")
-        target = candidate / PurePosixPath(source_paths[0].relative_to(current).as_posix())
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_paths[0], target)
-
-
-def desired_stack_incarnation_paths(root: Path) -> tuple[Path, ...]:
-    directory = root / DESIRED_STACK_INCARNATIONS_PATH
+def load_resource_incarnation_tombstones(
+    root: Path,
+) -> dict[tuple[str, str, str], ResourceIncarnationTombstone]:
+    directory = root / DESIRED_RESOURCE_INCARNATIONS_PATH
+    tombstones: dict[tuple[str, str, str], ResourceIncarnationTombstone] = {}
     if not directory.is_dir():
-        return ()
-    paths = sorted(path for path in directory.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"})
-    names: dict[str, Path] = {}
-    for path in paths:
-        if path.stem in names:
-            raise OperationError(f"multiple Stack incarnation formats exist for {path.stem!r}")
-        names[path.stem] = path
-    return tuple(paths)
-
-
-def load_desired_stack_incarnation_tombstones(root: Path) -> dict[str, StackIncarnationTombstone]:
-    tombstones: dict[str, StackIncarnationTombstone] = {}
-    for path in desired_stack_incarnation_paths(root):
-        name = path.stem
+        return tombstones
+    for path in sorted(directory.rglob("*.json")):
         try:
-            tombstones[name] = StackIncarnationTombstone.from_document(load_json(path), name)
+            tombstone = ResourceIncarnationTombstone.from_document(load_json(path))
         except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
-            raise OperationError(f"invalid Stack incarnation tombstone for {name!r}") from exc
+            raise OperationError(f"invalid resource incarnation tombstone at {path.relative_to(root)}") from exc
+        key = (tombstone.api_version, tombstone.kind, tombstone.name)
+        if key in tombstones or path != resource_incarnation_path(root, tombstone):
+            raise OperationError(f"ambiguous resource incarnation tombstone for {key!r}")
+        tombstones[key] = tombstone
     return tombstones
 
 
-def write_stack_incarnation_tombstone(root: Path, tombstone: StackIncarnationTombstone) -> Path:
-    directory = root / DESIRED_STACK_INCARNATIONS_PATH
-    for path in document_candidates(directory, tombstone.stack_name):
-        path.unlink()
-    return write_document(
-        directory / f"{tombstone.stack_name}.json",
-        tombstone.document(),
-        format=DocumentFormat.JSON,
-    )
+def write_resource_incarnation_tombstone(root: Path, tombstone: ResourceIncarnationTombstone) -> Path:
+    path = resource_incarnation_path(root, tombstone)
+    return write_document(path, tombstone.document(), format=DocumentFormat.JSON)
 
 
-def copy_stack_incarnation_tombstones(current: Path, candidate: Path) -> None:
-    for tombstone in load_desired_stack_incarnation_tombstones(current).values():
-        source_paths = document_candidates(current / DESIRED_STACK_INCARNATIONS_PATH, tombstone.stack_name)
-        if len(source_paths) != 1:
-            raise OperationError(f"Stack incarnation tombstone for {tombstone.stack_name!r} is unavailable")
-        target = candidate / PurePosixPath(source_paths[0].relative_to(current).as_posix())
+def copy_resource_incarnation_tombstones(current: Path, candidate: Path) -> None:
+    for tombstone in load_resource_incarnation_tombstones(current).values():
+        source = resource_incarnation_path(current, tombstone)
+        target = resource_incarnation_path(candidate, tombstone)
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_paths[0], target)
+        shutil.copy2(source, target)
+
+
+def finalized_incarnation_for_resource(
+    tombstones: Mapping[tuple[str, str, str], ResourceIncarnationTombstone],
+    api_version: str,
+    kind: str,
+    name: str,
+) -> ResourceIncarnationTombstone | None:
+    return tombstones.get((api_version, kind, name))
 
 
 def load_desired_effect_leases(root: Path) -> dict[str, EffectLease]:
@@ -4212,9 +3831,6 @@ def effect_lease_snapshot(root: Path, unit_name: str, uid: str) -> EffectLeaseSn
         driver = unit.driver_name
         source_revision = source.revision if isinstance(source, DesiredSource) else None
 
-    intent_paths = document_candidates(root / DESIRED_DELETION_INTENTS_PATH, unit_name)
-    if len(intent_paths) > 1:
-        raise OperationError(f"multiple deletion intent formats exist for leased unit {unit_name!r}")
     cleanup_paths = document_candidates(root / DESIRED_CLEANUP_UNITS_PATH, unit_name)
     if len(cleanup_paths) > 1:
         raise OperationError(f"multiple cleanup formats exist for leased unit {unit_name!r}")
@@ -4225,8 +3841,6 @@ def effect_lease_snapshot(root: Path, unit_name: str, uid: str) -> EffectLeaseSn
         kind=kind,
         driver=driver,
         source_revision=source_revision,
-        deletion_intent_path=(intent_paths[0].relative_to(root).as_posix() if intent_paths else None),
-        deletion_intent_blob=file_blob(intent_paths[0]) if intent_paths else None,
         cleanup_path=cleanup_paths[0].relative_to(root).as_posix() if cleanup_paths else None,
         cleanup_blob=file_blob(cleanup_paths[0]) if cleanup_paths else None,
     )
@@ -4585,113 +4199,6 @@ def validate_effect_lease_head_for_store(
     )
 
 
-def load_desired_deletion_intents(root: Path) -> dict[str, UnitDeletionIntent]:
-    intents: dict[str, UnitDeletionIntent] = {}
-    for path in desired_deletion_intent_paths(root):
-        name = path.stem
-        try:
-            document = load_json(path)
-            retained_unit = None
-            retained_path: Path | None = None
-            raw_cleanup = document.get("cleanupIdentity")
-            if isinstance(raw_cleanup, dict) and isinstance(raw_cleanup.get("path"), str):
-                retained_path = root / PurePosixPath(raw_cleanup["path"])
-                if retained_path.is_file():
-                    try:
-                        retained_unit = load_desired_unit(retained_path, name)
-                    except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError):
-                        retained_unit = None
-            intent = UnitDeletionIntent.from_document(document, name, retained_unit)
-            if retained_unit is not None and retained_path is not None:
-                try:
-                    validate_retained_deletion_unit(retained_unit, retained_path, intent)
-                except OperationError:
-                    intent = replace(
-                        UnitDeletionIntent.from_document(document, name),
-                        retained_identity_known=False,
-                    )
-        except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
-            raise OperationError(f"invalid deletion intent for {name!r}") from exc
-        intents[name] = intent
-    return intents
-
-
-def write_deletion_intent(root: Path, intent: UnitDeletionIntent) -> Path:
-    directory = root / DESIRED_DELETION_INTENTS_PATH
-    for path in document_candidates(directory, intent.unit_name):
-        path.unlink()
-    return write_document(directory / f"{intent.unit_name}.json", intent.document(), format=DocumentFormat.JSON)
-
-
-def validate_retained_deletion_unit(
-    unit: UnitResource[Any], path: Path, intent: UnitDeletionIntent
-) -> tuple[str, DesiredSource | None]:
-    if file_blob(path) != intent.retained_unit_blob:
-        raise OperationError(f"retained desired Unit for {intent.unit_name!r} changed after deletion was requested")
-    if (
-        unit.metadata.uid != intent.uid
-        or unit.gvk.api_version != intent.retained_api_version
-        or unit.gvk.kind != intent.retained_kind
-        or unit.driver_name != intent.retained_driver
-    ):
-        raise OperationError(f"retained desired Unit for {intent.unit_name!r} no longer matches its deletion fence")
-    source_revision = getattr(unit.spec, "source", None)
-    if not isinstance(source_revision, DesiredSource):
-        source_revision = None
-    if (source_revision.revision if source_revision is not None else None) != intent.retained_source_revision:
-        raise OperationError(f"retained source revision for {intent.unit_name!r} changed after deletion was requested")
-    lifecycle = unit.metadata.lifecycle
-    owner = lifecycle.owner if lifecycle is not None else None
-    if intent.management_mode == "direct":
-        if (
-            lifecycle is None
-            or owner is not None
-            or lifecycle.management is None
-            or lifecycle.management.mode != "direct"
-        ):
-            raise OperationError(
-                f"retained desired Unit for {intent.unit_name!r} no longer has direct lifecycle authority"
-            )
-    elif lifecycle is None or (
-        owner is None and (lifecycle.management is None or lifecycle.management.mode != "sourceTracked")
-    ):
-        raise OperationError(f"retained desired Unit for {intent.unit_name!r} is not source-tracked or UID-owned")
-    if owner != intent.retained_owner:
-        raise OperationError(f"retained owner identity for {intent.unit_name!r} changed after deletion was requested")
-    dependencies = tuple(sorted(desired_observation_reference_units(unit)))
-    if dependencies != intent.retained_dependencies:
-        raise OperationError(
-            f"retained dependency identity for {intent.unit_name!r} changed after deletion was requested"
-        )
-    return require_unit(unit, intent.unit_name)
-
-
-def opaque_cleanup_root_for_intent(
-    unit_name: str,
-    intent: UnitDeletionIntent,
-    path: Path,
-    payload: object,
-) -> OpaqueCleanupRoot:
-    return OpaqueCleanupRoot(
-        path=path,
-        payload=payload,
-        metadata=ResourceMetadata(
-            name=unit_name,
-            uid=intent.uid,
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
-        ),
-        source=raw_document_source(payload),
-    )
-
-
-def deletion_intent_reason(intent: UnitDeletionIntent) -> str:
-    return (
-        f"deletion pending finalization (UID {intent.uid}, generation {intent.deletion_generation}); "
-        f"run finalize --unit {intent.unit_name} --uid {intent.uid} "
-        f"--deletion-generation {intent.deletion_generation}"
-    )
-
-
 def teardown_evidence_filename(unit_name: str, uid: str, deletion_generation: int) -> str:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", uid):
         raise OperationError("teardown evidence identity is not safe for a filename")
@@ -4754,7 +4261,9 @@ def load_teardown_evidence(
 
 def publish_teardown_observation_cas(
     observed_ref: str,
-    intent: UnitDeletionIntent,
+    unit_name: str,
+    uid: str,
+    deletion_generation: int,
     desired_revision: str,
     *,
     desired_ref: str | None = None,
@@ -4772,17 +4281,17 @@ def publish_teardown_observation_cas(
             if desired_ref is not None and lease_token is not None:
                 desired_revision = validate_effect_lease_head_for_store(
                     desired_ref,
-                    intent.unit_name,
-                    intent.uid,
+                    unit_name,
+                    uid,
                     lease_token,
                     lease_snapshot,
                     lease_ref=lease_ref,
                 )
             existing = load_teardown_evidence(
                 observed,
-                intent.unit_name,
-                intent.uid,
-                intent.deletion_generation,
+                unit_name,
+                uid,
+                deletion_generation,
             )
             try:
                 evidence_details = cast(
@@ -4794,26 +4303,23 @@ def publish_teardown_observation_cas(
             except (TypeError, ValueError) as exc:
                 raise OperationError("teardown returned non-JSON evidence details") from exc
             evidence = TeardownEvidence(
-                unit_name=intent.unit_name,
-                uid=intent.uid,
-                deletion_generation=intent.deletion_generation,
+                unit_name=unit_name,
+                uid=uid,
+                deletion_generation=deletion_generation,
                 desired_revision=desired_revision,
                 details=evidence_details,
             )
             legacy_evidence_removed = False
-            for legacy_path in document_candidates(observed / OBSERVED_TEARDOWN_EVIDENCE_PATH, intent.unit_name):
+            for legacy_path in document_candidates(observed / OBSERVED_TEARDOWN_EVIDENCE_PATH, unit_name):
                 try:
-                    legacy_evidence = TeardownEvidence.from_document(load_json(legacy_path), intent.unit_name)
+                    legacy_evidence = TeardownEvidence.from_document(load_json(legacy_path), unit_name)
                 except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
-                    raise OperationError(f"invalid teardown evidence for {intent.unit_name!r}") from exc
-                if (
-                    legacy_evidence.uid == intent.uid
-                    and legacy_evidence.deletion_generation == intent.deletion_generation
-                ):
+                    raise OperationError(f"invalid teardown evidence for {unit_name!r}") from exc
+                if legacy_evidence.uid == uid and legacy_evidence.deletion_generation == deletion_generation:
                     legacy_path.unlink()
                     legacy_evidence_removed = True
-            receipt_paths = document_candidates(observed / "units", intent.unit_name)
-            artifact_path = observed / "artifacts" / intent.unit_name
+            receipt_paths = document_candidates(observed / "units", unit_name)
+            artifact_path = observed / "artifacts" / unit_name
             had_active_observation = bool(receipt_paths) or artifact_path.exists()
             for receipt_path in receipt_paths:
                 receipt_path.unlink()
@@ -4824,13 +4330,13 @@ def publish_teardown_observation_cas(
             evidence_path = (
                 observed
                 / OBSERVED_TEARDOWN_EVIDENCE_PATH
-                / teardown_evidence_filename(intent.unit_name, intent.uid, intent.deletion_generation)
+                / teardown_evidence_filename(unit_name, uid, deletion_generation)
             )
             if desired_ref is not None and lease_token is not None:
                 latest_revision = validate_effect_lease_head_for_store(
                     desired_ref,
-                    intent.unit_name,
-                    intent.uid,
+                    unit_name,
+                    uid,
                     lease_token,
                     lease_snapshot,
                     lease_ref=lease_ref,
@@ -4838,9 +4344,9 @@ def publish_teardown_observation_cas(
                 if latest_revision != desired_revision:
                     desired_revision = latest_revision
                     evidence = TeardownEvidence(
-                        unit_name=intent.unit_name,
-                        uid=intent.uid,
-                        deletion_generation=intent.deletion_generation,
+                        unit_name=unit_name,
+                        uid=uid,
+                        deletion_generation=deletion_generation,
                         desired_revision=desired_revision,
                         details=evidence_details,
                     )
@@ -4857,7 +4363,7 @@ def publish_teardown_observation_cas(
                     observed_ref,
                     observed,
                     observed_revision,
-                    f"Record teardown of {intent.unit_name} generation {intent.deletion_generation}",
+                    f"Record teardown of {unit_name} generation {deletion_generation}",
                 )
             except subprocess.CalledProcessError as exc:
                 if attempt == 4 or not retryable_push_failure(exc):
@@ -4927,6 +4433,43 @@ def raw_document_source(payload: object) -> DesiredSource | None:
     )
 
 
+def opaque_resource_gvk(payload: object) -> tuple[str, str]:
+    if isinstance(payload, dict):
+        api_version = payload.get("apiVersion")
+        kind = payload.get("kind")
+        if isinstance(api_version, str) and "/" in api_version and isinstance(kind, str) and kind:
+            return api_version, kind
+    return CORE_API_VERSION, "OpaqueUnit"
+
+
+def opaque_cleanup_content_digest(opaque: OpaqueCleanupRoot) -> str:
+    metadata = replace(opaque.metadata, deletion=None).document(profile="desired")
+    document = {
+        "schema": 1,
+        "kind": "OpaqueCleanupRoot",
+        "metadata": metadata,
+        "payload": opaque.payload,
+    }
+    return f"sha256:{hashlib.sha256(canonical_json(document)).hexdigest()}"
+
+
+def mark_opaque_cleanup_for_deletion(
+    opaque: OpaqueCleanupRoot,
+    *,
+    generation: int | None = None,
+) -> OpaqueCleanupRoot:
+    current = opaque.metadata.deletion
+    if current is not None:
+        if current.resourceDigest != opaque_cleanup_content_digest(opaque):
+            raise OperationError(f"opaque cleanup root {opaque.metadata.name!r} changed after deletion started")
+        return opaque
+    deletion = DeletionMetadata(
+        generation=generation or 1,
+        resourceDigest=opaque_cleanup_content_digest(opaque),
+    )
+    return replace(opaque, metadata=replace(opaque.metadata, deletion=deletion))
+
+
 def opaque_cleanup_metadata(name: str, payload: object, source_revision: str) -> ResourceMetadata:
     has_metadata = isinstance(payload, dict) and "metadata" in payload
     metadata_document = payload.get("metadata") if isinstance(payload, dict) else None
@@ -4942,18 +4485,13 @@ def opaque_cleanup_metadata(name: str, payload: object, source_revision: str) ->
             except (KeyError, TypeError, ValueError) as exc:
                 raise OperationError(f"opaque cleanup metadata for {name!r} is invalid") from exc
             lifecycle = metadata.lifecycle
-            if lifecycle is not None and (
-                lifecycle.owner is not None
-                or (lifecycle.management is not None and lifecycle.management.mode == "direct")
+            if metadata.ownerReferences or (
+                lifecycle is not None and lifecycle.management is not None and lifecycle.management.mode == "direct"
             ):
                 raise OperationError(f"desired unit {name!r} collides with a directly managed or UID-owned resource")
             if metadata.uid is None:
                 raise OperationError(f"opaque cleanup metadata for {name!r} has no canonical UID")
-            return ResourceMetadata(
-                name=name,
-                uid=metadata.uid,
-                lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
-            )
+            return metadata
     provenance = json.dumps(
         {"name": name, "sourceRevision": source_revision, "payload": payload},
         sort_keys=True,
@@ -5029,12 +4567,12 @@ def source_tracked_metadata_for_uid(
 ) -> ResourceMetadata:
     """Build canonical recovery metadata without accepting authority from opaque payload bytes."""
 
-    lifecycle = (
-        DesiredLifecycle(owner=owner)
-        if owner is not None
-        else DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked"))
+    metadata = ResourceMetadata(
+        name=name,
+        uid=uid,
+        lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")) if owner is None else None,
+        ownerReferences=[owner] if owner is not None else None,
     )
-    metadata = ResourceMetadata(name=name, uid=uid, lifecycle=lifecycle)
     metadata.validate_desired()
     return metadata
 
@@ -5043,7 +4581,6 @@ def parse_opaque_recovery_unit(
     opaque: OpaqueCleanupRoot,
     unit_name: str,
     uid: str,
-    intent: UnitDeletionIntent | None = None,
 ) -> UnitResource[Any]:
     """Parse only the persisted opaque payload, applying an external UID fence."""
 
@@ -5063,25 +4600,8 @@ def parse_opaque_recovery_unit(
     if lifecycle is not None:
         if lifecycle.management is not None and lifecycle.management.mode == "direct":
             raise OperationError(f"opaque cleanup payload for {unit_name!r} has direct lifecycle authority")
-        if intent is None and lifecycle.owner is not None:
+        if resource_owner_reference(parsed) is not None:
             raise OperationError(f"opaque cleanup payload for {unit_name!r} has an unvalidated owner identity")
-    if intent is not None:
-        if (
-            parsed.gvk.api_version != intent.retained_api_version
-            or parsed.gvk.kind != intent.retained_kind
-            or parsed.driver_name != intent.retained_driver
-            or (lifecycle.owner if lifecycle is not None else None) != intent.retained_owner
-        ):
-            raise OperationError(f"opaque cleanup payload for {unit_name!r} conflicts with its deletion intent")
-        source = getattr(parsed.spec, "source", None)
-        source_revision = source.revision if isinstance(source, DesiredSource) else None
-        if source_revision != intent.retained_source_revision:
-            raise OperationError(f"opaque cleanup payload for {unit_name!r} conflicts with its retained source fence")
-        if intent.retained_source is not None:
-            if not isinstance(source, DesiredSource) or source.path != intent.retained_source.path:
-                raise OperationError(f"opaque cleanup payload for {unit_name!r} conflicts with its source path fence")
-        if tuple(sorted(desired_observation_reference_units(parsed))) != intent.retained_dependencies:
-            raise OperationError(f"opaque cleanup payload for {unit_name!r} conflicts with its dependency fence")
     return parsed
 
 
@@ -5113,7 +4633,7 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
             if current_revision is None:
                 raise OperationError(f"desired ref {desired_ref!r} has no state to recover")
             lease_root = current
-            if lease_ref != desired_ref:
+            if lease_ref is not None and lease_ref != desired_ref:
                 lease_root, _lease_revision = _effect_lease_store_root(
                     desired_ref,
                     current_revision,
@@ -5125,35 +4645,14 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
             opaque = load_desired_cleanup_roots(current).get(args.unit)
             if opaque is None:
                 raise OperationError(f"no opaque cleanup root exists for {args.unit!r}")
-            intents = load_desired_deletion_intents(current)
-            intent = intents.get(args.unit)
-            if intent is not None and intent.uid != args.uid:
-                raise OperationError(f"stale deletion intent UID fence for {args.unit!r}")
-            if intent is None and opaque.metadata.uid != args.uid:
+            if opaque.metadata.uid != args.uid:
                 raise OperationError(f"stale opaque cleanup UID fence for {args.unit!r}")
-            incarnation_tombstones = load_desired_unit_incarnation_tombstones(current)
-            incarnation = incarnation_tombstones.get(args.unit)
-            if incarnation is not None and incarnation.uid != args.uid:
-                raise OperationError(f"opaque cleanup {args.unit!r} conflicts with its incarnation fence")
-            if incarnation is not None and incarnation.state == "finalized":
+            opaque_deletion = opaque.metadata.deletion
+            if opaque_deletion is not None and opaque_deletion.resourceDigest != opaque_cleanup_content_digest(opaque):
+                raise OperationError(f"opaque cleanup root {args.unit!r} changed after deletion started")
+            incarnations = load_resource_incarnation_tombstones(current)
+            if any(tombstone.name == args.unit and tombstone.uid == args.uid for tombstone in incarnations.values()):
                 raise OperationError(f"opaque cleanup {args.unit!r} has already been finalized")
-            if intent is not None and intent.deletion_generation == 1:
-                # Generation-one intents predate incarnation fences.  Migrate the
-                # intent before recovery so legacy teardown evidence cannot prove
-                # completion for the recovered lifecycle.
-                incarnation = incarnation or UnitIncarnationTombstone(
-                    unit_name=args.unit,
-                    uid=args.uid,
-                    state="active",
-                    next_deletion_generation=2,
-                )
-                incarnation = replace(
-                    incarnation,
-                    state="active",
-                    next_deletion_generation=max(2, incarnation.next_deletion_generation),
-                )
-                incarnation_tombstones[args.unit] = incarnation
-                intent = replace(intent, deletion_generation=2)
             if any(
                 effect_lease_active(lease)
                 for lease in load_desired_effect_leases(lease_root).values()
@@ -5163,7 +4662,7 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
             if document_candidates(current / "units", args.unit):
                 raise OperationError(f"canonical desired Unit {args.unit!r} already exists")
 
-            parsed = parse_opaque_recovery_unit(opaque, args.unit, args.uid, intent)
+            parsed = parse_opaque_recovery_unit(opaque, args.unit, args.uid)
             specifications = load_environment_specifications(source_root, args.environment)
             source_specification = specifications.get(args.unit)
             source_present = source_specification is not None
@@ -5193,19 +4692,15 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
             else:
                 transition = False
 
-            if incarnation is None:
-                incarnation = UnitIncarnationTombstone(
-                    unit_name=args.unit,
-                    uid=args.uid,
-                    state="active",
-                    next_deletion_generation=2,
+            restored = parsed.with_metadata(source_tracked_metadata_for_uid(args.unit, args.uid))
+            if opaque_deletion is not None or not source_present or transition:
+                restored = cast(
+                    UnitResource[Any],
+                    mark_resource_for_deletion(
+                        restored,
+                        generation=opaque_deletion.generation if opaque_deletion is not None else None,
+                    ),
                 )
-
-            if intent is not None:
-                metadata = source_tracked_metadata_for_uid(args.unit, args.uid, intent.retained_owner)
-            else:
-                metadata = source_tracked_metadata_for_uid(args.unit, args.uid)
-            restored = parsed.with_metadata(metadata)
             require_unit(restored, args.unit)
             validate_unit_materialization(current, args.unit, parsed)
 
@@ -5220,28 +4715,9 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
                 source_root,
             )
             copy_unit_materialization(current, candidate, args.unit, restored)
-            write_unit_incarnation_tombstone(candidate, incarnation)
 
             transition_blocks = load_desired_transition_blocks(candidate)
             transition_blocks.pop(args.unit, None)
-            if intent is not None:
-                restored_path = unit_document_path(candidate, args.unit)
-                if file_blob(restored_path) != intent.retained_unit_blob:
-                    raise OperationError(
-                        f"recovered desired Unit for {args.unit!r} does not match its immutable retained_unit_blob"
-                    )
-                write_deletion_intent(candidate, intent)
-                transition_blocks[args.unit] = deletion_intent_reason(intent)
-            elif not source_present or transition:
-                restored_path = unit_document_path(candidate, args.unit)
-                new_intent = UnitDeletionIntent.from_unit(
-                    restored,
-                    restored_path,
-                    candidate,
-                    incarnation.next_deletion_generation,
-                )
-                write_deletion_intent(candidate, new_intent)
-                transition_blocks[args.unit] = deletion_intent_reason(new_intent)
             write_desired_transition_blocks(candidate, transition_blocks)
             load_desired_resource_graph(candidate)
             if args.dry:
@@ -5297,6 +4773,8 @@ def command_resolve_opaque_unit(args: argparse.Namespace) -> bool:
         raise OperationError(f"invalid unit name: {args.unit!r}")
     if not isinstance(args.uid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args.uid):
         raise OperationError("resolve-opaque-unit requires a valid --uid")
+    if not isinstance(args.deletion_generation, int) or args.deletion_generation < 1:
+        raise OperationError("resolve-opaque-unit requires --deletion-generation >= 1")
     if not args.confirm_external_cleanup:
         raise OperationError("resolve-opaque-unit requires --confirm-external-cleanup")
     if not isinstance(args.reason, str) or not args.reason.strip() or len(args.reason) > 500:
@@ -5312,7 +4790,7 @@ def command_resolve_opaque_unit(args: argparse.Namespace) -> bool:
             raise OperationError(f"desired ref {desired_ref!r} has no state")
         lease_ref = effect_lease_ref(args.environment, desired_ref)
         lease_root = current
-        if lease_ref != desired_ref:
+        if lease_ref is not None and lease_ref != desired_ref:
             lease_root, _lease_revision = _effect_lease_store_root(
                 desired_ref,
                 current_revision,
@@ -5326,12 +4804,15 @@ def command_resolve_opaque_unit(args: argparse.Namespace) -> bool:
             raise OperationError(f"no opaque cleanup root exists for {args.unit!r}")
         if opaque.metadata.uid != args.uid:
             raise OperationError(f"stale opaque cleanup UID fence for {args.unit!r}")
+        deletion = opaque.metadata.deletion
+        if deletion is None:
+            raise OperationError(f"opaque cleanup root for {args.unit!r} is not marked for deletion")
+        if deletion.generation != args.deletion_generation:
+            raise OperationError(f"stale opaque cleanup deletion generation fence for {args.unit!r}")
+        if deletion.resourceDigest != opaque_cleanup_content_digest(opaque):
+            raise OperationError(f"opaque cleanup root {args.unit!r} changed after deletion started")
         if document_candidates(current / "units", args.unit):
             raise OperationError(f"opaque cleanup root for {args.unit!r} conflicts with a desired Unit")
-        if args.unit in load_desired_deletion_intents(current):
-            raise OperationError(
-                f"opaque cleanup root for {args.unit!r} has a deletion intent; restore the Unit before resolving it"
-            )
         lease = load_desired_effect_leases(lease_root).get(args.unit)
         if lease is not None and effect_lease_active(lease):
             raise OperationError(f"active effect lease blocks opaque resolution for {args.unit!r}")
@@ -5346,9 +4827,16 @@ def command_resolve_opaque_unit(args: argparse.Namespace) -> bool:
         shutil.copytree(current, candidate)
         for path in document_candidates(candidate / DESIRED_CLEANUP_UNITS_PATH, args.unit):
             path.unlink()
-        write_unit_incarnation_tombstone(
+        api_version, kind = opaque_resource_gvk(opaque.payload)
+        write_resource_incarnation_tombstone(
             candidate,
-            UnitIncarnationTombstone(unit_name=args.unit, uid=args.uid),
+            ResourceIncarnationTombstone(
+                api_version=api_version,
+                kind=kind,
+                name=args.unit,
+                uid=args.uid,
+                deletion_generation=deletion.generation,
+            ),
         )
         blocks = load_desired_transition_blocks(candidate)
         blocks.pop(args.unit, None)
@@ -5390,6 +4878,17 @@ def command_resolve_opaque_unit(args: argparse.Namespace) -> bool:
             False,
             current,
             request_change=False,
+            finalized_resources=frozenset(
+                {
+                    ResourceFinalizationFence(
+                        api_version,
+                        kind,
+                        args.unit,
+                        args.uid,
+                        deletion.generation,
+                    )
+                }
+            ),
         )
         if outcome is not None:
             log_status(
@@ -5419,12 +4918,13 @@ def desired_metadata_for_candidate(
         return source_tracked_metadata_for_resource(previous)
     previous.metadata.validate_desired()
     lifecycle = previous.metadata.lifecycle
-    if lifecycle is None:
+    if lifecycle is None and resource_owner_reference(previous) is None:
         raise OperationError(f"{authored.name} has no desired lifecycle authority")
-    if lifecycle.owner is not None:
+    if resource_owner_reference(previous) is not None:
         raise OperationError(
             f"desired unit {authored.name!r} collides with a UID-fenced owned resource; refusing source adoption"
         )
+    assert lifecycle is not None
     assert lifecycle.management is not None
     if lifecycle.management.mode != "sourceTracked":
         raise OperationError(
@@ -5482,7 +4982,7 @@ def build_desired_candidate(
     candidate_units.mkdir(parents=True)
     (candidate / "stack-templates").mkdir(parents=True)
     (candidate / "stacks").mkdir(parents=True)
-    copy_stack_incarnation_tombstones(current_desired, candidate)
+    copy_resource_incarnation_tombstones(current_desired, candidate)
     stack_projection = project_stack_resources(
         source_root,
         environment_name,
@@ -5492,11 +4992,23 @@ def build_desired_candidate(
         current_desired,
         promotion,
     )
+    current_template_paths = _current_desired_stack_paths(current_desired, "StackTemplate")
+    candidate_template_paths = _current_desired_stack_paths(candidate, "StackTemplate")
+    for template_name, current_template_path in current_template_paths.items():
+        if template_name in candidate_template_paths:
+            continue
+        current_template = RESOURCE_CATALOG.parse_stack_template(
+            RESOURCE_CATALOG.load_document(current_template_path),
+            profile="desired",
+            expected_name=template_name,
+        )
+        target = candidate / "stack-templates" / current_template_path.name
+        _write_desired_resource(target, mark_resource_for_deletion(current_template))
     imported_artifact_fingerprints: dict[str, dict[str, str]] = {}
     imported_artifact_evidence: dict[str, dict[str, ResolvedArtifactImport]] = {}
     # Direct Stacks are controller-owned roots, so they must survive source
-    # advances just like direct Units. An active deletion intent is retained
-    # with the same root until finalization removes it explicitly.
+    # advances just like direct Units. Deletion metadata is retained with the
+    # same root until finalization removes it explicitly.
     source_stack_paths = _document_paths(project_environment_root(source_root, environment_name) / "stacks")
     current_stack_resources: dict[tuple[str, str, str], UnitResource[Any] | StackResource] = {}
     if _current_desired_stack_paths(current_desired, "Stack"):
@@ -5508,7 +5020,6 @@ def build_desired_candidate(
             # complete Stack graph. Do not make unrelated legacy cleanup
             # depend on Stack-only inspection.
             current_stack_resources = {}
-    stack_intents = load_desired_stack_deletion_intents(current_desired)
     for stack_name, current_stack_path in _current_desired_stack_paths(current_desired, "Stack").items():
         current_stack = RESOURCE_CATALOG.parse_stack(
             RESOURCE_CATALOG.load_document(current_stack_path), profile="desired", expected_name=stack_name
@@ -5516,17 +5027,17 @@ def build_desired_candidate(
         lifecycle = current_stack.metadata.lifecycle
         is_direct = (
             lifecycle is not None
-            and lifecycle.owner is None
+            and resource_owner_reference(current_stack) is None
             and lifecycle.management is not None
             and lifecycle.management.mode == "direct"
         )
         is_source_tracked = (
             lifecycle is not None
-            and lifecycle.owner is None
+            and resource_owner_reference(current_stack) is None
             and lifecycle.management is not None
             and lifecycle.management.mode == "sourceTracked"
         )
-        if not is_direct and not is_source_tracked and stack_name not in stack_intents:
+        if not is_direct and not is_source_tracked:
             continue
         if is_direct and stack_name in source_stack_paths:
             raise OperationError(f"source Stack {stack_name!r} collides with a directly managed desired Stack")
@@ -5537,30 +5048,15 @@ def build_desired_candidate(
         target = candidate / "stacks" / current_stack_path.name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(current_stack_path, target)
-        if is_source_tracked and stack_name not in source_stack_paths and stack_name not in stack_intents:
-            owned_units = [
-                resource
-                for resource in current_stack_resources.values()
-                if isinstance(resource, UnitResource)
-                and resource.metadata.lifecycle is not None
-                and resource.metadata.lifecycle.owner is not None
-                and resource.metadata.lifecycle.owner.kind == "Stack"
-                and resource.metadata.lifecycle.owner.name == stack_name
-                and resource.metadata.lifecycle.owner.uid == current_stack.metadata.uid
-            ]
-            intent = _stack_intent_for_resource(
-                environment_name,
-                current_stack,
-                current_stack_path,
-                current_desired,
-                owned_units,
-                dry=True,
-            )
-            write_stack_deletion_intent(candidate, intent)
-            transition_blocks = load_desired_transition_blocks(candidate)
-            transition_blocks[stack_name] = f"Stack deletion intent active at generation {intent.deletion_generation}"
-            write_desired_transition_blocks(candidate, transition_blocks)
-    copy_stack_deletion_intents(current_desired, candidate)
+        if is_source_tracked and stack_name not in source_stack_paths:
+            marked_stack = mark_resource_for_deletion(current_stack)
+            _write_desired_resource(target, marked_stack)
+            current_stack_resources = current_stack_resources or load_desired_resource_graph(current_desired)
+            for child in _owned_resource_closure(current_stack_resources, current_stack):
+                if child.name == current_stack.name:
+                    continue
+                child_path = _desired_resource_path(candidate, child)
+                _write_desired_resource(child_path, mark_resource_for_deletion(child))
     for unit_name, generated_unit in stack_projection.generated_units.items():
         if unit_name in specifications:
             raise OperationError(f"generated Stack Unit {unit_name!r} collides with a source Unit")
@@ -5571,110 +5067,23 @@ def build_desired_candidate(
             if any((source_root / name).is_file() for name in PROJECT_CONFIG_NAMES)
             else SourceRevisionPolicy()
         )
-    copy_unit_incarnation_tombstones(current_desired, candidate)
     if promotion is not None:
         write_preferred_document(candidate / "promotion.json", promotion.document(), source_root)
 
     prepared: dict[str, tuple[UnitResource[Any], ResolvedUnitSourceResult]] = {}
     retained_transitions: dict[str, UnitResource[Any]] = {}
     opaque_transitions = load_desired_cleanup_roots(current_desired)
-    deletion_intents = load_desired_deletion_intents(current_desired)
+    opaque_transitions = {
+        name: mark_opaque_cleanup_for_deletion(opaque) if name not in specifications else opaque
+        for name, opaque in opaque_transitions.items()
+    }
     blocked_transitions = load_desired_transition_blocks(current_desired)
-    incarnation_tombstones = load_desired_unit_incarnation_tombstones(current_desired)
+    incarnation_tombstones = load_resource_incarnation_tombstones(current_desired)
     blocked: dict[str, str] = {}
     cleanup_inputs: dict[str, DesiredCleanupInput] = {}
     refreshes: dict[str, str] = {}
 
-    def adopt_existing_incarnation(unit: UnitResource[Any]) -> UnitIncarnationTombstone | None:
-        """Durably fence a canonical pre-record Unit without changing its UID."""
-
-        existing = incarnation_tombstones.get(unit.name)
-        if existing is not None:
-            return existing
-        if unit.is_legacy_compatibility or unit.metadata.uid is None:
-            return None
-        adopted = UnitIncarnationTombstone(
-            unit_name=unit.name,
-            uid=unit.metadata.uid,
-            state="active",
-            next_deletion_generation=2,
-        )
-        incarnation_tombstones[unit.name] = adopted
-        write_unit_incarnation_tombstone(candidate, adopted)
-        return adopted
-
-    def retain_deletion_intent(unit_name: str, intent: UnitDeletionIntent) -> None:
-        if intent.deletion_generation == 1 and unit_name not in incarnation_tombstones:
-            # Intents written before incarnation fences were introduced can still
-            # carry evidence for a UID that has already been reused. Adopt that
-            # UID once and move the intent to a new deletion generation so the
-            # old evidence cannot satisfy it.
-            adopted = UnitIncarnationTombstone(
-                unit_name=unit_name,
-                uid=intent.uid,
-                state="active",
-                next_deletion_generation=2,
-            )
-            incarnation_tombstones[unit_name] = adopted
-            write_unit_incarnation_tombstone(candidate, adopted)
-            intent = replace(intent, deletion_generation=2)
-        retained_path = current_desired / PurePosixPath(intent.cleanup_identity.path)
-        retained: UnitResource[Any] | None = None
-        opaque: OpaqueCleanupRoot | None = None
-        if retained_path.is_file():
-            try:
-                candidate_unit = load_desired_unit(retained_path, unit_name)
-                candidate_unit.metadata.validate_desired()
-                if candidate_unit.is_legacy_compatibility:
-                    raise OperationError("retained desired Unit is legacy")
-                validate_retained_deletion_unit(candidate_unit, retained_path, intent)
-                target_path = candidate / PurePosixPath(intent.cleanup_identity.path)
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(retained_path, target_path)
-                if getattr(candidate_unit.spec, "materialization", None) is not None:
-                    copy_unit_materialization(current_desired, candidate, unit_name, candidate_unit)
-                retained = candidate_unit
-            except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError):
-                opaque = opaque_cleanup_root_for_intent(
-                    unit_name,
-                    intent,
-                    retained_path,
-                    opaque_document_payload(retained_path),
-                )
-        if retained is None:
-            if opaque is None:
-                existing = opaque_transitions.get(unit_name)
-                if existing is not None:
-                    opaque = opaque_cleanup_root_for_intent(unit_name, intent, existing.path, existing.payload)
-                else:
-                    opaque = opaque_cleanup_root_for_intent(
-                        unit_name,
-                        intent,
-                        retained_path,
-                        {
-                            "kind": "UnavailableRetainedUnit",
-                            "unitName": unit_name,
-                            "uid": intent.uid,
-                            "retainedPath": intent.cleanup_identity.path,
-                        },
-                    )
-            write_opaque_cleanup_root(candidate, unit_name, opaque)
-        write_deletion_intent(candidate, intent)
-        reason = deletion_intent_reason(intent)
-        blocked_transitions[unit_name] = reason
-        blocked[unit_name] = reason
-        cleanup_inputs[unit_name] = DesiredCleanupInput(
-            unit_name=unit_name,
-            desired=retained,
-            source=getattr(retained.spec, "source", None) if retained is not None else intent.retained_source,
-        )
-        if verbose:
-            log_status("WAIT", f"{style_unit(unit_name)}: {reason}")
-
     for unit_name, specification in specifications.items():
-        if unit_name in deletion_intents:
-            retain_deletion_intent(unit_name, deletion_intents[unit_name])
-            continue
         if unit_name in opaque_transitions:
             blocked_transitions.setdefault(unit_name, "opaque cleanup root retained pending explicit adoption")
             if verbose:
@@ -5702,12 +5111,12 @@ def build_desired_candidate(
                 continue
         if previous is not None and not previous.is_legacy_compatibility:
             previous.metadata.validate_desired()
-            adopt_existing_incarnation(previous)
             lifecycle = previous.metadata.lifecycle
-            assert lifecycle is not None
-            if lifecycle.owner is not None or (
-                lifecycle.management is not None and lifecycle.management.mode == "direct"
-            ):
+            owner = resource_owner_reference(previous)
+            is_direct = (
+                lifecycle is not None and lifecycle.management is not None and lifecycle.management.mode == "direct"
+            )
+            if owner is not None or is_direct:
                 if previous.gvk != specification.gvk or previous.driver_name != specification.driver_name:
                     raise OperationError(
                         f"desired unit {unit_name!r} collides with a directly managed or UID-owned resource"
@@ -5801,11 +5210,19 @@ def build_desired_candidate(
             )
             previous_unit = unit_document_path(current_desired, unit_name)
             previous = load_desired_unit(previous_unit, unit_name) if previous_unit.is_file() else None
-            previous_incarnation = incarnation_tombstones.get(unit_name) if previous is None else None
+            previous_incarnation = (
+                finalized_incarnation_for_resource(
+                    incarnation_tombstones,
+                    resolved.gvk.api_version,
+                    resolved.gvk.kind,
+                    unit_name,
+                )
+                if previous is None
+                else None
+            )
             owner = stack_projection.owners.get(unit_name)
             if owner is not None and preserve_stack_owned_metadata and previous is not None:
-                previous_lifecycle = previous.metadata.lifecycle
-                previous_owner = previous_lifecycle.owner if previous_lifecycle is not None else None
+                previous_owner = resource_owner_reference(previous)
                 if previous_owner is not None and previous_owner.kind == "Stack" and previous_owner.name == owner.name:
                     resolved = resolved.with_metadata(previous.metadata)
                 else:
@@ -5887,8 +5304,7 @@ def build_desired_candidate(
                 log_status("CARRY", f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}")
         elif previous_driver == next_driver:
             previous_resource = load_desired_unit(previous, unit_name)
-            previous_lifecycle = previous_resource.metadata.lifecycle
-            previous_owner = previous_lifecycle.owner if previous_lifecycle is not None else None
+            previous_owner = resource_owner_reference(previous_resource)
             stack_owner = stack_projection.owners.get(unit_name)
             retained_metadata = (
                 previous_resource.metadata
@@ -5944,109 +5360,58 @@ def build_desired_candidate(
             desired=retained,
             source=getattr(retained.spec, "source", None),
         )
-        retained_candidate_path = unit_document_path(candidate, unit_name)
-        incarnation = incarnation_tombstones.get(unit_name)
-        intent = UnitDeletionIntent.from_unit(
-            retained,
-            retained_candidate_path,
-            candidate,
-            incarnation.next_deletion_generation if incarnation is not None else 1,
+        retained = cast(UnitResource[Any], mark_resource_for_deletion(retained))
+        write_desired_candidate_unit(candidate / "units" / previous_path.name, retained, source_root)
+        cleanup_inputs[unit_name] = DesiredCleanupInput(
+            unit_name=unit_name,
+            desired=retained,
+            source=getattr(retained.spec, "source", None),
         )
-        deletion_intents[unit_name] = intent
-        write_deletion_intent(candidate, intent)
-        blocked_transitions[unit_name] = deletion_intent_reason(intent)
-        blocked[unit_name] = deletion_intent_reason(intent)
     for unit_name, previous_path in _current_desired_unit_paths(current_desired).items():
         if unit_name in specifications:
-            continue
-        if unit_name in deletion_intents:
-            retain_deletion_intent(unit_name, deletion_intents[unit_name])
             continue
         try:
             previous = load_desired_unit(previous_path, unit_name)
         except Exception:
             opaque_payload = opaque_document_payload(previous_path)
-            opaque_transitions[unit_name] = OpaqueCleanupRoot(
-                path=previous_path,
-                payload=opaque_payload,
-                metadata=opaque_cleanup_metadata(unit_name, opaque_payload, source_revision),
-                source=raw_document_source(opaque_payload),
+            opaque_transitions[unit_name] = mark_opaque_cleanup_for_deletion(
+                OpaqueCleanupRoot(
+                    path=previous_path,
+                    payload=opaque_payload,
+                    metadata=opaque_cleanup_metadata(unit_name, opaque_payload, source_revision),
+                    source=raw_document_source(opaque_payload),
+                )
             )
             blocked_transitions[unit_name] = "source absent; opaque cleanup root retained"
             continue
         retained = previous
         if previous.is_legacy_compatibility:
             retained = previous.with_metadata(source_tracked_metadata_for_resource(previous))
-        incarnation = adopt_existing_incarnation(retained)
         write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
         if getattr(retained.spec, "materialization", None) is not None:
             copy_unit_materialization(current_desired, candidate, unit_name, previous)
         lifecycle = retained.metadata.lifecycle
         if lifecycle is not None and lifecycle.management is not None and lifecycle.management.mode == "sourceTracked":
-            retained_candidate_path = unit_document_path(candidate, unit_name)
-            intent = UnitDeletionIntent.from_unit(
-                retained,
-                retained_candidate_path,
-                candidate,
-                incarnation.next_deletion_generation if incarnation is not None else 1,
-            )
-            deletion_intents[unit_name] = intent
-            write_deletion_intent(candidate, intent)
-            deletion_reason = deletion_intent_reason(intent)
-            blocked_transitions[unit_name] = deletion_reason
-            blocked[unit_name] = deletion_reason
+            retained = cast(UnitResource[Any], mark_resource_for_deletion(retained))
+            write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
             cleanup_inputs[unit_name] = DesiredCleanupInput(
                 unit_name=unit_name,
                 desired=retained,
                 source=getattr(retained.spec, "source", None),
             )
-            if verbose:
-                log_status("WAIT", f"{style_unit(unit_name)}: {deletion_reason}")
     # Publish transition blocks before validating the graph. A Stack with an
     # unavailable downstream input may intentionally omit that generated Unit
     # until the upstream artifact becomes observed.
     write_desired_transition_blocks(candidate, blocked_transitions)
 
-    # A source-absent parent makes its owned/dependent closure deletion obligations
-    # explicit as well, even when a child still appears in the source snapshot.
-    closure_changed = True
-    while closure_changed:
-        closure_changed = False
-        resources = load_desired_resource_graph(candidate, validate=not preserve_stack_owned_metadata)
-        for parent_name, parent_intent in tuple(deletion_intents.items()):
-            parent_key = (
-                parent_intent.retained_api_version,
-                parent_intent.retained_kind,
-                parent_name,
-            )
-            for _child_name, child in resources.items():
-                if not isinstance(child, UnitResource):
-                    continue
-                child_resource_name = child.name
-                if child_resource_name == parent_name or child_resource_name in deletion_intents:
-                    continue
-                lifecycle = child.metadata.lifecycle
-                owner = lifecycle.owner if lifecycle is not None else None
-                owner_match = (
-                    owner is not None
-                    and (owner.apiVersion, owner.kind, owner.name) == parent_key
-                    and owner.uid == parent_intent.uid
-                )
-                if not owner_match:
-                    continue
-                child_path = unit_document_path(candidate, child_resource_name)
-                child_intent = UnitDeletionIntent.from_unit(child, child_path, candidate)
-                deletion_intents[child_resource_name] = child_intent
-                write_deletion_intent(candidate, child_intent)
-                child_reason = deletion_intent_reason(child_intent)
-                blocked_transitions[child_resource_name] = child_reason
-                blocked[child_resource_name] = child_reason
-                cleanup_inputs[child_resource_name] = DesiredCleanupInput(
-                    unit_name=child_resource_name,
-                    desired=child,
-                    source=getattr(child.spec, "source", None),
-                )
-                closure_changed = True
+    resources = load_desired_resource_graph(candidate, validate=False)
+    deleting = [resource for resource in resources.values() if resource_deletion(resource) is not None]
+    for parent in deleting:
+        for child in _owned_resource_closure(resources, parent):
+            if child.name == parent.name or resource_deletion(child) is not None:
+                continue
+            marked_child = mark_resource_for_deletion(child)
+            _write_desired_resource(_desired_resource_path(candidate, child), marked_child)
     for unit_name, opaque in opaque_transitions.items():
         write_opaque_cleanup_root(candidate, unit_name, opaque)
         cleanup_inputs[unit_name] = DesiredCleanupInput(
@@ -6456,8 +5821,6 @@ def validate_effect_leases_preserved(
             kind=None,
             driver=None,
             source_revision=None,
-            deletion_intent_path=None,
-            deletion_intent_blob=None,
             cleanup_path=None,
             cleanup_blob=None,
         )
@@ -6818,8 +6181,11 @@ def publish_desired_change(
     current_root: Path | None = None,
     allow_removed_units: frozenset[str] = frozenset(),
     request_change: bool = True,
+    finalized_resources: frozenset[ResourceFinalizationFence] = frozenset(),
 ) -> tuple[str, ChangeRequestResult | ManualChangeRequest | None]:
     load_desired_resource_graph(candidate)
+    if current_root is not None:
+        validate_desired_resource_transition(current_root, candidate, finalized_resources)
     lease_ref = effect_lease_ref(environment, target_ref)
     validate_effect_leases_preserved(
         target_ref,
@@ -6885,7 +6251,7 @@ def validate_materialized_desired(
 def canonicalize_rollback_unit(
     candidate_path: Path,
     current_path: Path,
-    finalized_incarnation: UnitIncarnationTombstone | None = None,
+    finalized_incarnation: ResourceIncarnationTombstone | None = None,
 ) -> None:
     """Keep historical payload while carrying forward the current incarnation identity."""
 
@@ -6939,106 +6305,50 @@ def copy_current_blocked_unit(current: Path, candidate: Path, unit_name: str) ->
 
 
 def merge_current_cleanup_state(current: Path, candidate: Path) -> None:
-    """Carry only active current cleanup lifecycles through a historical rollback."""
+    """Carry deletion metadata and opaque cleanup roots through a rollback."""
 
-    stack_incarnation_directory = candidate / DESIRED_STACK_INCARNATIONS_PATH
-    if stack_incarnation_directory.is_dir():
-        for tombstone_path in stack_incarnation_directory.iterdir():
-            if tombstone_path.is_file() and tombstone_path.suffix in {".json", ".yaml", ".yml"}:
-                tombstone_path.unlink()
-    copy_stack_incarnation_tombstones(current, candidate)
-    incarnation_directory = candidate / DESIRED_UNIT_INCARNATIONS_PATH
-    if incarnation_directory.is_dir():
-        for tombstone_path in incarnation_directory.iterdir():
-            if tombstone_path.is_file() and tombstone_path.suffix in {".json", ".yaml", ".yml"}:
-                tombstone_path.unlink()
-    copy_unit_incarnation_tombstones(current, candidate)
-    current_roots = load_desired_cleanup_roots(current)
-    current_intents = load_desired_deletion_intents(current)
+    copy_resource_incarnation_tombstones(current, candidate)
     current_blocks = load_desired_transition_blocks(current)
+    current_roots = load_desired_cleanup_roots(current)
     cleanup_directory = candidate / DESIRED_CLEANUP_UNITS_PATH
     if cleanup_directory.is_dir():
         for cleanup_path in cleanup_directory.iterdir():
             if cleanup_path.is_file() and cleanup_path.suffix in {".json", ".yaml", ".yml"}:
                 cleanup_path.unlink()
-    deletion_directory = candidate / DESIRED_DELETION_INTENTS_PATH
-    if deletion_directory.is_dir():
-        for intent_path in deletion_directory.iterdir():
-            if intent_path.is_file() and intent_path.suffix in {".json", ".yaml", ".yml"}:
-                intent_path.unlink()
-    merged_blocks = dict(current_blocks)
     for name, root in current_roots.items():
         for unit_path in document_candidates(candidate / "units", name):
             unit_path.unlink()
         write_opaque_cleanup_root(candidate, name, root)
-        merged_blocks.setdefault(name, "opaque cleanup root retained pending explicit adoption")
-    for name, intent in current_intents.items():
-        for unit_path in document_candidates(candidate / "units", name):
-            unit_path.unlink()
-        retained_path = current / PurePosixPath(intent.cleanup_identity.path)
-        retained_unit: UnitResource[Any] | None = None
-        if retained_path.is_file():
-            try:
-                candidate_unit = load_desired_unit(retained_path, name)
-                candidate_unit.metadata.validate_desired()
-                validate_retained_deletion_unit(candidate_unit, retained_path, intent)
-                retained_unit = candidate_unit
-            except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError):
-                retained_unit = None
-        if retained_unit is not None:
-            target_path = candidate / PurePosixPath(intent.cleanup_identity.path)
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(retained_path, target_path)
-            if getattr(retained_unit.spec, "materialization", None) is not None:
-                copy_unit_materialization(current, candidate, name, retained_unit)
-        else:
-            current_root = current_roots.get(name)
-            if current_root is not None:
-                write_opaque_cleanup_root(candidate, name, current_root)
-                write_deletion_intent(candidate, intent)
-                merged_blocks[name] = deletion_intent_reason(intent)
-                continue
-            payload = (
-                opaque_document_payload(retained_path)
-                if retained_path.is_file()
-                else {
-                    "kind": "UnavailableRetainedUnit",
-                    "unitName": name,
-                    "uid": intent.uid,
-                    "retainedPath": intent.cleanup_identity.path,
-                }
-            )
-            write_opaque_cleanup_root(
-                candidate,
-                name,
-                opaque_cleanup_root_for_intent(name, intent, retained_path, payload),
-            )
-        write_deletion_intent(candidate, intent)
-        merged_blocks[name] = deletion_intent_reason(intent)
+    resources = load_desired_resource_graph(current, validate=False)
+    for resource in resources.values():
+        if resource_deletion(resource) is None:
+            continue
+        source_path = _desired_resource_path(current, resource)
+        target_path = _desired_resource_path(candidate, resource)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target_path)
+        if isinstance(resource, UnitResource):
+            copy_unit_materialization(current, candidate, resource.name, resource)
     for name in current_blocks:
-        if name in current_roots or name in current_intents:
+        if name in current_roots:
             continue
         current_path = unit_document_path(current, name)
         if current_path.is_file():
             copy_current_blocked_unit(current, candidate, name)
-        else:
-            for unit_path in document_candidates(candidate / "units", name):
-                unit_path.unlink()
-    write_desired_transition_blocks(candidate, merged_blocks)
+    write_desired_transition_blocks(candidate, current_blocks)
 
 
 def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[str, ...]:
     """Find active owned or observation-dependent descendants of a teardown target."""
 
-    resources = load_desired_resource_graph(root)
+    resources = load_desired_resource_graph(root, validate=False)
     explicit_dependencies = stack_dependency_edges(resources, include_missing=True)
-    intents = load_desired_deletion_intents(root)
     opaque_roots = load_desired_cleanup_roots(root)
     target_identity = (target.gvk.api_version, target.gvk.kind, target.name, target.metadata.uid or "")
     pending = [target_identity]
     dependents: set[str] = set()
     for opaque_name in opaque_roots:
-        if opaque_name != target.name and opaque_name not in intents:
+        if opaque_name != target.name:
             dependents.add(f"{opaque_name} (opaque cleanup root lacks a validated deletion identity)")
     while pending:
         parent_identity = pending.pop()
@@ -7047,17 +6357,9 @@ def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[s
             child_identity = (child.gvk.api_version, child.gvk.kind, child.name, child.metadata.uid or "")
             if child_identity == parent_identity or child.name in dependents:
                 continue
-            lifecycle = child.metadata.lifecycle
-            owner = lifecycle.owner if lifecycle is not None else None
+            owner = resource_owner_reference(child)
             owner_matches = (
-                owner is not None
-                and (
-                    owner.apiVersion,
-                    owner.kind,
-                    owner.name,
-                    owner.uid,
-                )
-                == parent_identity
+                owner is not None and (owner.apiVersion, owner.kind, owner.name, owner.uid) == parent_identity
             )
             dependency_matches = isinstance(child, UnitResource) and bool(
                 (desired_observation_reference_units(child) | set(explicit_dependencies.get(child.name, ())))
@@ -7066,36 +6368,6 @@ def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[s
             if owner_matches or dependency_matches:
                 dependents.add(child.name)
                 pending.append(child_identity)
-        for child_name, intent in intents.items():
-            if child_name in dependents or child_name == target.name:
-                continue
-            if not intent.retained_identity_known:
-                dependents.add(f"{child_name} (deletion intent lacks validated owner/dependency identity)")
-                continue
-            owner = intent.retained_owner
-            owner_matches = (
-                owner is not None
-                and (
-                    owner.apiVersion,
-                    owner.kind,
-                    owner.name,
-                    owner.uid,
-                )
-                == parent_identity
-            )
-            dependency_matches = bool(
-                (set(intent.retained_dependencies) | set(explicit_dependencies.get(child_name, ()))) & parent_names
-            )
-            if owner_matches or dependency_matches:
-                dependents.add(child_name)
-                pending.append(
-                    (
-                        intent.retained_api_version,
-                        intent.retained_kind,
-                        child_name,
-                        intent.uid,
-                    )
-                )
     return tuple(sorted(dependents))
 
 
@@ -7265,12 +6537,18 @@ def command_rollback(args: argparse.Namespace) -> None:
                 copy_unit_materialization(target, candidate, unit_name, historical_unit)
         merge_current_cleanup_state(current, candidate)
         current_cleanup_names = set(load_desired_cleanup_roots(current))
-        finalized_incarnations = load_desired_unit_incarnation_tombstones(candidate)
+        finalized_incarnations = load_resource_incarnation_tombstones(candidate)
         for candidate_path in _current_desired_unit_paths(candidate).values():
+            candidate_unit = load_desired_unit(candidate_path, candidate_path.stem)
             canonicalize_rollback_unit(
                 candidate_path,
                 unit_document_path(current, candidate_path.stem),
-                finalized_incarnations.get(candidate_path.stem),
+                finalized_incarnation_for_resource(
+                    finalized_incarnations,
+                    candidate_unit.gvk.api_version,
+                    candidate_unit.gvk.kind,
+                    candidate_path.stem,
+                ),
             )
         for unit_name in materialized_units:
             if unit_name in current_cleanup_names:
@@ -7334,270 +6612,6 @@ def command_rollback(args: argparse.Namespace) -> None:
             return
         print(revision)
         write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
-
-
-def _command_request_delete_direct_unit(args: argparse.Namespace) -> bool:
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
-        raise OperationError(f"invalid unit name: {args.unit!r}")
-    if not isinstance(args.uid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args.uid):
-        raise OperationError("request-delete-direct-unit requires a valid --uid")
-    desired_ref, observed_ref = deployment_refs(
-        REPOSITORY_ROOT,
-        args.environment,
-        args.desired_ref,
-        None,
-    )
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        temporary = Path(temporary_directory)
-        current = temporary / "current"
-        candidate = temporary / "candidate"
-        current_revision = observed_tree(desired_ref, current)
-        if current_revision is None:
-            raise OperationError(f"desired ref {desired_ref!r} has no state")
-        unit_paths = document_candidates(current / "units", args.unit)
-        if not unit_paths:
-            raise OperationError(f"desired Unit {args.unit!r} is not present")
-        unit_path = unit_paths[0]
-        unit = load_desired_unit(unit_path, args.unit)
-        if unit.is_legacy_compatibility:
-            raise OperationError(f"desired Unit {args.unit!r} is legacy; advance desired state first")
-        unit.metadata.validate_desired()
-        lifecycle = unit.metadata.lifecycle
-        if lifecycle is not None and lifecycle.owner is not None:
-            raise OperationError(f"desired Unit {args.unit!r} is UID-owned, not directly managed")
-        if lifecycle is None or lifecycle.management is None or lifecycle.management.mode != "direct":
-            raise OperationError(f"desired Unit {args.unit!r} is not directly managed")
-        if unit.metadata.uid != args.uid:
-            raise OperationError(f"stale desired Unit UID fence for {args.unit!r}")
-
-        intents = load_desired_deletion_intents(current)
-        existing_intent = intents.get(args.unit)
-        if existing_intent is not None:
-            if existing_intent.uid != args.uid or existing_intent.management_mode != "direct":
-                raise OperationError(f"desired Unit {args.unit!r} has a conflicting deletion intent")
-            return False
-
-        incarnations = load_desired_unit_incarnation_tombstones(current)
-        incarnation = incarnations.get(args.unit)
-        if incarnation is not None:
-            if incarnation.uid != args.uid:
-                raise OperationError(f"desired Unit {args.unit!r} conflicts with its incarnation fence")
-            if incarnation.state == "finalized":
-                raise OperationError(f"desired Unit {args.unit!r} has already been finalized")
-        else:
-            incarnation = UnitIncarnationTombstone(
-                unit_name=args.unit,
-                uid=args.uid,
-                state="active",
-                next_deletion_generation=2,
-            )
-
-        shutil.copytree(current, candidate)
-        write_unit_incarnation_tombstone(candidate, incarnation)
-        intent = UnitDeletionIntent.from_unit(
-            unit,
-            unit_path,
-            current,
-            incarnation.next_deletion_generation,
-        )
-        write_deletion_intent(candidate, intent)
-        transition_blocks = load_desired_transition_blocks(candidate)
-        transition_blocks[args.unit] = deletion_intent_reason(intent)
-        write_desired_transition_blocks(candidate, transition_blocks)
-        load_desired_resource_graph(candidate)
-        candidate_id = candidate_identifier(
-            "request-delete-direct-unit",
-            args.environment,
-            candidate,
-            desired_ref,
-            current_revision,
-            {"unit": args.unit, "uid": args.uid, "deletionGeneration": intent.deletion_generation},
-        )
-        candidate_ref = resolve_candidate_ref(
-            REPOSITORY_ROOT,
-            args.environment,
-            "request-delete-direct-unit",
-            candidate_id,
-            args.candidate_ref,
-        )
-        if candidate_ref in {desired_ref, observed_ref}:
-            raise OperationError("direct deletion candidate ref conflicts with deployment state")
-        revision, outcome = publish_desired_change(
-            args.environment,
-            candidate,
-            desired_ref,
-            current_revision,
-            candidate_ref,
-            f"Request deletion of direct Unit {args.unit} generation {intent.deletion_generation}",
-            f"Request deletion of direct Unit {args.unit}",
-            f"Create a UID-fenced deletion intent for directly managed `{args.unit}`.",
-            args.dry,
-            current,
-            request_change=False,
-        )
-        if args.dry:
-            return False
-        print(revision)
-        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
-        return True
-
-
-def command_request_delete_direct_unit(args: argparse.Namespace) -> bool:
-    with unit_effect_lock(args.environment, getattr(args, "unit", "<invalid>")):
-        return _command_request_delete_direct_unit(args)
-
-
-def _direct_stack_uid(
-    environment: str,
-    stack_name: str,
-    request_identity: str,
-    desired_revision: str,
-    previous_uid: str | None = None,
-) -> str:
-    digest = hashlib.sha256(
-        f"gitopsctr/direct-stack-uid/v3\0{environment}\0{stack_name}\0{request_identity}\0{desired_revision}\0{previous_uid or ''}".encode()
-    ).hexdigest()[:32]
-    return f"d1-{digest}"
-
-
-def _selected_stack_template_resources(
-    stack_name: str,
-    resources: Sequence[StackTemplateResource],
-    selected: str | None,
-) -> tuple[StackTemplateResource, ...]:
-    """Select a complete dependency-closed Unit projection from a template."""
-
-    if selected is None:
-        return tuple(resources)
-    names = [name.strip() for name in selected.split(",") if name.strip()]
-    if not names or len(set(names)) != len(names):
-        raise OperationError("--units must contain one or more unique Unit template names")
-    by_name = {resource.name: resource for resource in resources}
-    unknown = sorted(set(names) - set(by_name))
-    if unknown:
-        raise OperationError(f"Stack {stack_name!r} selects unknown Unit templates: {', '.join(unknown)}")
-    selected_names = set(names)
-    for resource in resources:
-        if resource.name in selected_names:
-            omitted = sorted(set(resource.dependsOn) - selected_names)
-            if omitted:
-                raise OperationError(
-                    f"Stack {stack_name!r} selects {resource.name!r} but omits dependencies: {', '.join(omitted)}"
-                )
-    return tuple(resource for resource in resources if resource.name in selected_names)
-
-
-def _stack_pin_name(environment: str, stack_name: str, uid: str) -> str:
-    return f"stacks/{environment}/{stack_name}/{uid}"
-
-
-def _stack_pin_claim(
-    environment: str,
-    stack_name: str,
-    uid: str,
-    pin_revision: str,
-    target_ref: str,
-    target_revision: str,
-    candidate_ref: str,
-    *,
-    state: Literal["preparing", "active", "reaping"] = "preparing",
-    candidate_revision: str | None = None,
-) -> ControllerPinClaim:
-    return ControllerPinClaim(
-        environment=environment,
-        stack_name=stack_name,
-        uid=uid,
-        pin_name=_stack_pin_name(environment, stack_name, uid),
-        pin_revision=pin_revision,
-        target_ref=target_ref,
-        target_revision=target_revision,
-        candidate_ref=candidate_ref,
-        candidate_revision=candidate_revision,
-        state=state,
-    )
-
-
-def _controller_pin_revision(pin_name: str) -> str | None:
-    """Read one controller pin without changing the local repository."""
-
-    ref = f"refs/heads/gitopsctr/pins/{pin_name}"
-    result = state_store().git("ls-remote", "--exit-code", "--refs", "origin", ref, check=False)
-    if result.returncode == 2:
-        return None
-    if result.returncode != 0:
-        raise OperationError(result.stderr.strip() or f"could not inspect controller pin {pin_name!r}")
-    lines = result.stdout.splitlines()
-    if len(lines) != 1 or len(lines[0].split()) != 2:
-        raise OperationError(f"controller pin {pin_name!r} inspection returned an invalid result")
-    revision, actual_ref = lines[0].split()
-    if actual_ref != ref or not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise OperationError(f"controller pin {pin_name!r} inspection returned an invalid identity")
-    return revision
-
-
-def _replace_controller_pin(pin_name: str, expected_revision: str, revision: str) -> ControllerPin:
-    """Advance a Stack source pin with an exact remote-head fence.
-
-    GitStateStore intentionally exposes create/release operations only. A Stack
-    update needs the equivalent of a CAS replacement so an old cleanup source
-    can never be silently replaced by a concurrent actor.
-    """
-
-    store = state_store()
-    if expected_revision == revision:
-        actual = _controller_pin_revision(pin_name)
-        if actual is None:
-            store.create_controller_pin(pin_name, revision)
-        elif actual != revision:
-            raise OperationError(
-                f"controller pin {pin_name!r} changed before update: expected {expected_revision}, found {actual}"
-            )
-        return ControllerPin(pin_name, f"refs/heads/gitopsctr/pins/{pin_name}", revision)
-    replace_pin = getattr(store, "replace_controller_pin", None)
-    if callable(replace_pin):
-        return cast(ControllerPin, replace_pin(pin_name, expected_revision, revision))
-    ref = f"refs/heads/gitopsctr/pins/{pin_name}"
-    actual = _controller_pin_revision(pin_name)
-    if actual != expected_revision:
-        raise OperationError(
-            f"controller pin {pin_name!r} changed before update: expected {expected_revision}, found {actual}"
-        )
-    pushed = store.git(
-        "push",
-        f"--force-with-lease={ref}:{expected_revision}",
-        "origin",
-        f"{revision}:{ref}",
-        check=False,
-    )
-    actual = _controller_pin_revision(pin_name)
-    if actual != revision:
-        raise OperationError(pushed.stderr.strip() or f"controller pin {pin_name!r} changed during update")
-    return ControllerPin(pin_name, ref, revision)
-
-
-def _restore_controller_pin(pin_name: str, expected_revision: str, revision: str) -> None:
-    """Best-effort rollback for a pin changed before failed candidate publication."""
-
-    _replace_controller_pin(pin_name, expected_revision, revision)
-
-
-def _parse_stack_parameters(raw: str) -> JsonObjectValue:
-    try:
-        value = json.loads(raw)
-        validated = require_json_value(value)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise OperationError(f"--parameters must be a finite JSON object: {exc}") from exc
-    if not isinstance(validated, dict):
-        raise OperationError("--parameters must contain a JSON object")
-    return JsonObjectValue(validated)
-
-
-def _parameter_values(value: object) -> list[object]:
-    if isinstance(value, dict):
-        return [value, *[item for child in value.values() for item in _parameter_values(child)]]
-    if isinstance(value, list):
-        return [item for child in value for item in _parameter_values(child)]
-    return [value]
 
 
 def _command_instantiate_stack(args: argparse.Namespace) -> bool:
@@ -7713,7 +6727,7 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
         # the same head remain replay-idempotent, while a same-name request
         # after a finalized root has a new desired head and cannot
         # reuse the old UID or its teardown evidence.
-        previous_tombstone = load_desired_stack_incarnation_tombstones(current).get(args.stack)
+        previous_tombstone = load_resource_incarnation_tombstones(current).get((CORE_API_VERSION, "Stack", args.stack))
         direct_uid = _direct_stack_uid(
             args.environment,
             args.stack,
@@ -7787,7 +6801,7 @@ def _command_instantiate_stack(args: argparse.Namespace) -> bool:
                 owned_metadata = ResourceMetadata(
                     name=resource.name,
                     uid=previous_unit.metadata.uid,
-                    lifecycle=owned_metadata.lifecycle,
+                    ownerReferences=owned_metadata.ownerReferences,
                 )
             write_desired_candidate_unit(
                 unit_path,
@@ -7921,7 +6935,7 @@ def _direct_stack_update_replay_matches(
     if (
         stack.metadata.uid != uid
         or lifecycle is None
-        or lifecycle.owner is not None
+        or resource_owner_reference(stack) is not None
         or lifecycle.management is None
         or lifecycle.management.mode != "direct"
         or not isinstance(stack.spec, DesiredStackSpec)
@@ -8029,7 +7043,7 @@ def _command_update_direct_stack(args: argparse.Namespace) -> bool:
             RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name=args.stack
         )
         lifecycle = existing.metadata.lifecycle
-        if lifecycle is None or lifecycle.owner is not None or lifecycle.management is None:
+        if lifecycle is None or resource_owner_reference(existing) is not None or lifecycle.management is None:
             raise OperationError(f"desired Stack {args.stack!r} is not a root resource")
         if lifecycle.management.mode != "direct":
             raise OperationError(f"desired Stack {args.stack!r} is source-tracked, not directly managed")
@@ -8043,8 +7057,8 @@ def _command_update_direct_stack(args: argparse.Namespace) -> bool:
         )
         if existing_template_name != args.template:
             raise OperationError("direct Stack update cannot change the StackTemplate identity")
-        if load_desired_stack_deletion_intents(current).get(args.stack) is not None:
-            raise OperationError(f"desired Stack {args.stack!r} has an active deletion intent")
+        if resource_deletion(existing) is not None:
+            raise OperationError(f"desired Stack {args.stack!r} is marked for deletion")
 
         if current_revision != args.desired_revision:
             if _direct_stack_update_replay_matches(
@@ -8153,6 +7167,8 @@ def _command_update_direct_stack(args: argparse.Namespace) -> bool:
         )
         if not isinstance(projected.spec, DesiredStackSpec) or projected.spec.resolvedProjection is None:
             raise OperationError(f"updated Stack {args.stack!r} has no generated Unit projection")
+        if resource_deletion(existing) is not None:
+            raise OperationError(f"Stack {args.stack!r} is deleting and cannot be updated")
         template_provenance = StackInstantiationProvenance(
             templateRevision=source_revision,
             templatePath=template_path.relative_to(source).as_posix(),
@@ -8195,7 +7211,7 @@ def _command_update_direct_stack(args: argparse.Namespace) -> bool:
         transition_blocks = load_desired_transition_blocks(candidate)
         for previous_name, previous_path in _current_desired_unit_paths(current).items():
             previous_unit = load_desired_unit(previous_path, previous_name)
-            previous_owner = previous_unit.metadata.lifecycle.owner if previous_unit.metadata.lifecycle else None
+            previous_owner = resource_owner_reference(previous_unit)
             if (
                 previous_owner is None
                 or previous_owner.kind != "Stack"
@@ -8204,10 +7220,8 @@ def _command_update_direct_stack(args: argparse.Namespace) -> bool:
                 or previous_name in projected_unit_names
             ):
                 continue
-            retained_path = unit_document_path(candidate, previous_name)
-            intent = UnitDeletionIntent.from_unit(previous_unit, retained_path, candidate)
-            write_deletion_intent(candidate, intent)
-            transition_blocks[previous_name] = deletion_intent_reason(intent)
+            retained = cast(UnitResource[Any], mark_resource_for_deletion(previous_unit))
+            write_desired_candidate_unit(unit_document_path(candidate, previous_name), retained, REPOSITORY_ROOT)
         write_desired_transition_blocks(candidate, transition_blocks)
         for resource in expanded:
             unit_path = unit_document_path(candidate, resource.name)
@@ -8230,7 +7244,7 @@ def _command_update_direct_stack(args: argparse.Namespace) -> bool:
                 owned_metadata = ResourceMetadata(
                     name=resource.name,
                     uid=previous_unit.metadata.uid,
-                    lifecycle=owned_metadata.lifecycle,
+                    ownerReferences=owned_metadata.ownerReferences,
                 )
             write_desired_candidate_unit(
                 unit_path,
@@ -8346,559 +7360,257 @@ def command_update_direct_stack(args: argparse.Namespace) -> bool:
         return _command_update_direct_stack(args)
 
 
-def _stack_intent_for_resource(
-    environment: str,
-    stack: StackResource,
-    stack_path: Path,
-    current: Path,
-    owned_units: Sequence[UnitResource[Any]],
-    *,
-    dry: bool,
-) -> StackDeletionIntent:
-    if not isinstance(stack.spec, DesiredStackSpec):
-        raise OperationError("desired Stack is missing its canonical spec")
-    if stack.metadata.uid is None:
-        raise OperationError("direct Stack is missing its UID")
-    lifecycle = stack.metadata.lifecycle
-    if lifecycle is None or lifecycle.management is None:
-        raise OperationError("Stack deletion requires a root lifecycle authority")
-    management_mode = lifecycle.management.mode
-    if management_mode == "direct" and stack.spec.provenance is None:
-        raise OperationError("direct Stack is missing instantiation provenance")
-    if management_mode == "sourceTracked" and stack.spec.provenance is not None:
-        raise OperationError("source-tracked Stack cannot carry direct instantiation provenance")
-    pin_name = _stack_pin_name(environment, stack.name, stack.metadata.uid)
-    pin: ControllerPin | None = None
-    if stack.spec.provenance is not None:
-        pin = ControllerPin(
-            pin_name,
-            f"refs/heads/gitopsctr/pins/{pin_name}",
-            stack.spec.provenance.templateRevision,
-        )
-        if not dry:
-            pin = state_store().create_controller_pin(pin_name, pin.revision)
-    closure = tuple(
-        StackOwnedUnitIdentity(unit.name, unit.metadata.uid or "", 1)
-        for unit in sorted(owned_units, key=lambda item: item.name)
-    )
-    if any(not identity.uid for identity in closure):
-        raise OperationError("owned Stack Units must have canonical UIDs before deletion")
-    return StackDeletionIntent(
-        stack_name=stack.name,
-        uid=stack.metadata.uid,
-        deletion_generation=1,
-        management_mode=management_mode,
-        cleanup_identity=StackCleanupIdentity(
-            path=stack_path.relative_to(current).as_posix(),
-            uid=stack.metadata.uid,
-            blob=file_blob(stack_path),
-        ),
-        retained_template=(stack.spec.template if isinstance(stack.spec.template, str) else stack.spec.template.name),
-        retained_parameters=stack.spec.parameters,
-        retained_provenance=stack.spec.provenance,
-        owned_unit_closure=closure,
-        controller_pin=pin,
-    )
-
-
-def _release_stack_controller_pin(intent: StackDeletionIntent) -> None:
-    """Release a finalized Stack pin and claim under both identity fences."""
-
-    pin = intent.controller_pin
-    if pin is None:
+def _release_stack_pin(environment: str, stack: StackResource) -> None:
+    if not isinstance(stack.spec, DesiredStackSpec) or stack.spec.provenance is None:
         return
+    if stack.metadata.uid is None:
+        raise OperationError(f"Stack {stack.name!r} has no UID")
+    pin_name = _stack_pin_name(environment, stack.name, stack.metadata.uid)
+    pin_revision = stack.spec.provenance.templateRevision
     store = state_store()
     read_claim = getattr(store, "read_controller_pin_claim", None)
     delete_claim = getattr(store, "delete_controller_pin_claim", None)
-    claim = read_claim(pin.name) if read_claim is not None else None
+    claim = read_claim(pin_name) if callable(read_claim) else None
     if claim is not None:
-        if claim.pin_name != pin.name or claim.uid != intent.uid or claim.pin_revision != pin.revision:
-            raise OperationError(f"Stack {intent.stack_name}: controller pin claim fence does not match the Stack")
+        if claim.uid != stack.metadata.uid or claim.pin_revision != pin_revision:
+            raise OperationError(f"Stack {stack.name!r}: controller pin claim fence does not match the Stack")
         if not callable(delete_claim) or claim.revision is None:
-            raise OperationError(f"Stack {intent.stack_name}: controller pin claim cannot be released safely")
-    store.release_controller_pin(pin.name, pin.revision)
+            raise OperationError(f"Stack {stack.name!r}: controller pin claim cannot be released safely")
+    store.release_controller_pin(pin_name, pin_revision)
     if claim is not None:
         cast(Callable[[str, str], object], delete_claim)(
             claim.ref.removeprefix("gitopsctr/pin-claims/"), claim.revision
         )
 
 
-def _command_request_delete_direct_stack(args: argparse.Namespace) -> bool:
-    _resource_name(args.environment, "environment name")
-    _resource_name(args.stack, "Stack name")
-    if not isinstance(args.uid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args.uid):
-        raise OperationError("request-delete-direct-stack requires a valid --uid")
-    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, None)
-    current_revision = fetch_ref(desired_ref)
-    if current_revision is None:
-        raise OperationError(f"desired ref {desired_ref!r} has no state")
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        temporary = Path(temporary_directory)
-        current = temporary / "current"
-        candidate = temporary / "candidate"
-        materialize_revision(current_revision, current)
-        stack_path = _current_desired_stack_paths(current, "Stack").get(args.stack)
-        if stack_path is None:
-            raise OperationError(f"desired Stack {args.stack!r} is not present")
-        stack = RESOURCE_CATALOG.parse_stack(
-            RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name=args.stack
-        )
-        stack.metadata.validate_desired()
-        lifecycle = stack.metadata.lifecycle
-        if lifecycle is None or lifecycle.owner is not None or lifecycle.management is None:
-            raise OperationError(f"desired Stack {args.stack!r} is not a root resource")
-        if lifecycle.management.mode != "direct":
-            raise OperationError(f"desired Stack {args.stack!r} is not directly managed")
-        if stack.metadata.uid != args.uid:
-            raise OperationError(f"stale desired Stack UID fence for {args.stack!r}")
-        existing = load_desired_stack_deletion_intents(current).get(args.stack)
-        if existing is not None:
-            if existing.uid != args.uid:
-                raise OperationError(f"desired Stack {args.stack!r} has a conflicting deletion intent")
-            return False
-        resources = load_desired_resource_graph(current)
-        owner_key = (CORE_API_VERSION, "Stack", args.stack)
-        owned_units: list[UnitResource[Any]] = []
-        for resource in resources.values():
-            if not isinstance(resource, UnitResource):
-                continue
-            resource.metadata.validate_desired()
-            resource_lifecycle = resource.metadata.lifecycle
-            if (
-                resource_lifecycle is not None
-                and resource_lifecycle.owner is not None
-                and (resource_lifecycle.owner.apiVersion, resource_lifecycle.owner.kind, resource_lifecycle.owner.name)
-                == owner_key
-                and resource_lifecycle.owner.uid == args.uid
-            ):
-                owned_units.append(resource)
-        shutil.copytree(current, candidate)
-        intent = _stack_intent_for_resource(
-            args.environment,
-            stack,
-            stack_path,
-            current,
-            owned_units,
-            dry=args.dry,
-        )
-        write_stack_deletion_intent(candidate, intent)
-        blocks = load_desired_transition_blocks(candidate)
-        blocks[args.stack] = f"Stack deletion intent active at generation {intent.deletion_generation}"
-        for unit in owned_units:
-            unit_path = unit_document_path(candidate, unit.name)
-            child_intents = load_desired_deletion_intents(candidate)
-            if unit.name not in child_intents:
-                write_deletion_intent(candidate, UnitDeletionIntent.from_unit(unit, unit_path, candidate))
-            blocks[unit.name] = deletion_intent_reason(load_desired_deletion_intents(candidate)[unit.name])
-        write_desired_transition_blocks(candidate, blocks)
-        load_desired_resource_graph(candidate)
-        candidate_id = candidate_identifier(
-            "request-delete-direct-stack",
-            args.environment,
-            candidate,
-            desired_ref,
-            current_revision,
-            {"stack": args.stack, "uid": args.uid, "deletionGeneration": intent.deletion_generation},
-        )
-        candidate_ref = resolve_candidate_ref(
-            REPOSITORY_ROOT,
-            args.environment,
-            "request-delete-direct-stack",
-            candidate_id,
-            args.candidate_ref,
-        )
-        revision, outcome = publish_desired_change(
-            args.environment,
-            candidate,
-            desired_ref,
-            current_revision,
-            candidate_ref,
-            f"Request deletion of direct Stack {args.stack} generation {intent.deletion_generation}",
-            f"Request deletion of direct Stack {args.stack}",
-            f"Create a UID-fenced deletion intent for directly managed Stack `{args.stack}`.",
-            args.dry,
-            current,
-            request_change=False,
-        )
-        if args.dry:
-            return False
-        print(revision)
-        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
-        return True
+def _release_finalized_stack_pin(
+    environment: str,
+    name: str,
+    uid: str,
+    deletion_generation: int,
+    desired_root: Path,
+) -> bool:
+    tombstone = load_resource_incarnation_tombstones(desired_root).get((CORE_API_VERSION, "Stack", name))
+    if tombstone is None or tombstone.uid != uid or tombstone.deletion_generation != deletion_generation:
+        return False
+    pin_name = _stack_pin_name(environment, name, uid)
+    store = state_store()
+    read_claim = getattr(store, "read_controller_pin_claim", None)
+    claim = read_claim(pin_name) if callable(read_claim) else None
+    if claim is None:
+        return False
+    if claim.environment != environment or claim.stack_name != name or claim.uid != uid:
+        raise OperationError(f"Stack {name!r}: controller pin claim fence does not match the finalized Stack")
+    delete_claim = getattr(store, "delete_controller_pin_claim", None)
+    if not callable(delete_claim) or claim.revision is None:
+        raise OperationError(f"Stack {name!r}: controller pin claim cannot be released safely")
+    store.release_controller_pin(claim.pin_name, claim.pin_revision)
+    cast(Callable[[str, str], object], delete_claim)(claim.ref.removeprefix("gitopsctr/pin-claims/"), claim.revision)
+    return True
 
 
-def command_request_delete_direct_stack(args: argparse.Namespace) -> bool:
-    with unit_effect_lock(args.environment, f"stack-{getattr(args, 'stack', '<invalid>')}"):
-        return _command_request_delete_direct_stack(args)
+def _release_finalized_unit_lease(
+    name: str,
+    uid: str,
+    deletion_generation: int,
+    desired_ref: str,
+    current_revision: str,
+    desired_root: Path,
+    lease_ref: str | None,
+) -> bool:
+    """Release a separate-store lease after desired finalization succeeded."""
 
-
-def _command_finalize_stack(args: argparse.Namespace) -> bool:
-    _resource_name(args.environment, "environment name")
-    _resource_name(args.stack, "Stack name")
-    if not isinstance(args.uid, str) or not args.uid:
-        raise OperationError("finalize-stack requires --uid")
-    if not isinstance(args.deletion_generation, int) or args.deletion_generation < 1:
-        raise OperationError("finalize-stack requires --deletion-generation >= 1")
-    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
-    current_revision = fetch_ref(desired_ref)
-    if current_revision is None:
+    if lease_ref is None:
+        return False
+    tombstones = load_resource_incarnation_tombstones(desired_root)
+    matches = [
+        tombstone
+        for tombstone in tombstones.values()
+        if tombstone.name == name
+        and tombstone.uid == uid
+        and tombstone.deletion_generation == deletion_generation
+        and f"{tombstone.api_version}/{tombstone.kind}" in DRIVER_NAMES_BY_GVK
+    ]
+    if len(matches) != 1:
         return False
     with tempfile.TemporaryDirectory() as temporary_directory:
-        temporary = Path(temporary_directory)
-        current = temporary / "current"
-        materialize_revision(current_revision, current)
-        intent = load_desired_stack_deletion_intents(current).get(args.stack)
-        if intent is None:
-            return False
-        if intent.uid != args.uid:
-            raise OperationError(f"stale Stack deletion intent UID fence for {args.stack!r}")
-        if intent.deletion_generation != args.deletion_generation:
-            raise OperationError(f"stale Stack deletion generation fence for {args.stack!r}")
-        stack_path = _current_desired_stack_paths(current, "Stack").get(args.stack)
-        candidate = temporary / "candidate"
-        if stack_path is None:
-            tombstone = load_desired_stack_incarnation_tombstones(current).get(args.stack)
-            if tombstone is None or tombstone.uid != args.uid:
-                return False
-            child_intents = load_desired_deletion_intents(current)
-            active_children = sorted(
-                identity.unit_name for identity in intent.owned_unit_closure if identity.unit_name in child_intents
-            )
-            if active_children:
-                raise OperationError("active owned Units must be finalized first: " + ", ".join(active_children))
-            if not args.dry:
-                _release_stack_controller_pin(intent)
-            shutil.copytree(current, candidate)
-            for path in document_candidates(candidate / DESIRED_STACK_DELETION_INTENTS_PATH, args.stack):
-                path.unlink()
-            blocks = load_desired_transition_blocks(candidate)
-            blocks.pop(args.stack, None)
-            write_desired_transition_blocks(candidate, blocks)
-            load_desired_resource_graph(candidate)
-        else:
-            if file_blob(stack_path) != intent.cleanup_identity.blob:
-                raise OperationError(f"retained Stack cleanup root changed for {args.stack!r}")
-            resources = load_desired_resource_graph(current)
-            child_intents = load_desired_deletion_intents(current)
-            active_children = [
-                resource.name
-                for resource in resources.values()
-                if isinstance(resource, UnitResource)
-                and resource.metadata.lifecycle is not None
-                and resource.metadata.lifecycle.owner is not None
-                and resource.metadata.lifecycle.owner.kind == "Stack"
-                and resource.metadata.lifecycle.owner.name == args.stack
-                and resource.metadata.lifecycle.owner.uid == args.uid
-            ]
-            active_children.extend(
-                identity.unit_name
-                for identity in intent.owned_unit_closure
-                if identity.unit_name in child_intents and identity.unit_name not in active_children
-            )
-            if active_children:
-                raise OperationError(
-                    "active owned Units must be finalized first: " + ", ".join(sorted(active_children))
-                )
-            shutil.copytree(current, candidate)
-            write_stack_incarnation_tombstone(
-                candidate,
-                StackIncarnationTombstone(stack_name=args.stack, uid=intent.uid),
-            )
-            for path in document_candidates(candidate / "stacks", args.stack):
-                path.unlink()
-            if intent.controller_pin is None:
-                for path in document_candidates(candidate / DESIRED_STACK_DELETION_INTENTS_PATH, args.stack):
-                    path.unlink()
-            blocks = load_desired_transition_blocks(candidate)
-            blocks.pop(args.stack, None)
-            write_desired_transition_blocks(candidate, blocks)
-            load_desired_resource_graph(candidate)
-        candidate_id = candidate_identifier(
-            "finalize-stack",
-            args.environment,
-            candidate,
+        lease_root, _lease_revision = _effect_lease_store_root(
             desired_ref,
             current_revision,
-            {"stack": args.stack, "uid": args.uid, "deletionGeneration": args.deletion_generation},
+            desired_root,
+            lease_ref,
+            Path(temporary_directory) / "leases",
         )
-        candidate_ref = resolve_candidate_ref(
-            REPOSITORY_ROOT,
-            args.environment,
-            "finalize-stack",
-            candidate_id,
-            args.candidate_ref if stack_path is not None else None,
-        )
-        revision, outcome = publish_desired_change(
-            args.environment,
-            candidate,
-            desired_ref,
-            current_revision,
-            candidate_ref,
-            f"Finalize direct Stack {args.stack} generation {args.deletion_generation}",
-            f"Finalize direct Stack {args.stack}",
-            f"Remove the finalized direct Stack `{args.stack}` after its owned Units are absent.",
-            args.dry,
-            current,
-            request_change=False,
-        )
-        if args.dry:
-            return False
-        if outcome is None and intent.controller_pin is not None and stack_path is not None:
-            _release_stack_controller_pin(intent)
-            cleanup_candidate = temporary / "cleanup-candidate"
-            shutil.copytree(candidate, cleanup_candidate)
-            for path in document_candidates(cleanup_candidate / DESIRED_STACK_DELETION_INTENTS_PATH, args.stack):
-                path.unlink()
-            cleanup_blocks = load_desired_transition_blocks(cleanup_candidate)
-            cleanup_blocks.pop(args.stack, None)
-            write_desired_transition_blocks(cleanup_candidate, cleanup_blocks)
-            load_desired_resource_graph(cleanup_candidate)
-            cleanup_id = candidate_identifier(
-                "finalize-stack",
-                args.environment,
-                cleanup_candidate,
-                desired_ref,
-                revision,
-                {
-                    "stack": args.stack,
-                    "uid": args.uid,
-                    "deletionGeneration": args.deletion_generation,
-                    "phase": "pin-cleanup",
-                },
-            )
-            cleanup_ref = resolve_candidate_ref(
-                REPOSITORY_ROOT,
-                args.environment,
-                "finalize-stack",
-                cleanup_id,
-                None,
-            )
-            revision, outcome = publish_desired_change(
-                args.environment,
-                cleanup_candidate,
-                desired_ref,
-                revision,
-                cleanup_ref,
-                f"Finalize direct Stack {args.stack} pin cleanup",
-                f"Finalize direct Stack {args.stack}",
-                f"Remove the completed deletion intent for directly managed Stack `{args.stack}`.",
-                False,
-                candidate,
-                request_change=False,
-            )
-            candidate_ref = cleanup_ref
-        print(revision)
-        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
-        return True
+        lease = load_desired_effect_leases(lease_root).get(name)
+    if lease is None:
+        return False
+    if lease.uid != uid:
+        raise OperationError(f"effect lease for finalized Unit {name!r} is fenced to another UID")
+    release_effect_lease(
+        desired_ref,
+        name,
+        lease.token,
+        uid,
+        verify_snapshot=False,
+        lease_ref=lease_ref,
+    )
+    return True
 
 
-def command_finalize_stack(args: argparse.Namespace) -> bool:
-    with unit_effect_lock(args.environment, f"stack-{getattr(args, 'stack', '<invalid>')}"):
-        return _command_finalize_stack(args)
+def _resource_matches_category(resource: UnitResource[Any] | StackResource, category: str) -> bool:
+    return (category == "Unit" and isinstance(resource, UnitResource)) or (
+        category in {"Stack", "StackTemplate"} and resource.gvk.kind == category
+    )
 
 
 def _command_finalize(args: argparse.Namespace) -> bool:
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
-        raise OperationError(f"invalid unit name: {args.unit!r}")
-    if not isinstance(getattr(args, "uid", None), str) or not args.uid:
+    category = {
+        "unit": "Unit",
+        "stack": "Stack",
+        "stacktemplate": "StackTemplate",
+    }[args.kind.lower()]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.name):
+        raise OperationError(f"invalid resource name: {args.name!r}")
+    if not isinstance(args.uid, str) or not args.uid:
         raise OperationError("finalize requires --uid")
-    if (
-        not isinstance(getattr(args, "deletion_generation", None), int)
-        or isinstance(args.deletion_generation, bool)
-        or args.deletion_generation < 1
-    ):
+    if not isinstance(args.deletion_generation, int) or args.deletion_generation < 1:
         raise OperationError("finalize requires --deletion-generation >= 1")
-    desired_ref, observed_ref = deployment_refs(
-        REPOSITORY_ROOT,
-        args.environment,
-        args.desired_ref,
-        args.observed_ref,
-    )
+    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
     lease_ref = effect_lease_ref(args.environment, desired_ref)
-    log_heading(f"Finalize {style_unit(args.unit)}")
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
         current = temporary / "current"
-        observed = temporary / "observed"
         current_revision = observed_tree(desired_ref, current)
         if current_revision is None:
-            log_status("KEEP", f"{style_unit(args.unit)}: no desired state")
             return False
-        intents = load_desired_deletion_intents(current)
-        stack_intents = load_desired_stack_deletion_intents(current)
-        intent = intents.get(args.unit)
-        if intent is None:
-            log_status("KEEP", f"{style_unit(args.unit)}: no deletion intent")
+        resources = load_desired_resource_graph(current, validate=False)
+        matches = [
+            resource
+            for resource in resources.values()
+            if resource.name == args.name and _resource_matches_category(resource, category)
+        ]
+        if len(matches) != 1:
+            if category == "Stack" and not args.dry:
+                return _release_finalized_stack_pin(
+                    args.environment,
+                    args.name,
+                    args.uid,
+                    args.deletion_generation,
+                    current,
+                )
+            if category == "Unit" and not args.dry:
+                return _release_finalized_unit_lease(
+                    args.name,
+                    args.uid,
+                    args.deletion_generation,
+                    desired_ref,
+                    current_revision,
+                    current,
+                    lease_ref,
+                )
             return False
-        if args.uid != intent.uid:
-            raise OperationError(f"stale deletion intent UID fence for {args.unit!r}")
-        if args.deletion_generation != intent.deletion_generation:
-            raise OperationError(f"stale deletion generation fence for {args.unit!r}")
-        retained_path = current / PurePosixPath(intent.cleanup_identity.path)
-        if not retained_path.is_file():
-            log_status("WAIT", f"{style_unit(args.unit)}: retained desired Unit is unavailable; deletion intent kept")
+        resource = matches[0]
+        deletion = resource_deletion(resource)
+        if deletion is None:
             return False
-        try:
-            unit = load_desired_unit(retained_path, args.unit)
-            unit.metadata.validate_desired()
-            lifecycle = unit.metadata.lifecycle
-            if unit.is_legacy_compatibility or unit.metadata.uid != intent.uid:
-                raise OperationError("retained desired Unit is not the fenced canonical incarnation")
-            if intent.management_mode == "direct":
-                if (
-                    lifecycle is None
-                    or lifecycle.owner is not None
-                    or lifecycle.management is None
-                    or lifecycle.management.mode != "direct"
-                ):
-                    raise OperationError("retained desired Unit is not directly managed")
-            else:
-                if lifecycle is None:
-                    raise OperationError("retained desired Unit is not source-tracked")
-                if lifecycle.owner is None and (
-                    lifecycle.management is None or lifecycle.management.mode != "sourceTracked"
-                ):
-                    raise OperationError("retained desired Unit is not source-tracked or UID-owned")
-            if unit_contains_reference(unit):
-                raise OperationError("retained desired Unit contains unresolved inputs")
-            require_unit(unit, args.unit)
-            validate_retained_deletion_unit(unit, retained_path, intent)
-            validate_unit_materialization(current, args.unit, unit)
-            load_desired_resource_graph(current)
-            if intent.retained_owner is not None:
-                if intent.retained_owner.kind == "Stack":
-                    owner_intent = stack_intents.get(intent.retained_owner.name)
-                    owner_uid = owner_intent.uid if owner_intent is not None else None
-                else:
-                    owner_intent = intents.get(intent.retained_owner.name)
-                    owner_uid = owner_intent.uid if owner_intent is not None else None
-                if owner_uid != intent.retained_owner.uid:
-                    raise OperationError(
-                        f"owner deletion intent for {args.unit!r} is not active; finalize the owner closure in order"
+        if resource.metadata.uid != args.uid:
+            raise OperationError(f"stale {category} UID fence for {args.name!r}")
+        if deletion.generation != args.deletion_generation:
+            raise OperationError(f"stale {category} deletion generation fence for {args.name!r}")
+        if resource_content_digest(resource) != deletion.resourceDigest:
+            raise OperationError(f"{category} {args.name!r} changed after deletion started")
+
+        children = []
+        for child in resources.values():
+            owner = resource_owner_reference(child)
+            if (
+                owner is not None
+                and owner.apiVersion == resource.gvk.api_version
+                and owner.kind == resource.gvk.kind
+                and owner.name == resource.name
+                and owner.uid == resource.metadata.uid
+            ):
+                children.append(child)
+        if children:
+            raise OperationError(
+                "owned resources must be finalized first: " + ", ".join(sorted(child.name for child in children))
+            )
+        if isinstance(resource, StackResource) and resource.gvk.kind == "StackTemplate":
+            referencing_stacks = [
+                item.name
+                for item in resources.values()
+                if isinstance(item, StackResource)
+                and item.gvk.kind == "Stack"
+                and isinstance(item.spec, (StackSpec, DesiredStackSpec))
+                and (
+                    item.spec.template == resource.name
+                    or (
+                        isinstance(item.spec.template, StackTemplateReference)
+                        and item.spec.template.name == resource.name
                     )
+                )
+            ]
+            if referencing_stacks:
+                raise OperationError("Stacks reference this StackTemplate: " + ", ".join(sorted(referencing_stacks)))
+
+        unit: UnitResource[Any] | None = resource if isinstance(resource, UnitResource) else None
+        observed = temporary / "observed"
+        lease_acquisition: EffectLeaseAcquisition | None = None
+        teardown_details: Mapping[str, object] = {}
+        source = getattr(unit.spec, "source", None) if unit is not None else None
+        if unit is not None:
+            require_unit(unit, unit.name)
+            validate_unit_materialization(current, unit.name, unit)
             dependents = active_teardown_dependents(current, unit)
             if dependents:
-                raise OperationError(f"active owned/dependent Units must be finalized first: {', '.join(dependents)}")
-        except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError) as exc:
-            log_status("WAIT", f"{style_unit(args.unit)}: {exc}; deletion intent kept")
-            return False
-        observed_tree(observed_ref, observed)
-        existing_evidence = load_teardown_evidence(
-            observed,
-            args.unit,
-            intent.uid,
-            intent.deletion_generation,
-        )
-        previous_receipt = None
-        receipt_paths = document_candidates(observed / "units", args.unit)
-        if receipt_paths:
-            try:
-                candidate_receipt = load_receipt(receipt_paths[0], args.unit)
-                if (
-                    candidate_receipt.spec.desired.unitBlob == intent.retained_unit_blob
-                    and candidate_receipt.spec.subject.name == intent.unit_name
-                    and candidate_receipt.spec.subject.apiVersion == intent.retained_api_version
-                    and candidate_receipt.spec.subject.kind == intent.retained_kind
-                    and candidate_receipt.driver_name == intent.retained_driver
-                ):
-                    previous_receipt = candidate_receipt
-            except (DocumentFormatError, OperationError, KeyError, TypeError, ValueError):
-                # Finalization historically removed malformed observations. Keep
-                # that behavior while passing valid receipts to retrying drivers.
-                previous_receipt = None
-        if existing_evidence is not None and args.dry:
-            log_status("DRY", f"{style_unit(args.unit)}: teardown evidence already exists")
-            return False
-        driver = unit.driver
-        # Direct lifecycle authority controls who may initiate deletion, not
-        # whether the driver gets the deployment source it needs to tear down
-        # the retained Unit.
-        source = getattr(unit.spec, "source", None)
-        source_root = None
-        if existing_evidence is None:
-            if not isinstance(driver, TeardownCapability):
-                log_status(
-                    "WAIT",
-                    f"{style_unit(args.unit)}: driver {unit.driver_name} does not support teardown; "
-                    "install teardown support or resolve the intent explicitly",
-                )
-                return False
-            if source is not None and not isinstance(source, DesiredSource):
-                log_status(
-                    "WAIT", f"{style_unit(args.unit)}: retained source identity is invalid; deletion intent kept"
-                )
-                return False
+                raise OperationError("active owned/dependent Units must be finalized first: " + ", ".join(dependents))
             if args.dry:
                 log_status(
-                    "DRY", f"{style_unit(args.unit)}: teardown would run at generation {intent.deletion_generation}"
+                    "DRY",
+                    f"{style_unit(unit.name)}: teardown would run at generation {deletion.generation}",
                 )
                 return False
-            assert_desired_ref_fence(desired_ref, current_revision, args.unit, intent.uid)
+            observed_tree(observed_ref, observed)
+            receipt_path = unit_document_path(observed, unit.name)
+            previous_receipt = load_receipt(receipt_path, unit.name) if receipt_path.is_file() else None
+            existing_evidence = load_teardown_evidence(observed, unit.name, args.uid, deletion.generation)
+            if existing_evidence is not None:
+                teardown_details = existing_evidence.details
+            elif not isinstance(unit.driver, TeardownCapability):
+                raise OperationError(f"driver {unit.driver_name} does not support teardown")
+            if source is not None and not isinstance(source, DesiredSource):
+                raise OperationError(f"retained source identity for {unit.name!r} is invalid")
+            source_root = None
             if source is not None and source.revision is not None:
                 source_root = temporary / "source"
-                try:
-                    materialize_revision(source.revision, source_root)
-                except (DocumentFormatError, OperationError, subprocess.CalledProcessError) as exc:
-                    log_status("WAIT", f"{style_unit(args.unit)}: retained source is unavailable: {exc}")
-                    return False
+                materialize_revision(source.revision, source_root)
 
-        def assert_no_active_teardown_dependents(desired_root: Path) -> None:
-            latest_unit = load_desired_unit(unit_document_path(desired_root, args.unit), args.unit)
-            if latest_unit.metadata.uid != intent.uid:
-                raise EffectLeaseUnavailable(f"desired Unit {args.unit!r} changed before dependency validation; retry")
-            latest_dependents = active_teardown_dependents(desired_root, latest_unit)
-            if latest_dependents:
-                raise EffectLeaseUnavailable(
-                    "active owned/dependent Units appeared before effect lease acquisition: "
-                    + ", ".join(latest_dependents)
+            def assert_no_dependents(desired_root: Path) -> None:
+                latest = load_desired_unit(unit_document_path(desired_root, unit.name), unit.name)
+                if latest.metadata.uid != args.uid:
+                    raise EffectLeaseUnavailable(f"desired Unit {unit.name!r} changed before finalization")
+                active = active_teardown_dependents(desired_root, latest)
+                if active:
+                    raise EffectLeaseUnavailable("active dependents appeared: " + ", ".join(active))
+
+            if lease_ref is not None:
+                lease_acquisition = acquire_effect_lease(
+                    desired_ref,
+                    current_revision,
+                    unit.name,
+                    args.uid,
+                    precondition=assert_no_dependents,
+                    resume_existing=existing_evidence is not None,
+                    lease_ref=lease_ref,
                 )
-
-        try:
-            lease_acquisition = acquire_effect_lease(
-                desired_ref,
-                current_revision,
-                args.unit,
-                intent.uid,
-                precondition=assert_no_active_teardown_dependents,
-                resume_existing=existing_evidence is not None,
-                lease_ref=lease_ref,
-            )
-        except EffectLeaseUnavailable as exc:
-            log_status("WAIT", f"{style_unit(args.unit)}: {exc}")
-            return False
-        heartbeat: EffectLeaseHeartbeat | None = None
-        teardown_driver: TeardownCapability | None = None
-        driver_started = False
-        teardown_details: Mapping[str, object] | None = (
-            existing_evidence.details if existing_evidence is not None else None
-        )
-        try:
-            if lease_acquisition.revision == current_revision:
-                write_effect_lease(current, lease_acquisition.lease)
-            else:
-                refresh_materialized_root(lease_acquisition.revision, current)
-            current_revision = lease_acquisition.revision
+                if lease_acquisition.revision != current_revision:
+                    current_revision = lease_acquisition.revision
+                    refresh_materialized_root(current_revision, current)
+                elif lease_ref == desired_ref:
+                    write_effect_lease(current, lease_acquisition.lease)
             if existing_evidence is None:
-                assert_desired_ref_fence(desired_ref, current_revision, args.unit, intent.uid)
-                assert isinstance(driver, TeardownCapability)
-                teardown_driver = cast(TeardownCapability, driver)
-                heartbeat = start_effect_lease_heartbeat(desired_ref, lease_acquisition, lease_ref=lease_ref)
-        except BaseException:
-            if not driver_started:
-                try:
-                    release_pre_effect_lease(desired_ref, lease_acquisition, lease_ref=lease_ref)
-                except Exception as release_exc:
-                    log_status(
-                        "WAIT",
-                        f"{style_unit(args.unit)}: pre-effect lease release failed; explicit recovery remains: "
-                        f"{release_exc}",
-                    )
-            raise
-        if existing_evidence is None:
-            try:
-                assert teardown_driver is not None
-                driver_started = True
-                teardown_result = teardown_driver.teardown(
+                assert isinstance(unit.driver, TeardownCapability)
+                result = unit.driver.teardown(
                     TeardownContext(
                         environment=args.environment,
                         desired_root=current,
@@ -8906,201 +7618,110 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                         source_root=source_root,
                         source_revision=source.revision if source is not None else None,
                         source_path=source.path if source is not None else None,
-                        unit_name=args.unit,
+                        unit_name=unit.name,
                         unit=unit.spec,
-                        resource_uid=intent.uid,
-                        deletion_generation=intent.deletion_generation,
+                        resource_uid=args.uid,
+                        deletion_generation=deletion.generation,
                         previous_receipt=previous_receipt,
                         report=Path(args.report).resolve() if args.report else None,
                         execution=DriverExecution.console(),
                     )
                 )
-                if teardown_result is not None and not isinstance(teardown_result, TeardownResult):
+                if result is not None and not isinstance(result, TeardownResult):
                     raise DriverError("teardown returned an invalid result")
-                teardown_details = teardown_result.details if teardown_result is not None else {}
-            except (DriverError, OperationError, subprocess.CalledProcessError) as exc:
-                try:
-                    if heartbeat is not None:
-                        heartbeat.stop()
-                except Exception:
-                    pass
-                if not driver_started:
-                    try:
-                        release_pre_effect_lease(desired_ref, lease_acquisition, lease_ref=lease_ref)
-                    except (OperationError, subprocess.CalledProcessError) as release_exc:
-                        log_status(
-                            "WAIT",
-                            f"{style_unit(args.unit)}: pre-effect lease release failed; explicit recovery remains: "
-                            f"{release_exc}",
-                        )
-                detail = (exc.stderr or "").strip() if isinstance(exc, subprocess.CalledProcessError) else str(exc)
-                log_status("WAIT", f"{style_unit(args.unit)}: teardown failed: {detail or exc}; deletion intent kept")
-                return False
-            except BaseException:
-                try:
-                    if heartbeat is not None:
-                        heartbeat.stop()
-                except Exception:
-                    pass
-                if not driver_started:
-                    try:
-                        release_pre_effect_lease(desired_ref, lease_acquisition, lease_ref=lease_ref)
-                    except (OperationError, subprocess.CalledProcessError):
-                        pass
-                raise
-            try:
-                assert heartbeat is not None
-                lease_acquisition = heartbeat.stop()
-            except EffectLeaseUnavailable as exc:
-                log_status("WAIT", f"{style_unit(args.unit)}: {exc}; teardown evidence was not published")
-                return False
-        try:
-            lease_acquisition = rebase_effect_completion(
-                desired_ref,
-                lease_acquisition,
-                args.unit,
-                intent.uid,
-                current,
-                lease_ref=lease_ref,
-            )
-        except EffectLeaseUnavailable as exc:
-            log_status("WAIT", f"{style_unit(args.unit)}: {exc}; teardown evidence was not published")
-            return False
-        current_revision = lease_acquisition.revision
-        try:
+                teardown_details = result.details if result is not None else {}
             publish_teardown_observation_cas(
                 observed_ref,
-                intent,
+                unit.name,
+                args.uid,
+                deletion.generation,
                 current_revision,
                 desired_ref=desired_ref,
                 lease_ref=lease_ref,
-                lease_token=lease_acquisition.lease.token,
-                lease_snapshot=lease_acquisition.lease.snapshot,
+                lease_token=lease_acquisition.lease.token if lease_acquisition is not None else None,
+                lease_snapshot=lease_acquisition.lease.snapshot if lease_acquisition is not None else None,
                 details=teardown_details,
             )
-        except (OperationError, subprocess.CalledProcessError) as exc:
-            log_status("WAIT", f"{style_unit(args.unit)}: teardown evidence was not published: {exc}")
-            return False
-        try:
-            lease_acquisition = rebase_effect_completion(
-                desired_ref,
-                lease_acquisition,
-                args.unit,
-                intent.uid,
-                current,
-                lease_ref=lease_ref,
-            )
-        except EffectLeaseUnavailable as exc:
-            log_status("WAIT", f"{style_unit(args.unit)}: {exc}; teardown completion was not published")
-            return False
-        current_revision = lease_acquisition.revision
+
         candidate = temporary / "candidate"
-        candidate_ref = ""
-        outcome: ChangeRequestResult | ManualChangeRequest | None = None
-        for attempt in range(5):
-            if attempt:
-                try:
-                    lease_acquisition = rebase_effect_completion(
-                        desired_ref,
-                        lease_acquisition,
-                        args.unit,
-                        intent.uid,
-                        current,
-                        lease_ref=lease_ref,
-                    )
-                except EffectLeaseUnavailable as exc:
-                    log_status("WAIT", f"{style_unit(args.unit)}: {exc}; finalization was not published")
-                    return False
-                current_revision = lease_acquisition.revision
-            if candidate.exists():
-                shutil.rmtree(candidate)
-            shutil.copytree(current, candidate)
-            for path in document_candidates(candidate / "units", args.unit):
-                path.unlink()
-            for path in document_candidates(candidate / DESIRED_DELETION_INTENTS_PATH, args.unit):
-                path.unlink()
-            for path in document_candidates(candidate / DESIRED_EFFECT_LEASES_PATH, args.unit):
-                path.unlink()
+        shutil.copytree(current, candidate)
+        path = _desired_resource_path(candidate, resource)
+        for candidate_path in document_candidates(path.parent, resource.name):
+            candidate_path.unlink()
+        if unit is not None:
             materialization = getattr(unit.spec, "materialization", None)
             if materialization is not None:
                 materialized_path = candidate / materialization.path
                 if materialized_path.is_dir():
                     shutil.rmtree(materialized_path)
-            transition_blocks = load_desired_transition_blocks(candidate)
-            transition_blocks.pop(args.unit, None)
-            write_desired_transition_blocks(candidate, transition_blocks)
-            write_unit_incarnation_tombstone(
-                candidate,
-                UnitIncarnationTombstone(unit_name=args.unit, uid=intent.uid),
-            )
-            load_desired_resource_graph(candidate)
-            candidate_id = candidate_identifier(
-                "finalize",
-                args.environment,
-                candidate,
-                desired_ref,
-                current_revision,
+            remove_effect_lease(candidate, resource.name)
+        write_resource_incarnation_tombstone(
+            candidate,
+            ResourceIncarnationTombstone(
+                api_version=resource.gvk.api_version,
+                kind=resource.gvk.kind,
+                name=resource.name,
+                uid=args.uid,
+                deletion_generation=deletion.generation,
+            ),
+        )
+        load_desired_resource_graph(candidate)
+        candidate_id = candidate_identifier(
+            "finalize",
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            {"kind": category, "name": args.name, "uid": args.uid, "deletionGeneration": deletion.generation},
+        )
+        candidate_ref = resolve_candidate_ref(
+            REPOSITORY_ROOT, args.environment, "finalize", candidate_id, args.candidate_ref
+        )
+        revision, outcome = publish_desired_change(
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            candidate_ref,
+            f"Finalize deletion of {category} {args.name}",
+            f"Finalize deletion of {category} {args.name}",
+            f"Remove the finalized resource {category} {args.name}.",
+            args.dry,
+            current,
+            frozenset({resource.name}) if unit is not None else frozenset(),
+            request_change=False,
+            finalized_resources=frozenset(
                 {
-                    "unit": args.unit,
-                    "uid": intent.uid,
-                    "deletionGeneration": intent.deletion_generation,
-                },
-            )
-            candidate_ref = resolve_candidate_ref(
-                REPOSITORY_ROOT,
-                args.environment,
-                "finalize",
-                candidate_id,
-                args.candidate_ref,
-            )
-            try:
-                revision, outcome = publish_desired_change(
-                    args.environment,
-                    candidate,
-                    desired_ref,
-                    current_revision,
-                    candidate_ref,
-                    f"Finalize deletion of {args.unit} generation {intent.deletion_generation}",
-                    f"Finalize deletion of {args.unit} generation {intent.deletion_generation}",
-                    f"Finalize deletion of `{args.unit}` after successful UID-fenced teardown.",
-                    False,
-                    current,
-                    frozenset({args.unit}),
-                    request_change=False,
-                )
-                break
-            except (EffectLeaseUnavailable, subprocess.CalledProcessError) as exc:
-                if attempt == 4 or (isinstance(exc, subprocess.CalledProcessError) and not retryable_push_failure(exc)):
-                    log_status("WAIT", f"{style_unit(args.unit)}: finalization publication was fenced: {exc}")
-                    return False
-                log_status("RETRY", f"finalization publication attempt {attempt + 2}/5")
-        else:
-            return False
-        if outcome is None:
+                    ResourceFinalizationFence(
+                        resource.gvk.api_version,
+                        resource.gvk.kind,
+                        resource.name,
+                        args.uid,
+                        deletion.generation,
+                    )
+                }
+            ),
+        )
+        if not args.dry and isinstance(resource, StackResource) and resource.gvk.kind == "Stack" and outcome is None:
+            _release_stack_pin(args.environment, resource)
+        if not args.dry and lease_acquisition is not None and outcome is None:
             release_effect_lease(
                 desired_ref,
-                args.unit,
+                resource.name,
                 lease_acquisition.lease.token,
-                intent.uid,
+                args.uid,
                 verify_snapshot=False,
                 lease_ref=lease_ref,
             )
-        if outcome is not None:
-            log_status(
-                "REVIEW",
-                f"{style_branch(candidate_ref)} submitted at {describe_revision(revision)}; "
-                f"{style_branch(desired_ref)} remains at {describe_revision(current_revision)} "
-                "with the effect lease retained pending merge",
-            )
-        else:
-            log_status("UPDATE", f"{style_branch(desired_ref)} advanced to {describe_revision(revision)}")
+        if args.dry:
+            return False
         print(revision)
         write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
         return True
 
 
 def command_finalize(args: argparse.Namespace) -> bool:
-    with unit_effect_lock(args.environment, getattr(args, "unit", "<invalid>")):
+    with unit_effect_lock(args.environment, getattr(args, "name", "<invalid>")):
         return _command_finalize(args)
 
 
@@ -9130,6 +7751,154 @@ def command_recover_effect_lease(args: argparse.Namespace) -> None:
 def command_resolve_desired(args: argparse.Namespace) -> None:
     revision = resolve_ref(args.desired_ref, args.desired_revision)
     print(revision)
+
+
+def _direct_stack_uid(
+    environment: str,
+    stack_name: str,
+    request_identity: str,
+    desired_revision: str,
+    previous_uid: str | None = None,
+) -> str:
+    digest = hashlib.sha256(
+        f"gitopsctr/direct-stack-uid/v3\0{environment}\0{stack_name}\0{request_identity}\0{desired_revision}\0{previous_uid or ''}".encode()
+    ).hexdigest()[:32]
+    return f"d1-{digest}"
+
+
+def _selected_stack_template_resources(
+    stack_name: str,
+    resources: Sequence[StackTemplateResource],
+    selected: str | None,
+) -> tuple[StackTemplateResource, ...]:
+    """Select a dependency-closed Unit projection from a StackTemplate."""
+
+    if selected is None:
+        return tuple(resources)
+    names = [name.strip() for name in selected.split(",") if name.strip()]
+    if not names or len(set(names)) != len(names):
+        raise OperationError("--units must contain one or more unique Unit template names")
+    by_name = {resource.name: resource for resource in resources}
+    unknown = sorted(set(names) - set(by_name))
+    if unknown:
+        raise OperationError(f"Stack {stack_name!r} selects unknown Unit templates: {', '.join(unknown)}")
+    selected_names = set(names)
+    for resource in resources:
+        if resource.name in selected_names:
+            omitted = sorted(set(resource.dependsOn) - selected_names)
+            if omitted:
+                raise OperationError(
+                    f"Stack {stack_name!r} selects {resource.name!r} but omits dependencies: {', '.join(omitted)}"
+                )
+    return tuple(resource for resource in resources if resource.name in selected_names)
+
+
+def _stack_pin_name(environment: str, stack_name: str, uid: str) -> str:
+    return f"stacks/{environment}/{stack_name}/{uid}"
+
+
+def _stack_pin_claim(
+    environment: str,
+    stack_name: str,
+    uid: str,
+    pin_revision: str,
+    target_ref: str,
+    target_revision: str,
+    candidate_ref: str,
+    *,
+    state: Literal["preparing", "active", "reaping"] = "preparing",
+    candidate_revision: str | None = None,
+) -> ControllerPinClaim:
+    return ControllerPinClaim(
+        environment=environment,
+        stack_name=stack_name,
+        uid=uid,
+        pin_name=_stack_pin_name(environment, stack_name, uid),
+        pin_revision=pin_revision,
+        target_ref=target_ref,
+        target_revision=target_revision,
+        candidate_ref=candidate_ref,
+        candidate_revision=candidate_revision,
+        state=state,
+    )
+
+
+def _controller_pin_revision(pin_name: str) -> str | None:
+    """Read one controller pin without changing the local repository."""
+
+    ref = f"refs/heads/gitopsctr/pins/{pin_name}"
+    result = state_store().git("ls-remote", "--exit-code", "--refs", "origin", ref, check=False)
+    if result.returncode == 2:
+        return None
+    if result.returncode != 0:
+        raise OperationError(result.stderr.strip() or f"could not inspect controller pin {pin_name!r}")
+    lines = result.stdout.splitlines()
+    if len(lines) != 1 or len(lines[0].split()) != 2:
+        raise OperationError(f"controller pin {pin_name!r} inspection returned an invalid result")
+    revision, actual_ref = lines[0].split()
+    if actual_ref != ref or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise OperationError(f"controller pin {pin_name!r} inspection returned an invalid identity")
+    return revision
+
+
+def _replace_controller_pin(pin_name: str, expected_revision: str, revision: str) -> ControllerPin:
+    """Advance a Stack source pin with an exact remote-head fence."""
+
+    store = state_store()
+    if expected_revision == revision:
+        actual = _controller_pin_revision(pin_name)
+        if actual is None:
+            store.create_controller_pin(pin_name, revision)
+        elif actual != revision:
+            raise OperationError(
+                f"controller pin {pin_name!r} changed before update: expected {expected_revision}, found {actual}"
+            )
+        return ControllerPin(pin_name, f"refs/heads/gitopsctr/pins/{pin_name}", revision)
+    replace_pin = getattr(store, "replace_controller_pin", None)
+    if callable(replace_pin):
+        return cast(ControllerPin, replace_pin(pin_name, expected_revision, revision))
+    ref = f"refs/heads/gitopsctr/pins/{pin_name}"
+    actual = _controller_pin_revision(pin_name)
+    if actual != expected_revision:
+        raise OperationError(
+            f"controller pin {pin_name!r} changed before update: expected {expected_revision}, found {actual}"
+        )
+    pushed = store.git(
+        "push",
+        f"--force-with-lease={ref}:{expected_revision}",
+        "origin",
+        f"{revision}:{ref}",
+        check=False,
+    )
+    actual = _controller_pin_revision(pin_name)
+    if actual != revision:
+        raise OperationError(pushed.stderr.strip() or f"controller pin {pin_name!r} changed during update")
+    return ControllerPin(pin_name, ref, revision)
+
+
+def _restore_controller_pin(pin_name: str, expected_revision: str, revision: str) -> None:
+    """Best-effort rollback for a pin changed before failed candidate publication."""
+
+    _replace_controller_pin(pin_name, expected_revision, revision)
+
+
+def _parse_stack_parameters(raw: str) -> JsonObjectValue:
+    try:
+        value = json.loads(raw)
+        validated = require_json_value(value)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise OperationError(f"--parameters must be a finite JSON object: {exc}") from exc
+    if not isinstance(validated, dict):
+        raise OperationError("--parameters must contain a JSON object")
+    return JsonObjectValue(validated)
+
+
+def _parameter_values(value: object) -> list[object]:
+    if isinstance(value, dict):
+        return [value, *[item for child in value.values() for item in _parameter_values(child)]]
+    if isinstance(value, list):
+        return [item for child in value for item in _parameter_values(child)]
+    return [value]
 
 
 def _compatibility_finding(code: str, path: str, unit: str, message: str) -> CompatibilityFinding:
@@ -9234,46 +8003,6 @@ def _audit_desired_compatibility(root: Path) -> list[CompatibilityFinding]:
                     "desired resource graph is invalid",
                 )
             )
-
-    intent_paths = _compatibility_document_paths(root, DESIRED_DELETION_INTENTS_PATH)
-    intent_by_unit: dict[str, list[Path]] = {}
-    for path in intent_paths:
-        intent_by_unit.setdefault(path.stem, []).append(path)
-    for unit_name, paths in sorted(intent_by_unit.items()):
-        if len(paths) > 1:
-            findings.append(
-                _compatibility_finding(
-                    "ambiguous-cleanup-state",
-                    _compatibility_path(root, paths[0].parent),
-                    unit_name,
-                    "multiple deletion intent documents use the same name",
-                )
-            )
-
-    if all(len(paths) == 1 for paths in intent_by_unit.values()):
-        try:
-            intents = load_desired_deletion_intents(root)
-        except Exception:
-            findings.append(
-                _compatibility_finding(
-                    "unparseable-cleanup-state",
-                    DESIRED_DELETION_INTENTS_PATH.as_posix(),
-                    "",
-                    "deletion intent state cannot be read",
-                )
-            )
-        else:
-            for unit_name, intent in sorted(intents.items()):
-                if not intent.retained_identity_known:
-                    intent_path = intent_by_unit[unit_name][0]
-                    findings.append(
-                        _compatibility_finding(
-                            "unverified-deletion-identity",
-                            _compatibility_path(root, intent_path),
-                            unit_name,
-                            "deletion intent retained identity is not verified",
-                        )
-                    )
 
     cleanup_paths = _compatibility_document_paths(root, DESIRED_CLEANUP_UNITS_PATH)
     cleanup_by_unit: dict[str, list[Path]] = {}
@@ -10259,11 +8988,14 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             log_status("DONE", f"{style_unit(args.unit)}: no changes")
             write_reconcile_outputs(False)
             return False
-        if deletion_intent := load_desired_deletion_intents(desired).get(args.unit):
-            log_status("WAIT", deletion_intent_reason(deletion_intent))
-            log_status("DONE", f"{style_unit(args.unit)}: no changes")
-            write_reconcile_outputs(False)
-            return False
+        deletion_path = unit_document_path(desired, args.unit)
+        if deletion_path.is_file():
+            deleting_unit = load_desired_unit(deletion_path, args.unit)
+            if resource_deletion(deleting_unit) is not None:
+                log_status("WAIT", deletion_reason(deleting_unit))
+                log_status("DONE", f"{style_unit(args.unit)}: no changes")
+                write_reconcile_outputs(False)
+                return False
         unit_path = unit_document_path(desired, args.unit)
         if not unit_path.is_file():
             log_status("WAIT", "desired inputs are not materialized")
@@ -11236,10 +9968,12 @@ def command_apply_unit(args: argparse.Namespace) -> None:
     unit = RESOURCE_CATALOG.parse_unit(document, profile="desired")
     if unit.metadata.lifecycle is None or unit.metadata.lifecycle.management is None:
         raise OperationError("apply unit requires desired lifecycle metadata")
-    if unit.metadata.lifecycle.owner is not None or unit.metadata.lifecycle.management.mode != "direct":
+    if resource_owner_reference(unit) is not None or unit.metadata.lifecycle.management.mode != "direct":
         raise OperationError("apply unit requires a directly managed root Unit")
     if unit.metadata.uid is None:
         raise OperationError("apply unit requires a Unit UID")
+    if resource_deletion(unit) is not None:
+        raise OperationError("apply unit cannot set deletion metadata; use delete unit --in=state")
     desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, None)
     current_revision = fetch_ref(desired_ref)
     if current_revision is None:
@@ -11261,6 +9995,12 @@ def command_apply_unit(args: argparse.Namespace) -> None:
                 raise OperationError(f"stale desired head for {unit.name!r}")
         elif args.uid is not None:
             raise OperationError(f"desired Unit {unit.name!r} is not present")
+        else:
+            finalized = load_resource_incarnation_tombstones(current)
+            if any(
+                tombstone.name == unit.name and tombstone.uid == unit.metadata.uid for tombstone in finalized.values()
+            ):
+                raise OperationError(f"finalized desired Unit UID cannot be reused for {unit.name!r}")
         shutil.copytree(current, candidate)
         write_desired_candidate_unit(candidate / "units" / existing_path.name, unit, REPOSITORY_ROOT)
         load_desired_resource_graph(candidate)
@@ -11296,34 +10036,122 @@ def command_apply_unit(args: argparse.Namespace) -> None:
         write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
 
 
+def _desired_resource_path(root: Path, resource: UnitResource[Any] | StackResource) -> Path:
+    if isinstance(resource, UnitResource):
+        return unit_document_path(root, resource.name)
+    directory = "stack-templates" if resource.gvk.kind == "StackTemplate" else "stacks"
+    paths = document_candidates(root / directory, resource.name)
+    if len(paths) != 1:
+        raise OperationError(f"desired {resource.gvk.kind} {resource.name!r} is unavailable")
+    return paths[0]
+
+
+def _write_desired_resource(path: Path, resource: UnitResource[Any] | StackResource) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(resource, UnitResource):
+        write_desired_candidate_unit(path, resource, REPOSITORY_ROOT)
+    else:
+        _write_desired_stack_resource(path, resource, REPOSITORY_ROOT)
+
+
+def _owned_resource_closure(
+    resources: Mapping[tuple[str, str, str], UnitResource[Any] | StackResource],
+    target: UnitResource[Any] | StackResource,
+) -> tuple[UnitResource[Any] | StackResource, ...]:
+    selected = {(target.gvk.api_version, target.gvk.kind, target.name): target}
+    changed = True
+    while changed:
+        changed = False
+        for key, resource in resources.items():
+            if key in selected:
+                continue
+            owner = resource_owner_reference(resource)
+            if owner is None:
+                continue
+            if (owner.apiVersion, owner.kind, owner.name) in selected:
+                parent = selected[(owner.apiVersion, owner.kind, owner.name)]
+                if parent.metadata.uid != owner.uid:
+                    continue
+                selected[key] = resource
+                changed = True
+    return tuple(selected.values())
+
+
+def _command_delete_state_resource(args: argparse.Namespace) -> bool:
+    if not args.uid:
+        raise OperationError("state deletion requires --uid")
+    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, None)
+    current_revision = fetch_ref(desired_ref)
+    if current_revision is None:
+        raise OperationError(f"desired ref {desired_ref!r} has no state")
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary = Path(temporary_directory)
+        current = temporary / "current"
+        candidate = temporary / "candidate"
+        materialize_revision(current_revision, current)
+        resources = load_desired_resource_graph(current)
+        matches = [
+            resource
+            for resource in resources.values()
+            if resource.name == args.name
+            and (
+                (args.kind == "Unit" and isinstance(resource, UnitResource))
+                or (args.kind in {"Stack", "StackTemplate"} and resource.gvk.kind == args.kind)
+            )
+        ]
+        if len(matches) != 1:
+            raise OperationError(f"desired {args.kind} {args.name!r} is not present")
+        target = matches[0]
+        if target.metadata.uid != args.uid:
+            raise OperationError(f"stale desired {args.kind} UID fence for {args.name!r}")
+        if resource_owner_reference(target) is not None:
+            raise OperationError(f"desired {args.kind} {args.name!r} is owned; delete its owner instead")
+        if resource_deletion(target) is not None:
+            deletion = resource_deletion(target)
+            if deletion is not None and deletion.resourceDigest != resource_content_digest(target):
+                raise OperationError(f"desired {args.kind} {args.name!r} changed after deletion started")
+            return False
+        shutil.copytree(current, candidate)
+        for resource in _owned_resource_closure(resources, target):
+            marked = mark_resource_for_deletion(resource)
+            _write_desired_resource(_desired_resource_path(candidate, resource), marked)
+        load_desired_resource_graph(candidate)
+        candidate_id = candidate_identifier(
+            "delete",
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            {"kind": args.kind, "name": args.name, "uid": args.uid},
+        )
+        candidate_ref = resolve_candidate_ref(
+            REPOSITORY_ROOT, args.environment, "delete", candidate_id, args.candidate_ref
+        )
+        if candidate_ref in {desired_ref, observed_ref}:
+            raise OperationError("deletion candidate ref conflicts with deployment state")
+        revision, outcome = publish_desired_change(
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            candidate_ref,
+            f"Mark {args.kind} {args.name} for deletion",
+            f"Delete {args.kind} {args.name}",
+            f"Mark `{args.kind} {args.name}` and its UID-owned resources for deletion.",
+            args.dry,
+            current,
+            request_change=False,
+        )
+        if args.dry:
+            return False
+        print(revision)
+        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
+        return True
+
+
 def command_delete_resource(args: argparse.Namespace) -> None:
     if args.input_location == "state":
-        if args.kind == "StackTemplate":
-            raise OperationError("StackTemplates are source-authored resources and cannot be state-managed")
-        if not args.uid:
-            raise OperationError("state deletion requires --uid")
-        if args.kind == "Stack":
-            command_request_delete_direct_stack(
-                argparse.Namespace(
-                    environment=args.environment,
-                    stack=args.name,
-                    uid=args.uid,
-                    desired_ref=args.desired_ref,
-                    candidate_ref=args.candidate_ref,
-                    dry=args.dry,
-                )
-            )
-        else:
-            command_request_delete_direct_unit(
-                argparse.Namespace(
-                    environment=args.environment,
-                    unit=args.name,
-                    uid=args.uid,
-                    desired_ref=args.desired_ref,
-                    candidate_ref=args.candidate_ref,
-                    dry=args.dry,
-                )
-            )
+        _command_delete_state_resource(args)
         return
     project = load_project_config(REPOSITORY_ROOT)
     target = _source_resource_path(args.kind, args.name, args.environment, project)
@@ -11669,10 +10497,7 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
             (
                 "recover-opaque-unit",
                 "resolve-opaque-unit",
-                "request-delete-direct-unit",
-                "request-delete-direct-stack",
                 "finalize",
-                "finalize-stack",
             ),
         ),
         (
@@ -12056,6 +10881,12 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_opaque.add_argument("--unit", required=True)
     resolve_opaque.add_argument("--uid", required=True, help="exact opaque cleanup UID fence")
     resolve_opaque.add_argument(
+        "--deletion-generation",
+        required=True,
+        type=int,
+        help="expected opaque cleanup deletion generation fence",
+    )
+    resolve_opaque.add_argument(
         "--reason",
         required=True,
         help="bounded operator reason for the confirmed external cleanup",
@@ -12073,43 +10904,14 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_opaque.add_argument("--dry", action="store_true")
     resolve_opaque.set_defaults(handler=command_resolve_opaque_unit)
 
-    request_delete_direct = commands.add_parser(
-        "request-delete-direct-unit",
-        help="request UID-fenced deletion of a directly managed desired Unit",
-    )
-    request_delete_direct.add_argument("--environment", required=True)
-    request_delete_direct.add_argument("--unit", required=True)
-    request_delete_direct.add_argument("--uid", required=True, help="exact direct Unit UID fence")
-    request_delete_direct.add_argument("--desired-ref", help="override the environment's desired ref")
-    request_delete_direct.add_argument(
-        "--candidate-ref",
-        help="exact candidate ref override when the environment uses a pull-request change gate",
-    )
-    request_delete_direct.add_argument("--dry", action="store_true")
-    request_delete_direct.set_defaults(handler=command_request_delete_direct_unit)
-
-    request_delete_direct_stack = commands.add_parser(
-        "request-delete-direct-stack",
-        help="request UID-fenced deletion of a directly managed desired Stack",
-    )
-    request_delete_direct_stack.add_argument("--environment", required=True)
-    request_delete_direct_stack.add_argument("--stack", required=True)
-    request_delete_direct_stack.add_argument("--uid", required=True, help="exact direct Stack UID fence")
-    request_delete_direct_stack.add_argument("--desired-ref", help="override the environment's desired ref")
-    request_delete_direct_stack.add_argument(
-        "--candidate-ref",
-        help="exact candidate ref override when the environment uses a pull-request change gate",
-    )
-    request_delete_direct_stack.add_argument("--dry", action="store_true")
-    request_delete_direct_stack.set_defaults(handler=command_request_delete_direct_stack)
-
     finalize = commands.add_parser(
         "finalize",
-        help="finalize one durable deletion intent",
+        help="finalize one resource marked for deletion",
     )
     finalize.add_argument("--environment", required=True)
-    finalize.add_argument("--unit", required=True)
-    finalize.add_argument("--uid", required=True, help="expected deletion-intent UID fence")
+    finalize.add_argument("kind", type=str.lower, choices=("unit", "stack", "stacktemplate"))
+    finalize.add_argument("--name", required=True)
+    finalize.add_argument("--uid", required=True, help="expected resource UID fence")
     finalize.add_argument(
         "--deletion-generation",
         required=True,
@@ -12125,28 +10927,6 @@ def build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--report", help="directory where the driver may write teardown reports")
     finalize.add_argument("--dry", action="store_true")
     finalize.set_defaults(handler=command_finalize)
-
-    finalize_stack = commands.add_parser(
-        "finalize-stack",
-        help="finalize one durable direct Stack deletion intent after owned Units are gone",
-    )
-    finalize_stack.add_argument("--environment", required=True)
-    finalize_stack.add_argument("--stack", required=True)
-    finalize_stack.add_argument("--uid", required=True, help="expected Stack deletion-intent UID fence")
-    finalize_stack.add_argument(
-        "--deletion-generation",
-        required=True,
-        type=int,
-        help="expected Stack deletion generation fence",
-    )
-    finalize_stack.add_argument("--desired-ref", help="override the environment's desired ref")
-    finalize_stack.add_argument("--observed-ref", help="override the environment's observed ref")
-    finalize_stack.add_argument(
-        "--candidate-ref",
-        help="exact candidate ref override when the environment uses a pull-request change gate",
-    )
-    finalize_stack.add_argument("--dry", action="store_true")
-    finalize_stack.set_defaults(handler=command_finalize_stack)
 
     resolve = commands.add_parser(
         "resolve-desired",

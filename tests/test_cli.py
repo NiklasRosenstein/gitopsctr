@@ -66,6 +66,49 @@ def test_root_help_groups_commands_and_describes_each_command():
     assert "    reconcile           reconcile one deployment unit" in help_text
 
 
+def test_delete_and_finalize_use_generic_resource_commands():
+    parser = deploy_release.build_parser()
+
+    delete = parser.parse_args(
+        [
+            "delete",
+            "unit",
+            "--in=state",
+            "--environment",
+            "preview",
+            "--name",
+            "application",
+            "--uid",
+            "d1-application",
+        ]
+    )
+    assert delete.handler is deploy_release.command_delete_resource
+    assert delete.kind == "Unit"
+    assert delete.input_location == "state"
+    assert delete.name == "application"
+    assert delete.uid == "d1-application"
+
+    finalize = parser.parse_args(
+        [
+            "finalize",
+            "unit",
+            "--environment",
+            "preview",
+            "--name",
+            "application",
+            "--uid",
+            "d1-application",
+            "--deletion-generation",
+            "1",
+        ]
+    )
+    assert finalize.handler is deploy_release.command_finalize
+    assert finalize.kind == "unit"
+    assert finalize.name == "application"
+    assert finalize.uid == "d1-application"
+    assert finalize.deletion_generation == 1
+
+
 def test_lifecycle_candidate_publication_delegates_change_request_to_ci(tmp_path, monkeypatch):
     monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
     monkeypatch.setattr(deploy_release, "load_desired_resource_graph", lambda *_args, **_kwargs: {})
@@ -329,7 +372,7 @@ def test_blocked_driver_transition_omits_previous_unit_and_reports_wait(tmp_path
     assert "retain opaque cleanup root" in capsys.readouterr().err
 
 
-def test_parseable_driver_transition_creates_fenced_deletion_intent(tmp_path):
+def test_parseable_driver_transition_retains_fenced_deletion_metadata(tmp_path):
     source = tmp_path / "source"
     current = tmp_path / "current"
     observed = tmp_path / "observed"
@@ -351,22 +394,22 @@ def test_parseable_driver_transition_creates_fenced_deletion_intent(tmp_path):
     _write_json(current / "units/application.json", deploy_release.serialize_unit_document(current_unit))
     observed.mkdir()
 
-    result = deploy_release.build_desired_candidate(
-        "dev", source, "b" * 40, current, observed, None, candidate, verbose=False
-    )
+    deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate, verbose=False)
 
-    intent = deploy_release.load_desired_deletion_intents(candidate)["application"]
-    assert intent.uid == current_unit.metadata.uid
-    assert (
-        deploy_release.load_desired_unit(candidate / "units/application.json", "application").metadata.uid == intent.uid
-    )
-    assert result.blocked["application"] == deploy_release.deletion_intent_reason(intent)
-    assert deploy_release.load_desired_transition_blocks(candidate)["application"] == (
-        deploy_release.deletion_intent_reason(intent)
-    )
+    retained = deploy_release.load_desired_unit(candidate / "units/application.json", "application")
+    deletion = retained.metadata.deletion
+    assert retained.metadata.uid == current_unit.metadata.uid
+    assert deletion is not None
+    assert deletion.generation == 1
+    assert deletion.resourceDigest == deploy_release.resource_content_digest(current_unit)
+    assert deploy_release.reconciliation_statuses(["application"], candidate, observed) == [
+        ("application", "WAIT", deploy_release.deletion_reason(retained))
+    ]
 
     deploy_release.build_desired_candidate("dev", source, "c" * 40, candidate, observed, None, repeated, verbose=False)
-    assert deploy_release.load_desired_deletion_intents(repeated)["application"].uid == intent.uid
+    repeated_resource = deploy_release.load_desired_unit(repeated / "units/application.json", "application")
+    assert repeated_resource.metadata.uid == current_unit.metadata.uid
+    assert repeated_resource.metadata.deletion == deletion
 
 
 def test_finalized_same_name_recreation_gets_new_uid_from_tombstone(tmp_path):
@@ -391,15 +434,26 @@ def test_finalized_same_name_recreation_gets_new_uid_from_tombstone(tmp_path):
     current.mkdir()
     observed.mkdir()
     old_uid = "d1-finalized-application"
-    deploy_release.write_unit_incarnation_tombstone(
+    deploy_release.write_resource_incarnation_tombstone(
         current,
-        deploy_release.UnitIncarnationTombstone(unit_name="application", uid=old_uid),
+        deploy_release.ResourceIncarnationTombstone(
+            api_version="unit.gitopsctr.io/v1",
+            kind="Terraform",
+            name="application",
+            uid=old_uid,
+            deletion_generation=1,
+        ),
     )
 
     deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate, verbose=False)
     recreated = deploy_release.load_desired_unit(candidate / "units/application.json", "application")
     assert recreated.metadata.uid != old_uid
-    assert deploy_release.load_desired_unit_incarnation_tombstones(candidate)["application"].uid == old_uid
+    assert (
+        deploy_release.load_resource_incarnation_tombstones(candidate)[
+            ("unit.gitopsctr.io/v1", "Terraform", "application")
+        ].uid
+        == old_uid
+    )
 
     deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, repeated, verbose=False)
     assert deploy_release.load_desired_unit(repeated / "units/application.json", "application").metadata.uid == (
@@ -473,6 +527,10 @@ def test_source_absent_unparseable_unit_is_retained_only_as_cleanup_payload(tmp_
     assert not (candidate / "units/orphan.json").exists()
     cleanup = deploy_release.load_json(candidate / ".gitopsctr/cleanup/units/orphan.json")
     assert cleanup["payload"] == raw
+    assert cleanup["metadata"]["deletion"]["generation"] == 1
+    opaque = deploy_release.load_desired_cleanup_roots(candidate)["orphan"]
+    assert opaque.metadata.deletion is not None
+    assert opaque.metadata.deletion.resourceDigest == deploy_release.opaque_cleanup_content_digest(opaque)
     assert deploy_release.load_desired_transition_blocks(candidate)["orphan"] == (
         "source absent; opaque cleanup root retained"
     )
@@ -837,12 +895,11 @@ def test_observation_publication_rebases_after_unrelated_lease_renewal(tmp_path,
     receipt_path = next(path for path in observed_publication if path.startswith("units/application."))
     assert yaml.safe_load(observed_publication[receipt_path])["spec"]["desired"]["revision"] == "b" * 40
     assert deploy_release.load_desired_effect_leases(desired)["worker"].token == worker_lease.token
-    intent = deploy_release.UnitDeletionIntent.from_unit(
-        units["application"], desired / "units/application.json", desired
-    )
     deploy_release.publish_teardown_observation_cas(
         "observed/dev",
-        intent,
+        "application",
+        units["application"].metadata.uid,
+        1,
         "b" * 40,
         desired_ref="deploy/dev",
         lease_token=application_lease.token,
@@ -996,7 +1053,7 @@ def test_opaque_cleanup_metadata_rejects_explicit_name_mismatch(metadata):
         {
             "name": "frontend",
             "uid": "uid-1",
-            "lifecycle": {"owner": {"apiVersion": "unit.gitopsctr.io/v1", "kind": "Terraform", "name": "owner"}},
+            "ownerReferences": [{"apiVersion": "unit.gitopsctr.io/v1", "kind": "Terraform", "name": "owner"}],
         },
     ],
 )
