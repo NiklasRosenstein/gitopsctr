@@ -876,7 +876,7 @@ def _desired_tree() -> Path:
     return output
 
 
-def stack_acceptance(registry_port: int, app_port: int) -> None:
+def stack_acceptance(registry_port: int, app_port: int) -> RefHeads:
     stack_port = app_port + 1
     add_stack_source(stack_port)
     try:
@@ -928,7 +928,9 @@ def stack_acceptance(registry_port: int, app_port: int) -> None:
             raise RuntimeError("Stack finalization left its Docker container running")
         if verify_application(app_port) == "":
             raise RuntimeError("direct demo application became unavailable during Stack cleanup")
+        final_heads = deployment_heads()
         print("Acceptance passed: Stack-driven Docker/Terraform cleanup removed the Stack application.")
+        return final_heads
     finally:
         clean(f"localhost:{registry_port}")
 
@@ -943,8 +945,7 @@ def acceptance(registry_port: int, app_port: int) -> None:
         second_heads = deployment_heads()
         if second_heads != first_heads:
             raise RuntimeError("clean convergence moved desired or observed refs")
-        stack_acceptance(registry_port, app_port)
-        final_heads = deployment_heads()
+        final_heads = stack_acceptance(registry_port, app_port)
         print(
             "Acceptance passed: "
             f"gitopsctr/desired/dev={final_heads.desired[:12]} "

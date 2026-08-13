@@ -179,13 +179,7 @@ def test_demo_stack_cleanup_commands_match_planned_cli_contract():
 
 def test_demo_acceptance_delegates_stack_cleanup_after_clean_direct_convergence(monkeypatch):
     events: list[object] = []
-    heads = iter(
-        (
-            RefHeads("desired", "observed"),
-            RefHeads("desired", "observed"),
-            RefHeads("desired", "observed"),
-        )
-    )
+    heads = iter((RefHeads("desired", "observed"), RefHeads("desired", "observed")))
     monkeypatch.setattr(demo, "clean", lambda registry: events.append(("clean", registry)))
     monkeypatch.setattr(
         demo,
@@ -196,7 +190,10 @@ def test_demo_acceptance_delegates_stack_cleanup_after_clean_direct_convergence(
     monkeypatch.setattr(
         demo,
         "stack_acceptance",
-        lambda registry_port, app_port: events.append(("stack_acceptance", registry_port, app_port)),
+        lambda registry_port, app_port: (
+            events.append(("stack_acceptance", registry_port, app_port)),
+            RefHeads("final-desired", "final-observed"),
+        )[1],
     )
 
     demo.acceptance(5001, 18081)
@@ -212,13 +209,7 @@ def test_demo_acceptance_delegates_stack_cleanup_after_clean_direct_convergence(
 
 def test_demo_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):
     events: list[object] = []
-    heads = iter(
-        (
-            RefHeads("desired", "observed"),
-            RefHeads("desired", "observed"),
-            RefHeads("desired", "observed"),
-        )
-    )
+    heads = iter((RefHeads("desired", "observed"), RefHeads("desired", "observed")))
     monkeypatch.setattr(demo, "clean", lambda registry: events.append(("clean", registry)))
     monkeypatch.setattr(
         demo,
@@ -226,7 +217,7 @@ def test_demo_acceptance_requires_stable_refs_and_always_cleans(monkeypatch):
         lambda registry_port, app_port, **kwargs: events.append(("converge", registry_port, app_port, kwargs)),
     )
     monkeypatch.setattr(demo, "deployment_heads", lambda: next(heads))
-    monkeypatch.setattr(demo, "stack_acceptance", lambda *_args: None)
+    monkeypatch.setattr(demo, "stack_acceptance", lambda *_args: RefHeads("final-desired", "final-observed"))
 
     demo.acceptance(5001, 18081)
 
