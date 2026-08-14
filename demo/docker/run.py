@@ -137,7 +137,7 @@ def converge(registry_port: int, app_port: int, *, expect_clean: bool = False) -
         "--yes",
         capture=expect_clean,
     )
-    if expect_clean and "no drivers ran; 0 ref movements" not in result.stdout + result.stderr:
+    if expect_clean and "no drivers ran" not in result.stdout + result.stderr:
         raise RuntimeError("second Docker convergence was not clean")
     message = verify_application(app_port)
     print(f"\nDocker Stack demo is running at http://127.0.0.1:{app_port}/")

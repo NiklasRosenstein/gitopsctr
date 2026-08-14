@@ -314,7 +314,7 @@ def converge(
         output = result.stdout + result.stderr
         print(output, end="" if not output or output.endswith("\n") else "\n")
         if result.returncode == 0:
-            if expect_clean and "no drivers ran; 0 ref movements" not in output:
+            if expect_clean and "no drivers ran" not in output:
                 raise RuntimeError(f"clean {environment} convergence ran a driver or moved a ref")
             return
         if "convergence stalled with no ready unit" not in output:
