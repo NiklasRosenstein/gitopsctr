@@ -118,8 +118,14 @@ decides whether a changed candidate is published to the desired ref or offered f
 the driver inspect its work without applying changes or publishing a receipt; normal reconciliation publishes a
 receipt only after the driver succeeds.
 
-`--source-revision` selects the committed source snapshot used to resolve paths and pins. Working-tree changes are
-excluded, so commit them and select that commit when they must affect the application.
+Without `--source-revision`, apply reads its explicit documents and source-less configuration from the current
+worktree. It does not silently substitute `HEAD` or create a hidden commit. If an authored Unit uses
+repository-backed `spec.source`, or a Stack selects a repository-local StackTemplate without its own exact Git
+commit, apply fails and asks for `--source-revision <commit>`.
+
+`--source-revision` selects the exact committed snapshot used for repository-backed paths and pins. In that mode,
+working-tree changes are excluded and apply reports that exclusion. Commit the intended content and select that
+commit explicitly.
 
 For local orchestration, converge a unit and its dependencies until clean:
 

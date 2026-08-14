@@ -50,6 +50,39 @@ def _authored_unit(path: Path, name: str) -> Path:
     return path
 
 
+def _authored_source_less_unit(path: Path, name: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "FrontendS3Cloudfront",
+                "metadata": {"name": name},
+                "spec": {
+                    "inputs": {
+                        "bundle": "registry.example/frontend@sha256:" + "0" * 64,
+                        "bucket": "example-frontend",
+                        "distributionId": "EXAMPLE123",
+                        "url": "https://www.example.invalid",
+                        "runtimeConfig": {
+                            "schema": 1,
+                            "apiBase": "https://api.example.invalid",
+                            "auth": {
+                                "mode": "cognito",
+                                "issuer": "https://issuer.example.invalid",
+                                "clientId": "example-client",
+                            },
+                        },
+                    },
+                    "pull": {"credentialProvider": {"type": "aws-ecr"}},
+                },
+            },
+            sort_keys=False,
+        )
+    )
+    return path
+
+
 def _apply(source: Path, revision: str, *files: Path, partition: str | None = None):
     arguments = [
         "apply",
@@ -57,6 +90,23 @@ def _apply(source: Path, revision: str, *files: Path, partition: str | None = No
         "dev",
         "--source-revision",
         revision,
+        "--desired-ref",
+        "deploy/dev",
+        "--observed-ref",
+        "observed/dev",
+    ]
+    if partition is not None:
+        arguments.extend(("--partition", partition))
+    for path in files:
+        arguments.extend(("-f", str(path)))
+    return controller.command_apply(controller.build_parser().parse_args(arguments))
+
+
+def _apply_worktree(*files: Path, partition: str | None = None):
+    arguments = [
+        "apply",
+        "--environment",
+        "dev",
         "--desired-ref",
         "deploy/dev",
         "--observed-ref",
@@ -88,6 +138,66 @@ def test_apply_resolves_authored_unit_and_is_noop(tmp_path: Path, monkeypatch: p
 
     second = _apply(source, revision, authored, partition="application")
     assert second == first
+
+
+def test_apply_without_source_revision_uses_worktree_for_source_less_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source, store, _revision = _repository(tmp_path, monkeypatch)
+    authored = _authored_source_less_unit(source / "frontend.yaml", "frontend")
+
+    published = _apply_worktree(authored)
+
+    assert published is not None
+    desired = tmp_path / "source-less"
+    store.materialize(published, desired)
+    unit = controller.load_desired_unit(controller.unit_document_path(desired, "frontend"), "frontend")
+    assert getattr(unit.spec, "source", None) is None
+
+
+def test_apply_without_source_revision_rejects_repository_backed_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source, _store, _revision = _repository(tmp_path, monkeypatch)
+    authored = _authored_unit(source / "application.yaml", "application")
+
+    with pytest.raises(OperationError, match=r"Unit 'application'.*--source-revision <commit>"):
+        _apply_worktree(authored)
+
+
+def test_apply_without_source_revision_rejects_repository_stacktemplate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source, _store, _revision = _repository(tmp_path, monkeypatch)
+    environment = source / "deployment/environments/dev"
+    write_stack_source(
+        environment,
+        unit_templates={
+            "preview-app": {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "Terraform",
+                "spec": {"source": {"path": "."}},
+            }
+        },
+    )
+
+    with pytest.raises(OperationError, match=r"Stack 'web'.*StackTemplate 'preview'.*--source-revision <commit>"):
+        _apply_worktree(environment / "stacks/web.json")
+
+
+def test_missing_required_source_revision_does_not_initialize_gated_desired_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source, store, _revision = _repository(tmp_path, monkeypatch)
+    git(source, "push", "origin", ":refs/heads/deploy/dev")
+    environment = source / "deployment/environments/dev/environment.json"
+    document = yaml.safe_load(environment.read_text())
+    document["spec"]["changeGate"] = "pullRequest"
+    environment.write_text(json.dumps(document))
+    authored = _authored_unit(source / "application.yaml", "application")
+
+    with pytest.raises(OperationError, match=r"--source-revision <commit>"):
+        _apply_worktree(authored)
+
+    assert store.fetch("deploy/dev").revision is None
 
 
 def test_first_apply_initializes_an_unpublished_desired_ref(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

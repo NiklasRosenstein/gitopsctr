@@ -1719,7 +1719,7 @@ class SourceRevisionUnavailableError(OperationError):
 def resolved_unit_source(
     specification: UnitResource[Any],
     source_root: Path,
-    source_revision: str,
+    source_revision: str | None,
     current_desired: Path,
     source_revision_policy: SourceRevisionPolicy | None = None,
     source_revision_operation: Literal["apply", "plan"] = "apply",
@@ -1728,6 +1728,10 @@ def resolved_unit_source(
     driver, source = require_unit_specification(specification)
     if source is None:
         return ResolvedUnitSourceResult(source=None, disposition=SourceResolutionDisposition.UNCHANGED)
+    if source_revision is None:
+        raise OperationError(
+            f"Unit {specification.name!r} uses repository-backed source; apply it with --source-revision <commit>"
+        )
     input_hash = unit_input_hash(specification, source_root)
     revision = source_revision
     prior = prior_unit_source(specification.name, current_desired)
@@ -2198,7 +2202,7 @@ def _resolve_stack_template(
     source_root: Path,
     template_ref: StackTemplateReference,
     templates: Mapping[str, StackResource],
-    source_revision: str,
+    source_revision: str | None,
     promotion: PromotionContext | None = None,
 ) -> tuple[StackResource, ResolvedStackTemplateSource]:
     """Resolve one StackTemplate source for desired-state projection."""
@@ -2278,7 +2282,13 @@ def _resolve_stack_template(
             if revision.returncode != 0:
                 raise OperationError(f"Git ref {request.ref!r} does not exist in the source repository")
             selected = revision.stdout.strip()
-        selected = selected or source_revision
+        if selected is None:
+            if source_revision is None:
+                raise OperationError(
+                    f"Stack {template_ref.name!r} uses a repository-local StackTemplate source; "
+                    "apply it with --source-revision <commit>"
+                )
+            selected = source_revision
         with tempfile.TemporaryDirectory(prefix="gitopsctr-stack-template-") as temporary_directory:
             if selected == source_revision:
                 checkout = source_root
@@ -2311,6 +2321,11 @@ def _resolve_stack_template(
     template = templates.get(template_ref.name)
     if template is None:
         raise OperationError(f"Stack {template_ref.name!r} references missing StackTemplate")
+    if source_revision is None:
+        raise OperationError(
+            f"Stack {template_ref.name!r} uses StackTemplate {template_ref.name!r} from the source repository; "
+            "apply it with --source-revision <commit>"
+        )
     path_candidates = document_candidates(
         source_root.joinpath(*load_project_config(source_root).stack_templates_path.parts), template_ref.name
     )
@@ -2330,7 +2345,7 @@ def _resolve_stack_template(
 def _stack_root_metadata(
     kind: Literal["StackTemplate", "Stack"],
     name: str,
-    source_revision: str,
+    source_revision: str | None,
     current_desired: Path | None = None,
     partition: str | None = None,
 ) -> ResourceMetadata:
@@ -2403,7 +2418,7 @@ def _stack_owned_metadata(name: str, owner: DesiredOwnerReference) -> ResourceMe
 def project_stack_resources(
     source_root: Path,
     environment_name: str,
-    source_revision: str,
+    source_revision: str | None,
     candidate: Path,
     project_root: Path,
     current_desired: Path | None = None,
@@ -3070,7 +3085,7 @@ def materialize_resolved_unit(
     environment_name: str,
     resolved: UnitResource[Any],
     source_root: Path,
-    source_revision: str,
+    source_revision: str | None,
     current_desired: Path,
     candidate: Path,
 ) -> UnitResource[Any]:
@@ -4382,7 +4397,7 @@ def mark_opaque_cleanup_for_deletion(
     return replace(opaque, metadata=replace(opaque.metadata, deletion=deletion))
 
 
-def opaque_cleanup_metadata(name: str, payload: object, source_revision: str) -> ResourceMetadata:
+def opaque_cleanup_metadata(name: str, payload: object, source_revision: str | None) -> ResourceMetadata:
     has_metadata = isinstance(payload, dict) and "metadata" in payload
     metadata_document = payload.get("metadata") if isinstance(payload, dict) else None
     if has_metadata and not isinstance(metadata_document, dict):
@@ -4842,7 +4857,7 @@ def _current_desired_unit_paths(current_desired: Path) -> dict[str, Path]:
 def build_desired_candidate(
     environment_name: str,
     source_root: Path,
-    source_revision: str,
+    source_revision: str | None,
     current_desired: Path,
     observed: Path,
     observed_revision: str | None,
@@ -7961,6 +7976,28 @@ def _copy_apply_source_base(source: Path, destination: Path, environment: str) -
         shutil.rmtree(target_environment / collection, ignore_errors=True)
 
 
+def _materialize_apply_worktree(destination: Path) -> None:
+    """Copy the current, non-ignored worktree without inventing a Git revision."""
+
+    listed = git("ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    for value in listed.stdout.split("\0"):
+        if not value:
+            continue
+        relative = PurePosixPath(value)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise OperationError(f"Git returned an unsafe worktree path: {value!r}")
+        source = REPOSITORY_ROOT.joinpath(*relative.parts)
+        if not source.exists() and not source.is_symlink():
+            # A tracked deletion is part of the current worktree.
+            continue
+        target = destination.joinpath(*relative.parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            target.symlink_to(os.readlink(source))
+        elif source.is_file():
+            shutil.copy2(source, target)
+
+
 def _write_apply_authored_documents(
     source: Path,
     environment: str,
@@ -7989,6 +8026,35 @@ def _write_apply_authored_documents(
             directory = environment_root / "units"
         write_document(directory / f"{name}.yaml", document, format=DocumentFormat.YAML)
     return units, stacks
+
+
+def _validate_apply_source_revision(
+    source_revision: str | None,
+    units: Sequence[UnitResource[Any]],
+    stacks: Sequence[StackResource],
+) -> None:
+    """Reject repository-backed input before apply can mutate deployment refs."""
+
+    if source_revision is not None:
+        return
+    for unit in units:
+        _driver, source = require_unit_specification(unit)
+        if source is not None:
+            raise OperationError(
+                f"Unit {unit.name!r} uses repository-backed source; apply it with --source-revision <commit>"
+            )
+    for stack in stacks:
+        assert isinstance(stack.spec, StackSpec)
+        template = _stack_template_reference(stack.spec)
+        requires_revision = isinstance(template.source, StackTemplateFromResource)
+        if isinstance(template.source, StackTemplateFromGit):
+            request = template.source.fromGit
+            requires_revision = request.path == "." and request.commit is None and request.ref is None
+        if requires_revision:
+            raise OperationError(
+                f"Stack {stack.name!r} uses repository-backed StackTemplate {template.name!r}; "
+                "apply it with --source-revision <commit>"
+            )
 
 
 def _applied_root_closure(
@@ -8076,7 +8142,13 @@ def command_apply(args: argparse.Namespace) -> str | None:
     _resource_name(args.environment, "environment name")
     partition = _resource_name(args.partition, "partition name") if args.partition is not None else None
     documents = _load_apply_documents(args.files)
-    source_revision = git("rev-parse", f"{args.source_revision or 'HEAD'}^{{commit}}").stdout.strip()
+    source_revision = (
+        git("rev-parse", f"{args.source_revision}^{{commit}}").stdout.strip()
+        if args.source_revision is not None
+        else None
+    )
+    if source_revision is not None:
+        warn_if_source_revision_excludes_changes(source_revision)
     desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
     with tempfile.TemporaryDirectory(prefix="gitopsctr-apply-") as temporary_directory:
         temporary = Path(temporary_directory)
@@ -8085,13 +8157,15 @@ def command_apply(args: argparse.Namespace) -> str | None:
         current = temporary / "current"
         observed = temporary / "observed"
         candidate = temporary / "candidate"
-        materialize_revision(source_revision, source)
+        if source_revision is None:
+            _materialize_apply_worktree(source)
+        else:
+            materialize_revision(source_revision, source)
         _copy_apply_source_base(source, apply_source, args.environment)
         authored_units, authored_stacks = _write_apply_authored_documents(apply_source, args.environment, documents)
+        _validate_apply_source_revision(source_revision, authored_units, authored_stacks)
         current_revision = observed_tree(desired_ref, current)
         observed_revision = observed_tree(observed_ref, observed)
-        if current_revision is None and change_gate(source, args.environment) == "pullRequest" and not args.dry:
-            current_revision = _initialize_gated_desired_ref(source, args.environment, desired_ref, current)
         build_desired_candidate(
             args.environment,
             apply_source,
@@ -8154,13 +8228,20 @@ def command_apply(args: argparse.Namespace) -> str | None:
         _copy_unrelated_desired_resources(current, candidate, frozenset(applied), partition)
         _prune_omitted_partition_resources(current, candidate, frozenset(applied), partition)
         load_desired_resource_graph(candidate)
+        if current_revision is None and change_gate(source, args.environment) == "pullRequest" and not args.dry:
+            current_revision = _initialize_gated_desired_ref(source, args.environment, desired_ref, current)
         if current_revision is not None and directory_files(current) == directory_files(candidate):
             if not args.dry:
                 _ensure_stack_source_pins(args.environment, current)
             log_status("KEEP", f"{style_branch(desired_ref)} is already resolved")
             return current_revision
         candidate_id = candidate_identifier(
-            "apply", args.environment, candidate, desired_ref, current_revision or "", {"partition": partition}
+            "apply",
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision or "",
+            {"partition": partition, "sourceRevision": source_revision},
         )
         candidate_ref = resolve_candidate_ref(
             REPOSITORY_ROOT, args.environment, "apply", candidate_id, args.candidate_ref
@@ -8794,7 +8875,10 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--environment", required=True)
     apply.add_argument("-f", "--file", dest="files", action="append", required=True)
     apply.add_argument("--partition", help="authoritative management partition")
-    apply.add_argument("--source-revision", help="source commit used for source pins; defaults to HEAD")
+    apply.add_argument(
+        "--source-revision",
+        help="required commit when an input uses repository-backed source; otherwise apply reads the worktree",
+    )
     apply.add_argument("--desired-ref")
     apply.add_argument("--observed-ref")
     apply.add_argument("--candidate-ref")
