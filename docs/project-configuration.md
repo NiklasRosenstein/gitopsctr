@@ -34,7 +34,7 @@ spec:
       candidate: gitopsctr/candidates/{environment}/{id}
   sourceRevisionPolicy:
     unavailableWhen: outside-candidate-history
-    whenUnavailableDuringAdvance: refresh
+    whenUnavailableDuringApply: refresh
     whenUnavailableDuringPlan: error
 ```
 
@@ -114,13 +114,12 @@ refreshed or rejected for each operation. It defaults to:
 | Field | Default | Behavior |
 | --- | --- | --- |
 | `unavailableWhen` | `outside-candidate-history` | A retained revision is available only when its commit is an ancestor of the candidate revision. `missing` checks only whether Git can resolve the commit object. |
-| `whenUnavailableDuringAdvance` | `refresh` | `advance-desired`, including `advance-desired --dry`, replaces the retained revision with the candidate revision. `error` leaves desired state unchanged. |
+| `whenUnavailableDuringApply` | `refresh` | `apply`, including `apply --dry`, replaces the retained revision with the selected source revision. `error` leaves desired state unchanged. |
 | `whenUnavailableDuringPlan` | `error` | `reconcile --plan` fails before invoking the driver. `refresh` uses a refreshed source only in the dry candidate. |
 
 The history check uses `git merge-base --is-ancestor`. Under
 `outside-candidate-history`, a local but unreachable commit is unavailable.
-Source-less units are not affected. If planning fails, run `advance-desired`
-from a durable source revision first.
+Source-less units are not affected. If planning fails, apply the resource from a durable source revision first.
 
 ### Provenance-only source refreshes
 
@@ -130,19 +129,19 @@ it covers the declared source inputs, driver version, and authored driver specif
 declarations are therefore critical; a file omitted from the list can make two revisions appear equivalent when they are
 not.
 
-If a refreshed unit cannot resolve a dependency because an upstream receipt is stale, advancement may **carry forward**
+If a refreshed unit cannot resolve a dependency because an upstream receipt is stale, apply may **carry forward**
 the previous fully resolved dependency snapshot. This preserves `resolvedInputs`, resolved driver values, and valid
 materialization descriptors while replacing only the source identity. Carry forward does not mean that new upstream state
-was resolved, and advancement may update a downstream unit while its upstream receipt is stale. The blockage remains
+was resolved, and apply may update a downstream unit while its upstream receipt is stale. The blockage remains
 visible in the log as `CARRY`.
 
 The refreshed desired unit is a real desired-state change. Its source revision changes the unit blob, so the old receipt is
 stale and is never silently rebound; the downstream unit may perform a no-op reconciliation using the carried snapshot. Once
-the upstream receipt is current, a later advancement resolves the downstream unit again and replaces the carried-forward
+the upstream receipt is current, a later application resolves the downstream unit again and replaces the carried-forward
 dependency fingerprints. Dependency-aware convergence still selects the stale upstream unit first.
 
-Persistent advancement should use a durable, eligible source revision, normally enforced with the project's retained source
-ref or `--require-source-ref`. `advance-desired --dry` reports refresh and carry-forward decisions without publishing.
+Persistent apply should use a durable, eligible source revision. `apply --dry` reports refresh and carry-forward
+decisions without publishing.
 `reconcile --plan` remains read-only and follows `whenUnavailableDuringPlan`; when that policy is `error`, it does not
 perform an implicit persistent repair. If there is no previous fully resolved unit, its validation fails, inputs or authored
 specification changed, policy rejects the refresh, or materialized data is not valid under the unchanged input hash, the
@@ -169,15 +168,3 @@ not fetched and does not change runtime validation.
 The published Draft 2020-12 resource schema is
 [`Project.schema.json`](schemas/apis/gitopsctr.io/v1/Project.schema.json), next
 to the schemas for the other `gitopsctr.io/v1` kinds.
-
-When migrating legacy documents, supply the required project identity:
-
-```console
-python tools/migrate_documents.py --project-name my-project --apply
-```
-
-The migration preserves an existing Project configuration. It uses that
-configuration to find desired and observed refs and writes canonical
-source-tracked metadata for legacy desired Units. It does not retire the
-runtime legacy reader; verify every supported desired ref before removing that
-compatibility path.

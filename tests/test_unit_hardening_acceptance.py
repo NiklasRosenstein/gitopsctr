@@ -78,8 +78,7 @@ def test_effect_lease_blocks_opaque_recovery(tmp_path: Path, monkeypatch: pytest
             metadata=controller.ResourceMetadata(
                 name="application",
                 uid=uid,
-                lifecycle=controller.DesiredLifecycle(management=controller.LifecycleManagement(mode="sourceTracked")),
-            ),
+            ).with_partition("application"),
             source=None,
         ),
     )
@@ -127,8 +126,7 @@ def test_opaque_operator_resolution_requires_external_cleanup_confirmation(tmp_p
             metadata=controller.ResourceMetadata(
                 name="application",
                 uid=uid,
-                lifecycle=controller.DesiredLifecycle(management=controller.LifecycleManagement(mode="sourceTracked")),
-            ),
+            ).with_partition("application"),
             source=None,
         ),
     )
@@ -168,8 +166,7 @@ def test_opaque_recovery_restores_parseable_payload_with_deletion_metadata(tmp_p
             metadata=controller.ResourceMetadata(
                 name="application",
                 uid=uid,
-                lifecycle=controller.DesiredLifecycle(management=controller.LifecycleManagement(mode="sourceTracked")),
-            ),
+            ).with_partition("application"),
             source=None,
         ),
     )

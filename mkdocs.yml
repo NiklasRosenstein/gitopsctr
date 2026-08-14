@@ -39,6 +39,7 @@ nav:
   - Extending gitopsctr:
       - Driver execution: driver-execution.md
   - Reference:
+      - Resource model: resource-model.md
       - JSON Schemas: schemas.md
 markdown_extensions:
   - admonition

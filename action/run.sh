@@ -18,7 +18,6 @@ require_boolean() {
   fi
 }
 
-require_boolean advance "${ADVANCE}"
 require_boolean dry "${DRY}"
 require_boolean plan "${PLAN}"
 require_boolean reapply "${REAPPLY}"
@@ -27,12 +26,20 @@ if [[ "${PLAN}" == "true" && "${OPERATION}" != "reconcile" ]]; then
   echo "plan is only valid for operation reconcile" >&2
   exit 2
 fi
-if [[ "${DRY}" == "true" && "${OPERATION}" != "prepare" && "${OPERATION}" != "advance" && "${OPERATION}" != "rollback" ]]; then
-  echo "dry is only valid for operations prepare, advance, and rollback" >&2
+if [[ "${DRY}" == "true" && "${OPERATION}" != "apply" && "${OPERATION}" != "rollback" ]]; then
+  echo "dry is only valid for operations apply and rollback" >&2
   exit 2
 fi
 if [[ "${PLAN}" == "true" && "${DRY}" == "true" ]]; then
   echo "plan and dry are mutually exclusive" >&2
+  exit 2
+fi
+if [[ -n "${FILES}" && "${OPERATION}" != "apply" && "${OPERATION}" != "converge" && "${OPERATION}" != "promote" ]]; then
+  echo "files is only valid for operations apply, converge, and promote" >&2
+  exit 2
+fi
+if [[ -n "${PARTITION}" && "${OPERATION}" != "apply" && "${OPERATION}" != "converge" && "${OPERATION}" != "promote" ]]; then
+  echo "partition is only valid for operations apply, converge, and promote" >&2
   exit 2
 fi
 
@@ -41,64 +48,76 @@ args=(--repository "${working_directory}")
 
 write_prepare_outputs() {
   local active="$1"
-  local advance_after_reconcile="$2"
-  local desired_changed="$3"
-  local desired_revision="$4"
+  local desired_revision="$2"
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     {
       echo "active=${active}"
-      echo "advance_after_reconcile=${advance_after_reconcile}"
-      echo "desired_changed=${desired_changed}"
       echo "desired_revision=${desired_revision}"
     } >> "${GITHUB_OUTPUT}"
   fi
 }
 
+append_files() {
+  local count=0
+  local raw
+  while IFS= read -r raw || [[ -n "${raw}" ]]; do
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    [[ -z "${raw}" ]] && continue
+    args+=(--file "${raw}")
+    count=$((count + 1))
+  done <<< "${FILES}"
+  FILE_COUNT="${count}"
+}
+
 case "${OPERATION}" in
   prepare)
     require_input environment "${ENVIRONMENT}"
-    if [[ -n "${SOURCE_REVISION}" && -n "${DESIRED_REVISION}" ]]; then
-      echo "source-revision and desired-revision are mutually exclusive for operation prepare" >&2
+    if [[ -n "${SOURCE_REVISION}" || -n "${REQUIRE_SOURCE_REF}" ]]; then
+      echo "prepare selects existing desired state and does not accept source input" >&2
       exit 2
     fi
-    if [[ -z "${SOURCE_REVISION}" && -n "${REQUIRE_SOURCE_REF}" ]]; then
-      echo "require-source-ref requires source-revision for operation prepare" >&2
-      exit 2
-    fi
-
-    desired_changed=false
-    advance_after_reconcile=true
-    if [[ -n "${SOURCE_REVISION}" ]]; then
-      args+=(advance-desired --environment "${ENVIRONMENT}")
-      [[ -n "${DESIRED_REF}" ]] && args+=(--desired-ref "${DESIRED_REF}")
-      [[ -n "${OBSERVED_REF}" ]] && args+=(--observed-ref "${OBSERVED_REF}")
-      args+=(--source-revision "${SOURCE_REVISION}")
-      [[ -n "${REQUIRE_SOURCE_REF}" ]] && args+=(--require-source-ref "${REQUIRE_SOURCE_REF}")
-      [[ "${DRY}" == "true" ]] && args+=(--dry)
-      prepare_outputs="$(mktemp)"
-      trap 'rm -f "${prepare_outputs}"' EXIT
-      desired_revision=$(GITHUB_OUTPUT="${prepare_outputs}" gitopsctr "${args[@]}")
-      desired_changed=$(sed -n 's/^desired_changed=//p' "${prepare_outputs}" | tail -n 1)
-      desired_changed="${desired_changed:-false}"
-    else
-      desired_ref="${DESIRED_REF:-gitopsctr/desired/${ENVIRONMENT}}"
-      args+=(resolve-desired --desired-ref "${desired_ref}")
-      if [[ -n "${DESIRED_REVISION}" ]]; then
-        args+=(--desired-revision "${DESIRED_REVISION}")
-        advance_after_reconcile=false
-      fi
-      desired_revision=$(gitopsctr "${args[@]}")
-    fi
+    desired_ref="${DESIRED_REF:-gitopsctr/desired/${ENVIRONMENT}}"
+    args+=(resolve-desired --desired-ref "${desired_ref}")
+    [[ -n "${DESIRED_REVISION}" ]] && args+=(--desired-revision "${DESIRED_REVISION}")
+    desired_revision=$(gitopsctr "${args[@]}")
 
     if [[ -z "${desired_revision}" ]]; then
-      write_prepare_outputs false false false ""
-      if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-        echo "This run is superseded by a newer source revision." >> "${GITHUB_STEP_SUMMARY}"
-      fi
+      write_prepare_outputs false ""
     else
-      write_prepare_outputs true "${advance_after_reconcile}" "${desired_changed}" "${desired_revision}"
+      write_prepare_outputs true "${desired_revision}"
     fi
     exit 0
+    ;;
+  apply)
+    require_input environment "${ENVIRONMENT}"
+    args+=(apply --environment "${ENVIRONMENT}")
+    append_files
+    if [[ "${FILE_COUNT}" == "0" ]]; then
+      echo "files is required for operation apply" >&2
+      exit 2
+    fi
+    [[ -n "${PARTITION}" ]] && args+=(--partition "${PARTITION}")
+    [[ -n "${SOURCE_REVISION}" ]] && args+=(--source-revision "${SOURCE_REVISION}")
+    [[ -n "${DESIRED_REF}" ]] && args+=(--desired-ref "${DESIRED_REF}")
+    [[ -n "${OBSERVED_REF}" ]] && args+=(--observed-ref "${OBSERVED_REF}")
+    [[ -n "${CANDIDATE_REF}" ]] && args+=(--candidate-ref "${CANDIDATE_REF}")
+    [[ "${DRY}" == "true" ]] && args+=(--dry)
+    ;;
+  converge)
+    require_input environment "${ENVIRONMENT}"
+    if [[ -n "${UNIT}" && -n "${PARTITION}" ]]; then
+      echo "unit and partition are mutually exclusive for operation converge" >&2
+      exit 2
+    fi
+    args+=(converge --environment "${ENVIRONMENT}")
+    append_files
+    [[ -n "${PARTITION}" ]] && args+=(--partition "${PARTITION}")
+    [[ -n "${UNIT}" ]] && args+=(--unit "${UNIT}")
+    [[ -n "${SOURCE_REVISION}" ]] && args+=(--source-revision "${SOURCE_REVISION}")
+    [[ -n "${DESIRED_REF}" ]] && args+=(--desired-ref "${DESIRED_REF}")
+    [[ -n "${OBSERVED_REF}" ]] && args+=(--observed-ref "${OBSERVED_REF}")
+    [[ -n "${CANDIDATE_REF}" ]] && args+=(--candidate-ref "${CANDIDATE_REF}")
     ;;
   reconcile)
     require_input environment "${ENVIRONMENT}"
@@ -110,18 +129,8 @@ case "${OPERATION}" in
     [[ -n "${SOURCE_REVISION}" ]] && args+=(--source-revision "${SOURCE_REVISION}")
     [[ -n "${REQUIRE_SOURCE_REF}" ]] && args+=(--require-source-ref "${REQUIRE_SOURCE_REF}")
     [[ -n "${REPORT}" ]] && args+=(--report "${REPORT}")
-    [[ "${ADVANCE}" == "true" ]] && args+=(--advance)
     [[ "${PLAN}" == "true" ]] && args+=(--plan)
     [[ "${REAPPLY}" == "true" ]] && args+=(--reapply)
-    ;;
-  advance)
-    require_input environment "${ENVIRONMENT}"
-    args+=(advance-desired --environment "${ENVIRONMENT}")
-    [[ -n "${DESIRED_REF}" ]] && args+=(--desired-ref "${DESIRED_REF}")
-    [[ -n "${OBSERVED_REF}" ]] && args+=(--observed-ref "${OBSERVED_REF}")
-    [[ -n "${SOURCE_REVISION}" ]] && args+=(--source-revision "${SOURCE_REVISION}")
-    [[ -n "${REQUIRE_SOURCE_REF}" ]] && args+=(--require-source-ref "${REQUIRE_SOURCE_REF}")
-    [[ "${DRY}" == "true" ]] && args+=(--dry)
     ;;
   rollback)
     require_input environment "${ENVIRONMENT}"
@@ -161,11 +170,17 @@ case "${OPERATION}" in
       --to-environment "${TO_ENVIRONMENT}"
       --specification-revision "${specification_revision}"
     )
+    append_files
+    if [[ "${FILE_COUNT}" == "0" ]]; then
+      echo "files is required for operation promote" >&2
+      exit 2
+    fi
+    [[ -n "${PARTITION}" ]] && args+=(--partition "${PARTITION}")
     [[ -n "${SOURCE_REVISION}" ]] && args+=(--source-desired-revision "${SOURCE_REVISION}")
     [[ -n "${CANDIDATE_REF}" ]] && args+=(--candidate-ref "${CANDIDATE_REF}")
     ;;
   *)
-    echo "operation must be prepare, reconcile, advance, promote, or rollback" >&2
+    echo "operation must be prepare, apply, converge, reconcile, promote, or rollback" >&2
     exit 2
     ;;
 esac

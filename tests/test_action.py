@@ -18,12 +18,12 @@ def test_action_metadata_exposes_the_supported_operations_and_install_modes() ->
     assert metadata["inputs"]["package-source"]["default"] == "pypi"
     assert {
         "active",
-        "advance-after-reconcile",
         "reconciled",
-        "desired-changed",
         "desired-revision",
         "change-revision",
     } <= set(metadata["outputs"])
+    assert "advance" not in metadata["inputs"]
+    assert metadata["inputs"]["files"]["required"] is False
 
 
 def _fake_command(tmp_path: Path, name: str, body: str) -> Path:
@@ -38,17 +38,18 @@ def _action_environment(tmp_path: Path, **overrides: str) -> dict[str, str]:
     binary_directory.mkdir(exist_ok=True)
     environment = os.environ | {
         "ACTION_LOG": str(tmp_path / "action.log"),
-        "ADVANCE": "false",
         "CANDIDATE_REF": "",
         "DESIRED_REF": "",
         "DESIRED_REVISION": "",
         "DRY": "false",
         "ENVIRONMENT": "",
         "FROM_ENVIRONMENT": "",
+        "FILES": "",
         "GITHUB_OUTPUT": str(tmp_path / "github-output"),
         "OBSERVED_REF": "",
         "OPERATION": "",
         "PLAN": "false",
+        "PARTITION": "",
         "PATH": f"{binary_directory}:{os.environ['PATH']}",
         "REAPPLY": "false",
         "REPORT": "",
@@ -92,55 +93,10 @@ def _action_outputs(tmp_path: Path) -> dict[str, str]:
     return dict(line.split("=", 1) for line in (tmp_path / "github-output").read_text().splitlines())
 
 
-def test_prepare_action_advances_a_source_tracked_environment(tmp_path: Path) -> None:
-    revision = "d" * 40
-    result = _run_action(
-        tmp_path,
-        command_body=(
-            'printf "%s\\0" "$@" > "${ACTION_LOG}"\n'
-            f'printf "{revision}\\n"\n'
-            'printf "desired_changed=true\\ndesired_revision=%s\\n" "' + revision + '" >> "${GITHUB_OUTPUT}"'
-        ),
-        OPERATION="prepare",
-        ENVIRONMENT="dev",
-        SOURCE_REVISION="s" * 40,
-        DESIRED_REF="deploy/dev",
-        OBSERVED_REF="observed/dev",
-        REQUIRE_SOURCE_REF="main",
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert _action_arguments(tmp_path) == [
-        "--repository",
-        str(tmp_path),
-        "advance-desired",
-        "--environment",
-        "dev",
-        "--desired-ref",
-        "deploy/dev",
-        "--observed-ref",
-        "observed/dev",
-        "--source-revision",
-        "s" * 40,
-        "--require-source-ref",
-        "main",
-    ]
-    assert _action_outputs(tmp_path) == {
-        "active": "true",
-        "advance_after_reconcile": "true",
-        "desired_changed": "true",
-        "desired_revision": revision,
-    }
-
-
-@pytest.mark.parametrize(
-    ("desired_revision", "advance_after_reconcile"),
-    [("d" * 40, "false"), ("", "true")],
-)
+@pytest.mark.parametrize("desired_revision", ["d" * 40, ""])
 def test_prepare_action_resolves_existing_desired_state(
     tmp_path: Path,
     desired_revision: str,
-    advance_after_reconcile: str,
 ) -> None:
     resolved = "e" * 40
     result = _run_action(
@@ -164,28 +120,81 @@ def test_prepare_action_resolves_existing_desired_state(
     assert _action_arguments(tmp_path) == expected
     assert _action_outputs(tmp_path) == {
         "active": "true",
-        "advance_after_reconcile": advance_after_reconcile,
-        "desired_changed": "false",
         "desired_revision": resolved,
     }
 
 
-def test_prepare_action_reports_a_superseded_source_revision(tmp_path: Path) -> None:
+def test_prepare_action_reports_missing_desired_state(tmp_path: Path) -> None:
     result = _run_action(
         tmp_path,
         command_body='printf "%s\\0" "$@" > "${ACTION_LOG}"',
         OPERATION="prepare",
         ENVIRONMENT="dev",
-        SOURCE_REVISION="s" * 40,
     )
 
     assert result.returncode == 0, result.stderr
     assert _action_outputs(tmp_path) == {
         "active": "false",
-        "advance_after_reconcile": "false",
-        "desired_changed": "false",
         "desired_revision": "",
     }
+
+
+def test_apply_action_maps_explicit_files_partition_and_refs(tmp_path: Path) -> None:
+    result = _run_action(
+        tmp_path,
+        OPERATION="apply",
+        ENVIRONMENT="dev",
+        FILES="deployment/app.yaml\n deployment/worker.yaml ",
+        PARTITION="application",
+        SOURCE_REVISION="s" * 40,
+        DESIRED_REF="deploy/dev",
+        OBSERVED_REF="observed/dev",
+        CANDIDATE_REF="changes/dev/application",
+        DRY="true",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _action_arguments(tmp_path) == [
+        "--repository",
+        str(tmp_path),
+        "apply",
+        "--environment",
+        "dev",
+        "--file",
+        "deployment/app.yaml",
+        "--file",
+        "deployment/worker.yaml",
+        "--partition",
+        "application",
+        "--source-revision",
+        "s" * 40,
+        "--desired-ref",
+        "deploy/dev",
+        "--observed-ref",
+        "observed/dev",
+        "--candidate-ref",
+        "changes/dev/application",
+        "--dry",
+    ]
+
+
+@pytest.mark.parametrize("files", ["", "deployment/application.yaml"])
+def test_converge_action_maps_optional_input_and_selection(tmp_path: Path, files: str) -> None:
+    result = _run_action(
+        tmp_path,
+        OPERATION="converge",
+        ENVIRONMENT="dev",
+        FILES=files,
+        PARTITION="application",
+        SOURCE_REVISION="s" * 40,
+    )
+
+    assert result.returncode == 0, result.stderr
+    expected = ["--repository", str(tmp_path), "converge", "--environment", "dev"]
+    if files:
+        expected += ["--file", files]
+    expected += ["--partition", "application", "--source-revision", "s" * 40]
+    assert _action_arguments(tmp_path) == expected
 
 
 def test_reconcile_action_maps_typed_inputs_to_cli_arguments(tmp_path: Path) -> None:
@@ -197,7 +206,6 @@ def test_reconcile_action_maps_typed_inputs_to_cli_arguments(tmp_path: Path) -> 
         DESIRED_REVISION="d" * 40,
         SOURCE_REVISION="s" * 40,
         REQUIRE_SOURCE_REF="main",
-        ADVANCE="true",
         PLAN="true",
         REAPPLY="true",
         REPORT="reports/application",
@@ -220,34 +228,8 @@ def test_reconcile_action_maps_typed_inputs_to_cli_arguments(tmp_path: Path) -> 
         "main",
         "--report",
         "reports/application",
-        "--advance",
         "--plan",
         "--reapply",
-    ]
-
-
-def test_advance_action_maps_environment_and_refs(tmp_path: Path) -> None:
-    result = _run_action(
-        tmp_path,
-        OPERATION="advance",
-        ENVIRONMENT="staging",
-        DESIRED_REF="deploy/staging",
-        OBSERVED_REF="observed/staging",
-        DRY="true",
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert _action_arguments(tmp_path) == [
-        "--repository",
-        str(tmp_path),
-        "advance-desired",
-        "--environment",
-        "staging",
-        "--desired-ref",
-        "deploy/staging",
-        "--observed-ref",
-        "observed/staging",
-        "--dry",
     ]
 
 
@@ -304,6 +286,8 @@ def test_promote_action_defaults_to_the_workflow_revision(tmp_path: Path) -> Non
         OPERATION="promote",
         FROM_ENVIRONMENT="dev",
         TO_ENVIRONMENT="staging",
+        FILES="deployment/environments/staging/stacks/application.yaml",
+        PARTITION="application",
         SOURCE_REVISION="d" * 40,
     )
 
@@ -318,6 +302,10 @@ def test_promote_action_defaults_to_the_workflow_revision(tmp_path: Path) -> Non
         "staging",
         "--specification-revision",
         "f" * 40,
+        "--file",
+        "deployment/environments/staging/stacks/application.yaml",
+        "--partition",
+        "application",
         "--source-desired-revision",
         "d" * 40,
     ]
@@ -328,18 +316,22 @@ def test_promote_action_defaults_to_the_workflow_revision(tmp_path: Path) -> Non
     [
         ({"OPERATION": "reconcile", "ENVIRONMENT": "dev"}, "unit is required"),
         ({"OPERATION": "unknown"}, "operation must be"),
-        ({"OPERATION": "advance", "ENVIRONMENT": "dev", "DRY": "sometimes"}, "dry must be"),
-        ({"OPERATION": "advance", "ENVIRONMENT": "dev", "PLAN": "sometimes"}, "plan must be"),
-        ({"OPERATION": "advance", "ENVIRONMENT": "dev", "PLAN": "true"}, "plan is only valid"),
+        ({"OPERATION": "apply", "ENVIRONMENT": "dev", "DRY": "sometimes"}, "dry must be"),
+        ({"OPERATION": "apply", "ENVIRONMENT": "dev", "PLAN": "sometimes"}, "plan must be"),
+        ({"OPERATION": "apply", "ENVIRONMENT": "dev", "PLAN": "true"}, "plan is only valid"),
         ({"OPERATION": "reconcile", "ENVIRONMENT": "dev", "UNIT": "app", "DRY": "true"}, "dry is only valid"),
+        ({"OPERATION": "apply", "ENVIRONMENT": "dev"}, "files is required"),
+        ({"OPERATION": "promote", "FROM_ENVIRONMENT": "dev", "TO_ENVIRONMENT": "staging"}, "files is required"),
+        ({"OPERATION": "prepare", "ENVIRONMENT": "dev", "SOURCE_REVISION": "s" * 40}, "does not accept source"),
+        ({"OPERATION": "reconcile", "ENVIRONMENT": "dev", "UNIT": "app", "FILES": "app.yaml"}, "files is only"),
         (
             {
-                "OPERATION": "prepare",
+                "OPERATION": "converge",
                 "ENVIRONMENT": "dev",
-                "SOURCE_REVISION": "s" * 40,
-                "DESIRED_REVISION": "d" * 40,
+                "UNIT": "app",
+                "PARTITION": "application",
             },
-            "source-revision and desired-revision are mutually exclusive",
+            "mutually exclusive",
         ),
         (
             {"OPERATION": "rollback", "ENVIRONMENT": "prod", "ROLLBACK_REVISION": "d" * 40},

@@ -141,21 +141,16 @@ def test_artifact_driver_contract_is_exact(tmp_path: Path, monkeypatch: pytest.M
         )
 
 
-def test_artifact_resource_name_mismatch_warns_without_rejecting(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+def test_artifact_resource_name_mismatch_is_rejected() -> None:
     document = container_images()
     document["metadata"] = {"name": "release-images"}
 
-    controller.validate_artifact_output_identity(
-        "oci-images",
-        desired_images_unit(),
-        {"containers": document},
-    )
-
-    warning = capsys.readouterr().err
-    assert "WARN" in warning
-    assert "resource name 'release-images'" in warning
+    with pytest.raises(DriverError, match="wrong resource identity"):
+        controller.validate_artifact_output_identity(
+            "oci-images",
+            desired_images_unit(),
+            {"containers": document},
+        )
 
 
 def test_artifact_api_parses_to_its_registered_resource_type() -> None:
@@ -401,22 +396,27 @@ def test_stale_artifact_receipt_does_not_block_reconciliation_status(tmp_path: P
     desired_unit.write_text(
         json.dumps(
             {
-                "name": "images",
-                "driver": "oci-images",
-                "source": {
-                    "path": ".",
-                    "revision": "d" * 40,
-                    "driverVersion": 1,
-                    "inputHash": "sha256:" + "e" * 64,
-                },
-                "build": {"dockerfile": "Dockerfile", "platform": "linux/amd64"},
-                "publish": {
-                    "targets": {
-                        "application": {
-                            "type": "registry",
-                            "repository": "registry.example/application",
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "OciImages",
+                "metadata": ResourceMetadata.root_from_provenance(
+                    "images", "stale-artifact-receipt-test", partition="application"
+                ).document(profile="desired"),
+                "spec": {
+                    "source": {
+                        "path": ".",
+                        "revision": "d" * 40,
+                        "driverVersion": 1,
+                        "inputHash": "sha256:" + "e" * 64,
+                    },
+                    "build": {"dockerfile": "Dockerfile", "platform": "linux/amd64"},
+                    "publish": {
+                        "targets": {
+                            "application": {
+                                "type": "registry",
+                                "repository": "registry.example/application",
+                            }
                         }
-                    }
+                    },
                 },
             }
         )

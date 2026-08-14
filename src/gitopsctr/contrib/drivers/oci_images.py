@@ -321,12 +321,6 @@ class OciImagesDriver(
                 name: oci_digest(context.execution, repository, tag, docker_environment)
                 for name, repository in repositories.items()
             }
-            if not any(existing.values()):
-                legacy_tag = f"git-{context.source_revision}"
-                existing = {
-                    name: oci_digest(context.execution, repository, legacy_tag, docker_environment)
-                    for name, repository in repositories.items()
-                }
             published_digests = {digest for digest in existing.values() if digest is not None}
             if len(published_digests) > 1:
                 raise DriverError("published repositories disagree on the artifact digest")

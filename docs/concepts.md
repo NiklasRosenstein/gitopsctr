@@ -5,31 +5,46 @@ records each transition. Unit drivers perform external work.
 
 ```mermaid
 flowchart LR
-  source["Source commit<br/>authored intent"] -->|advance-desired| desired["Desired ref<br/>gitopsctr/desired/&lt;environment&gt;"]
+  source["Explicit input<br/>authored intent"] -->|apply| desired["Desired ref<br/>gitopsctr/desired/&lt;environment&gt;"]
   desired -->|reconcile| driver["Unit driver"]
   driver --> systems["External systems"]
   driver -->|receipt and artifacts| observed["Observed ref<br/>gitopsctr/observed/&lt;environment&gt;"]
-  observed -.->|unlock downstream inputs| desired
+  observed -.->|unlock the next explicit apply| source
 ```
 
-## Resources and units
+## Resource definitions and instances
 
 - A **Project** is one source repository containing project configuration and authored environments.
-- An **Environment** selects deployment refs, promotion rules, change gates, and its set of units.
+- An **Environment** is gitopsctr's namespace boundary. It selects deployment refs, promotion rules, change gates, and
+  its set of resources.
 - A **Unit** is a named deployable resource such as an image build, Terraform configuration, or Kubernetes release.
 - A **unit driver** implements a unit kind and may support planning, materialization, reconciliation, or verification.
 - A **dependency DAG** orders units whose authored values read receipts or artifacts from other units.
 
-The built-in kinds are only the kinds bundled with this distribution. Plugins can register additional unit and
-artifact kinds by full group/version/kind. See [Resources and API kinds](documents.md).
+gitopsctr's resource registry defines these concepts as invariants rather than scattering them through controller and
+CLI code. A **resource family definition** gives a kind or interface its CLI selectors. **Placements** say which
+source, desired, or observed representations the family can have, their scope, and their logical collection.
+**Relationship definitions** describe how separately stored resources relate, such as a Receipt observing a desired
+Unit. Persisted YAML or JSON documents are instances of those definitions; the registry does not create an additional
+document format.
 
-## The three Git states
+The built-in kinds are only the kinds bundled with this distribution. Plugins can register additional Unit and
+Artifact kinds by full group/version/kind and participate in the same model. See [Resources and API
+kinds](documents.md) for the authoring contracts and the generated [resource model](resource-model.md) for the
+authoritative plane and relationship matrix.
 
-| State | Owner | Typical contents |
+## The three storage planes
+
+| Plane | Owner | Typical representations |
 | --- | --- | --- |
-| Source commit | User | `Project`, authored `Environment` and Unit resources, deployment source files |
-| Desired ref | Controller | Fully resolved units and materialized payloads under `gitopsctr/desired/<environment>` by default |
-| Observed ref | Controller and drivers | Receipts and artifacts under `gitopsctr/observed/<environment>` by default |
+| Source | User | `Project`, authored `Environment`, Unit, Stack, and StackTemplate resources, plus deployment source files |
+| Desired | Controller | Resolved Unit, Stack, StackTemplate, and Promotion representations under `gitopsctr/desired/<environment>` by default |
+| Observed | Controller and drivers | Receipt and Artifact resources under `gitopsctr/observed/<environment>` by default |
+
+A resource family may have a representation in more than one plane. For example, Units and Stacks have authored
+source and resolved desired representations, while StackTemplates are project-scoped in source and environment-scoped
+in desired state. Receipt and Artifact resources live only in the observed plane. Physical Git paths are owned by the
+plane's collection adapter; placement is part of the resource definition rather than a controller convention.
 
 An environment may override the desired and observed ref names, but they must remain distinct. Separating them allows
 desired state to advance independently while receipts continue to describe the exact desired revision a driver
@@ -37,36 +52,37 @@ observed.
 
 ## Desired state, receipts, and artifacts
 
-`advance-desired` pins source inputs and resolves available references into an immutable desired unit. A unit is ready
+`apply` pins source inputs and resolves available references into an immutable desired unit. A unit is ready
 only when all required inputs are available. Materialization-capable drivers may also commit rendered payloads below
 `materialized/<unit>/`.
 
-Successful reconciliation writes a **Receipt** to the observed ref. It identifies the exact desired unit blob and
-contains the driver's typed result. A receipt is clean only while it still matches the current desired unit; otherwise
-it is stale and the unit needs reconciliation.
+Successful reconciliation writes a **Receipt** to the observed ref. A Receipt is a separate observed resource, not a
+Unit's embedded `status`. Its subject identifies a desired Unit, and its desired-unit blob identifies the exact Unit
+document that the driver reconciled. Comparing the separately stored documents derives whether the observation is
+current or stale; a Unit can also have no Receipt. Raw Unit output therefore remains the exact desired document, while
+the default Unit table can join that document with its Receipt to present operational state.
 
 Drivers may publish typed **artifacts** alongside their receipt, for example a `ContainerImages` resource containing
 immutable image URIs. Consumers use [reference expressions](references.md) to read receipt results, artifacts, or a
 promoted desired unit. The [Receipt](apis/receipt.md) and [artifact](apis/artifacts.md) API pages show how those lookups
 follow the desired and observed trees.
 
-## Advance, reconcile, and converge
+## Apply, reconcile, and converge
 
-- **Advance** resolves every currently ready unit and moves the desired ref when its tree changes.
+- **Apply** resolves explicit input and publishes a changed desired snapshot. A named partition makes those roots an
+  authoritative set, enabling omission-based pruning; unpartitioned roots are independently applied.
 - **Reconcile** plans or applies one desired unit and publishes its receipt after success.
-- **Converge** repeats those operations in dependency order until every selected unit is clean or waiting.
+- **Converge** reconciles current desired Units, or repeats apply and reconciliation when explicit input is supplied.
 - **Verify** checks supported units for external drift without writing receipts.
 
-Because observations can unlock downstream desired units, one source commit may produce several desired and observed
-ref advances before convergence becomes clean.
+Because observations can unlock downstream desired inputs, convergence with explicit input may produce several
+desired and observed commits before it becomes clean. Convergence without input cannot reconstruct authored intent.
 
 ## Promotion and rollback
 
-A **source-tracked environment** resolves authored resources from an explicit source revision. A **promotion-tracked
-environment** can advance only from a permitted source environment. It builds target desired state from a pinned
-target specification plus explicitly selected inputs from that source; it does not implicitly copy the source desired
-tree. Promotion records the exact source desired, source observed, and target specification revisions in a
-controller-owned `Promotion` resource.
+Promotion applies explicit target resources with pinned context from a permitted source environment. It does not
+implicitly copy the source desired tree. The resulting controller-owned `Promotion` resource records the exact source
+desired, source observed, and target specification revisions.
 
 ```mermaid
 flowchart LR

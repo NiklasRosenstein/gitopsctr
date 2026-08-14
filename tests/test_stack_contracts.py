@@ -4,34 +4,39 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
-from jsonschema import Draft202012Validator, ValidationError
+from jsonschema import Draft202012Validator
 
 from gitopsctr import schemas
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
     AuthoredResourceMetadata,
-    DesiredLifecycle,
     DesiredResourceMetadata,
     DesiredStackDocument,
     DesiredStackSpec,
-    LifecycleManagement,
+    MashumaroContract,
+    ResolvedArtifactImport,
+    ResolvedGitSource,
+    ResolvedStackTemplateSource,
     StackDocument,
-    StackInstantiationProvenance,
     StackSpec,
     StackTemplateDocument,
-    StackTemplateResource,
     StackTemplateSpec,
+    StackTemplateUnitTemplate,
 )
 from gitopsctr.document import ContractError, JsonObjectValue
-from gitopsctr.templates import ParameterTemplateObject, TemplateError
+from gitopsctr.templates import TemplateError, TemplateObject
 
 
 def template_document(resources: list[dict[str, object]], parameters: list[dict[str, str]]) -> dict[str, object]:
+    unit_templates = {
+        str(resource["name"]): {key: value for key, value in resource.items() if key != "name"}
+        for resource in resources
+    }
     return {
         "apiVersion": "gitopsctr.io/v1",
         "kind": "StackTemplate",
         "metadata": {"name": "preview"},
-        "spec": {"parameters": parameters, "resources": resources},
+        "spec": {"parameters": parameters, "unitTemplates": unit_templates},
     }
 
 
@@ -59,12 +64,12 @@ def test_stack_and_stack_template_authored_and_desired_contracts_are_typed():
         "metadata": {
             "name": "preview",
             "uid": "d1-preview",
-            "lifecycle": {"management": {"mode": "sourceTracked"}},
+            "labels": {"gitopsctr.io/partition": "application"},
         },
     }
     desired_parsed = CORE_CONTRACTS["stack-template-desired"].parse(desired)
     assert isinstance(desired_parsed.metadata, DesiredResourceMetadata)
-    assert desired_parsed.metadata.lifecycle == DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked"))
+    assert desired_parsed.metadata.labels == {"gitopsctr.io/partition": "application"}
 
     stack = StackDocument(
         apiVersion="gitopsctr.io/v1",
@@ -75,12 +80,14 @@ def test_stack_and_stack_template_authored_and_desired_contracts_are_typed():
     assert CORE_CONTRACTS["stack-authored"].parse(CORE_CONTRACTS["stack-authored"].dump(stack)) == stack
 
 
-def test_direct_stack_provenance_is_desired_only_and_round_trips():
-    provenance = StackInstantiationProvenance(
-        templateRevision="a" * 40,
-        templatePath="deployment/environments/dev/stack-templates/preview.yaml",
-        templateDigest="b" * 64,
-        requestIdentity="pull-123",
+def test_stack_resolved_source_is_desired_only_and_round_trips():
+    resolved_source = ResolvedStackTemplateSource(
+        fromGit=ResolvedGitSource(
+            path=".",
+            commit="a" * 40,
+            resourcePath="deployment/stack-templates/preview.yaml",
+            digest="b" * 64,
+        )
     )
     desired = DesiredStackDocument(
         apiVersion="gitopsctr.io/v1",
@@ -88,12 +95,12 @@ def test_direct_stack_provenance_is_desired_only_and_round_trips():
         metadata=DesiredResourceMetadata(
             name="preview",
             uid="d1-preview",
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
+            labels={"gitopsctr.io/partition": "application"},
         ),
         spec=DesiredStackSpec(
             template="preview",
             parameters=JsonObjectValue({"namespace": "preview-123"}),
-            provenance=provenance,
+            resolvedSource=resolved_source,
         ),
     )
     assert CORE_CONTRACTS["stack-desired"].parse(CORE_CONTRACTS["stack-desired"].dump(desired)) == desired
@@ -106,25 +113,17 @@ def test_direct_stack_provenance_is_desired_only_and_round_trips():
                 "spec": {
                     "template": "preview",
                     "parameters": {},
-                    "provenance": {
-                        "templateRevision": "a" * 40,
-                        "templatePath": "preview.yaml",
-                        "templateDigest": "b" * 64,
-                        "requestIdentity": "pull-123",
+                    "resolvedSource": {
+                        "fromGit": {
+                            "path": ".",
+                            "commit": "a" * 40,
+                            "resourcePath": "preview.yaml",
+                            "digest": "b" * 64,
+                        }
                     },
                 },
             }
         )
-
-
-def test_direct_stack_provenance_accepts_canonical_github_request_identity():
-    provenance = StackInstantiationProvenance(
-        templateRevision="a" * 40,
-        templatePath="deployment/environments/dev/stack-templates/preview.yaml",
-        templateDigest="b" * 64,
-        requestIdentity="github:example-org/application#123",
-    )
-    assert provenance.requestIdentity == "github:example-org/application#123"
 
 
 @pytest.mark.parametrize(
@@ -192,32 +191,27 @@ def test_expansion_preserves_order_does_not_mutate_authored_input_and_rejects_no
 
     non_unit = StackTemplateSpec(
         parameters=[],
-        resources=[
-            StackTemplateResource(
+        unitTemplates={
+            "nested": StackTemplateUnitTemplate(
                 apiVersion="gitopsctr.io/v1",
                 kind="Stack",
-                name="nested",
-                spec=ParameterTemplateObject({}),
+                spec=TemplateObject({}),
             )
-        ],
+        },
     )
     with pytest.raises(TemplateError, match="installed Unit"):
         non_unit.expand({})
 
 
 @pytest.mark.parametrize(
-    "resources, message",
+    "resources",
     [
-        ([unit_resource("app", {}), unit_resource("app", {})], "unique"),
-        ([unit_resource("app", {}, dependsOn=["missing"])], "missing dependencies"),
-        (
-            [unit_resource("a", {}, dependsOn=["b"]), unit_resource("b", {}, dependsOn=["a"])],
-            "acyclic",
-        ),
+        [unit_resource("app", {}, dependsOn=["missing"])],
+        [unit_resource("a", {}, dependsOn=["b"]), unit_resource("b", {}, dependsOn=["a"])],
     ],
 )
-def test_resource_graph_rejects_duplicate_missing_and_cyclic_dependencies(resources, message):
-    with pytest.raises((ContractError, ValueError)):
+def test_resource_graph_rejects_missing_and_cyclic_dependencies(resources):
+    with pytest.raises(ContractError):
         CORE_CONTRACTS["stack-template-authored"].parse(template_document(resources, []))
 
 
@@ -230,12 +224,29 @@ def test_parameter_expression_schema_is_recursive_and_published_in_catalog():
             [{"name": "value", "type": "array"}],
         )
     )
-    with pytest.raises(ValidationError):
-        Draft202012Validator(schema).validate(
-            template_document([unit_resource("app", {"bad": {"fromReceipt": {"unit": "db"}}})], [])
-        )
-
     documents = schemas.schema_documents()
     assert documents[Path("apis/gitopsctr.io/v1/StackTemplate/authored.schema.json")]["$id"].endswith(
         "/StackTemplate/authored.schema.json"
     )
+
+
+def test_promoted_artifact_lineage_requires_a_git_receipt_blob():
+    contract = MashumaroContract(ResolvedArtifactImport, "urn:test:resolved-artifact-import")
+    with pytest.raises(ContractError, match="does not match"):
+        contract.parse(
+            {
+                "sourceStack": "application",
+                "sourceStackUid": "uid-stack",
+                "sourceUnit": "images",
+                "sourceUnitUid": "uid-images",
+                "sourceDesiredRevision": "a" * 40,
+                "sourceObservedRevision": "b" * 40,
+                "receiptUnitBlob": "c" * 64,
+                "artifactName": "containers",
+                "apiVersion": "artifact.gitopsctr.io/v1",
+                "kind": "ContainerImages",
+                "artifactDigest": "sha256:" + "d" * 64,
+                "targetStackUid": "uid-target",
+                "artifactDocument": JsonObjectValue({}),
+            }
+        )

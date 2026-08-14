@@ -29,6 +29,27 @@ status:
 `spec.resolvedInputs` records the reference fingerprints used by that unit. `status.result` follows the subject
 driver's typed result contract. Drivers that publish artifacts also add descriptors under `status.artifacts`.
 
+## Receipt and Unit state
+
+A Receipt is a separately stored observed resource, not the `status` field of its desired Unit. The two resources may
+come from different Git revisions, and a desired Unit may have a current Receipt, a stale Receipt for an older Unit
+blob, or no Receipt. Conversely, deleting a desired Unit can leave an orphaned Receipt in a selected observed
+snapshot.
+
+The default Unit table makes this relationship convenient without hiding it:
+
+```console
+gitopsctr get units --environment dev
+gitopsctr get receipts --environment dev
+gitopsctr get unit infrastructure --environment dev -o yaml
+gitopsctr get receipt infrastructure --environment dev -o yaml
+```
+
+The table derives observation and reconciliation columns by joining the resources. The two YAML commands return the
+exact persisted Unit and Receipt documents; neither command synthesizes the Receipt into Unit status. Use
+`gitopsctr get receipt infrastructure --environment dev --artifact NAME` for one described Artifact resource, or
+`--artifacts` for all of them.
+
 ## How `fromReceipt` resolves
 
 ```mermaid

@@ -96,7 +96,7 @@ jobs:
         with:
           install_args: python uv helm kind kubectl
       - run: uv sync --locked --all-groups
-      - name: Instantiate, deploy, verify, and delete a direct preview
+      - name: Apply, deploy, verify, and delete an unpartitioned preview
         run: mise run demo-k8s acceptance --preview
       - name: Clean up Kubernetes resources
         if: always()

@@ -60,21 +60,30 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
 
 
 def _unit(name: str, driver: str, revision: str) -> UnitResource:
+    installed = deploy_release.UNIT_DRIVERS[driver]
+    specification: dict[str, object] = {
+        "source": {
+            "path": f"deployment/{name}",
+            "revision": revision,
+            "inputHash": f"sha256:{name}",
+            "driverVersion": installed.version,
+        },
+        "inputs": {"environment": "prod"},
+    }
+    if driver == "terraform":
+        specification["terraform"] = {"backend": {}, "variables": {}, "observeOutputs": []}
     unit = deploy_release.parse_desired_unit_document(
         {
-            "schema": 1,
-            "name": name,
-            "driver": driver,
-            "source": {
-                "path": f"deployment/{name}",
-                "revision": revision,
-                "driverVersion": deploy_release.DRIVER_VERSIONS[driver],
-            },
-            "inputs": {"environment": "prod"},
+            "apiVersion": installed.api_version,
+            "kind": installed.kind,
+            "metadata": ResourceMetadata.root_from_provenance(name, f"verify:{name}", partition="application").document(
+                profile="desired"
+            ),
+            "spec": specification,
         },
         name,
     )
-    return unit.with_metadata(ResourceMetadata.new_source_tracked(name))
+    return unit
 
 
 def _install_desired_state(monkeypatch, units: list[UnitResource]) -> list[str]:
@@ -300,9 +309,6 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
             observed_ref=None,
             plan=False,
             report=None,
-            source_revision=None,
-            advance=False,
-            require_source_ref=None,
             reapply=reapply,
         )
     )

@@ -73,7 +73,7 @@ def desired_example(unit: UnitResource) -> UnitResource:
                 metadata=JsonObjectValue(metadata),
             ),
         )
-    return unit.with_spec(desired).with_metadata(ResourceMetadata.new_source_tracked(unit.name))
+    return unit.with_spec(desired).with_metadata(ResourceMetadata.new_root(unit.name, partition="application"))
 
 
 def has_incomplete_frontend_inputs(unit: UnitResource) -> bool:
@@ -240,7 +240,7 @@ def test_generated_schemas_and_examples_validate_from_the_local_catalog():
         Draft202012Validator(by_id[environment["$schema"]], registry=registry).validate(environment)
 
 
-@pytest.mark.parametrize("field", ["uid", "lifecycle"])
+@pytest.mark.parametrize("field", ["uid", "labels"])
 def test_generated_desired_schema_rejects_explicit_null_metadata(field):
     authored = authored_examples()[0]
     desired = desired_example(authored)
@@ -250,6 +250,39 @@ def test_generated_desired_schema_rejects_explicit_null_metadata(field):
 
     with pytest.raises(ValidationError):
         Draft202012Validator(schema).validate(document)
+
+
+def test_generated_desired_schema_rejects_lifecycle_and_invalid_partition_metadata():
+    authored = authored_examples()[0]
+    desired = desired_example(authored)
+    document = controller.serialize_unit_document(desired, profile="desired")
+    schema = next(schema for schema in schemas.schema_documents().values() if schema.get("$id") == document["$schema"])
+
+    document["metadata"]["lifecycle"] = {"management": {"mode": "sourceTracked"}}
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
+
+    document["metadata"].pop("lifecycle")
+    document["metadata"]["labels"] = {"gitopsctr.io/partition": "Not Valid"}
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
+
+
+def test_desired_stack_template_schema_exposes_resolved_source_fields():
+    schema = schemas.core_resource_schema("StackTemplate", "desired")
+    spec = schema["properties"]["spec"]
+
+    assert "requestedSource" in spec["properties"]
+    assert "resolvedSource" in spec["properties"]
+    assert "unitTemplates" in spec["properties"]
+    assert "resources" not in spec["properties"]
+
+
+def test_authored_stack_template_schema_exposes_only_canonical_unit_templates():
+    spec = schemas.core_resource_schema("StackTemplate", "authored")["properties"]["spec"]
+
+    assert "unitTemplates" in spec["properties"]
+    assert "resources" not in spec["properties"]
 
 
 def test_schema_catalog_is_deterministic_checkable_and_prunes_obsolete_schemas(tmp_path):

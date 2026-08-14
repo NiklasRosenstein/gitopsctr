@@ -3,7 +3,7 @@
 The controller publishes candidate refs before it calls this module. This
 module does not update target refs. It creates or finds review requests and
 checks candidate heads from CI. Forge state and preview eligibility are outside
-the lifecycle core.
+the deployment core.
 """
 
 from __future__ import annotations

@@ -4,6 +4,12 @@
 change-gate behavior, promotion sources, and promotion evidence. Store it at
 `<environmentsPath>/<environment>/environment.yaml|json`; `metadata.name` must match the directory name.
 
+An Environment is gitopsctr's namespace boundary. Desired and observed resources are scoped to one Environment even
+when several environments store their histories in the same repository. Inspect one Environment with
+`gitopsctr get environment staging`; use `gitopsctr get environments` for the project-scoped collection. For other
+resource families, select one namespace with `--environment staging` or query all namespaces with
+`-A/--all-environments`.
+
 ```yaml
 # yaml-language-server: $schema=https://niklasrosenstein.github.io/gitopsctr/schemas/apis/gitopsctr.io/v1/Environment.schema.json
 apiVersion: gitopsctr.io/v1
@@ -58,8 +64,8 @@ different proposal fails while the branch exists. It cannot replace reviewed con
 
 - `changeGate: none` publishes promotion and rollback commits directly.
 - `changeGate: pullRequest` publishes promotions and rollbacks to a candidate ref for review.
-- `promotion.allowedSources` makes the environment promotion-tracked and lists the permitted source environments.
-  Without `promotion`, the environment is source-tracked.
+- `promotion.allowedSources` lists the environments whose pinned desired and observed evidence may be selected by a
+  promotion into this Environment. It does not change how ordinary resources are applied.
 - `promotionPolicy.minimumEvidence` defaults to `reconciled`. `materialized` permits promotion when every unit has
   materialized evidence even if no observed ref exists.
 

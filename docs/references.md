@@ -73,8 +73,8 @@ image:
     dryFallback: registry.invalid/application@sha256:0000000000000000000000000000000000000000000000000000000000000000
 ```
 
-The fallback is used only during dry resolution, including `reconcile --plan` and `advance-desired --dry`, and only
-when the reference is unavailable. Normal advancement and reconciliation never use it. Invalid expressions, type
+The fallback is used only during dry resolution, including `reconcile --plan` and `apply --dry`, and only when the
+reference is unavailable. Normal apply and reconciliation never use it. Invalid expressions, type
 errors, and broken active promotions remain fatal. A fallback cannot hide them.
 
 Fallback values use the same recursive template language as their containing field. They may be scalar, structured,

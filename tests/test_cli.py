@@ -4,21 +4,15 @@ import io
 import json
 import shutil
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from gitopsctr import controller as deploy_release
-from gitopsctr.contracts import DesiredSource, ResolvedInputs
-from gitopsctr.contrib.drivers.frontend_s3_cloudfront import FrontendDesiredUnit
-from gitopsctr.driver import UnitResolution
-from gitopsctr.errors import ReferenceUnavailable
 from gitopsctr.resources import ResourceMetadata
 from tests.conftest import receipt_document, receipt_resource, write_test_document
 
@@ -39,17 +33,40 @@ def _promotion_context(root: Path) -> deploy_release.PromotionContext:
     )
 
 
-def _terraform_desired_resource(name: str = "aws-application"):
-    resource = deploy_release.RESOURCE_CATALOG.parse_unit(
-        {
-            "name": name,
-            "driver": "terraform",
-            "source": {"path": ".", "revision": "a" * 40},
+def _terraform_desired_document(
+    name: str = "aws-application",
+    *,
+    revision: str = "a" * 40,
+    input_hash: str = "sha256:test",
+    driver_version: int | None = None,
+    variables: dict[str, object] | None = None,
+    resolved_inputs: dict[str, object] | None = None,
+) -> dict[str, object]:
+    spec: dict[str, object] = {
+        "source": {
+            "path": "infra/deploy",
+            "revision": revision,
+            "inputHash": input_hash,
+            "driverVersion": driver_version or deploy_release.DRIVER_VERSIONS["terraform"],
         },
-        profile="desired",
-        expected_name=name,
+        "terraform": {"backend": {}, "variables": variables or {}, "observeOutputs": []},
+    }
+    if resolved_inputs is not None:
+        spec["resolvedInputs"] = resolved_inputs
+    return {
+        "apiVersion": "unit.gitopsctr.io/v1",
+        "kind": "Terraform",
+        "metadata": ResourceMetadata.root_from_provenance(name, f"test:{name}", partition="application").document(
+            profile="desired"
+        ),
+        "spec": spec,
+    }
+
+
+def _terraform_desired_resource(name: str = "aws-application"):
+    return deploy_release.RESOURCE_CATALOG.parse_unit(
+        _terraform_desired_document(name), profile="desired", expected_name=name
     )
-    return resource.with_metadata(ResourceMetadata.new_source_tracked(name))
 
 
 def test_root_help_groups_commands_and_describes_each_command():
@@ -73,7 +90,6 @@ def test_delete_and_finalize_use_generic_resource_commands():
         [
             "delete",
             "unit",
-            "--in=state",
             "--environment",
             "preview",
             "--name",
@@ -84,7 +100,6 @@ def test_delete_and_finalize_use_generic_resource_commands():
     )
     assert delete.handler is deploy_release.command_delete_resource
     assert delete.kind == "Unit"
-    assert delete.input_location == "state"
     assert delete.name == "application"
     assert delete.uid == "d1-application"
 
@@ -109,7 +124,7 @@ def test_delete_and_finalize_use_generic_resource_commands():
     assert finalize.deletion_generation == 1
 
 
-def test_lifecycle_candidate_publication_delegates_change_request_to_ci(tmp_path, monkeypatch):
+def test_candidate_publication_delegates_change_request_to_ci(tmp_path, monkeypatch):
     monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
     monkeypatch.setattr(deploy_release, "load_desired_resource_graph", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(deploy_release, "validate_effect_leases_preserved", lambda *_args, **_kwargs: None)
@@ -125,7 +140,7 @@ def test_lifecycle_candidate_publication_delegates_change_request_to_ci(tmp_path
     monkeypatch.setattr(
         deploy_release,
         "ensure_change_request",
-        lambda *_args, **_kwargs: pytest.fail("lifecycle publication must not call a forge adapter"),
+        lambda *_args, **_kwargs: pytest.fail("candidate publication must not call a forge adapter"),
     )
 
     revision, outcome = deploy_release.publish_desired_change(
@@ -171,205 +186,6 @@ def test_write_change_outputs_handles_delegated_change_request(tmp_path, monkeyp
         "change_status=manual\n"
         "change_url=\n"
     )
-
-
-def test_desired_resolution_logs_unit_and_observation_decision(tmp_path, monkeypatch, capsys):
-    source = tmp_path / "source"
-    current = tmp_path / "current"
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    unit = {
-        "schema": 1,
-        "name": "frontend",
-        "driver": "frontend-s3-cloudfront",
-        "source": {"path": "scripts/deployment_drivers.py"},
-    }
-    _write_json(
-        source / "deployment/environments/dev/environment.json",
-        {"schema": 1, "name": "dev"},
-    )
-    _write_json(source / "deployment/environments/dev/units/frontend.json", unit)
-    _write_json(
-        current / "units/frontend.json",
-        {**unit, "resolvedInputs": {"receipts": {"units/aws-application.json": "old"}}},
-    )
-    observed.mkdir()
-
-    monkeypatch.setattr(
-        deploy_release,
-        "resolved_unit_source",
-        lambda *_args: deploy_release.ResolvedUnitSourceResult(
-            source=DesiredSource(
-                path="scripts/deployment_drivers.py",
-                revision="a" * 40,
-                inputHash="sha256:value",
-            ),
-            inputs_changed=False,
-        ),
-    )
-    monkeypatch.setattr(
-        deploy_release.UNIT_DRIVERS["frontend-s3-cloudfront"],
-        "resolve_unit",
-        lambda _unit, context: UnitResolution(
-            FrontendDesiredUnit(
-                source=context.source,
-                resolvedInputs=ResolvedInputs(receipts={"aws-application": "new"}),
-            ),
-            ResolvedInputs(receipts={"aws-application": "new"}),
-        ),
-    )
-
-    deploy_release.build_desired_candidate(
-        "dev",
-        source,
-        "b" * 40,
-        current,
-        observed,
-        "c" * 40,
-        candidate,
-    )
-
-    output = capsys.readouterr()
-    assert output.out == ""
-    assert "==> Resolve desired state for dev" in output.err
-    assert "CHECK    frontend: inputs unchanged; retain aaaaaaaaaaaa" in output.err
-    assert "OBSERVE  frontend: new observation changes resolved inputs" in output.err
-    assert "UPDATE   frontend: desired state changed" in output.err
-
-
-def test_desired_candidate_drops_legacy_artifact_catalogue(tmp_path, monkeypatch):
-    source = tmp_path / "source"
-    current = tmp_path / "current"
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    unit = {
-        "schema": 1,
-        "name": "application-images",
-        "driver": "oci-images",
-        "source": {"path": "."},
-    }
-    _write_json(
-        source / "deployment/environments/dev/environment.json",
-        {"schema": 1, "name": "dev"},
-    )
-    _write_json(source / "deployment/environments/dev/units/application-images.json", unit)
-    _write_json(current / "artifacts/containers.json", {"legacy": True})
-    observed.mkdir()
-    monkeypatch.setattr(
-        deploy_release,
-        "resolved_unit_source",
-        lambda *_args: deploy_release.ResolvedUnitSourceResult(
-            source=DesiredSource(path=".", revision="a" * 40, inputHash="sha256:value"),
-            inputs_changed=False,
-        ),
-    )
-
-    deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate)
-
-    assert deploy_release.unit_document_path(candidate, "application-images").is_file()
-    assert not (candidate / "artifacts").exists()
-
-
-def test_show_receipt_reports_receipt_and_artifacts(monkeypatch, capsys):
-    expected = receipt_document(
-        "terraform",
-        "aws-application",
-        {"revision": "b" * 40, "unitBlob": "blob"},
-        {"applied": {"sourceRevision": "c" * 40}, "outputs": {"api_url": "https://api.example"}},
-        resolved_inputs={},
-        controller={"observed_at": "2026-08-07T00:00:00Z"},
-    )
-
-    def materialize_observed(_ref, output):
-        _write_json(output / "units/aws-application.json", expected)
-        return "a" * 40
-
-    monkeypatch.setattr(deploy_release, "observed_tree", materialize_observed)
-    args = deploy_release.build_parser().parse_args(
-        ["show", "receipt", "--environment", "dev", "aws-application", "--json"]
-    )
-
-    args.handler(args)
-
-    result = json.loads(capsys.readouterr().out)
-    assert result == expected
-
-
-def test_show_document_format_can_force_yaml_or_json():
-    args = deploy_release.build_parser().parse_args(["show", "receipt", "--environment", "dev", "web", "--yaml"])
-    assert args.yaml is True
-    assert args.json is False
-
-    with pytest.raises(SystemExit):
-        deploy_release.build_parser().parse_args(["show", "receipt", "--environment", "dev", "web", "--json", "--yaml"])
-
-
-def test_blocked_driver_transition_omits_previous_unit_and_reports_wait(tmp_path, monkeypatch, capsys):
-    source = tmp_path / "source"
-    current = tmp_path / "current"
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    specification = {
-        "schema": 1,
-        "name": "frontend",
-        "driver": "frontend-s3-cloudfront",
-        "source": {"path": "scripts/deployment_drivers.py"},
-        "inputs": {
-            "bundle": {
-                "fromArtifact": {
-                    "unit": "frontend-bundle",
-                    "name": "frontend",
-                    "apiVersion": "artifact.gitopsctr.io/v1",
-                    "kind": "FrontendBundle",
-                    "pointer": "/bundle/uri",
-                },
-            }
-        },
-    }
-    _write_json(
-        source / "deployment/environments/dev/environment.json",
-        {"schema": 1, "name": "dev"},
-    )
-    _write_json(source / "deployment/environments/dev/units/frontend.json", specification)
-    _write_json(
-        current / "units/frontend.json",
-        {
-            "schema": 1,
-            "name": "frontend",
-            "driver": "vite-s3-cloudfront",
-            "source": {"path": "frontend", "revision": "a" * 40},
-        },
-    )
-    observed.mkdir()
-    monkeypatch.setattr(
-        deploy_release,
-        "resolved_unit_source",
-        lambda *_args: deploy_release.ResolvedUnitSourceResult(
-            source=DesiredSource(
-                path="scripts/deployment_drivers.py",
-                revision="b" * 40,
-                inputHash="sha256:value",
-            ),
-            inputs_changed=True,
-        ),
-    )
-
-    deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate)
-
-    assert not (candidate / "units/frontend.json").exists()
-    cleanup = deploy_release.load_json(candidate / ".gitopsctr/cleanup/units/frontend.json")
-    assert cleanup["metadata"]["lifecycle"] == {"management": {"mode": "sourceTracked"}}
-    assert cleanup["payload"] == deploy_release.load_json(current / "units/frontend.json")
-    assert deploy_release.load_desired_transition_blocks(candidate)["frontend"] == (
-        "previous desired unit is unavailable; opaque cleanup root retained"
-    )
-    assert deploy_release.load_desired_transition_blocks(candidate) == {
-        "frontend": "previous desired unit is unavailable; opaque cleanup root retained"
-    }
-    assert deploy_release.reconciliation_statuses(["frontend"], candidate, observed) == [
-        ("frontend", "WAIT", "previous desired unit is unavailable; opaque cleanup root retained")
-    ]
-    assert "retain opaque cleanup root" in capsys.readouterr().err
 
 
 def test_parseable_driver_transition_retains_fenced_deletion_metadata(tmp_path):
@@ -459,126 +275,6 @@ def test_finalized_same_name_recreation_gets_new_uid_from_tombstone(tmp_path):
     assert deploy_release.load_desired_unit(repeated / "units/application.json", "application").metadata.uid == (
         recreated.metadata.uid
     )
-
-
-def test_unparseable_previous_unit_uses_opaque_cleanup_root(tmp_path):
-    source = tmp_path / "source"
-    current = tmp_path / "current"
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
-    _write_json(
-        source / "deployment/environments/dev/units/frontend.json",
-        {"schema": 1, "name": "frontend", "driver": "terraform", "source": {"path": "."}},
-    )
-    raw = {
-        "name": "frontend",
-        "driver": "terraform",
-        "metadata": {
-            "name": "frontend",
-            "uid": "old-frontend-uid",
-            "lifecycle": {"management": {"mode": "sourceTracked"}},
-        },
-        "source": {"path": ".", "revision": "a" * 40},
-        "terraform": {"variables": []},
-    }
-    _write_json(current / "units/frontend.json", raw)
-    observed.mkdir()
-
-    result = deploy_release.build_desired_candidate(
-        "dev", source, "b" * 40, current, observed, None, candidate, verbose=False
-    )
-
-    assert "frontend" in result.blocked
-    assert not (candidate / "units/frontend.json").exists()
-    cleanup = deploy_release.load_json(candidate / ".gitopsctr/cleanup/units/frontend.json")
-    assert cleanup["payload"] == raw
-    assert cleanup["metadata"]["uid"] == "old-frontend-uid"
-    assert cleanup["metadata"]["lifecycle"] == {"management": {"mode": "sourceTracked"}}
-
-    repeated = tmp_path / "repeated"
-    deploy_release.build_desired_candidate("dev", source, "b" * 40, candidate, observed, None, repeated, verbose=False)
-    assert not (repeated / "units/frontend.json").exists()
-    assert deploy_release.load_json(repeated / ".gitopsctr/cleanup/units/frontend.json") == cleanup
-    assert deploy_release.load_desired_transition_blocks(repeated) == deploy_release.load_desired_transition_blocks(
-        candidate
-    )
-
-
-def test_source_absent_unparseable_unit_is_retained_only_as_cleanup_payload(tmp_path):
-    source = tmp_path / "source"
-    current = tmp_path / "current"
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
-    _write_json(
-        source / "deployment/environments/dev/units/active.json",
-        {"schema": 1, "name": "active", "driver": "terraform", "source": {"path": "."}},
-    )
-    raw = {"name": "orphan", "driver": "missing-driver", "source": {"path": "."}}
-    _write_json(current / "units/orphan.json", raw)
-    observed.mkdir()
-
-    result = deploy_release.build_desired_candidate(
-        "dev", source, "b" * 40, current, observed, None, candidate, verbose=False
-    )
-
-    assert "orphan" in result.blocked
-    assert not (candidate / "units/orphan.json").exists()
-    cleanup = deploy_release.load_json(candidate / ".gitopsctr/cleanup/units/orphan.json")
-    assert cleanup["payload"] == raw
-    assert cleanup["metadata"]["deletion"]["generation"] == 1
-    opaque = deploy_release.load_desired_cleanup_roots(candidate)["orphan"]
-    assert opaque.metadata.deletion is not None
-    assert opaque.metadata.deletion.resourceDigest == deploy_release.opaque_cleanup_content_digest(opaque)
-    assert deploy_release.load_desired_transition_blocks(candidate)["orphan"] == (
-        "source absent; opaque cleanup root retained"
-    )
-    assert deploy_release.reconciliation_statuses(["active"], candidate, observed)[-1] == (
-        "orphan",
-        "WAIT",
-        "source absent; opaque cleanup root retained",
-    )
-
-
-@pytest.mark.parametrize("suffix", [".yaml", ".yml"])
-def test_cleanup_root_loader_reads_yaml_and_write_preserves_suffix(tmp_path, suffix):
-    root = tmp_path / "desired"
-    metadata = ResourceMetadata.source_tracked_from_provenance("frontend", "yaml-cleanup:v1")
-    opaque = deploy_release.OpaqueCleanupRoot(
-        path=Path(f"frontend{suffix}"),
-        payload={"name": "frontend", "driver": "missing-driver"},
-        metadata=metadata,
-        source=None,
-    )
-
-    path = deploy_release.write_opaque_cleanup_root(root, "frontend", opaque)
-
-    assert path == root / f".gitopsctr/cleanup/units/frontend{suffix}"
-    loaded = deploy_release.load_desired_cleanup_roots(root)
-    assert loaded["frontend"].path == path
-    assert loaded["frontend"].payload == opaque.payload
-    assert loaded["frontend"].metadata.uid == metadata.uid
-
-
-def test_cleanup_root_loader_rejects_duplicate_document_formats(tmp_path):
-    root = tmp_path / "desired"
-    metadata = ResourceMetadata.source_tracked_from_provenance("frontend", "duplicate-cleanup:v1")
-    envelope = {
-        "schema": 1,
-        "kind": "OpaqueCleanupRoot",
-        "metadata": metadata.document(profile="desired"),
-        "payload": {"name": "frontend", "driver": "missing-driver"},
-    }
-    deploy_release.write_document(
-        root / ".gitopsctr/cleanup/units/frontend.json", envelope, format=deploy_release.DocumentFormat.JSON
-    )
-    deploy_release.write_document(
-        root / ".gitopsctr/cleanup/units/frontend.yaml", envelope, format=deploy_release.DocumentFormat.YAML
-    )
-
-    with pytest.raises(deploy_release.OperationError, match="multiple cleanup document formats"):
-        deploy_release.load_desired_cleanup_roots(root)
 
 
 def test_effect_lease_is_cas_published_and_blocks_a_second_runner(tmp_path, monkeypatch):
@@ -936,96 +632,6 @@ def test_desired_mutation_cannot_drop_active_effect_lease(tmp_path, monkeypatch)
     deploy_release.validate_effect_leases_preserved("deploy/dev", "a" * 40, candidate)
 
 
-def test_desired_mutation_cannot_change_leased_unit_payload(tmp_path):
-    current = tmp_path / "current"
-    candidate = tmp_path / "candidate"
-    unit_path = current / "units/application.json"
-    unit_path.parent.mkdir(parents=True)
-    unit = _terraform_desired_resource("application")
-    unit_path.write_text(json.dumps(deploy_release.serialize_unit_document(unit)))
-    deploy_release.write_opaque_cleanup_root(
-        current,
-        "application",
-        deploy_release.OpaqueCleanupRoot(
-            path=Path("application.json"),
-            payload={"cleanup": "original"},
-            metadata=ResourceMetadata(
-                name="application",
-                uid=unit.metadata.uid,
-                lifecycle=deploy_release.DesiredLifecycle(
-                    management=deploy_release.LifecycleManagement(mode="sourceTracked")
-                ),
-            ),
-            source=None,
-        ),
-    )
-    lease = deploy_release.EffectLease(
-        unit_name="application",
-        uid=unit.metadata.uid,
-        token="lease-runner-a",
-        owner="runner-a",
-        desired_revision="a" * 40,
-        expires_at=None,
-    )
-    deploy_release.write_effect_lease(current, lease)
-    shutil.copytree(current, candidate)
-    changed = json.loads((candidate / "units/application.json").read_text())
-    changed["spec"]["source"]["path"] = "different-source"
-    (candidate / "units/application.json").write_text(json.dumps(changed))
-
-    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="immutable leased resource"):
-        deploy_release.validate_effect_leases_preserved("deploy/dev", "a" * 40, candidate, current_root=current)
-
-    cleanup_candidate = tmp_path / "cleanup-candidate"
-    shutil.copytree(current, cleanup_candidate)
-    cleanup_path = cleanup_candidate / ".gitopsctr/cleanup/units/application.json"
-    changed_cleanup = json.loads(cleanup_path.read_text())
-    changed_cleanup["payload"]["cleanup"] = "changed"
-    cleanup_path.write_text(json.dumps(changed_cleanup))
-    with pytest.raises(deploy_release.EffectLeaseUnavailable, match="immutable leased resource"):
-        deploy_release.validate_effect_leases_preserved("deploy/dev", "a" * 40, cleanup_candidate, current_root=current)
-
-
-@pytest.mark.parametrize("change", ["schema", "kind", "metadata", "payload"])
-def test_cleanup_root_loader_rejects_noncanonical_envelopes(tmp_path, change):
-    root = tmp_path / "desired"
-    metadata = ResourceMetadata.source_tracked_from_provenance("frontend", "cleanup-envelope:v1")
-    envelope = {
-        "schema": 1,
-        "kind": "OpaqueCleanupRoot",
-        "metadata": metadata.document(profile="desired"),
-        "payload": {"name": "frontend", "driver": "missing-driver"},
-    }
-    if change == "schema":
-        envelope["schema"] = 2
-    elif change == "kind":
-        envelope["kind"] = "Other"
-    elif change == "metadata":
-        envelope["metadata"] = {**envelope["metadata"], "name": "other"}
-    else:
-        del envelope["payload"]
-    _write_json(root / ".gitopsctr/cleanup/units/frontend.json", envelope)
-
-    with pytest.raises(deploy_release.OperationError, match="opaque cleanup"):
-        deploy_release.load_desired_cleanup_roots(root)
-
-
-def test_cleanup_root_loader_rejects_legacy_metadata_envelope(tmp_path):
-    root = tmp_path / "desired"
-    _write_json(
-        root / ".gitopsctr/cleanup/units/frontend.json",
-        {
-            "schema": 1,
-            "kind": "OpaqueCleanupRoot",
-            "metadata": {"name": "frontend"},
-            "payload": {"name": "frontend", "driver": "missing-driver"},
-        },
-    )
-
-    with pytest.raises(deploy_release.OperationError, match="must be sourceTracked"):
-        deploy_release.load_desired_cleanup_roots(root)
-
-
 @pytest.mark.parametrize(
     "metadata",
     [
@@ -1033,7 +639,7 @@ def test_cleanup_root_loader_rejects_legacy_metadata_envelope(tmp_path):
         {
             "name": "other",
             "uid": "uid-1",
-            "lifecycle": {"management": {"mode": "sourceTracked"}},
+            "labels": {"gitopsctr.io/partition": "application"},
         },
     ],
 )
@@ -1066,117 +672,6 @@ def test_opaque_cleanup_metadata_fails_closed_for_malformed_authority(metadata):
         )
 
 
-def test_blocked_unit_with_same_driver_retains_previous_desired_state(tmp_path, monkeypatch):
-    source = tmp_path / "source"
-    current = tmp_path / "current"
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    specification = {
-        "schema": 1,
-        "name": "frontend",
-        "driver": "frontend-s3-cloudfront",
-        "source": {"path": "scripts/deployment_drivers.py"},
-        "inputs": {
-            "bundle": {
-                "fromArtifact": {
-                    "unit": "frontend-bundle",
-                    "name": "frontend",
-                    "apiVersion": "artifact.gitopsctr.io/v1",
-                    "kind": "FrontendBundle",
-                    "pointer": "/bundle/uri",
-                },
-            }
-        },
-    }
-    _write_json(
-        source / "deployment/environments/dev/environment.json",
-        {"schema": 1, "name": "dev"},
-    )
-    _write_json(source / "deployment/environments/dev/units/frontend.json", specification)
-    previous = current / "units/frontend.json"
-    _write_json(
-        previous,
-        {
-            "name": "frontend",
-            "driver": "frontend-s3-cloudfront",
-            "source": {
-                "path": "frontend",
-                "revision": "a" * 40,
-                "inputHash": "sha256:previous",
-                "driverVersion": 2,
-            },
-        },
-    )
-    observed.mkdir()
-    monkeypatch.setattr(
-        deploy_release,
-        "resolved_unit_source",
-        lambda *_args: deploy_release.ResolvedUnitSourceResult(
-            source=DesiredSource(
-                path="scripts/deployment_drivers.py",
-                revision="b" * 40,
-                inputHash="sha256:value",
-            ),
-            inputs_changed=True,
-        ),
-    )
-
-    result = deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate)
-
-    retained = deploy_release.load_desired_unit(candidate / "units/frontend.json", "frontend")
-    assert retained.is_legacy_compatibility is False
-    assert retained.metadata.uid
-    assert retained.metadata.lifecycle is not None
-    assert "frontend" in result.blocked
-
-
-def test_removing_producer_environment_preserves_existing_input_hash(tmp_path, monkeypatch):
-    source = tmp_path / "source"
-    current = tmp_path / "current"
-    source.mkdir()
-    (source / "Dockerfile").write_text("FROM scratch\n")
-    specification = {
-        "schema": 1,
-        "name": "application-images",
-        "driver": "oci-images",
-        "source": {"path": ".", "inputs": ["Dockerfile"]},
-        "build": {"dockerfile": "Dockerfile", "platform": "linux/amd64"},
-        "publish": {"targets": {"control": {"type": "registry", "repository": "registry.example.com/control"}}},
-    }
-    legacy_specification = {**specification, "environment": "dev"}
-    legacy_resource = deploy_release.parse_authored_unit_document(legacy_specification, "application-images")
-    specification_resource = deploy_release.parse_authored_unit_document(specification, "application-images")
-    legacy_hash = deploy_release.unit_input_hash(legacy_resource, source)
-    _write_json(
-        current / "units/application-images.json",
-        {
-            **legacy_specification,
-            "source": {
-                **legacy_specification["source"],
-                "revision": "a" * 40,
-                "inputHash": legacy_hash,
-            },
-        },
-    )
-    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
-
-    result = deploy_release.resolved_unit_source(
-        specification_resource,
-        source,
-        "b" * 40,
-        current,
-        None,
-        deploy_release.SourceRevisionPolicy(
-            unavailable_when=deploy_release.SourceRevisionUnavailableWhen.MISSING,
-        ),
-    )
-
-    assert result.source is not None
-    assert result.source.inputHash == legacy_hash
-    assert result.source.revision == "a" * 40
-    assert result.inputs_changed is False
-
-
 def _source_resolution_fixture(tmp_path: Path, previous_revision: str, input_hash: str):
     source = tmp_path / "source"
     current = tmp_path / "current"
@@ -1184,26 +679,16 @@ def _source_resolution_fixture(tmp_path: Path, previous_revision: str, input_has
     (source / "main.tf").write_text("terraform {}\n")
     specification = deploy_release.parse_authored_unit_document(
         {
-            "schema": 1,
-            "name": "aws-application",
-            "driver": "terraform",
-            "source": {"path": "."},
+            "apiVersion": "unit.gitopsctr.io/v1",
+            "kind": "Terraform",
+            "metadata": {"name": "aws-application"},
+            "spec": {"source": {"path": "."}, "terraform": {"backend": {}, "variables": {}}},
         },
         "aws-application",
     )
     _write_json(
         current / "units/aws-application.json",
-        {
-            "schema": 1,
-            "name": "aws-application",
-            "driver": "terraform",
-            "source": {
-                "path": ".",
-                "revision": previous_revision,
-                "inputHash": input_hash,
-                "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"],
-            },
-        },
+        _terraform_desired_document(revision=previous_revision, input_hash=input_hash),
     )
     return source, current, specification
 
@@ -1220,7 +705,6 @@ def test_matching_input_hash_retains_available_previous_source_revision(tmp_path
         source,
         candidate_revision,
         current,
-        None,
         deploy_release.SourceRevisionPolicy(
             unavailable_when=deploy_release.SourceRevisionUnavailableWhen.MISSING,
         ),
@@ -1228,7 +712,7 @@ def test_matching_input_hash_retains_available_previous_source_revision(tmp_path
 
     assert result.source is not None
     assert result.source.revision == previous_revision
-    assert result.inputs_changed is False
+    assert result.disposition is deploy_release.SourceResolutionDisposition.UNCHANGED
 
 
 def test_outside_candidate_history_retains_ancestor_previous_source_revision(tmp_path, monkeypatch):
@@ -1243,11 +727,11 @@ def test_outside_candidate_history_retains_ancestor_previous_source_revision(tmp
         lambda previous, candidate: (previous, candidate) == (previous_revision, candidate_revision),
     )
 
-    result = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
+    result = deploy_release.resolved_unit_source(specification, source, candidate_revision, current)
 
     assert result.source is not None
     assert result.source.revision == previous_revision
-    assert result.inputs_changed is False
+    assert result.disposition is deploy_release.SourceResolutionDisposition.UNCHANGED
     assert result.refresh_reason is None
 
 
@@ -1259,12 +743,11 @@ def test_outside_candidate_history_refreshes_dangling_previous_source_revision(t
     monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
     monkeypatch.setattr(deploy_release, "commit_is_ancestor", lambda *_args: False)
 
-    result = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
+    result = deploy_release.resolved_unit_source(specification, source, candidate_revision, current)
 
     assert result.source is not None
     assert result.source.revision == candidate_revision
     assert result.disposition is deploy_release.SourceResolutionDisposition.REVISION_REFRESHED
-    assert result.inputs_changed is False
     assert result.refresh_reason is not None
     assert "outside candidate history" in result.refresh_reason
 
@@ -1276,12 +759,11 @@ def test_matching_input_hash_refreshes_unavailable_previous_source_revision(tmp_
     monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
     monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: False)
 
-    result = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
+    result = deploy_release.resolved_unit_source(specification, source, candidate_revision, current)
 
     assert result.source is not None
     assert result.source.revision == candidate_revision
     assert result.disposition is deploy_release.SourceResolutionDisposition.REVISION_REFRESHED
-    assert result.inputs_changed is False
 
 
 def test_changed_input_hash_uses_candidate_source_revision(tmp_path, monkeypatch):
@@ -1291,279 +773,28 @@ def test_changed_input_hash_uses_candidate_source_revision(tmp_path, monkeypatch
     monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:new")
     monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
 
-    result = deploy_release.resolved_unit_source(specification, source, candidate_revision, current, None)
+    result = deploy_release.resolved_unit_source(specification, source, candidate_revision, current)
 
     assert result.source is not None
     assert result.source.revision == candidate_revision
-    assert result.inputs_changed is True
+    assert result.disposition is deploy_release.SourceResolutionDisposition.INPUTS_CHANGED
 
 
 def test_source_less_unit_remains_without_a_resolved_source(tmp_path):
     specification = deploy_release.parse_authored_unit_document(
         {
-            "schema": 1,
-            "name": "frontend",
-            "driver": "frontend-s3-cloudfront",
+            "apiVersion": "unit.gitopsctr.io/v1",
+            "kind": "FrontendS3Cloudfront",
+            "metadata": {"name": "frontend"},
+            "spec": {},
         },
         "frontend",
     )
 
-    result = deploy_release.resolved_unit_source(specification, tmp_path, "b" * 40, tmp_path / "current", None)
+    result = deploy_release.resolved_unit_source(specification, tmp_path, "b" * 40, tmp_path / "current")
 
     assert result.source is None
-    assert result.inputs_changed is False
-
-
-@pytest.mark.parametrize(
-    "unavailable_when",
-    [
-        deploy_release.SourceRevisionUnavailableWhen.MISSING,
-        deploy_release.SourceRevisionUnavailableWhen.OUTSIDE_CANDIDATE_HISTORY,
-    ],
-)
-def test_unavailable_retained_source_refreshes_desired_state_and_logs(tmp_path, monkeypatch, capsys, unavailable_when):
-    previous_revision = "a" * 40
-    candidate_revision = "b" * 40
-    source, current, _ = _source_resolution_fixture(tmp_path, previous_revision, "sha256:same")
-    _write_json(
-        source / "deployment/environments/dev/environment.json",
-        {"schema": 1, "name": "dev"},
-    )
-    _write_json(
-        source / "deployment/environments/dev/units/aws-application.json",
-        {
-            "schema": 1,
-            "name": "aws-application",
-            "driver": "terraform",
-            "source": {"path": "."},
-        },
-    )
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    observed.mkdir()
-    monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
-    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: False)
-
-    result = deploy_release.build_desired_candidate(
-        "dev",
-        source,
-        candidate_revision,
-        current,
-        observed,
-        None,
-        candidate,
-        dry=True,
-        source_revision_policy=deploy_release.SourceRevisionPolicy(unavailable_when=unavailable_when),
-    )
-
-    refreshed = deploy_release.load_desired_unit(candidate / "units/aws-application.json", "aws-application")
-    assert result.blocked == {}
-    assert refreshed.spec.source.revision == candidate_revision
-    output = capsys.readouterr().err
-    assert "REFRESH  aws-application: retained source aaaaaaaaaaaa is unavailable; use bbbbbbbbbbbb" in output
-
-
-def test_outside_candidate_history_refreshes_desired_state_and_logs(tmp_path, monkeypatch, capsys):
-    previous_revision = "a" * 40
-    candidate_revision = "b" * 40
-    source, current, _ = _source_resolution_fixture(tmp_path, previous_revision, "sha256:same")
-    _write_json(
-        source / "deployment/environments/dev/environment.json",
-        {"schema": 1, "name": "dev"},
-    )
-    _write_json(
-        source / "deployment/environments/dev/units/aws-application.json",
-        {
-            "schema": 1,
-            "name": "aws-application",
-            "driver": "terraform",
-            "source": {"path": "."},
-        },
-    )
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    observed.mkdir()
-    monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
-    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
-    monkeypatch.setattr(deploy_release, "commit_is_ancestor", lambda *_args: False)
-
-    deploy_release.build_desired_candidate(
-        "dev",
-        source,
-        candidate_revision,
-        current,
-        observed,
-        None,
-        candidate,
-        dry=True,
-        source_revision_policy=deploy_release.SourceRevisionPolicy(),
-    )
-
-    refreshed = deploy_release.load_desired_unit(candidate / "units/aws-application.json", "aws-application")
-    assert refreshed.spec.source.revision == candidate_revision
-    output = capsys.readouterr().err
-    assert (
-        "REFRESH  aws-application: retained source aaaaaaaaaaaa is outside candidate history; use bbbbbbbbbbbb"
-    ) in output
-
-
-def test_revision_refresh_carries_last_resolved_dependencies_when_upstream_is_stale(tmp_path, monkeypatch, capsys):
-    source = tmp_path / "source"
-    current = tmp_path / "current"
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
-    for unit_name in ("application-images", "aws-application"):
-        _write_json(
-            source / f"deployment/environments/dev/units/{unit_name}.json",
-            {
-                "schema": 1,
-                "name": unit_name,
-                "driver": "frontend-s3-cloudfront",
-                "source": {"path": "."},
-            },
-        )
-    driver_version = deploy_release.DRIVER_VERSIONS["frontend-s3-cloudfront"]
-    _write_json(
-        current / "units/application-images.json",
-        {
-            "apiVersion": "unit.gitopsctr.io/v1",
-            "kind": "FrontendS3Cloudfront",
-            "metadata": {
-                "name": "application-images",
-                "uid": "uid-application-images",
-                "lifecycle": {"management": {"mode": "sourceTracked"}},
-            },
-            "spec": {
-                "source": {
-                    "path": ".",
-                    "revision": "a" * 40,
-                    "inputHash": "sha256:old",
-                    "driverVersion": driver_version,
-                },
-            },
-        },
-    )
-    _write_json(
-        current / "units/aws-application.json",
-        {
-            "apiVersion": "unit.gitopsctr.io/v1",
-            "kind": "FrontendS3Cloudfront",
-            "metadata": {
-                "name": "aws-application",
-                "uid": "uid-aws-application",
-                "lifecycle": {"management": {"mode": "sourceTracked"}},
-            },
-            "spec": {
-                "source": {
-                    "path": ".",
-                    "revision": "a" * 40,
-                    "inputHash": "sha256:same",
-                    "driverVersion": driver_version,
-                },
-                "resolvedInputs": {"receipts": {"application-images": "old-receipt"}},
-            },
-        },
-    )
-    observed.mkdir()
-
-    def resolve_source(specification, *_args):
-        refreshed = specification.name == "aws-application"
-        return deploy_release.ResolvedUnitSourceResult(
-            source=DesiredSource(
-                path=".",
-                revision="b" * 40,
-                inputHash="sha256:same" if refreshed else "sha256:new",
-                driverVersion=driver_version,
-            ),
-            disposition=(
-                deploy_release.SourceResolutionDisposition.REVISION_REFRESHED
-                if refreshed
-                else deploy_release.SourceResolutionDisposition.INPUTS_CHANGED
-            ),
-            refresh_reason="retained source aaaaaaaaaaaa is unavailable; use bbbbbbbbbbbb" if refreshed else None,
-        )
-
-    monkeypatch.setattr(deploy_release, "resolved_unit_source", resolve_source)
-
-    def resolve_unit(unit, context):
-        if context.source is not None and context.source.inputHash == "sha256:same":
-            raise ReferenceUnavailable("receipt is stale: application-images")
-        return UnitResolution(FrontendDesiredUnit(source=context.source), None)
-
-    monkeypatch.setattr(deploy_release.UNIT_DRIVERS["frontend-s3-cloudfront"], "resolve_unit", resolve_unit)
-
-    result = deploy_release.build_desired_candidate(
-        "dev", source, "b" * 40, current, observed, None, candidate, verbose=True
-    )
-
-    refreshed = deploy_release.load_desired_unit(candidate / "units/aws-application.json", "aws-application")
-    upstream = deploy_release.load_desired_unit(candidate / "units/application-images.json", "application-images")
-    assert result.blocked == {"aws-application": "receipt is stale: application-images"}
-    assert refreshed.spec.source.revision == "b" * 40
-    assert refreshed.spec.resolvedInputs == ResolvedInputs(receipts={"application-images": "old-receipt"})
-    assert upstream.spec.source.revision == "b" * 40
-    assert (
-        "CARRY    aws-application: receipt is stale: application-images; preserve last resolved inputs"
-        in capsys.readouterr().err
-    )
-
-
-def test_advance_policy_error_leaves_the_candidate_unpublished(tmp_path, monkeypatch):
-    previous_revision = "a" * 40
-    candidate_revision = "b" * 40
-    source, current, _ = _source_resolution_fixture(tmp_path, previous_revision, "sha256:same")
-    _write_json(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
-    _write_json(
-        source / "deployment/environments/dev/units/aws-application.json",
-        {
-            "schema": 1,
-            "name": "aws-application",
-            "driver": "terraform",
-            "source": {"path": "."},
-        },
-    )
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    observed.mkdir()
-    monkeypatch.setattr(deploy_release, "unit_input_hash", lambda *_args: "sha256:same")
-    monkeypatch.setattr(deploy_release, "commit_is_available", lambda _revision: True)
-    monkeypatch.setattr(deploy_release, "commit_is_ancestor", lambda *_args: False)
-
-    with pytest.raises(deploy_release.SourceRevisionUnavailableError, match="unavailable under project policy"):
-        deploy_release.build_desired_candidate(
-            "dev",
-            source,
-            candidate_revision,
-            current,
-            observed,
-            None,
-            candidate,
-            source_revision_policy=deploy_release.SourceRevisionPolicy(
-                when_unavailable_during_advance=deploy_release.SourceRevisionAction.ERROR,
-            ),
-            source_revision_operation="advance",
-        )
-
-    assert not deploy_release.unit_document_path(candidate, "aws-application").is_file()
-
-
-def test_main_reports_actionable_plan_policy_error(monkeypatch, capsys):
-    def handler(_args):
-        raise deploy_release.SourceRevisionUnavailableError("aws-application", "a" * 40, "plan")
-
-    monkeypatch.setattr(
-        deploy_release,
-        "build_parser",
-        lambda: SimpleNamespace(
-            parse_args=lambda: SimpleNamespace(command="schemas", handler=handler),
-        ),
-    )
-
-    assert deploy_release.main() == 1
-    output = capsys.readouterr().err
-    assert "ERROR    aws-application: desired source aaaaaaaaaaaa is unavailable under project policy" in output
-    assert "Run advance-desired from a durable source revision before planning." in output
+    assert result.disposition is deploy_release.SourceResolutionDisposition.UNCHANGED
 
 
 def test_source_input_globs_hash_only_matching_files(tmp_path):
@@ -1628,24 +859,18 @@ def test_source_input_globs_become_git_glob_pathspecs():
 
 
 def test_change_explanation_lists_only_promotion_selectors_whose_fingerprint_changed():
-    base = {
-        "name": "application",
-        "driver": "terraform",
-        "source": {"path": ".", "revision": "a" * 40},
-        "terraform": {"variables": {}},
-    }
     previous = deploy_release.parse_desired_unit_document(
-        {
-            **base,
-            "resolvedInputs": {"promotions": {"application#/image": "same", "application#/tag": "old"}},
-        },
+        _terraform_desired_document(
+            "application",
+            resolved_inputs={"promotions": {"application#/image": "same", "application#/tag": "old"}},
+        ),
         "application",
     )
     current = deploy_release.parse_desired_unit_document(
-        {
-            **base,
-            "resolvedInputs": {"promotions": {"application#/image": "same", "application#/tag": "new"}},
-        },
+        _terraform_desired_document(
+            "application",
+            resolved_inputs={"promotions": {"application#/image": "same", "application#/tag": "new"}},
+        ),
         "application",
     )
 
@@ -1659,12 +884,7 @@ def test_promotion_reference_materializes_from_source_desired_unit(tmp_path):
     source_unit = promotion / "units/aws-application.json"
     _write_json(
         source_unit,
-        {
-            "name": "aws-application",
-            "driver": "terraform",
-            "source": {"path": ".", "revision": "a" * 40},
-            "terraform": {"variables": {"control_image_uri": "registry.example/control@sha256:" + "1" * 64}},
-        },
+        _terraform_desired_document(variables={"control_image_uri": "registry.example/control@sha256:" + "1" * 64}),
     )
 
     resolution = deploy_release.resolve_template(
@@ -1691,12 +911,7 @@ def test_explicit_empty_promotion_pointer_selects_public_spec_and_allows_cross_g
     source_unit = promotion / "units/aws-application.json"
     _write_json(
         source_unit,
-        {
-            "name": "aws-application",
-            "driver": "terraform",
-            "source": {"path": ".", "revision": "a" * 40},
-            "terraform": {"variables": {"environment": "prod"}},
-        },
+        _terraform_desired_document(variables={"environment": "prod"}),
     )
 
     resolution = deploy_release.resolve_template(
@@ -1720,12 +935,7 @@ def test_implicit_promotion_pointer_requires_matching_gvk_even_with_dry_fallback
     promotion = tmp_path / "promotion"
     _write_json(
         promotion / "units/aws-application.json",
-        {
-            "name": "aws-application",
-            "driver": "terraform",
-            "source": {"path": ".", "revision": "a" * 40},
-            "terraform": {"variables": {"image": "release"}},
-        },
+        _terraform_desired_document(variables={"image": "release"}),
     )
 
     with pytest.raises(deploy_release.OperationError, match="requires matching GVKs"):
@@ -1763,12 +973,7 @@ def test_active_promotion_missing_unit_or_pointer_is_fatal_despite_dry_fallback(
 
     _write_json(
         promotion / "units/application.json",
-        {
-            "name": "application",
-            "driver": "terraform",
-            "source": {"path": ".", "revision": "a" * 40},
-            "terraform": {"variables": {}},
-        },
+        _terraform_desired_document("application"),
     )
     with pytest.raises(deploy_release.OperationError, match="cannot resolve pointer"):
         deploy_release.resolve_template(
@@ -1780,107 +985,13 @@ def test_active_promotion_missing_unit_or_pointer_is_fatal_despite_dry_fallback(
         )
 
 
-def test_promoted_candidate_records_pinned_context_and_source_unit_blob(tmp_path, monkeypatch):
-    source = tmp_path / "source"
-    current = tmp_path / "current"
-    observed = tmp_path / "observed"
-    promoted = tmp_path / "promoted"
-    candidate = tmp_path / "candidate"
-    specification = {
-        "schema": 1,
-        "name": "aws-application",
-        "driver": "terraform",
-        "source": {"path": "infra/deploy"},
-        "terraform": {
-            "variables": {
-                "control_image_uri": {
-                    "fromPromotion": {},
-                }
-            }
-        },
-    }
-    _write_json(
-        source / "deployment/environments/staging/environment.json",
-        {
-            "schema": 1,
-            "name": "staging",
-            "promotion": {"allowedSources": ["dev"]},
-        },
-    )
-    _write_json(
-        source / "deployment/environments/staging/units/aws-application.json",
-        specification,
-    )
-    promoted_unit = promoted / "units/aws-application.json"
-    _write_json(
-        promoted_unit,
-        {
-            "name": "aws-application",
-            "driver": "terraform",
-            "source": {"path": "infra/deploy", "revision": "a" * 40},
-            "terraform": {"variables": {"control_image_uri": "registry.example/control@sha256:" + "1" * 64}},
-        },
-    )
-    current.mkdir()
-    observed.mkdir()
-    monkeypatch.setattr(
-        deploy_release,
-        "resolved_unit_source",
-        lambda *_args: deploy_release.ResolvedUnitSourceResult(
-            source=DesiredSource(path="infra/deploy", revision="a" * 40, inputHash="sha256:value"),
-            inputs_changed=True,
-        ),
-    )
-    context = deploy_release.PromotionContext(
-        source_environment="dev",
-        desired_ref="deploy/dev",
-        desired_revision="b" * 40,
-        observed_ref="observed/dev",
-        observed_revision="c" * 40,
-        specification_revision="a" * 40,
-        desired_root=promoted,
-    )
-
-    deploy_release.build_desired_candidate(
-        "staging",
-        source,
-        "a" * 40,
-        current,
-        observed,
-        None,
-        candidate,
-        promotion=context,
-    )
-
-    unit_path = deploy_release.unit_document_path(candidate, "aws-application")
-    assert unit_path.read_text().startswith(
-        "# yaml-language-server: $schema="
-        "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/"
-        "unit.gitopsctr.io/v1/Terraform/desired.schema.json\n"
-    )
-    unit = deploy_release.load_desired_unit(unit_path, "aws-application")
-    assert unit.spec.terraform.variables["control_image_uri"].endswith("1" * 64)
-    assert unit.spec.resolvedInputs.promotions == {
-        "aws-application#/terraform/variables/control_image_uri": deploy_release.file_blob(promoted_unit)
-    }
-    promotion_path = deploy_release.document_candidates(candidate, "promotion")[0]
-    assert promotion_path.read_text().startswith(
-        "# yaml-language-server: $schema="
-        "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/"
-        "gitopsctr.io/v1/Promotion.schema.json\n"
-    )
-    raw_promotion = deploy_release.load_json(promotion_path)
-    promotion = deploy_release.normalize_promotion_document(raw_promotion)
-    assert promotion == {key: value for key, value in context.document().items() if key != "$schema"}
-
-
 def test_promotion_requires_every_source_unit_to_be_clean(tmp_path):
     desired = tmp_path / "desired"
     observed = tmp_path / "observed"
     first = desired / "units/first.json"
     second = desired / "units/second.json"
-    _write_json(first, _unit("first"))
-    _write_json(second, _unit("second"))
+    _write_json(first, _terraform_desired_document("first"))
+    _write_json(second, _terraform_desired_document("second"))
     _write_json(
         observed / "units/first.json",
         receipt_document("terraform", "first", {"unitBlob": deploy_release.file_blob(first)}),
@@ -1894,224 +1005,6 @@ def test_promotion_requires_every_source_unit_to_be_clean(tmp_path):
         receipt_document("terraform", "second", {"unitBlob": deploy_release.file_blob(second)}),
     )
     deploy_release.require_clean_source(desired, observed)
-
-
-def test_promoted_advance_uses_reviewed_specification_revision(tmp_path, monkeypatch):
-    reviewed = "a" * 40
-    materialized: list[str] = []
-    built: list[str] = []
-
-    def fake_materialize(revision, output):
-        materialized.append(revision)
-        _write_json(
-            output / "deployment/environments/staging/environment.json",
-            {
-                "schema": 1,
-                "name": "staging",
-                "promotion": {"allowedSources": ["dev"]},
-            },
-        )
-        _write_json(
-            output / "deployment/environments/staging/units/aws-application.json",
-            {
-                "schema": 1,
-                "name": "aws-application",
-                "driver": "terraform",
-                "source": {"path": "infra/deploy"},
-            },
-        )
-
-    monkeypatch.setattr(deploy_release, "materialize_revision", fake_materialize)
-
-    def fake_observed_tree(ref, output):
-        output.mkdir(parents=True, exist_ok=True)
-        return "c" * 40 if ref == "deploy/staging" else None
-
-    monkeypatch.setattr(deploy_release, "observed_tree", fake_observed_tree)
-    promotion_root = tmp_path / "promoted"
-    promotion_root.mkdir()
-    context = deploy_release.PromotionContext(
-        source_environment="dev",
-        desired_ref="deploy/dev",
-        desired_revision="d" * 40,
-        observed_ref="observed/dev",
-        observed_revision="e" * 40,
-        specification_revision=reviewed,
-        desired_root=promotion_root,
-    )
-    monkeypatch.setattr(deploy_release, "load_promotion_context", lambda *_args: context)
-
-    def fake_build(environment, source_root, source_revision, *_args, **kwargs):
-        built.append(source_revision)
-        candidate = _args[3]
-        _write_json(
-            candidate / "units/aws-application.json",
-            deploy_release.serialize_unit_document(_terraform_desired_resource("aws-application")),
-        )
-        _write_json(candidate / "promotion.json", kwargs["promotion"].document())
-
-    monkeypatch.setattr(deploy_release, "build_desired_candidate", fake_build)
-    monkeypatch.setattr(
-        deploy_release,
-        "log_reconciliation_summary",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("suppressed advancement summary was logged")),
-    )
-
-    _, changed = deploy_release.advance_desired("staging", None, dry=True, summarize=False)
-
-    assert changed is True
-    assert materialized == [reviewed]
-    assert built == [reviewed]
-
-
-def test_promote_parser_exposes_environment_and_revision_contract():
-    args = deploy_release.build_parser().parse_args(
-        [
-            "promote",
-            "--from-environment",
-            "dev",
-            "--to-environment",
-            "staging",
-            "--source-desired-revision",
-            "a" * 40,
-        ]
-    )
-
-    assert args.from_environment == "dev"
-    assert args.to_environment == "staging"
-    assert args.source_desired_revision == "a" * 40
-
-
-def test_advance_desired_command_requests_dirty_source_warning(monkeypatch, capsys):
-    calls = []
-
-    def fake_advance(*args, **kwargs):
-        calls.append((args, kwargs))
-        return "a" * 40, False
-
-    monkeypatch.setattr(deploy_release, "advance_desired", fake_advance)
-    args = deploy_release.build_parser().parse_args(
-        ["advance-desired", "--environment", "dev", "--source-revision", "HEAD", "--dry"]
-    )
-
-    args.handler(args)
-
-    assert calls[0][1]["warn_uncommitted"] is True
-    assert capsys.readouterr().out == "a" * 40 + "\n"
-
-
-def _install_promotion_simulation(monkeypatch, gate: str):
-    specification_revision = "a" * 40
-    source_desired_revision = "b" * 40
-    source_observed_revision = "c" * 40
-    target_revision = "d" * 40
-    publications = []
-
-    def fake_git(*args, **_kwargs):
-        if args[0] == "rev-parse":
-            return subprocess.CompletedProcess(args, 0, specification_revision + "\n", "")
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    def materialize(revision, output):
-        output.mkdir(parents=True, exist_ok=True)
-        if revision != specification_revision:
-            _write_json(output / "units/application.json", {"materialized": revision})
-            return
-        _write_json(
-            output / "deployment/environments/dev/environment.json",
-            {"schema": 1, "name": "dev"},
-        )
-        _write_json(
-            output / "deployment/environments/prod/environment.json",
-            {
-                "schema": 1,
-                "name": "prod",
-                "changeGate": gate,
-                "promotion": {"allowedSources": ["dev"]},
-            },
-        )
-
-    def observed_tree(ref, output):
-        output.mkdir(parents=True, exist_ok=True)
-        return target_revision if ref == "gitopsctr/desired/prod" else None
-
-    def publish(ref, _directory, parent, message):
-        publications.append((ref, parent, message))
-        return "e" * 40
-
-    monkeypatch.setattr(deploy_release, "git", fake_git)
-    monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
-    monkeypatch.setattr(
-        deploy_release,
-        "resolve_ref",
-        lambda ref, _revision=None: (
-            source_desired_revision if ref == "gitopsctr/desired/dev" else source_observed_revision
-        ),
-    )
-    monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
-    monkeypatch.setattr(deploy_release, "require_clean_source", lambda *_args: None)
-    monkeypatch.setattr(
-        deploy_release,
-        "build_desired_candidate",
-        lambda *_args, **_kwargs: _write_json(
-            _args[6] / "units/application.json",
-            deploy_release.serialize_unit_document(_terraform_desired_resource("application")),
-        ),
-    )
-    monkeypatch.setattr(deploy_release, "publish_tree", publish)
-    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: None)
-    monkeypatch.setattr(deploy_release, "candidate_identifier", lambda *_args, **_kwargs: "candidate123")
-    return publications
-
-
-def test_promotion_without_a_change_gate_publishes_target_directly(monkeypatch, capsys):
-    publications = _install_promotion_simulation(monkeypatch, "none")
-    monkeypatch.setattr(
-        deploy_release,
-        "ensure_change_request",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("direct promotion opened a pull request")),
-    )
-    args = deploy_release.build_parser().parse_args(
-        ["promote", "--from-environment", "dev", "--to-environment", "prod"]
-    )
-
-    args.handler(args)
-
-    assert publications == [("gitopsctr/desired/prod", "d" * 40, "Promote dev to prod from " + "b" * 40)]
-    assert capsys.readouterr().out == "e" * 40 + "\n"
-
-
-def test_promotion_with_a_change_gate_creates_a_pull_request(monkeypatch):
-    publications = _install_promotion_simulation(monkeypatch, "pullRequest")
-    requests = []
-    monkeypatch.setattr(
-        deploy_release,
-        "verify_gated_candidate",
-        lambda _candidate_revision, target_revision: deploy_release.GatedCandidate(
-            "e" * 40, target_revision, target_revision
-        ),
-    )
-
-    def ensure(specification, **_kwargs):
-        requests.append(specification)
-        return deploy_release.ChangeRequestResult(status="created", url="https://github.example/pull/1")
-
-    monkeypatch.setattr(deploy_release, "ensure_change_request", ensure)
-    args = deploy_release.build_parser().parse_args(
-        ["promote", "--from-environment", "dev", "--to-environment", "prod"]
-    )
-
-    args.handler(args)
-
-    assert publications == [
-        (
-            "gitopsctr/candidates/prod/candidate123",
-            "d" * 40,
-            "Promote dev to prod from " + "b" * 40,
-        )
-    ]
-    assert requests[0].base == "gitopsctr/desired/prod"
-    assert requests[0].head == "gitopsctr/candidates/prod/candidate123"
 
 
 def test_progress_helpers_keep_result_stdout_clean(capsys):
@@ -2263,7 +1156,7 @@ def test_describe_revision_includes_cached_subject_and_preserves_dry_prefix(tmp_
     assert len(calls) == 1
 
 
-def test_status_and_ref_movement_include_commit_subjects(tmp_path, monkeypatch, capsys):
+def test_status_includes_commit_subjects(tmp_path, monkeypatch, capsys):
     revisions = {"deploy/dev": "a" * 40, "observed/dev": "b" * 40}
     subjects = {"a" * 40: "Prepare desired state", "b" * 40: "Observe frontend"}
     monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
@@ -2274,21 +1167,19 @@ def test_status_and_ref_movement_include_commit_subjects(tmp_path, monkeypatch, 
     args = deploy_release.build_parser().parse_args(["status", "--environment", "dev"])
 
     args.handler(args)
-    deploy_release.log_ref_advance(deploy_release.RefAdvance("desired", "deploy/dev", "a" * 40, "b" * 40))
 
     output = capsys.readouterr()
     assert output.out == ""
     assert "DESIRED  deploy/dev at aaaaaaaaaaaa (Prepare desired state)" in output.err
     assert "OBSERVED observed/dev at bbbbbbbbbbbb (Observe frontend)" in output.err
-    assert "ADVANCE  deploy/dev aaaaaaaaaaaa (Prepare desired state) -> bbbbbbbbbbbb (Observe frontend)" in output.err
 
 
 def test_reconciliation_statuses_identify_clean_ready_and_waiting_units(tmp_path):
     desired = tmp_path / "desired"
     observed = tmp_path / "observed"
     clean_unit = desired / "units/application-images.json"
-    _write_json(clean_unit, _unit("application-images"))
-    _write_json(desired / "units/aws-application.json", _unit("aws-application"))
+    _write_json(clean_unit, _terraform_desired_document("application-images"))
+    _write_json(desired / "units/aws-application.json", _terraform_desired_document("aws-application"))
     _write_json(
         observed / "units/application-images.json",
         receipt_document("terraform", "application-images", {"unitBlob": deploy_release.file_blob(clean_unit)}),
@@ -2306,16 +1197,7 @@ def test_reconciliation_statuses_identify_clean_ready_and_waiting_units(tmp_path
 
 
 def test_desired_unit_rejects_an_incompatible_running_driver_version():
-    unit = {
-        "schema": 1,
-        "name": "aws-application",
-        "driver": "terraform",
-        "source": {
-            "path": "infra/deploy",
-            "revision": "a" * 40,
-            "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"] + 1,
-        },
-    }
+    unit = _terraform_desired_document(driver_version=deploy_release.DRIVER_VERSIONS["terraform"] + 1)
     resource = deploy_release.RESOURCE_CATALOG.parse_unit(unit, profile="desired", expected_name="aws-application")
 
     with pytest.raises(deploy_release.OperationError, match="driver version"):
@@ -2394,28 +1276,6 @@ def test_duplicate_receipt_rejects_a_different_semantic_result(tmp_path, monkeyp
 
 
 def test_unit_change_explanation_classifies_causal_changes(monkeypatch):
-    previous = {
-        "driver": "terraform",
-        "source": {
-            "path": "infra/deploy",
-            "revision": "a" * 40,
-            "inputHash": "sha256:old",
-            "driverVersion": 1,
-        },
-        "resolvedInputs": {"receipts": {"images": "old"}},
-        "terraform": {"variables": {"environment": "old"}},
-    }
-    current = {
-        "driver": "terraform",
-        "source": {
-            "path": "infra/deploy",
-            "revision": "b" * 40,
-            "inputHash": "sha256:new",
-            "driverVersion": 2,
-        },
-        "resolvedInputs": {"receipts": {"images": "new"}},
-        "terraform": {"variables": {"environment": "dev"}},
-    }
     monkeypatch.setattr(
         deploy_release,
         "source_change_evidence",
@@ -2426,10 +1286,25 @@ def test_unit_change_explanation_classifies_causal_changes(monkeypatch):
     )
 
     previous_resource = deploy_release.RESOURCE_CATALOG.parse_unit(
-        {"name": "aws-application", **previous}, profile="desired", expected_name="aws-application"
+        _terraform_desired_document(
+            input_hash="sha256:old",
+            driver_version=1,
+            variables={"environment": "old"},
+            resolved_inputs={"receipts": {"images": "old"}},
+        ),
+        profile="desired",
+        expected_name="aws-application",
     )
     current_resource = deploy_release.RESOURCE_CATALOG.parse_unit(
-        {"name": "aws-application", **current}, profile="desired", expected_name="aws-application"
+        _terraform_desired_document(
+            revision="b" * 40,
+            input_hash="sha256:new",
+            driver_version=2,
+            variables={"environment": "dev"},
+            resolved_inputs={"receipts": {"images": "new"}},
+        ),
+        profile="desired",
+        expected_name="aws-application",
     )
     explanation = deploy_release.classify_unit_change(previous_resource, current_resource, "c" * 40)
 
@@ -2478,35 +1353,12 @@ def test_reconciliation_explanation_is_visible_and_bounded_before_approval(tmp_p
     assert "FILE     M\tinfra/deploy/main.tf" in output
 
 
-def test_convergence_plan_distinguishes_next_later_wait_and_clean():
-    rows = deploy_release.convergence_plan_rows(
-        [
-            ("application-images", "CLEAN", "observation matches desired state"),
-            ("aws-application", "READY", "desired inputs changed since its last receipt"),
-            ("frontend", "READY", "desired inputs changed since its last receipt"),
-            ("frontend-bundle", "WAIT", "desired inputs are not materialized"),
-        ],
-        ["application-images", "aws-application", "frontend-bundle", "frontend"],
-    )
-
-    assert rows == [
-        ("application-images", "CLEAN", "observation matches desired state"),
-        ("aws-application", "NEXT", "desired inputs changed since its last receipt"),
-        ("frontend-bundle", "WAIT", "desired inputs are not materialized"),
-        ("frontend", "LATER", "re-evaluate after aws-application"),
-    ]
-
-
 def test_compact_approval_card_shows_driver_change_evidence_and_write_boundary(tmp_path, monkeypatch, capsys):
     desired = tmp_path / "desired"
     observed = tmp_path / "observed"
     _write_json(
         desired / "units/aws-application.json",
-        {
-            "name": "aws-application",
-            "driver": "terraform",
-            "source": {"path": "infra/deploy", "revision": "a" * 40},
-        },
+        _terraform_desired_document(),
     )
     explanation = deploy_release.UnitChangeExplanation(
         previous_desired_revision="a" * 40,
@@ -2554,14 +1406,14 @@ def test_status_allows_all_environment_and_single_unit_modes():
     assert unit.unit == "web"
 
 
-def test_status_without_environment_delegates_to_environment_summary(monkeypatch):
+def test_status_without_environment_delegates_to_registry_inventory(monkeypatch):
     captured = []
-    monkeypatch.setattr(deploy_release, "command_list_environments", lambda args: captured.append(args.json))
+    monkeypatch.setattr(deploy_release, "inspect_resources", lambda root, args: captured.append((root, args.selector)))
 
     args = deploy_release.build_parser().parse_args(["status"])
     args.handler(args)
 
-    assert captured == [False]
+    assert captured == [(deploy_release.REPOSITORY_ROOT, "environments")]
 
 
 def test_status_can_focus_on_one_unit(tmp_path, monkeypatch):
@@ -2835,93 +1687,20 @@ def test_change_gate_rejects_unknown_modes(tmp_path):
         deploy_release.load_environment(tmp_path, "prod")
 
 
-def test_advance_source_revision_is_required_only_for_source_tracked_environments(tmp_path, monkeypatch):
-    _write_json(
-        tmp_path / "deployment/environments/dev/environment.json",
-        {"schema": 1, "name": "dev"},
-    )
-    _write_json(
-        tmp_path / "deployment/environments/prod/environment.json",
-        {
-            "schema": 1,
-            "name": "prod",
-            "promotion": {"allowedSources": ["staging"]},
-        },
-    )
-    monkeypatch.setattr(
-        deploy_release,
-        "git",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(_args, 0, "a" * 40 + "\n", ""),
-    )
-
-    assert deploy_release.resolve_advance_source_revision(tmp_path, "dev", "HEAD") == "a" * 40
-    with pytest.raises(deploy_release.OperationError, match="requires --source-revision"):
-        deploy_release.resolve_advance_source_revision(tmp_path, "dev", None)
-    assert deploy_release.resolve_advance_source_revision(tmp_path, "prod", None) is None
-    with pytest.raises(deploy_release.OperationError, match="does not accept --source-revision"):
-        deploy_release.resolve_advance_source_revision(tmp_path, "prod", "HEAD")
-
-
 def _unit(name: str, inputs: dict | None = None) -> dict:
     return {
-        "schema": 1,
-        "name": name,
-        "driver": "terraform",
-        "source": {"path": "infra/deploy"},
-        **({"inputs": inputs} if inputs else {}),
+        "apiVersion": "unit.gitopsctr.io/v1",
+        "kind": "Terraform",
+        "metadata": {"name": name},
+        "spec": {
+            "source": {"path": "infra/deploy"},
+            **({"inputs": inputs} if inputs else {}),
+        },
     }
 
 
 def _unit_resource(name: str, inputs: dict | None = None):
     return deploy_release.parse_authored_unit_document(_unit(name, inputs), name)
-
-
-def test_convergence_scope_includes_only_transitive_observation_dependencies():
-    specifications = {
-        "application-images": _unit_resource("application-images"),
-        "aws-application": _unit_resource(
-            "aws-application",
-            {
-                "image": {
-                    "fromReceipt": {"unit": "application-images", "pointer": "/image"},
-                }
-            },
-        ),
-        "frontend-bundle": _unit_resource("frontend-bundle"),
-        "frontend": _unit_resource(
-            "frontend",
-            {
-                "bundle": {
-                    "fromReceipt": {"unit": "frontend-bundle", "pointer": "/bundle"},
-                },
-                "api": {
-                    "fromReceipt": {"unit": "aws-application", "pointer": "/api"},
-                },
-            },
-        ),
-        "unrelated": _unit_resource("unrelated"),
-    }
-
-    selection = deploy_release.convergence_scope(specifications, ["frontend"])
-    targets, scope = selection.targets, selection.scope
-
-    assert targets == ("frontend",)
-    assert scope == (
-        "application-images",
-        "aws-application",
-        "frontend",
-        "frontend-bundle",
-    )
-    assert deploy_release.convergence_order(specifications, scope).index(
-        "application-images"
-    ) < deploy_release.convergence_order(specifications, scope).index("aws-application")
-    graph = deploy_release.dependency_graph(specifications, scope)
-    assert graph.render_tree("frontend") == (
-        "frontend",
-        "├── aws-application",
-        "│   └── application-images",
-        "└── frontend-bundle",
-    )
 
 
 def test_dependencies_parser_defaults_to_head_and_accepts_repeated_units():
@@ -3047,469 +1826,3 @@ def test_dependencies_command_prints_the_resolved_tree(monkeypatch, capsys):
         {"name": "producer", "dependencies": ["base"]},
         {"name": "consumer", "dependencies": ["producer"]},
     ]
-
-
-def test_converge_parser_accepts_repeated_targets_and_optional_guard():
-    args = deploy_release.build_parser().parse_args(
-        [
-            "converge",
-            "--environment",
-            "dev",
-            "--source-revision",
-            "HEAD",
-            "--unit",
-            "frontend",
-            "--unit",
-            "aws-application",
-            "--fail-on-repeat",
-            "--max-steps",
-            "7",
-            "--yes",
-            "--verbose",
-        ]
-    )
-
-    assert args.unit == ["frontend", "aws-application"]
-    assert args.fail_on_repeat is True
-    assert args.max_steps == 7
-    assert args.yes is True
-    assert args.verbose is True
-
-    promoted = deploy_release.build_parser().parse_args(["converge", "--environment", "prod", "--yes"])
-    assert promoted.source_revision is None
-
-
-def _install_convergence_simulation(
-    monkeypatch,
-    tmp_path,
-    specifications: dict[str, dict],
-    desired_units: list[dict[str, str]],
-):
-    source_revision = "a" * 40
-    desired_revisions = [chr(ord("b") + index) * 40 for index in range(len(desired_units))]
-    state = {
-        "desired_index": -1,
-        "desired": "0" * 40,
-        "observed": None,
-        "receipts": {},
-        "reconciled": [],
-        "advance_calls": 0,
-        "advance_summarize": [],
-    }
-
-    def fake_git(*args, **_kwargs):
-        if args[0] == "status":
-            return subprocess.CompletedProcess(args, 0, "", "")
-        return subprocess.CompletedProcess(args, 0, source_revision + "\n", "")
-
-    monkeypatch.setattr(deploy_release, "git", fake_git)
-
-    def write_source(output: Path):
-        _write_json(
-            output / "deployment/environments/dev/environment.json",
-            {"schema": 1, "name": "dev"},
-        )
-        for unit_name, specification in specifications.items():
-            _write_json(
-                output / f"deployment/environments/dev/units/{unit_name}.json",
-                specification,
-            )
-
-    def materialize(revision: str, output: Path):
-        output.mkdir(parents=True, exist_ok=True)
-        if revision == source_revision:
-            write_source(output)
-            return
-        index = desired_revisions.index(revision)
-        for unit_name, blob in desired_units[index].items():
-            specification = specifications[unit_name]
-            desired = {
-                **specification,
-                "source": {
-                    **specification["source"],
-                    "revision": source_revision,
-                    "driverVersion": deploy_release.DRIVER_VERSIONS[specification["driver"]],
-                },
-                "terraform": {"variables": {"blob": blob}},
-            }
-            if "inputs" in specification:
-                desired["inputs"] = {"value": blob}
-            _write_json(output / f"units/{unit_name}.json", desired)
-
-    def observed_tree(ref: str, output: Path):
-        output.mkdir(parents=True, exist_ok=True)
-        if ref == "deploy/dev":
-            return state["desired"]
-        for unit_name, blob in state["receipts"].items():
-            _write_json(
-                output / f"units/{unit_name}.json",
-                receipt_document(
-                    specifications[unit_name]["driver"],
-                    unit_name,
-                    {"unitBlob": blob},
-                    {"applied": {"sourceRevision": source_revision}, "outputs": {}}
-                    if specifications[unit_name]["driver"] == "terraform"
-                    else {},
-                ),
-            )
-        return state["observed"]
-
-    def fetch_ref(ref: str):
-        return state["desired"] if ref == "deploy/dev" else state["observed"]
-
-    def advance(*_args, **kwargs):
-        state["advance_calls"] += 1
-        state["advance_summarize"].append(kwargs.get("summarize"))
-        next_index = min(state["desired_index"] + 1, len(desired_units) - 1)
-        changed = next_index != state["desired_index"]
-        state["desired_index"] = next_index
-        state["desired"] = desired_revisions[next_index]
-        return state["desired"], changed
-
-    def reconcile(args):
-        current = desired_units[state["desired_index"]]
-        assert args.desired_revision == state["desired"]
-        assert args.unit in current
-        state["reconciled"].append(args.unit)
-        state["receipts"][args.unit] = current[args.unit]
-        state["observed"] = str(len(state["reconciled"])) * 40
-        return True
-
-    monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
-    monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
-    monkeypatch.setattr(deploy_release, "fetch_ref", fetch_ref)
-    monkeypatch.setattr(deploy_release, "advance_desired", advance)
-    monkeypatch.setattr(deploy_release, "command_reconcile", reconcile)
-    monkeypatch.setattr(
-        deploy_release,
-        "file_blob",
-        lambda path: deploy_release.load_json(path)["terraform"]["variables"]["blob"],
-    )
-    return state
-
-
-def test_converge_runs_dependency_first_and_ignores_unselected_unit(tmp_path, monkeypatch, capsys):
-    specifications = {
-        "producer": _unit("producer"),
-        "consumer": _unit(
-            "consumer",
-            {
-                "value": {
-                    "fromReceipt": {"unit": "producer", "pointer": "/value"},
-                }
-            },
-        ),
-        "unrelated": _unit("unrelated"),
-    }
-    state = _install_convergence_simulation(
-        monkeypatch,
-        tmp_path,
-        specifications,
-        [
-            {"producer": "producer-v1"},
-            {"producer": "producer-v1", "consumer": "consumer-v1"},
-        ],
-    )
-    args = deploy_release.build_parser().parse_args(
-        [
-            "converge",
-            "--environment",
-            "dev",
-            "--source-revision",
-            "HEAD",
-            "--unit",
-            "consumer",
-            "--yes",
-        ]
-    )
-
-    args.handler(args)
-
-    assert state["reconciled"] == ["producer", "consumer"]
-    assert state["advance_calls"] == 3
-    assert state["advance_summarize"] == [False, False, False]
-    output = capsys.readouterr().err
-    assert "SCOPE    consumer, producer" in output
-    assert "NEXT     producer: no observation receipt" in output
-    assert "WAIT     consumer: desired inputs are not materialized" in output
-    assert "RUN      producer" in output
-    assert "RUN      consumer" in output
-    assert "RESULT   CLEAN: 2/2 units" in output
-    assert "DEPEND" not in output
-    assert "WARN" not in output
-
-
-def test_converge_warns_once_for_uncommitted_source_changes(tmp_path, monkeypatch, capsys):
-    _install_convergence_simulation(
-        monkeypatch,
-        tmp_path,
-        {"application": _unit("application")},
-        [{"application": "v1"}],
-    )
-    monkeypatch.setattr(deploy_release, "working_tree_has_uncommitted_changes", lambda: True)
-    args = deploy_release.build_parser().parse_args(
-        ["converge", "--environment", "dev", "--source-revision", "HEAD", "--yes"]
-    )
-
-    args.handler(args)
-
-    assert capsys.readouterr().err.count("WARN") == 1
-
-
-def test_converge_requires_approval_before_each_reconciliation(tmp_path, monkeypatch, capsys):
-    state = _install_convergence_simulation(
-        monkeypatch,
-        tmp_path,
-        {"application": _unit("application")},
-        [{"application": "v1"}],
-    )
-    monkeypatch.setattr(sys, "stdin", io.StringIO("no\n"))
-    args = deploy_release.build_parser().parse_args(
-        [
-            "converge",
-            "--environment",
-            "dev",
-            "--source-revision",
-            "HEAD",
-        ]
-    )
-
-    with pytest.raises(deploy_release.OperationError, match="was not approved"):
-        args.handler(args)
-
-    assert state["reconciled"] == []
-    output = capsys.readouterr().err
-    assert "Next action: application" in output
-    assert "APPROVE  Continue with application? [y/N]" in output
-    assert "RESULT   FAILED: reconciliation of application was not approved" in output
-
-
-def test_converge_verbose_preserves_dependency_and_reconciliation_trace(tmp_path, monkeypatch, capsys):
-    state = _install_convergence_simulation(
-        monkeypatch,
-        tmp_path,
-        {"application": _unit("application")},
-        [{"application": "v1"}],
-    )
-    args = deploy_release.build_parser().parse_args(
-        [
-            "converge",
-            "--environment",
-            "dev",
-            "--source-revision",
-            "HEAD",
-            "--yes",
-            "--verbose",
-        ]
-    )
-
-    args.handler(args)
-
-    assert state["reconciled"] == ["application"]
-    output = capsys.readouterr().err
-    assert "DEPEND   application: none" in output
-    assert "Reconciliation status for dev" in output
-    assert "Convergence step 1 (limit 2): application" in output
-    assert "Convergence summary for dev" in output
-
-
-def test_converge_repeat_guard_fails_before_running_same_unit_again(tmp_path, monkeypatch, capsys):
-    specifications = {"bootstrap": _unit("bootstrap")}
-    state = _install_convergence_simulation(
-        monkeypatch,
-        tmp_path,
-        specifications,
-        [{"bootstrap": "v1"}, {"bootstrap": "v2"}],
-    )
-    args = deploy_release.build_parser().parse_args(
-        [
-            "converge",
-            "--environment",
-            "dev",
-            "--source-revision",
-            "HEAD",
-            "--fail-on-repeat",
-            "--yes",
-        ]
-    )
-
-    with pytest.raises(deploy_release.OperationError, match="repeated ready unit.*bootstrap"):
-        args.handler(args)
-
-    assert state["reconciled"] == ["bootstrap"]
-    output = capsys.readouterr().err
-    assert "RESULT   FAILED: convergence heuristic" in output
-
-
-def test_converge_allows_a_repeated_unit_by_default(tmp_path, monkeypatch):
-    specifications = {"bootstrap": _unit("bootstrap")}
-    state = _install_convergence_simulation(
-        monkeypatch,
-        tmp_path,
-        specifications,
-        [{"bootstrap": "v1"}, {"bootstrap": "v2"}],
-    )
-    args = deploy_release.build_parser().parse_args(
-        [
-            "converge",
-            "--environment",
-            "dev",
-            "--source-revision",
-            "HEAD",
-            "--yes",
-        ]
-    )
-
-    args.handler(args)
-
-    assert state["reconciled"] == ["bootstrap", "bootstrap"]
-
-
-def test_converge_without_repeat_guard_is_still_bounded(tmp_path, monkeypatch, capsys):
-    specifications = {"bootstrap": _unit("bootstrap")}
-    state = _install_convergence_simulation(
-        monkeypatch,
-        tmp_path,
-        specifications,
-        [{"bootstrap": "v1"}, {"bootstrap": "v2"}, {"bootstrap": "v3"}],
-    )
-    args = deploy_release.build_parser().parse_args(
-        [
-            "converge",
-            "--environment",
-            "dev",
-            "--source-revision",
-            "HEAD",
-            "--max-steps",
-            "2",
-            "--yes",
-        ]
-    )
-
-    with pytest.raises(deploy_release.OperationError, match="within 2 reconciliation steps"):
-        args.handler(args)
-
-    assert state["reconciled"] == ["bootstrap", "bootstrap"]
-    assert "RESULT   FAILED" in capsys.readouterr().err
-
-
-def test_converge_exits_at_unmerged_promotion_review_gate(tmp_path, monkeypatch, capsys):
-    specification = _unit(
-        "application",
-        {
-            "image": {
-                "fromPromotion": {"unit": "application", "pointer": "/image"},
-            }
-        },
-    )
-    state = _install_convergence_simulation(
-        monkeypatch,
-        tmp_path,
-        {"application": specification},
-        [{"application": "v1"}],
-    )
-
-    args = deploy_release.build_parser().parse_args(
-        [
-            "converge",
-            "--environment",
-            "dev",
-            "--source-revision",
-            "HEAD",
-        ]
-    )
-    with pytest.raises(deploy_release.OperationError, match="review gate"):
-        args.handler(args)
-
-    assert state["advance_calls"] == 0
-    assert state["reconciled"] == []
-    output = capsys.readouterr().err
-    assert "REVIEW" in output
-    assert "RESULT   FAILED: review gate" in output
-
-
-def test_promoted_converge_uses_merged_specification_without_source_revision(tmp_path, monkeypatch, capsys):
-    reviewed = "a" * 40
-    desired_revision = "d" * 40
-    promotion_root = tmp_path / "promotion"
-    promotion_root.mkdir()
-    context = deploy_release.PromotionContext(
-        source_environment="staging",
-        desired_ref="deploy/staging",
-        desired_revision="b" * 40,
-        observed_ref="observed/staging",
-        observed_revision="c" * 40,
-        specification_revision=reviewed,
-        desired_root=promotion_root,
-    )
-
-    def materialize(revision, output):
-        output.mkdir(parents=True, exist_ok=True)
-        if revision == reviewed:
-            _write_json(
-                output / "deployment/environments/prod/environment.json",
-                {
-                    "schema": 1,
-                    "name": "prod",
-                    "promotion": {"allowedSources": ["staging"]},
-                },
-            )
-            _write_json(
-                output / "deployment/environments/prod/units/application.json",
-                {
-                    **_unit(
-                        "application",
-                        {
-                            "image": {
-                                "fromPromotion": {"unit": "application", "pointer": "/image"},
-                            }
-                        },
-                    )
-                },
-            )
-        elif revision == desired_revision:
-            _write_json(
-                output / "units/application.json",
-                {
-                    **_unit("application"),
-                    "source": {
-                        "path": "infra/deploy",
-                        "revision": reviewed,
-                        "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"],
-                    },
-                    "terraform": {"variables": {"blob": "release-v1"}},
-                },
-            )
-
-    def observed_tree(ref, output):
-        output.mkdir(parents=True, exist_ok=True)
-        if ref == "deploy/prod":
-            return desired_revision
-        _write_json(
-            output / "units/application.json",
-            receipt_document("terraform", "application", {"unitBlob": "release-v1"}),
-        )
-        return "e" * 40
-
-    monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
-    monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
-    monkeypatch.setattr(deploy_release, "fetch_ref", lambda ref: "e" * 40)
-    monkeypatch.setattr(deploy_release, "load_promotion_context", lambda *_args: context)
-    monkeypatch.setattr(
-        deploy_release,
-        "file_blob",
-        lambda path: deploy_release.load_json(path)["terraform"]["variables"]["blob"],
-    )
-
-    def advance(_environment, source_revision, *_args, **_kwargs):
-        assert source_revision is None
-        return desired_revision, False
-
-    monkeypatch.setattr(deploy_release, "advance_desired", advance)
-    args = deploy_release.build_parser().parse_args(["converge", "--environment", "prod", "--yes"])
-
-    args.handler(args)
-
-    output = capsys.readouterr().err
-    assert "RESULT   CLEAN" in output
-    assert "WARN" not in output

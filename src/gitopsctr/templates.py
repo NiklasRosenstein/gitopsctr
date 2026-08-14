@@ -19,7 +19,7 @@ from gitopsctr.api import GVK
 from gitopsctr.document import REFERENCE_KEYS as DOCUMENT_REFERENCE_KEYS
 from gitopsctr.document import JsonObject, JsonScalar, JsonValue, require_json_value
 
-# ``fromEnvironment`` is a value lookup, not a source or lifecycle reference.
+# ``fromEnvironment`` is a value lookup, not a template-source reference.
 # Keep it in this module's expression language without changing the lower-level
 # document contract used by resolved JSON values.
 REFERENCE_KEYS = frozenset((*DOCUMENT_REFERENCE_KEYS, "fromEnvironment"))

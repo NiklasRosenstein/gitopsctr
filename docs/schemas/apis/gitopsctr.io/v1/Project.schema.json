@@ -125,9 +125,9 @@
               ],
               "type": "string"
             },
-            "whenUnavailableDuringAdvance": {
+            "whenUnavailableDuringApply": {
               "default": "refresh",
-              "description": "Action when an unavailable retained source is found during advancement.",
+              "description": "Action when an unavailable retained source is found during apply.",
               "enum": [
                 "refresh",
                 "error"

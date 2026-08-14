@@ -1,13 +1,52 @@
 # GitHub Action
 
-The repository's composite Action wraps `prepare`, `reconcile`, `advance`, `promote`, and `rollback`. The caller must
-check out the deployment repository, supply deployment credentials and external tools, and configure concurrency.
-`prepare` is Action-only orchestration: it advances from a supplied source revision or resolves an existing desired
-revision; it is not an additional CLI command or persisted resource.
+The repository's composite Action wraps `apply`, `converge`, `reconcile`, `promote`, and `rollback`. It also provides
+`prepare` as a read-only helper that selects an existing desired revision before reconciliation jobs fan out. The
+caller must check out the deployment repository, supply deployment credentials and external tools, and configure
+concurrency.
+
+## Apply explicit input
+
+Apply one authoritative partition from checked-out files:
+
+```yaml
+- id: apply
+  uses: NiklasRosenstein/gitopsctr@<commit-or-ref>
+  with:
+    operation: apply
+    package-source: action
+    environment: dev
+    partition: application
+    files: |
+      deployment/environments/dev/stacks/application.yaml
+    source-revision: ${{ github.sha }}
+```
+
+`files` is a newline-separated list of paths. The Action passes every path directly to `gitopsctr apply -f`; it never
+reconstructs implicit source input. Apply and gated publication expose `change-revision`, `change-status`,
+`change-url`, `candidate-ref`, and `target-ref`.
+
+## Converge
+
+Converge with the same explicit input for the duration of the Action step:
+
+```yaml
+- uses: NiklasRosenstein/gitopsctr@<commit-or-ref>
+  with:
+    operation: converge
+    package-source: action
+    environment: dev
+    partition: application
+    files: deployment/environments/dev/stacks/application.yaml
+    source-revision: ${{ github.sha }}
+```
+
+Omit `files` to reconcile current desired state. Omit both `unit` and `partition` to converge every desired Unit;
+`partition` selects all Units in that apply partition, while `unit` selects one explicit Unit.
 
 ## Prepare and reconcile
 
-Prepare selects one exact desired revision before reconciliation jobs fan out:
+`prepare` resolves an existing desired-ref head or exact desired revision. It never applies authored source:
 
 ```yaml
 - id: prepare
@@ -16,17 +55,7 @@ Prepare selects one exact desired revision before reconciliation jobs fan out:
     operation: prepare
     package-source: action
     environment: dev
-    source-revision: ${{ github.sha }}
-    require-source-ref: main
-```
 
-Important outputs are `active`, `desired-revision`, `desired-changed`, and `advance-after-reconcile`. A superseded
-source revision returns `active=false`. Supplying an exact desired revision fixes the run; otherwise later receipts may
-unlock another desired advance.
-
-Reconcile one selected unit with the prepared revision:
-
-```yaml
 - uses: NiklasRosenstein/gitopsctr@<commit-or-ref>
   with:
     operation: reconcile
@@ -36,7 +65,12 @@ Reconcile one selected unit with the prepared revision:
     desired-revision: ${{ steps.prepare.outputs.desired-revision }}
 ```
 
+The prepare outputs are `active` and `desired-revision`. `active=false` means the selected desired state does not
+exist. Reconcile publishes a Receipt only after its driver succeeds.
+
 ## Promote
+
+Promotion requires explicit target input in addition to its pinned source context:
 
 ```yaml
 - uses: NiklasRosenstein/gitopsctr@<commit-or-ref>
@@ -44,12 +78,13 @@ Reconcile one selected unit with the prepared revision:
     operation: promote
     from-environment: dev
     to-environment: staging
+    files: deployment/environments/staging/stacks/application.yaml
+    partition: application
     specification-revision: ${{ github.sha }}
 ```
 
-Direct and gated changes expose `change-revision`, `change-status`, `change-url`, `candidate-ref`, and `target-ref`.
-The optional `candidate-ref` input is an exact override for either a gated promotion or rollback. Gated changes require
-`contents: write` and `pull-requests: write`; receipt publication requires `contents: write`.
+The same change outputs describe direct publication or a gated candidate. Gated changes require `contents: write` and
+`pull-requests: write`; Receipt publication requires `contents: write`.
 
 ## Roll back
 
@@ -63,8 +98,7 @@ The optional `candidate-ref` input is an exact override for either a gated promo
     reason: Incident mitigation
 ```
 
-An empty `units` input rolls back the full tree. The same change outputs describe direct publication or a gated
-candidate.
+An empty `units` input rolls back the full tree.
 
 ## Package source
 

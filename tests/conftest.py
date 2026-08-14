@@ -9,7 +9,7 @@ FIXTURE_REPOSITORY = Path(__file__).parent / "fixtures/repository"
 
 
 def write_test_document(path: Path, value: object) -> None:
-    """Write legacy-shaped test data, enveloping authored source documents."""
+    """Write concise test data, enveloping authored source resources when needed."""
 
     if not isinstance(value, dict):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,14 +36,26 @@ def write_test_document(path: Path, value: object) -> None:
                 )
             )
         if path.stem == "environment":
-            value = controller_module.serialize_environment_document(
-                controller_module.normalize_environment_document(value, path.parent.name)
-            )
-        elif path.parent.name == "units":
-            value = controller_module.serialize_unit_document(
-                controller_module.parse_authored_unit_document(value, path.stem),
-                profile="authored",
-            )
+            if value.get("apiVersion") is None:
+                specification = {key: item for key, item in value.items() if key not in {"$schema", "schema", "name"}}
+                value = {
+                    "apiVersion": "gitopsctr.io/v1",
+                    "kind": "Environment",
+                    "metadata": {"name": value.get("name", path.parent.name)},
+                    "spec": specification,
+                }
+        elif path.parent.name == "units" and value.get("apiVersion") is None:
+            driver_name = value.get("driver")
+            plugin = controller_module.UNIT_DRIVERS.get(driver_name) if isinstance(driver_name, str) else None
+            if plugin is not None:
+                value = {
+                    "apiVersion": plugin.api_version,
+                    "kind": plugin.kind,
+                    "metadata": {"name": value.get("name", path.stem)},
+                    "spec": {
+                        key: item for key, item in value.items() if key not in {"$schema", "schema", "name", "driver"}
+                    },
+                }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value))
 

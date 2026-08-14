@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
 import tarfile
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from gitopsctr.errors import OperationError
 
@@ -44,113 +43,6 @@ class ControllerPin:
     name: str
     ref: str
     revision: str
-
-
-PinClaimState = Literal["preparing", "active", "reaping"]
-
-
-@dataclass(frozen=True)
-class ControllerPinClaim:
-    """A CAS-fenced claim for one controller-owned Stack pin."""
-
-    environment: str
-    stack_name: str
-    uid: str
-    pin_name: str
-    pin_revision: str
-    target_ref: str
-    target_revision: str
-    candidate_ref: str
-    candidate_revision: str | None
-    state: PinClaimState
-    revision: str | None = None
-
-    @property
-    def ref(self) -> str:
-        return f"gitopsctr/pin-claims/stacks/{self.environment}/{self.stack_name}/{self.uid}"
-
-    def document(self) -> dict[str, object]:
-        return {
-            "schema": 1,
-            "kind": "ControllerPinClaim",
-            "environment": self.environment,
-            "stackName": self.stack_name,
-            "uid": self.uid,
-            "pinName": self.pin_name,
-            "pinRevision": self.pin_revision,
-            "targetRef": self.target_ref,
-            "targetRevision": self.target_revision,
-            "candidateRef": self.candidate_ref,
-            "candidateRevision": self.candidate_revision,
-            "state": self.state,
-        }
-
-    @classmethod
-    def from_document(cls, document: object, *, revision: str | None = None) -> ControllerPinClaim:
-        if not isinstance(document, dict):
-            raise OperationError("controller pin claim is not an object")
-        expected = {
-            "schema",
-            "kind",
-            "environment",
-            "stackName",
-            "uid",
-            "pinName",
-            "pinRevision",
-            "targetRef",
-            "targetRevision",
-            "candidateRef",
-            "candidateRevision",
-            "state",
-        }
-        if set(document) != expected or document.get("schema") != 1 or document.get("kind") != "ControllerPinClaim":
-            raise OperationError("controller pin claim has an invalid shape")
-        values = {key: document[key] for key in expected - {"schema", "kind"}}
-        if not all(
-            isinstance(values[key], str) and values[key]
-            for key in (
-                "environment",
-                "stackName",
-                "uid",
-                "pinName",
-                "pinRevision",
-                "targetRef",
-                "targetRevision",
-                "candidateRef",
-                "state",
-            )
-        ):
-            raise OperationError("controller pin claim has invalid string fields")
-        candidate_revision = values["candidateRevision"]
-        if candidate_revision is not None and not isinstance(candidate_revision, str):
-            raise OperationError("controller pin claim has an invalid candidate revision")
-        state = values["state"]
-        if not isinstance(state, str) or state not in {"preparing", "active", "reaping"}:
-            raise OperationError("controller pin claim has an invalid state")
-        claim = cls(
-            environment=values["environment"],
-            stack_name=values["stackName"],
-            uid=values["uid"],
-            pin_name=values["pinName"],
-            pin_revision=values["pinRevision"],
-            target_ref=values["targetRef"],
-            target_revision=values["targetRevision"],
-            candidate_ref=values["candidateRef"],
-            candidate_revision=candidate_revision,
-            state=state,
-            revision=revision,
-        )
-        if claim.pin_name != f"stacks/{claim.environment}/{claim.stack_name}/{claim.uid}":
-            raise OperationError("controller pin claim does not match its Stack identity")
-        if not re.fullmatch(r"[0-9a-f]{40}", claim.pin_revision) or not re.fullmatch(
-            r"[0-9a-f]{40}", claim.target_revision
-        ):
-            raise OperationError("controller pin claim has an invalid revision")
-        if claim.candidate_revision is not None and not re.fullmatch(r"[0-9a-f]{40}", claim.candidate_revision):
-            raise OperationError("controller pin claim has an invalid candidate revision")
-        if claim.revision is not None and not re.fullmatch(r"[0-9a-f]{40}", claim.revision):
-            raise OperationError("controller pin claim has an invalid claim revision")
-        return claim
 
 
 @dataclass(frozen=True)
@@ -208,32 +100,62 @@ class GitStateStore:
         A concurrent creator cannot replace the pin with another revision.
         """
 
-        pin_ref = self._controller_pin_ref(name)
-        resolved_revision = self._resolve_commit(revision)
-        existing_revision = self._remote_ref_revision(pin_ref)
-        if existing_revision is not None:
-            if existing_revision != resolved_revision:
-                raise OperationError(
-                    f"controller pin {name!r} already points to {existing_revision}, "
-                    f"not requested revision {resolved_revision}"
+        return self.create_controller_pins({name: revision})[0]
+
+    def create_controller_pins(self, revisions: Mapping[str, str]) -> tuple[ControllerPin, ...]:
+        """Atomically retain a set of exact revisions under controller refs.
+
+        Existing exact pins are idempotent. All requested commits and ref names
+        are validated before the first remote mutation, and missing refs are
+        created by one atomic push so a failed batch cannot leave a partial set.
+        """
+
+        requested = tuple(
+            sorted(
+                (
+                    name,
+                    self._controller_pin_ref(name),
+                    self._resolve_commit(revision),
                 )
-            return ControllerPin(name, pin_ref, resolved_revision)
+                for name, revision in revisions.items()
+            )
+        )
+        if not requested:
+            return ()
+        for _attempt in range(3):
+            missing: list[tuple[str, str, str]] = []
+            for name, pin_ref, revision in requested:
+                existing_revision = self._remote_ref_revision(pin_ref)
+                if existing_revision is None:
+                    missing.append((name, pin_ref, revision))
+                elif existing_revision != revision:
+                    raise OperationError(
+                        f"controller pin {name!r} already points to {existing_revision}, "
+                        f"not requested revision {revision}"
+                    )
+            if not missing:
+                return tuple(ControllerPin(name, pin_ref, revision) for name, pin_ref, revision in requested)
 
-        pushed = self.git("push", "origin", f"{resolved_revision}:{pin_ref}", check=False)
-        if pushed.returncode != 0:
-            # Another actor may have won the create race.  Re-inspect the
-            # remote and accept only the exact requested revision.
-            existing_revision = self._remote_ref_revision(pin_ref)
-            if existing_revision == resolved_revision:
-                return ControllerPin(name, pin_ref, resolved_revision)
-            if existing_revision is not None:
-                raise OperationError(f"controller pin {name!r} was created at unexpected revision {existing_revision}")
-            raise OperationError(pushed.stderr.strip() or f"could not create controller pin {name!r}")
+            pushed = self.git(
+                "push",
+                "--atomic",
+                "origin",
+                *(f"{revision}:{pin_ref}" for _name, pin_ref, revision in missing),
+                check=False,
+            )
+            remaining = [
+                (name, pin_ref, revision)
+                for name, pin_ref, revision in requested
+                if self._remote_ref_revision(pin_ref) != revision
+            ]
+            if not remaining:
+                return tuple(ControllerPin(name, pin_ref, revision) for name, pin_ref, revision in requested)
+            if pushed.returncode == 0:
+                names = ", ".join(repr(name) for name, _pin_ref, _revision in remaining)
+                raise OperationError(f"controller pins were not retained at the requested revisions: {names}")
 
-        existing_revision = self._remote_ref_revision(pin_ref)
-        if existing_revision != resolved_revision:
-            raise OperationError(f"controller pin {name!r} was not retained at the requested revision")
-        return ControllerPin(name, pin_ref, resolved_revision)
+        names = ", ".join(repr(name) for name, _pin_ref, _revision in remaining)
+        raise OperationError(pushed.stderr.strip() or f"could not atomically create controller pins: {names}")
 
     def release_controller_pin(self, name: str, expected_revision: str) -> bool:
         """Release a pin only when its remote revision matches.
@@ -297,116 +219,6 @@ class GitStateStore:
                 raise OperationError("remote ref inspection returned an invalid result")
             refs.append(GitRefSnapshot(ref.removeprefix(prefix), revision))
         return tuple(sorted(refs, key=lambda snapshot: snapshot.ref))
-
-    def read_controller_pin_claim(self, name: str) -> ControllerPinClaim | None:
-        """Read one claim, retaining its remote commit as the CAS revision."""
-
-        ref = self._controller_pin_claim_ref(name)
-        snapshot = self._remote_ref_snapshot(ref)
-        if snapshot.revision is None:
-            return None
-        remote_ref = ref if ref.startswith("refs/heads/") else f"refs/heads/{ref}"
-        fetched = self.git("fetch", "--no-tags", "origin", remote_ref, check=False)
-        if fetched.returncode != 0:
-            raise OperationError(fetched.stderr.strip() or f"could not fetch controller pin claim {name!r}")
-        result = self.git("show", f"{snapshot.revision}:claim.json", check=False)
-        if result.returncode != 0:
-            raise OperationError(result.stderr.strip() or f"controller pin claim {name!r} is unreadable")
-        try:
-            document = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise OperationError(f"controller pin claim {name!r} is not valid JSON") from exc
-        claim = ControllerPinClaim.from_document(document, revision=snapshot.revision)
-        if claim.ref != ref.removeprefix("refs/heads/"):
-            raise OperationError(f"controller pin claim {name!r} has an invalid identity")
-        return claim
-
-    def list_controller_pin_claims(self) -> tuple[ControllerPinClaim, ...]:
-        """List and validate all Stack pin claims."""
-
-        prefix = "gitopsctr/pin-claims/stacks/"
-        claims: list[ControllerPinClaim] = []
-        for snapshot in self.list_remote_refs():
-            if not snapshot.ref.startswith(prefix):
-                continue
-            claim = self.read_controller_pin_claim(snapshot.ref.removeprefix("gitopsctr/pin-claims/"))
-            if claim is None:
-                raise OperationError(f"controller pin claim {snapshot.ref!r} disappeared during inspection")
-            claims.append(claim)
-        return tuple(sorted(claims, key=lambda claim: claim.ref))
-
-    def create_controller_pin_claim(self, claim: ControllerPinClaim) -> ControllerPinClaim:
-        """Create an exact claim, or return the identical existing claim."""
-
-        self._validate_controller_pin_claim(claim)
-        existing = self.read_controller_pin_claim(claim.ref.removeprefix("gitopsctr/pin-claims/"))
-        if existing is not None:
-            if existing.document() != claim.document():
-                raise OperationError(f"controller pin claim {claim.ref!r} already exists with different contents")
-            return existing
-        try:
-            return self._publish_controller_pin_claim(claim, None)
-        except subprocess.CalledProcessError as exc:
-            existing = self.read_controller_pin_claim(claim.ref.removeprefix("gitopsctr/pin-claims/"))
-            if existing is not None and existing.document() == claim.document():
-                return existing
-            raise OperationError(f"controller pin claim {claim.ref!r} changed during creation") from exc
-
-    def update_controller_pin_claim(self, claim: ControllerPinClaim, expected_revision: str) -> ControllerPinClaim:
-        """Advance a claim only from the exact expected commit."""
-
-        self._validate_controller_pin_claim(claim)
-        current = self.read_controller_pin_claim(claim.ref.removeprefix("gitopsctr/pin-claims/"))
-        if current is None or current.revision != expected_revision:
-            raise OperationError(f"controller pin claim {claim.ref!r} changed before update")
-        try:
-            return self._publish_controller_pin_claim(claim, expected_revision)
-        except subprocess.CalledProcessError as exc:
-            raise OperationError(f"controller pin claim {claim.ref!r} changed during update") from exc
-
-    def delete_controller_pin_claim(self, name: str, expected_revision: str) -> bool:
-        """Delete a claim only while its remote commit matches the fence."""
-
-        ref = self._controller_pin_claim_ref(name)
-        current = self._remote_ref_snapshot(ref)
-        if current.revision is None:
-            return False
-        if current.revision != expected_revision:
-            raise OperationError(f"controller pin claim {name!r} changed before deletion")
-        result = self.git(
-            "push",
-            f"--force-with-lease={ref if ref.startswith('refs/heads/') else f'refs/heads/{ref}'}:{expected_revision}",
-            "origin",
-            f":{ref if ref.startswith('refs/heads/') else f'refs/heads/{ref}'}",
-            check=False,
-        )
-        remaining = self._remote_ref_snapshot(ref).revision
-        if remaining is None:
-            return True
-        if remaining != expected_revision:
-            raise OperationError(f"controller pin claim {name!r} changed during deletion")
-        raise OperationError(result.stderr.strip() or f"could not delete controller pin claim {name!r}")
-
-    def _publish_controller_pin_claim(
-        self,
-        claim: ControllerPinClaim,
-        parent: str | None,
-    ) -> ControllerPinClaim:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "claim.json"
-            path.write_text(json.dumps(claim.document(), sort_keys=True, separators=(",", ":")) + "\n")
-            published = self.publish(claim.ref, Path(directory), parent, f"Update controller pin claim {claim.ref}")
-        return ControllerPinClaim.from_document(claim.document(), revision=published.revision)
-
-    def _validate_controller_pin_claim(self, claim: ControllerPinClaim) -> None:
-        ControllerPinClaim.from_document(claim.document())
-        self._controller_pin_claim_ref(claim.ref.removeprefix("gitopsctr/pin-claims/"))
-
-    def _controller_pin_claim_ref(self, name: str) -> str:
-        ref = f"refs/heads/gitopsctr/pin-claims/{name}"
-        if self.git("check-ref-format", ref, check=False).returncode != 0:
-            raise OperationError(f"invalid controller pin claim name: {name!r}")
-        return ref
 
     def _remote_ref_snapshot(self, ref: str) -> GitRefSnapshot:
         remote_ref = ref if ref.startswith("refs/heads/") else f"refs/heads/{ref}"

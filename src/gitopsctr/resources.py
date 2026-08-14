@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 from uuid import uuid4
@@ -13,17 +14,17 @@ from gitopsctr.api import GVK
 from gitopsctr.artifacts import ArtifactApi
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
+    DESIRED_UID_PATTERN,
+    PARTITION_LABEL,
     ArtifactDescriptor,
     AuthoredResourceMetadata,
     DeletionMetadata,
-    DesiredLifecycle,
     DesiredOwnerReference,
     DesiredResourceMetadata,
     DesiredStackDocument,
     DesiredStackSpec,
     DesiredStackTemplateDocument,
     DesiredStackTemplateSpec,
-    LifecycleManagement,
     ReceiptDesired,
     ResolvedInputs,
     StackDocument,
@@ -32,7 +33,7 @@ from gitopsctr.contracts import (
     StackTemplateFromResource,
     StackTemplateSpec,
     StrictModel,
-    scope_stack_template_resources,
+    stack_generated_unit_name,
 )
 from gitopsctr.document import ContractError, JsonObject, JsonObjectValue, TypedDocumentContract
 from gitopsctr.driver import InstalledUnitDriver
@@ -55,78 +56,92 @@ UNIT_API_VERSION = "unit.gitopsctr.io/v1"
 class ResourceMetadata(StrictModel):
     name: str
     uid: str | None = None
-    lifecycle: DesiredLifecycle | None = None
+    labels: dict[str, str] | None = None
     ownerReferences: list[DesiredOwnerReference] | None = None
     deletion: DeletionMetadata | None = None
 
-    @property
-    def is_legacy_compatibility(self) -> bool:
-        return self.uid is None and self.lifecycle is None and self.ownerReferences is None and self.deletion is None
-
     def validate_desired(self) -> None:
-        if self.is_legacy_compatibility:
-            return
         if self.uid is None:
             raise ValueError("desired metadata requires uid")
         DesiredResourceMetadata(
             name=self.name,
             uid=self.uid,
-            lifecycle=self.lifecycle,
+            labels=self.labels,
             ownerReferences=self.ownerReferences,
             deletion=self.deletion,
         )
 
     def as_desired(self) -> DesiredResourceMetadata:
         self.validate_desired()
-        if self.is_legacy_compatibility:
-            raise ValueError("legacy metadata has no desired identity")
         assert self.uid is not None
         return DesiredResourceMetadata(
             name=self.name,
             uid=self.uid,
-            lifecycle=self.lifecycle,
+            labels=self.labels,
             ownerReferences=self.ownerReferences,
             deletion=self.deletion,
         )
 
     @classmethod
-    def new_source_tracked(cls, name: str) -> ResourceMetadata:
-        return cls(
-            name=name,
-            uid=uuid4().hex,
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
-        )
+    def new_root(cls, name: str, *, partition: str | None = None) -> ResourceMetadata:
+        """Create a new desired root identity in an optional management partition."""
+
+        metadata = cls(name=name, uid=uuid4().hex)
+        return metadata.with_partition(partition)
 
     @classmethod
-    def source_tracked_from_provenance(cls, name: str, provenance: str) -> ResourceMetadata:
-        """Create a source-tracked identity for one desired proposal."""
+    def root_from_provenance(cls, name: str, provenance: str, *, partition: str | None = None) -> ResourceMetadata:
+        """Create a deterministic desired root identity for one proposal."""
 
         digest = hashlib.sha256(f"gitopsctr/desired-uid/v1\0{provenance}".encode()).hexdigest()[:32]
-        return cls(
-            name=name,
-            uid=f"d1-{digest}",
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
-        )
+        metadata = cls(name=name, uid=f"d1-{digest}")
+        return metadata.with_partition(partition)
+
+    @property
+    def is_root(self) -> bool:
+        return self.ownerReferences is None
+
+    @property
+    def partition(self) -> str | None:
+        """Return this desired root's management partition, if any."""
+
+        if not self.is_root:
+            raise ValueError("owned desired resources do not have a management partition")
+        return self.labels.get(PARTITION_LABEL) if self.labels is not None else None
+
+    @property
+    def is_unpartitioned_root(self) -> bool:
+        return self.is_root and self.partition is None
+
+    def with_partition(self, partition: str | None, *, preserve_existing: bool = False) -> ResourceMetadata:
+        """Return a root stamped with a partition, optionally retaining an existing one."""
+
+        if not self.is_root:
+            raise ValueError("cannot stamp an owned desired resource with a management partition")
+        existing = self.partition
+        if preserve_existing and existing is not None:
+            partition = existing
+        labels = dict(self.labels or {})
+        if partition is None:
+            labels.pop(PARTITION_LABEL, None)
+        else:
+            labels[PARTITION_LABEL] = partition
+        updated = replace(self, labels=labels or None)
+        if updated.uid is not None:
+            updated.validate_desired()
+        return updated
 
     def document(self, *, profile: Literal["authored", "desired"]) -> JsonObject:
         if profile == "authored":
             if (
                 self.uid is not None
-                or self.lifecycle is not None
+                or self.labels is not None
                 or self.ownerReferences is not None
                 or self.deletion is not None
             ):
                 raise ValueError("authored metadata may contain only name")
             return {"name": self.name}
-        if self.is_legacy_compatibility:
-            raise ValueError("desired metadata must be canonical; adopt legacy identity before serialization")
-        document = {key: value for key, value in self.as_desired().to_dict().items() if value is not None}
-        lifecycle = document.get("lifecycle")
-        if isinstance(lifecycle, dict):
-            document["lifecycle"] = {key: value for key, value in lifecycle.items() if value is not None}
-            if not document["lifecycle"]:
-                del document["lifecycle"]
-        return document
+        return {key: value for key, value in self.as_desired().to_dict().items() if value is not None}
 
 
 @dataclass(frozen=True)
@@ -145,10 +160,6 @@ class UnitResource[ModelT: StrictModel]:
     @property
     def driver_name(self) -> str:
         return self.driver.driver_name
-
-    @property
-    def is_legacy_compatibility(self) -> bool:
-        return self.metadata.is_legacy_compatibility
 
     def with_metadata(self, metadata: ResourceMetadata) -> UnitResource[ModelT]:
         return UnitResource(self.gvk, metadata, self.driver, self.spec)
@@ -169,10 +180,6 @@ class StackResource:
     def name(self) -> str:
         return self.metadata.name
 
-    @property
-    def is_legacy_compatibility(self) -> bool:
-        return self.metadata.is_legacy_compatibility
-
     def with_metadata(self, metadata: ResourceMetadata) -> StackResource:
         return StackResource(self.gvk, metadata, self.spec)
 
@@ -181,7 +188,7 @@ DesiredGraphResource = UnitResource[Any] | StackResource
 
 
 def _stack_template_name(spec: StackSpec | DesiredStackSpec) -> str:
-    """Return the logical template name from old or current Stack syntax."""
+    """Return the logical template name from shorthand or explicit Stack syntax."""
 
     template = spec.template
     return template if isinstance(template, str) else template.name
@@ -194,6 +201,187 @@ def _stack_uses_resource_template(spec: StackSpec | DesiredStackSpec) -> bool:
     return isinstance(template, str) or isinstance(template.source, StackTemplateFromResource)
 
 
+@dataclass(frozen=True)
+class _ProjectedStackUnit:
+    """The graph-relevant portion of one Stack projection entry."""
+
+    logical_name: str
+    api_version: str
+    kind: str
+    name: str
+    dependencies: tuple[str, ...]
+
+
+def _resolved_stack_projection(stack: StackResource) -> tuple[_ProjectedStackUnit, ...]:
+    """Parse the immutable Unit topology recorded by a desired Stack."""
+
+    if not isinstance(stack.spec, DesiredStackSpec) or stack.spec.resolvedProjection is None:
+        raise ValueError(f"Stack {stack.name!r} with a non-resource template source requires resolvedProjection")
+    projection = stack.spec.resolvedProjection
+    if set(projection) != {"units"} or not isinstance(projection.get("units"), dict):
+        raise ValueError(f"Stack {stack.name!r} has an invalid resolvedProjection")
+    units = cast(dict[object, object], projection["units"])
+    projected: list[_ProjectedStackUnit] = []
+    for logical_name, value in units.items():
+        if not isinstance(logical_name, str) or not re.fullmatch(DESIRED_UID_PATTERN, logical_name):
+            raise ValueError(f"Stack {stack.name!r} resolvedProjection has an invalid Unit name")
+        if not isinstance(value, dict) or set(value) != {"apiVersion", "kind", "spec", "dependsOn"}:
+            raise ValueError(
+                f"Stack {stack.name!r} resolvedProjection Unit {logical_name!r} has an invalid declaration"
+            )
+        api_version = value.get("apiVersion")
+        kind = value.get("kind")
+        specification = value.get("spec")
+        dependencies = value.get("dependsOn")
+        if not isinstance(api_version, str) or re.fullmatch(r"[^/]+/[^/]+", api_version) is None:
+            raise ValueError(f"Stack {stack.name!r} resolvedProjection Unit {logical_name!r} has an invalid apiVersion")
+        if not isinstance(kind, str) or re.fullmatch(r"[A-Z][A-Za-z0-9]*", kind) is None:
+            raise ValueError(f"Stack {stack.name!r} resolvedProjection Unit {logical_name!r} has an invalid kind")
+        if not isinstance(specification, dict):
+            raise ValueError(f"Stack {stack.name!r} resolvedProjection Unit {logical_name!r} has an invalid spec")
+        if (
+            not isinstance(dependencies, list)
+            or not all(
+                isinstance(dependency, str) and re.fullmatch(DESIRED_UID_PATTERN, dependency)
+                for dependency in dependencies
+            )
+            or len(set(dependencies)) != len(dependencies)
+        ):
+            raise ValueError(f"Stack {stack.name!r} resolvedProjection Unit {logical_name!r} has invalid dependencies")
+        if logical_name in dependencies:
+            raise ValueError(f"Stack {stack.name!r} resolvedProjection Unit {logical_name!r} cannot depend on itself")
+        projected.append(
+            _ProjectedStackUnit(
+                logical_name=logical_name,
+                api_version=api_version,
+                kind=kind,
+                name=stack_generated_unit_name(stack.name, logical_name),
+                dependencies=tuple(stack_generated_unit_name(stack.name, dependency) for dependency in dependencies),
+            )
+        )
+    return tuple(projected)
+
+
+def _resource_template_projection(
+    stack: StackResource,
+    template: StackResource,
+) -> tuple[_ProjectedStackUnit, ...]:
+    """Expand a sibling StackTemplate and validate any persisted projection against it."""
+
+    assert isinstance(stack.spec, (StackSpec, DesiredStackSpec))
+    assert isinstance(template.spec, StackTemplateSpec)
+    expanded = template.spec.expand(stack.spec.parameters)
+    projected: tuple[_ProjectedStackUnit, ...] | None = None
+    if isinstance(stack.spec, DesiredStackSpec) and stack.spec.resolvedProjection is not None:
+        projected = _resolved_stack_projection(stack)
+        selected_names = {resource.logical_name for resource in projected}
+    else:
+        selected_names = set(stack.spec.units or (resource.name for resource in expanded))
+    expanded = tuple(resource for resource in expanded if resource.name in selected_names)
+    expected = tuple(
+        _ProjectedStackUnit(
+            logical_name=resource.name,
+            api_version=resource.apiVersion,
+            kind=resource.kind,
+            name=stack_generated_unit_name(stack.name, resource.name),
+            dependencies=tuple(stack_generated_unit_name(stack.name, dependency) for dependency in resource.dependsOn),
+        )
+        for resource in expanded
+    )
+    if projected is not None and {resource.logical_name: resource for resource in projected} != {
+        resource.logical_name: resource for resource in expected
+    }:
+        raise ValueError(f"Stack {stack.name!r} resolvedProjection does not match StackTemplate expansion")
+    return expected
+
+
+def _validate_stack_projection(
+    stack: StackResource,
+    projected: tuple[_ProjectedStackUnit, ...],
+    identities: Mapping[tuple[str, str, str], DesiredGraphResource],
+) -> None:
+    """Validate a projected topology against the concrete desired Unit graph."""
+
+    by_name = {resource.name: resource for resource in projected}
+    if len(by_name) != len(projected):
+        raise ValueError(f"Stack {stack.name!r} resolvedProjection has duplicate generated Unit names")
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visiting:
+            raise ValueError(f"Stack {stack.name!r} resolvedProjection dependencies must be acyclic")
+        if name in visited:
+            return
+        visiting.add(name)
+        for dependency in by_name[name].dependencies:
+            if dependency not in by_name:
+                raise ValueError(f"Stack {stack.name!r} Unit {name!r} depends on missing generated Unit {dependency!r}")
+            visit(dependency)
+        visiting.remove(name)
+        visited.add(name)
+
+    for name in by_name:
+        visit(name)
+
+    expected_owner = (stack.gvk.api_version, stack.gvk.kind, stack.name, stack.metadata.uid)
+    actual_owned: dict[tuple[str, str, str], UnitResource[Any]] = {}
+    for key, resource in identities.items():
+        if not isinstance(resource, UnitResource) or resource.metadata.ownerReferences is None:
+            continue
+        owner = resource.metadata.ownerReferences[0]
+        if (owner.apiVersion, owner.kind, owner.name, owner.uid) == expected_owner:
+            actual_owned[key] = resource
+
+    for generated in projected:
+        generated_key = (generated.api_version, generated.kind, generated.name)
+        generated_resource = identities.get(generated_key)
+        if generated_resource is None:
+            same_name = [resource for resource in actual_owned.values() if resource.name == generated.name]
+            if same_name:
+                actual = same_name[0]
+                raise ValueError(
+                    f"Stack {stack.name!r} generated Unit {generated.name!r} has GVK {actual.gvk}, "
+                    f"expected {generated.api_version}/{generated.kind}"
+                )
+            raise ValueError(f"Stack {stack.name!r} expansion is missing generated Unit {generated.name!r}")
+        if not isinstance(generated_resource, UnitResource):
+            raise ValueError(f"Stack {stack.name!r} expansion {generated.name!r} is not a Unit")
+        generated_owner_references = generated_resource.metadata.ownerReferences
+        actual_owner = (
+            (
+                generated_owner_references[0].apiVersion,
+                generated_owner_references[0].kind,
+                generated_owner_references[0].name,
+                generated_owner_references[0].uid,
+            )
+            if generated_owner_references is not None
+            else None
+        )
+        if actual_owner != expected_owner:
+            raise ValueError(f"Stack {stack.name!r} generated Unit {generated.name!r} has an invalid owner reference")
+        for dependency in generated.dependencies:
+            dependency_resource = by_name[dependency]
+            dependency_key = (
+                dependency_resource.api_version,
+                dependency_resource.kind,
+                dependency_resource.name,
+            )
+            if dependency_key not in identities:
+                raise ValueError(f"Stack {stack.name!r} dependency {dependency!r} is absent from this ref")
+
+    expected_keys = {(resource.api_version, resource.kind, resource.name) for resource in projected}
+    unexpected = [
+        resource
+        for key, resource in actual_owned.items()
+        if key not in expected_keys and resource.metadata.deletion is None
+    ]
+    if unexpected:
+        names = ", ".join(sorted(resource.name for resource in unexpected))
+        raise ValueError(f"Stack {stack.name!r} has unexpected generated Units: {names}")
+
+
 def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], DesiredGraphResource]) -> None:
     """Validate UID fencing and acyclicity for resources from one desired ref.
 
@@ -203,31 +391,21 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
     """
 
     identities: dict[tuple[str, str, str], DesiredGraphResource] = {}
-    legacy_keys: set[tuple[str, str, str]] = set()
     for key, unit in resources.items():
         expected_key = (unit.gvk.api_version, unit.gvk.kind, unit.name)
         if expected_key in identities:
             raise ValueError(f"duplicate desired resource identity: {expected_key!r}")
         if key != expected_key:
             raise ValueError(f"desired resource mapping key {key!r} does not match resource identity {expected_key!r}")
-        if unit.is_legacy_compatibility:
-            # Legacy desired documents are compatibility roots. They may gate
-            # graph publication while migration is in progress, but cannot
-            # participate in UID-fenced ownership until explicitly adopted.
-            legacy_keys.add(key)
         identities[key] = unit
     edges: dict[tuple[str, str, str], tuple[str, str, str]] = {}
     for key, unit in identities.items():
-        if key in legacy_keys:
-            continue
         unit.metadata.validate_desired()
         owner_references = unit.metadata.ownerReferences
         if owner_references is None:
             continue
         owner = owner_references[0]
         owner_key = (owner.apiVersion, owner.kind, owner.name)
-        if owner_key in legacy_keys:
-            raise ValueError(f"desired owner reference for {key[2]!r} cannot target a legacy compatibility root")
         owner_resource = identities.get(owner_key)
         if owner_resource is None:
             raise ValueError(f"desired owner reference for {key[2]!r} does not identify a resource in this ref")
@@ -255,9 +433,10 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
     for key in identities:
         visit(key)
 
-    # StackTemplate dependency declarations are retained in the desired
-    # StackTemplate document. Re-check them after expansion so a projected
-    # graph cannot silently omit a generated Unit or its dependency edge.
+    # Resolve each Stack's authoritative Unit topology, then validate every
+    # source mode through the same concrete desired-graph checks. Repository
+    # and promotion sources deliberately never consult a same-named sibling
+    # StackTemplate: their immutable resolvedProjection is the graph record.
     templates = {
         resource.name: resource
         for resource in identities.values()
@@ -270,75 +449,17 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
     ):
         if not isinstance(stack.spec, (StackSpec, DesiredStackSpec)):
             raise ValueError(f"Stack {stack.name!r} has an invalid Stack spec")
-        lifecycle = stack.metadata.lifecycle
-        if lifecycle is None or lifecycle.management is None:
+        if not stack.metadata.is_root:
             raise ValueError(f"Stack {stack.name!r} must be a root resource")
-        has_provenance = isinstance(stack.spec, DesiredStackSpec) and stack.spec.provenance is not None
-        if lifecycle.management.mode == "direct" and not has_provenance:
-            raise ValueError(f"direct Stack {stack.name!r} is missing instantiation provenance")
-        if lifecycle.management.mode == "sourceTracked" and has_provenance:
-            raise ValueError(f"source-tracked Stack {stack.name!r} must not carry direct instantiation provenance")
-        if not _stack_uses_resource_template(stack.spec):
-            # Git and promotion sources are self-contained in the desired
-            # Stack projection. They do not require a sibling catalog entry.
-            continue
-        template_name = _stack_template_name(stack.spec)
-        template = templates.get(template_name)
-        if template is None:
-            raise ValueError(f"Stack {stack.name!r} references missing StackTemplate {template_name!r} in this ref")
-        assert isinstance(template.spec, StackTemplateSpec)
-        expanded = scope_stack_template_resources(stack.name, template.spec.expand(stack.spec.parameters))
-        if isinstance(stack.spec, DesiredStackSpec) and stack.spec.resolvedProjection is not None:
-            projected_units = stack.spec.resolvedProjection.get("units")
-            if isinstance(projected_units, dict):
-                projected_names = set(projected_units)
-                expanded = tuple(
-                    resource
-                    for resource in expanded
-                    if resource.name.removeprefix(f"{stack.name}--") in projected_names
-                )
-        expanded_by_name = {resource.name: resource for resource in expanded}
-        for generated in expanded:
-            generated_key = (generated.apiVersion, generated.kind, generated.name)
-            generated_resource = identities.get(generated_key)
-            if generated_resource is None:
-                raise ValueError(f"Stack {stack.name!r} expansion is missing generated Unit {generated.name!r}")
-            if not isinstance(generated_resource, UnitResource):
-                raise ValueError(f"Stack {stack.name!r} expansion {generated.name!r} is not a Unit")
-            generated_owner_references = generated_resource.metadata.ownerReferences
-            expected_owner = (
-                stack.gvk.api_version,
-                stack.gvk.kind,
-                stack.name,
-                stack.metadata.uid,
-            )
-            actual_owner = (
-                (
-                    generated_owner_references[0].apiVersion,
-                    generated_owner_references[0].kind,
-                    generated_owner_references[0].name,
-                    generated_owner_references[0].uid,
-                )
-                if generated_owner_references is not None
-                else None
-            )
-            if actual_owner != expected_owner:
-                raise ValueError(
-                    f"Stack {stack.name!r} generated Unit {generated.name!r} has an invalid owner reference"
-                )
-            for dependency in generated.dependsOn:
-                dependency_resource = expanded_by_name.get(dependency)
-                if dependency_resource is None:
-                    raise ValueError(
-                        f"Stack {stack.name!r} Unit {generated.name!r} depends on missing generated Unit {dependency!r}"
-                    )
-                dependency_key = (
-                    dependency_resource.apiVersion,
-                    dependency_resource.kind,
-                    dependency_resource.name,
-                )
-                if dependency_key not in identities:
-                    raise ValueError(f"Stack {stack.name!r} dependency {dependency!r} is absent from this ref")
+        if _stack_uses_resource_template(stack.spec):
+            template_name = _stack_template_name(stack.spec)
+            template = templates.get(template_name)
+            if template is None:
+                raise ValueError(f"Stack {stack.name!r} references missing StackTemplate {template_name!r} in this ref")
+            projected = _resource_template_projection(stack, template)
+        else:
+            projected = _resolved_stack_projection(stack)
+        _validate_stack_projection(stack, projected, identities)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -408,15 +529,7 @@ class ResourceCatalog:
         except (OSError, DocumentFormatError) as exc:
             raise OperationError(f"could not read {path}: {exc}") from exc
 
-    @staticmethod
-    def _without_legacy_schema(document: JsonObject) -> JsonObject:
-        if document.get("schema") == 1:
-            return {key: value for key, value in document.items() if key != "schema"}
-        return document
-
     def normalize_environment(self, document: JsonObject, expected_name: str | None = None) -> JsonObject:
-        if document.get("apiVersion") is None:
-            return self._without_legacy_schema(document)
         if document.get("apiVersion") != CORE_API_VERSION or document.get("kind") != "Environment":
             raise OperationError("environment must use apiVersion gitopsctr.io/v1 and kind Environment")
         metadata, specification = document.get("metadata"), document.get("spec")
@@ -432,13 +545,16 @@ class ResourceCatalog:
         return {"name": name, **specification}
 
     def normalize_promotion(self, document: JsonObject) -> JsonObject:
-        if document.get("apiVersion") is None:
-            return self._without_legacy_schema(document)
         if document.get("apiVersion") != CORE_API_VERSION or document.get("kind") != "Promotion":
             raise OperationError("promotion must use apiVersion gitopsctr.io/v1 and kind Promotion")
-        specification = document.get("spec")
-        if not isinstance(specification, dict):
-            raise OperationError("promotion envelope requires a spec mapping")
+        metadata, specification = document.get("metadata"), document.get("spec")
+        if (
+            not isinstance(metadata, dict)
+            or not isinstance(metadata.get("name"), str)
+            or not metadata["name"]
+            or not isinstance(specification, dict)
+        ):
+            raise OperationError("promotion envelope requires metadata.name and a spec mapping")
         return dict(specification)
 
     def parse_unit[ModelT: StrictModel](
@@ -450,52 +566,35 @@ class ResourceCatalog:
     ) -> UnitResource[ModelT]:
         """Parse a persisted envelope directly into its registered typed specification."""
 
-        if document.get("apiVersion") is None:
-            legacy = self._without_legacy_schema(document)
-            name, driver_name = legacy.get("name"), legacy.get("driver")
-            if not isinstance(name, str) or not isinstance(driver_name, str):
-                raise OperationError("legacy unit requires string name and driver fields")
-            driver = self.drivers.get(driver_name)
-            if driver is None:
-                raise OperationError(f"unit uses an unknown driver: {driver_name!r}")
-            specification: object = {
-                key: value for key, value in legacy.items() if key not in {"$schema", "schema", "name", "driver"}
-            }
-            gvk = GVK(driver.api_version, driver.kind)
-        else:
-            api_version, kind = document.get("apiVersion"), document.get("kind")
-            metadata, specification = document.get("metadata"), document.get("spec")
-            if not isinstance(api_version, str) or not isinstance(kind, str) or not isinstance(metadata, dict):
-                raise OperationError("unit envelope requires apiVersion, kind, and metadata")
-            if api_version != UNIT_API_VERSION:
-                raise OperationError(f"unsupported unit API version: {api_version!r}")
-            driver_name = self.driver_names_by_gvk.get(f"{api_version}/{kind}")
-            driver = self.drivers.get(driver_name) if driver_name is not None else None
-            if driver is None:
-                raise OperationError(f"no installed unit driver handles {api_version}/{kind}")
-            name = metadata.get("name")
-            if not isinstance(specification, dict):
-                raise OperationError(f"unit {name} requires a spec mapping")
-            gvk = GVK(api_version, kind)
+        api_version, kind = document.get("apiVersion"), document.get("kind")
+        metadata, specification = document.get("metadata"), document.get("spec")
+        if not isinstance(api_version, str) or not isinstance(kind, str) or not isinstance(metadata, dict):
+            raise OperationError("unit envelope requires apiVersion, kind, and metadata")
+        if api_version != UNIT_API_VERSION:
+            raise OperationError(f"unsupported unit API version: {api_version!r}")
+        driver_name = self.driver_names_by_gvk.get(f"{api_version}/{kind}")
+        driver = self.drivers.get(driver_name) if driver_name is not None else None
+        if driver is None:
+            raise OperationError(f"no installed unit driver handles {api_version}/{kind}")
+        name = metadata.get("name")
+        if not isinstance(specification, dict):
+            raise OperationError(f"unit {name} requires a spec mapping")
+        gvk = GVK(api_version, kind)
         if not isinstance(name, str) or not name or (expected_name is not None and name != expected_name):
             raise OperationError(f"unit metadata.name must be {expected_name or 'a non-empty name'!r}")
-        if document.get("apiVersion") is None:
-            metadata_model = ResourceMetadata(name=name)
-        elif profile == "authored":
+        if profile == "authored":
             if set(metadata) != {"name"}:
                 raise OperationError("authored unit metadata may contain only name")
             metadata_model = ResourceMetadata(name=name)
         elif profile == "desired":
             try:
-                if set(metadata) == {"name"}:
-                    metadata_model = ResourceMetadata(name=name)
-                else:
-                    metadata_model = ResourceMetadata.from_dict(metadata)
-                    if metadata_model.is_legacy_compatibility:
-                        raise ValueError("desired metadata with lifecycle fields cannot use null values")
-                    metadata_model.validate_desired()
+                nullable_fields = {"uid", "labels", "ownerReferences", "deletion"}
+                if any(field in metadata and metadata[field] is None for field in nullable_fields):
+                    raise ValueError("desired metadata fields cannot use null values")
+                metadata_model = ResourceMetadata.from_dict(metadata)
+                metadata_model.validate_desired()
             except (TypeError, ValueError, KeyError) as exc:
-                raise OperationError(f"desired unit {name} has invalid lifecycle metadata: {exc}") from exc
+                raise OperationError(f"desired unit {name} has invalid metadata: {exc}") from exc
         else:
             metadata_model = ResourceMetadata(name=name)
         contract = {
@@ -513,7 +612,7 @@ class ResourceCatalog:
         return ResourceMetadata(
             name=document.name,
             uid=document.uid,
-            lifecycle=document.lifecycle,
+            labels=document.labels,
             ownerReferences=document.ownerReferences,
             deletion=document.deletion,
         )
@@ -569,7 +668,6 @@ class ResourceCatalog:
                     else DesiredStackTemplateSpec(
                         parameters=resource.spec.parameters,
                         unitTemplates=resource.spec.unitTemplates,
-                        resources=resource.spec.resources,
                     )
                 )
                 document = DesiredStackTemplateDocument(
@@ -583,8 +681,8 @@ class ResourceCatalog:
             if not isinstance(resource.spec, (StackSpec, DesiredStackSpec)):
                 raise OperationError("Stack resource has an invalid spec")
             if profile == "authored":
-                if not isinstance(resource.spec, StackSpec) or getattr(resource.spec, "provenance", None) is not None:
-                    raise OperationError("authored Stack metadata may not contain controller provenance")
+                if not isinstance(resource.spec, StackSpec):
+                    raise OperationError("authored Stack has an invalid specification")
                 document = StackDocument(
                     apiVersion=CORE_API_VERSION,
                     kind="Stack",
@@ -615,7 +713,7 @@ class ResourceCatalog:
         name = environment.get("name")
         if not isinstance(name, str):
             raise OperationError("environment is missing its name")
-        specification = {key: value for key, value in environment.items() if key not in {"schema", "name", "$schema"}}
+        specification = {key: value for key, value in environment.items() if key not in {"name", "$schema"}}
         return {
             "$schema": resource_schema_url(CORE_API_VERSION, "Environment"),
             "apiVersion": CORE_API_VERSION,
@@ -625,7 +723,7 @@ class ResourceCatalog:
         }
 
     def serialize_promotion(self, promotion: JsonObject) -> JsonObject:
-        specification = {key: value for key, value in promotion.items() if key not in {"schema", "$schema"}}
+        specification = {key: value for key, value in promotion.items() if key != "$schema"}
         source = specification.get("source", {})
         source_name = source.get("environment", "promotion") if isinstance(source, dict) else "promotion"
         return {
@@ -767,8 +865,6 @@ class ResourceCatalog:
 
     def load_receipt(self, path: Path, expected_unit: str | None = None) -> ReceiptResource[Any]:
         document = self.load_document(path)
-        if self.strict_resource_documents(path) and document.get("apiVersion") is None:
-            raise OperationError(f"legacy receipt document is not valid in a migrated project: {path}")
         return self.parse_receipt(document, expected_unit or path.stem)
 
     @staticmethod
@@ -788,12 +884,6 @@ class ResourceCatalog:
             return directory / f"{unit_name}{load_project_config(project_root).write_format.suffix}"
         return directory / f"{unit_name}.json"
 
-    @staticmethod
-    def strict_resource_documents(path: Path) -> bool:
-        return any(
-            any((parent / name).is_file() for name in PROJECT_CONFIG_NAMES) for parent in (path.parent, *path.parents)
-        )
-
     def load_unit[ModelT: StrictModel](
         self,
         path: Path,
@@ -802,8 +892,6 @@ class ResourceCatalog:
         profile: Literal["authored", "resolved", "desired"],
     ) -> UnitResource[ModelT]:
         document = self.load_document(path)
-        if self.strict_resource_documents(path) and document.get("apiVersion") is None:
-            raise OperationError(f"legacy unit document is not valid in a migrated project: {path}")
         return self.parse_unit(document, profile=profile, expected_name=expected_name or path.stem)
 
     def reference_document_path(self, root: Path, reference: str) -> Path:

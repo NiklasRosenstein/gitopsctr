@@ -71,7 +71,7 @@ delivery:
   mode: external
 ```
 
-Advancement publishes manifests and finishes the unit as `MATERIALIZED`. No external action or receipt occurs. This
+Apply publishes manifests and finishes the unit as `MATERIALIZED`. No external action or receipt occurs. This
 fits Argo CD or Flux setups that already watch `gitopsctr/desired/<environment>` but do not need the controller to
 observe them.
 
@@ -142,10 +142,10 @@ mise run demo-k8s clean
 GITOPSCTR_K8S_PROVIDER=minikube mise run demo-k8s run
 ```
 
-`mise run demo-k8s acceptance` starts from empty state, reconciles the source-tracked dev Stack, promotes its exact
+`mise run demo-k8s acceptance` starts from empty state, applies and reconciles the partitioned dev Stack, promotes its exact
 image artifact into staging, verifies both workloads, proves clean convergence, and always removes the cluster.
-`mise run demo-k8s acceptance --preview` instead instantiates, updates, and requests deletion of a directly managed
-preview Stack built from the same template.
+`mise run demo-k8s acceptance --preview` instead applies, updates, and requests deletion of an unpartitioned preview
+Stack built from the same template.
 
 Add `--delivery argocd` to any Kubernetes demo command to exercise external delivery. It installs an isolated Argo CD
 Core instance, creates automated Applications before their materialized payloads exist, and observes Argo CD syncing

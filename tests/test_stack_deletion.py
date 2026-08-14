@@ -9,7 +9,7 @@ import pytest
 
 from gitopsctr import controller
 from gitopsctr.errors import OperationError
-from gitopsctr.state import ControllerPinClaim
+from gitopsctr.state import ControllerPin
 from tests.stack_deletion_support import deletion_args as _args
 from tests.stack_deletion_support import fake_git as _fake_git
 from tests.stack_deletion_support import stack_tree as _stack_tree
@@ -50,37 +50,59 @@ def _configure_state(monkeypatch, tmp_path: Path, current: Path, store=None) -> 
         monkeypatch.setattr(controller, "state_store", lambda: store)
 
 
-def test_stack_pin_release_validates_claim_before_releasing_pin(tmp_path: Path, monkeypatch):
+def test_stack_pin_release_releases_every_source_commit_for_exact_incarnation(tmp_path: Path, monkeypatch):
     current = tmp_path / "current"
     _stack_tree(current)
     stack = _stack(current)
-    assert isinstance(stack.spec, controller.DesiredStackSpec)
-    assert stack.spec.provenance is not None
-    pin_name = controller._stack_pin_name("dev", stack.name, stack.metadata.uid)
-    claim = ControllerPinClaim(
-        environment="dev",
-        stack_name="preview",
-        uid="different-stack",
-        pin_name=pin_name,
-        pin_revision=stack.spec.provenance.templateRevision,
-        target_ref="deploy/dev",
-        target_revision="b" * 40,
-        candidate_ref="candidate/dev",
-        candidate_revision=None,
-        state="active",
-        revision="c" * 40,
+    first = ControllerPin(
+        f"stacks/dev/preview/{stack.metadata.uid}/{'a' * 40}",
+        f"refs/heads/gitopsctr/pins/stacks/dev/preview/{stack.metadata.uid}/{'a' * 40}",
+        "a" * 40,
+    )
+    second = ControllerPin(
+        f"stacks/dev/preview/{stack.metadata.uid}/{'b' * 40}",
+        f"refs/heads/gitopsctr/pins/stacks/dev/preview/{stack.metadata.uid}/{'b' * 40}",
+        "b" * 40,
+    )
+    unrelated = ControllerPin(
+        f"stacks/dev/preview/d1-other/{'c' * 40}",
+        f"refs/heads/gitopsctr/pins/stacks/dev/preview/d1-other/{'c' * 40}",
+        "c" * 40,
     )
     released: list[tuple[str, str]] = []
     monkeypatch.setattr(
         controller,
         "state_store",
         lambda: SimpleNamespace(
-            read_controller_pin_claim=lambda _name: claim,
+            list_controller_pins=lambda: (first, second, unrelated),
             release_controller_pin=lambda name, revision: released.append((name, revision)),
         ),
     )
 
-    with pytest.raises(OperationError, match="claim fence"):
+    controller._release_stack_pin("dev", stack)
+    assert released == [(first.name, first.revision), (second.name, second.revision)]
+
+
+def test_stack_pin_release_validates_all_pin_identities_before_mutation(tmp_path: Path, monkeypatch):
+    current = tmp_path / "current"
+    _stack_tree(current)
+    stack = _stack(current)
+    malformed = ControllerPin(
+        f"stacks/dev/preview/{stack.metadata.uid}/not-a-commit",
+        f"refs/heads/gitopsctr/pins/stacks/dev/preview/{stack.metadata.uid}/not-a-commit",
+        "a" * 40,
+    )
+    released: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        controller,
+        "state_store",
+        lambda: SimpleNamespace(
+            list_controller_pins=lambda: (malformed,),
+            release_controller_pin=lambda name, revision: released.append((name, revision)),
+        ),
+    )
+
+    with pytest.raises(OperationError, match="invalid identity"):
         controller._release_stack_pin("dev", stack)
     assert released == []
 
@@ -106,16 +128,11 @@ def test_delete_stack_marks_stack_and_owned_units_with_metadata(tmp_path: Path, 
     assert unit.metadata.ownerReferences[0].uid == stack.metadata.uid
 
 
-@pytest.mark.parametrize("mode", ["direct", "sourceTracked"])
-def test_delete_and_finalize_standalone_stacktemplate(tmp_path: Path, monkeypatch, mode: str):
+def test_delete_and_finalize_standalone_stacktemplate(tmp_path: Path, monkeypatch):
     current = tmp_path / "current"
     _stack_tree(current)
     (current / "stacks/preview.json").unlink()
     (current / "units/preview--preview-app.json").unlink()
-    template_path = current / "stack-templates/preview.json"
-    template = json.loads(template_path.read_text())
-    template["metadata"]["lifecycle"]["management"]["mode"] = mode
-    template_path.write_text(json.dumps(template))
     published, publish = _publish_snapshots(tmp_path)
     _configure_state(monkeypatch, tmp_path, current)
     monkeypatch.setattr(controller, "publish_desired_change", publish)
@@ -147,7 +164,15 @@ def test_finalize_stack_requires_child_first_then_releases_pin(tmp_path: Path, m
     _stack_tree(current)
     published, publish = _publish_snapshots(tmp_path)
     released: list[tuple[str, str]] = []
-    store = SimpleNamespace(release_controller_pin=lambda name, revision: released.append((name, revision)))
+    pin = ControllerPin(
+        f"stacks/dev/preview/d1-stack-preview/{'a' * 40}",
+        f"refs/heads/gitopsctr/pins/stacks/dev/preview/d1-stack-preview/{'a' * 40}",
+        "a" * 40,
+    )
+    store = SimpleNamespace(
+        list_controller_pins=lambda: (pin,),
+        release_controller_pin=lambda name, revision: released.append((name, revision)),
+    )
     _configure_state(monkeypatch, tmp_path, current, store)
     monkeypatch.setattr(controller, "publish_desired_change", publish)
     assert controller.command_delete_resource(_args()) is None
@@ -183,19 +208,15 @@ def test_finalize_stack_requires_child_first_then_releases_pin(tmp_path: Path, m
 
     finalized = published[1]
     assert not list(finalized.glob("stacks/preview.*"))
-    assert released == [("stacks/dev/preview/d1-stack-direct", "a" * 40)]
+    assert released == [(pin.name, "a" * 40)]
 
 
-def test_finalize_source_tracked_stack_after_child_finalization(tmp_path: Path, monkeypatch):
+def test_finalize_stack_without_local_source_pin_after_child_finalization(tmp_path: Path, monkeypatch):
     current = tmp_path / "current"
     _stack_tree(current)
-    stack_path = current / "stacks/preview.json"
-    stack = json.loads(stack_path.read_text())
-    stack["metadata"]["lifecycle"]["management"]["mode"] = "sourceTracked"
-    stack["spec"].pop("provenance", None)
-    stack_path.write_text(json.dumps(stack))
     published, publish = _publish_snapshots(tmp_path)
-    _configure_state(monkeypatch, tmp_path, current)
+    store = SimpleNamespace(list_controller_pins=lambda: ())
+    _configure_state(monkeypatch, tmp_path, current, store)
     monkeypatch.setattr(controller, "publish_desired_change", publish)
 
     assert controller.command_delete_resource(_args()) is None

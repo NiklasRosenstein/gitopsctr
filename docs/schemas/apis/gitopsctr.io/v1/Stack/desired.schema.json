@@ -14,28 +14,19 @@
     },
     "metadata": {
       "additionalProperties": false,
-      "oneOf": [
-        {
-          "not": {
+      "not": {
+        "properties": {
+          "labels": {
             "required": [
-              "ownerReferences"
+              "gitopsctr.io/partition"
             ]
-          },
-          "required": [
-            "lifecycle"
-          ]
+          }
         },
-        {
-          "not": {
-            "required": [
-              "lifecycle"
-            ]
-          },
-          "required": [
-            "ownerReferences"
-          ]
-        }
-      ],
+        "required": [
+          "ownerReferences",
+          "labels"
+        ]
+      },
       "properties": {
         "deletion": {
           "additionalProperties": false,
@@ -56,30 +47,19 @@
           "title": "DeletionMetadata",
           "type": "object"
         },
-        "lifecycle": {
-          "additionalProperties": false,
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
           "properties": {
-            "management": {
-              "additionalProperties": false,
-              "properties": {
-                "mode": {
-                  "enum": [
-                    "sourceTracked",
-                    "direct"
-                  ]
-                }
-              },
-              "required": [
-                "mode"
-              ],
-              "title": "LifecycleManagement",
-              "type": "object"
+            "gitopsctr.io/partition": {
+              "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+              "type": "string"
             }
           },
-          "required": [
-            "management"
-          ],
-          "title": "DesiredLifecycle",
+          "propertyNames": {
+            "type": "string"
+          },
           "type": "object"
         },
         "name": {
@@ -183,43 +163,6 @@
         },
         "parameters": {
           "type": "object"
-        },
-        "provenance": {
-          "anyOf": [
-            {
-              "additionalProperties": false,
-              "properties": {
-                "requestIdentity": {
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/#!-]{0,127}$",
-                  "type": "string"
-                },
-                "templateDigest": {
-                  "pattern": "^[0-9a-f]{64}$",
-                  "type": "string"
-                },
-                "templatePath": {
-                  "pattern": "^[^/].*",
-                  "type": "string"
-                },
-                "templateRevision": {
-                  "pattern": "^[0-9a-f]{40}$",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "templateRevision",
-                "templatePath",
-                "templateDigest",
-                "requestIdentity"
-              ],
-              "title": "StackInstantiationProvenance",
-              "type": "object"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
         },
         "requestedSource": {
           "anyOf": [
@@ -383,7 +326,7 @@
                     "type": "string"
                   },
                   "receiptUnitBlob": {
-                    "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+                    "pattern": "^[0-9a-f]{40}$",
                     "type": "string"
                   },
                   "sourceDesiredRevision": {

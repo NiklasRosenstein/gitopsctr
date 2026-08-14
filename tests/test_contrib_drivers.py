@@ -79,6 +79,12 @@ def test_contributed_api_entry_points_register_resource_kinds_and_drivers():
     assert entry_points == {
         "artifact.gitopsctr.io/v1/ContainerImages": "gitopsctr.artifacts:CONTAINER_IMAGES",
         "artifact.gitopsctr.io/v1/FrontendBundle": "gitopsctr.artifacts:FRONTEND_BUNDLE",
+        "gitopsctr.io/v1/Environment": "gitopsctr.core_api:ENVIRONMENT",
+        "gitopsctr.io/v1/Project": "gitopsctr.core_api:PROJECT",
+        "gitopsctr.io/v1/Promotion": "gitopsctr.core_api:PROMOTION",
+        "gitopsctr.io/v1/Receipt": "gitopsctr.core_api:RECEIPT",
+        "gitopsctr.io/v1/Stack": "gitopsctr.core_api:STACK",
+        "gitopsctr.io/v1/StackTemplate": "gitopsctr.core_api:STACK_TEMPLATE",
         "unit.gitopsctr.io/v1/FrontendS3Cloudfront": "gitopsctr.contrib.drivers.frontend_s3_cloudfront:API_KIND",
         "unit.gitopsctr.io/v1/KubernetesManifests": "gitopsctr.contrib.drivers.kubernetes_manifests:API_KIND",
         "unit.gitopsctr.io/v1/OciImages": "gitopsctr.contrib.drivers.oci_images:API_KIND",

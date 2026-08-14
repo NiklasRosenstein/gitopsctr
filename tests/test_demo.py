@@ -64,6 +64,36 @@ def test_docker_demo_projects_only_stack_owned_units(tmp_path, monkeypatch):
     assert deploy_spec["terraform"]["variables"]["image"]["fromArtifact"]["unit"] == "application--image"
 
 
+def test_docker_converge_reapplies_the_authoritative_partition(monkeypatch):
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(docker_demo, "require_commands", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(docker_demo, "prepare_repository", lambda *_args: None)
+    monkeypatch.setattr(docker_demo, "ensure_registry", lambda *_args: None)
+    monkeypatch.setattr(docker_demo, "verify_application", lambda *_args: "ok")
+    monkeypatch.setattr(
+        docker_demo,
+        "_run_controller",
+        lambda *args, **_kwargs: calls.append(args) or subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    docker_demo.converge(5001, 18081)
+
+    assert calls == [
+        (
+            "converge",
+            "--environment",
+            "dev",
+            "--partition",
+            "application",
+            "--file",
+            "deployment/environments/dev/stacks",
+            "--source-revision",
+            "HEAD",
+            "--yes",
+        )
+    ]
+
+
 def test_docker_acceptance_proves_clean_convergence_then_finalizes(monkeypatch):
     events: list[object] = []
     heads = iter((RefHeads("desired", "observed"), RefHeads("desired", "observed")))
@@ -76,7 +106,7 @@ def test_docker_acceptance_proves_clean_convergence_then_finalizes(monkeypatch):
     monkeypatch.setattr(docker_demo, "deployment_heads", lambda: next(heads))
     monkeypatch.setattr(
         docker_demo,
-        "remove_and_finalize_source_stack",
+        "remove_and_finalize_partitioned_stack",
         lambda: events.append(("finalize",)),
     )
 
@@ -97,7 +127,7 @@ def test_docker_acceptance_always_cleans_after_failed_invariant(monkeypatch):
     monkeypatch.setattr(docker_demo, "clean", cleaned.append)
     monkeypatch.setattr(docker_demo, "converge", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(docker_demo, "deployment_heads", lambda: next(heads))
-    monkeypatch.setattr(docker_demo, "remove_and_finalize_source_stack", lambda: None)
+    monkeypatch.setattr(docker_demo, "remove_and_finalize_partitioned_stack", lambda: None)
 
     with pytest.raises(RuntimeError, match="moved desired or observed refs"):
         docker_demo.acceptance(5001, 18081)
@@ -106,7 +136,7 @@ def test_docker_acceptance_always_cleans_after_failed_invariant(monkeypatch):
 
 
 @pytest.mark.parametrize("provider", ("kind", "minikube"))
-def test_k8s_demo_projects_source_tracked_stack_for_provider(tmp_path, monkeypatch, provider):
+def test_k8s_demo_projects_partitioned_stack_for_provider(tmp_path, monkeypatch, provider):
     worktree = tmp_path / provider / "repository"
     shutil.copytree(k8s_demo.TEMPLATE, worktree)
     monkeypatch.setattr(k8s_demo, "docker_platform", lambda: "linux/amd64")
@@ -195,6 +225,34 @@ def test_k8s_staging_stack_uses_promoted_template_pin_with_target_parameters(tmp
     assert deploy.spec.materialize.values._serialize()["message"] == "promoted from dev to staging"
 
 
+def test_k8s_promotion_passes_explicit_target_input(monkeypatch):
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(k8s_demo, "converge", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(k8s_demo, "verify_workload", lambda *_args, **_kwargs: "image@sha256:1")
+    monkeypatch.setattr(k8s_demo, "deployment_heads", lambda *_args, **_kwargs: RefHeads("desired", "observed"))
+    monkeypatch.setattr(
+        k8s_demo,
+        "run_controller",
+        lambda _provider, *args, **_kwargs: calls.append(args) or subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    k8s_demo.run_promotion_story("kind", "direct")
+
+    assert calls == [
+        (
+            "promote",
+            "--from-environment",
+            "dev",
+            "--to-environment",
+            "staging",
+            "--file",
+            "deployment/environments/staging/stacks/application.yaml",
+            "--partition",
+            "application",
+        )
+    ]
+
+
 @pytest.mark.parametrize("provider", ("kind", "minikube"))
 def test_argocd_delivery_uses_parameterized_stack_observer(tmp_path, monkeypatch, provider):
     worktree = tmp_path / provider / "repository"
@@ -230,7 +288,7 @@ def test_argocd_delivery_uses_parameterized_stack_observer(tmp_path, monkeypatch
     }
 
 
-def test_preview_application_targets_direct_stack_projection():
+def test_preview_application_targets_unpartitioned_stack_projection():
     application = k8s_demo.argo_application_document("preview", preview=True)
     assert application["spec"]["source"]["targetRevision"] == "gitopsctr/desired/preview"
     assert application["spec"]["source"]["path"] == "materialized/preview--deploy"
@@ -240,8 +298,6 @@ def test_existing_preview_at_current_source_only_converges(monkeypatch, tmp_path
     events: list[object] = []
     monkeypatch.setattr(k8s_demo, "repository", lambda *_args, **_kwargs: SimpleNamespace(worktree=tmp_path))
     monkeypatch.setattr(k8s_demo, "source_revision", lambda _worktree: "a" * 40)
-    monkeypatch.setattr(k8s_demo, "instantiate_preview", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(k8s_demo, "update_preview", lambda *_args, **_kwargs: events.append("update"))
     monkeypatch.setattr(
         k8s_demo,
         "converge",
@@ -258,9 +314,9 @@ def test_existing_preview_at_current_source_only_converges(monkeypatch, tmp_path
 
     assert heads == RefHeads("desired", "observed")
     assert image == "application--image:r1"
-    assert [event for event in events if event == "update"] == []
     assert len(events) == 1
     assert events[0][0] == "converge"
+    assert events[0][2]["files"] == ("deployment/environments/preview/stacks/preview.yaml",)
 
 
 def test_provider_defaults_to_kind_and_accepts_minikube(monkeypatch):

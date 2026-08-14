@@ -33,9 +33,11 @@ run = "uv run gitopsctr schemas export docs/schemas"
 [tasks.schemas-check]
 run = "uv run gitopsctr schemas export docs/schemas --check"
 
-[tasks.migrate-documents]
-description = "Preview the one-shot JSON-to-YAML resource migration"
-run = "uv run python tools/migrate_documents.py --project-name gitopsctr"
+[tasks.resource-model]
+run = "uv run python -m gitopsctr.resource_model_export export docs/resource-model.md"
+
+[tasks.resource-model-check]
+run = "uv run python -m gitopsctr.resource_model_export export docs/resource-model.md --check"
 
 [tasks.docs]
 run = "uv run mkdocs build --strict"
@@ -45,13 +47,13 @@ description = "Serve the documentation with live reload"
 run = "uv run mkdocs serve"
 
 [tasks.check]
-depends = ["actionlint", "docs", "lint", "schemas-check", "typecheck", "test"]
+depends = ["actionlint", "docs", "lint", "resource-model-check", "schemas-check", "typecheck", "test"]
 
 [tasks.build]
 run = "uv build"
 
 [tasks.demo-docker]
-description = "Run, clean, or accept the source-tracked Docker Stack demo"
+description = "Run, clean, or accept the partitioned Docker Stack demo"
 usage = '''
 arg "[operation]" default="run" {
   choices "run" "clean" "acceptance"
@@ -60,12 +62,12 @@ arg "[operation]" default="run" {
 run = 'uv run python -m demo.docker.run "${usage_operation?}"'
 
 [tasks.demo-k8s]
-description = "Run, clean, or accept the promoted/direct-preview Kubernetes Stack demo"
+description = "Run, clean, or accept the promoted/unpartitioned-preview Kubernetes Stack demo"
 usage = '''
 arg "[operation]" default="run" {
   choices "run" "clean" "acceptance"
 }
-flag "--preview" help="Use a directly managed preview Stack"
+flag "--preview" help="Apply an unpartitioned preview Stack"
 flag "--delivery <delivery>" default="direct" {
   choices "direct" "argocd"
 }

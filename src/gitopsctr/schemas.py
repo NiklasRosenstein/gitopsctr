@@ -14,6 +14,7 @@ from gitopsctr.contracts import (
     SCHEMA_ROOT,
     DesiredResourceMetadata,
     DesiredStackSpec,
+    DesiredStackTemplateSpec,
     MashumaroContract,
     ResolvedInputs,
     StackSpec,
@@ -80,15 +81,9 @@ def _desired_metadata_schema() -> JsonObject:
     schema.pop("title", None)
     metadata_properties = cast(dict[str, Any], schema["properties"])
     metadata_properties["name"]["minLength"] = 1
-    for key in ("lifecycle", "ownerReferences", "deletion"):
+    for key in ("labels", "ownerReferences", "deletion"):
         property_schema = cast(dict[str, Any], metadata_properties[key])
         metadata_properties[key] = cast(list[dict[str, Any]], property_schema["anyOf"])[0]
-
-    lifecycle = cast(dict[str, Any], metadata_properties["lifecycle"])
-    lifecycle_properties = cast(dict[str, Any], lifecycle["properties"])
-    management_schema = cast(dict[str, Any], lifecycle_properties["management"])
-    lifecycle_properties["management"] = cast(list[dict[str, Any]], management_schema["anyOf"])[0]
-    lifecycle["required"] = ["management"]
 
     owner_references = cast(dict[str, Any], metadata_properties["ownerReferences"])
     owner_references["minItems"] = 1
@@ -99,10 +94,15 @@ def _desired_metadata_schema() -> JsonObject:
 
     deletion = cast(dict[str, Any], metadata_properties["deletion"])
     cast(dict[str, Any], deletion["properties"])["generation"]["minimum"] = 1
-    schema["oneOf"] = [
-        {"required": ["lifecycle"], "not": {"required": ["ownerReferences"]}},
-        {"required": ["ownerReferences"], "not": {"required": ["lifecycle"]}},
-    ]
+    labels = cast(dict[str, Any], metadata_properties["labels"])
+    label_properties = cast(dict[str, Any], labels.setdefault("properties", {}))
+    label_properties["gitopsctr.io/partition"] = {"type": "string", "pattern": r"^[a-z0-9][a-z0-9-]{0,62}$"}
+    schema["not"] = {
+        "required": ["ownerReferences", "labels"],
+        "properties": {
+            "labels": {"required": ["gitopsctr.io/partition"]},
+        },
+    }
     return schema
 
 
@@ -240,7 +240,13 @@ def core_resource_schema(kind: str, profile: str = "authored") -> JsonObject:
         schema["$id"] = resource_schema_url("gitopsctr.io/v1", kind)
         return schema
     elif kind == "StackTemplate":
-        specification = _model_specification_schema(StackTemplateSpec, "stack-template-spec")
+        specification = _model_specification_schema(
+            DesiredStackTemplateSpec if profile == "desired" else StackTemplateSpec,
+            "stack-template-spec",
+        )
+        # `resources` is an internal computed expansion view. Authored and
+        # desired StackTemplate documents expose only the canonical map form.
+        cast(dict[str, Any], specification.get("properties", {})).pop("resources", None)
     elif kind == "Stack":
         specification = _model_specification_schema(
             DesiredStackSpec if profile == "desired" and kind == "Stack" else StackSpec,

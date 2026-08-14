@@ -10,50 +10,137 @@ output uses color. Redirected output is plain. `NO_COLOR=1` disables color and
 
 ## Inspect and validate
 
-Start with read-only discovery:
+`get` is the resource-oriented, read-only inspection command. An Environment is analogous to a Kubernetes namespace:
+environment-scoped resources require `--environment NAME`, while `-A` or `--all-environments` queries every authored
+environment.
 
 ```console
-gitopsctr list environments
-gitopsctr list units --environment dev
+gitopsctr get environments
+gitopsctr get environment dev
+gitopsctr get units --environment dev
+gitopsctr get units -A
+gitopsctr get unit application--deploy --environment dev
+gitopsctr get stacks --environment dev
+gitopsctr get stack application --environment dev
+gitopsctr get stacktemplates --environment dev
+gitopsctr get stacktemplate application --environment dev
+gitopsctr get promotions --environment staging
+gitopsctr get promotion dev --environment staging
+gitopsctr get receipts --environment dev
+gitopsctr get receipt application--image --environment dev
 gitopsctr status --environment dev
-gitopsctr show desired --environment dev application
-gitopsctr show receipt --environment dev application
 gitopsctr dependencies --environment dev --unit application
 gitopsctr validate
 ```
 
-`show receipt --artifact NAME` prints one typed artifact and `--artifacts` prints all artifacts. Add `--json` or
-`--yaml` to the `show` commands to override the Project's preferred output format.
-
-## Resolve and reconcile
-
-A source-tracked environment normally moves through these operations:
+Singular and plural selectors are equivalent apart from whether a name is supplied. A named lookup with `-A` returns
+every matching resource and includes its Environment, which is useful when names are reused across namespaces:
 
 ```console
-gitopsctr advance-desired --environment dev --source-revision HEAD --dry
-gitopsctr advance-desired --environment dev --source-revision HEAD
-gitopsctr reconcile --environment dev --unit application --plan --source-revision HEAD
+gitopsctr get unit application--deploy -A
+```
+
+`--environment` and `-A/--all-environments` are mutually exclusive. Project-scoped Environment queries need neither.
+A collection with no matches succeeds with an empty table; a named lookup with no matches fails and identifies the
+resource and Environment.
+
+### Tables and raw resources
+
+`-o table` is the default. Tables are operational views rather than stored API documents. In particular, the Units
+table joins desired Units with their separately stored Receipts to show `OBSERVATION` (`CURRENT`, `STALE`, `MISSING`,
+or `N/A`) and `RECONCILIATION` (`CLEAN`, `READY`, `WAIT`, or `MATERIALIZED`). The Receipts table reports `CURRENT`,
+`STALE`, or `ORPHAN` relative to the selected desired snapshot. These relationships are derived at read time; a
+Receipt is not embedded into Unit `status`.
+
+The built-in views use these columns, with `ENVIRONMENT` added for `-A`:
+
+| Resource | Default columns |
+| --- | --- |
+| Environments | `NAME`, `DESIRED`, `OBSERVED`, reconciliation counts |
+| Units | `NAME`, `KIND`, `DESIRED`, `OBSERVATION`, `RECONCILIATION`, `REASON` |
+| Stacks | `NAME`, `TEMPLATE`, `PARTITION`, `UNITS`, `STATE` |
+| StackTemplates | `NAME`, `PARAMETERS`, `UNITS` |
+| Promotions | `NAME`, `SOURCE`, pinned desired, observed, and specification revisions |
+| Receipts | `NAME`, subject `KIND`, `OBSERVATION`, `ARTIFACTS` |
+
+For Units, `DESIRED` is the short Git blob identity of that exact persisted Unit document—the same identity used by a
+Receipt's freshness binding. It is intentionally per-resource rather than repeating the desired snapshot commit on
+every row.
+
+Use `-o yaml` or `-o json` for machine-readable output:
+
+```console
+gitopsctr get unit application--deploy --environment dev -o yaml
+gitopsctr get receipts -A -o json
+```
+
+A single result is the exact persisted resource document. Multi-result output is a schema-versioned inspection
+envelope: every item contains its Environment, plane, ref, revision, and path provenance alongside the exact document.
+The envelope does not synthesize a joined API resource.
+
+Desired resource queries accept `--desired-ref` and `--desired-revision`; Receipt queries accept `--observed-ref` and
+`--observed-revision`. Explicit ref or revision overrides cannot be combined with `-A`, because each Environment may
+resolve different deployment refs.
+
+Receipt artifacts remain explicitly subordinate to their producing Receipt. `--artifact NAME` prints one typed
+Artifact resource and `--artifacts` prints every artifact described by the Receipt:
+
+```console
+gitopsctr get receipt application--image --environment dev --artifact containers
+gitopsctr get receipt application--image --environment dev --artifacts
+```
+
+There is no standalone Artifact selector in this release because Artifact identity is producer-qualified. `status`
+remains the higher-level diagnostic view and includes authored resources that have not yet resolved into persisted
+desired Units; `get units` lists persisted desired Units only.
+
+## Apply and reconcile
+
+`apply` is the sole desired-state constructor. It takes explicit authored or canonical desired resources, resolves
+authored inputs, and atomically publishes the resulting desired snapshot:
+
+```console
+gitopsctr apply --environment dev \
+  --partition application \
+  --file deployment/environments/dev/stacks/application.yaml \
+  --source-revision HEAD
+gitopsctr reconcile --environment dev --unit application --plan
 gitopsctr reconcile --environment dev --unit application
 ```
 
-When you select a source revision, `advance-desired`, `reconcile`, and
-`converge` use its committed snapshot. If the working tree has changes,
-gitopsctr warns that it will exclude them. Commit the changes and select that
-commit if they must affect the operation.
+The optional partition identifies an authoritative apply set. Reapplying partition `application` means the supplied
+roots are its complete membership: members omitted from that application begin deletion. Different partitions and
+unpartitioned roots are untouched. Without `--partition`, apply updates only the named inputs; an existing root keeps
+its partition, while a new root is unpartitioned. Owned resources inherit selection through `ownerReferences`.
 
-Dry advance shows the controller-owned Git changes. A reconciliation plan lets
-the driver inspect its work without applying changes or publishing a receipt.
-Normal reconciliation publishes a receipt only after the driver succeeds.
+`--dry` previews the controller-owned Git changes. A no-op application creates no commit. An Environment change gate
+decides whether a changed candidate is published to the desired ref or offered for review. A reconciliation plan lets
+the driver inspect its work without applying changes or publishing a receipt; normal reconciliation publishes a
+receipt only after the driver succeeds.
+
+`--source-revision` selects the committed source snapshot used to resolve paths and pins. Working-tree changes are
+excluded, so commit them and select that commit when they must affect the application.
 
 For local orchestration, converge a unit and its dependencies until clean:
 
 ```console
-gitopsctr converge --environment dev --source-revision HEAD --unit application --yes
+gitopsctr converge --environment dev --unit application --yes
 ```
 
-Without `--unit`, `converge` targets the full environment. It advances desired
-state, reconciles ready units in dependency order, and repeats until all units
-are clean or progress is blocked.
+Without `--unit` or `--partition`, `converge` targets every persisted desired Unit. `--partition application` is
+selection shorthand for the Units rooted in that partition, including owned descendants. Supplying `--file` makes
+converge retain those exact inputs for the invocation and alternate apply with dependency-ordered reconciliation:
+
+```console
+gitopsctr converge --environment dev \
+  --partition application \
+  --file deployment/environments/dev/stacks/application.yaml \
+  --source-revision HEAD \
+  --yes
+```
+
+Without `--file`, converge only reconciles current desired state; it cannot reconstruct authored input. If an
+observation unlocks another dynamic reference, invoke apply again with the explicit input or use `converge --file`.
 
 ## Promote and verify
 
@@ -64,12 +151,16 @@ selected values or artifacts from the reviewed source state:
 gitopsctr promote \
   --from-environment dev \
   --to-environment staging \
+  --file deployment/environments/staging/stacks/application.yaml \
+  --partition application \
   --specification-revision SOURCE_SHA
 gitopsctr verify --environment staging
 ```
 
-The Promotion resource pins three independently selected revisions: the source desired revision, its matching source
-observed revision, and `--specification-revision`, which contains the target Environment and authored resources.
+Promotion applies the explicit target resources passed with `--file`; `--partition` gives that target apply set the
+same omission-based pruning semantics as ordinary apply. The Promotion resource pins three independently selected
+revisions: the source desired revision, its matching source observed revision, and `--specification-revision`, which
+contains the target Environment, project configuration, and template sources.
 `--source-desired-revision` defaults to the source desired-ref head; `--specification-revision` defaults to `HEAD`.
 Pass the latter explicitly when `HEAD` might have advanced beyond the source revision reviewed in the source
 environment.

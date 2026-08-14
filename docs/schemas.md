@@ -7,8 +7,8 @@ resources use `unit.gitopsctr.io/v1`. Each unit kind publishes schemas for:
 - `authored`: source input owned by the user;
 - `desired`: the fully resolved resource stored under
   `gitopsctr/desired/<environment>/units/`;
-- `receipt`: the applied result and controller evidence stored under the
-  observed ref.
+- `receipt`: the contract that specializes a separate observed Receipt for
+  that Unit kind; it is not embedded Unit status.
 
 The complete machine-readable catalog is
 [`schemas/index.json`](schemas/index.json).

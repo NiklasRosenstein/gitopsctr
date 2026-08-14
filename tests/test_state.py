@@ -1,13 +1,13 @@
 """Git commit-graph safety checks for change-gated candidates."""
 
 import subprocess
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from gitopsctr.errors import OperationError
-from gitopsctr.state import ControllerPinClaim, GitRefSnapshot, GitStateStore
+from gitopsctr.state import ControllerPin, GitRefSnapshot, GitStateStore
 
 
 @dataclass(frozen=True)
@@ -137,6 +137,22 @@ def test_controller_pin_create_and_repeat_are_idempotent(bare_repository: BareRe
     assert _remote_revision(bare_repository, pin.ref) == revision
 
 
+def test_controller_pin_batch_is_atomic_and_sorted(bare_repository: BareRepository):
+    first = _git(bare_repository.working, "rev-parse", "HEAD")
+    second = _commit(bare_repository.working, "state", "second\n", "second")
+    _git(bare_repository.working, "push", "origin", "main")
+    store = GitStateStore(bare_repository.working)
+
+    pins = store.create_controller_pins({"stacks/dev/z": first, "stacks/dev/a": second})
+
+    assert pins == (
+        ControllerPin("stacks/dev/a", _pin_ref("stacks/dev/a"), second),
+        ControllerPin("stacks/dev/z", _pin_ref("stacks/dev/z"), first),
+    )
+    assert _remote_revision(bare_repository, _pin_ref("stacks/dev/a")) == second
+    assert _remote_revision(bare_repository, _pin_ref("stacks/dev/z")) == first
+
+
 def test_controller_pin_listing_is_sorted_and_read_only(bare_repository: BareRepository):
     first = _git(bare_repository.working, "rev-parse", "HEAD")
     second = _commit(bare_repository.working, "state", "second\n", "second")
@@ -163,41 +179,6 @@ def test_remote_ref_listing_is_sorted_and_read_only(bare_repository: BareReposit
         GitRefSnapshot("candidate/z", first),
         GitRefSnapshot("main", first),
     )
-
-
-def test_controller_pin_claim_is_cas_fenced_and_recoverable(bare_repository: BareRepository):
-    revision = _git(bare_repository.working, "rev-parse", "HEAD")
-    claim = ControllerPinClaim(
-        environment="dev",
-        stack_name="preview",
-        uid="d1-stack-direct",
-        pin_name="stacks/dev/preview/d1-stack-direct",
-        pin_revision=revision,
-        target_ref="deploy/dev",
-        target_revision=revision,
-        candidate_ref="gitopsctr/candidates/dev/abc123456789",
-        candidate_revision=None,
-        state="preparing",
-    )
-    store = GitStateStore(bare_repository.working)
-
-    created = store.create_controller_pin_claim(claim)
-    repeated = store.create_controller_pin_claim(claim)
-
-    assert created.revision is not None
-    assert repeated == created
-    assert store.read_controller_pin_claim("stacks/dev/preview/d1-stack-direct") == created
-    assert store.list_controller_pin_claims() == (created,)
-
-    active = replace(claim, state="active", candidate_revision=revision)
-    updated = store.update_controller_pin_claim(active, created.revision)
-    assert updated.revision is not None and updated.revision != created.revision
-    with pytest.raises(OperationError, match="changed before update"):
-        store.update_controller_pin_claim(replace(active, state="reaping"), created.revision)
-    with pytest.raises(OperationError, match="changed before deletion"):
-        store.delete_controller_pin_claim("stacks/dev/preview/d1-stack-direct", created.revision)
-    assert store.delete_controller_pin_claim("stacks/dev/preview/d1-stack-direct", updated.revision)
-    assert store.read_controller_pin_claim("stacks/dev/preview/d1-stack-direct") is None
 
 
 def test_controller_pin_mismatched_create_fails_closed(bare_repository: BareRepository):

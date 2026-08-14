@@ -1,6 +1,6 @@
 # Docker Stack demo
 
-This demo exercises one source-tracked `Stack` with real local effects:
+This demo applies one authored `Stack` as the authoritative `application` partition and exercises real local effects:
 
 1. `application--image` builds the HTTP application and publishes it to a local OCI registry.
 2. Its `containers` artifact carries the immutable image digest.
@@ -21,8 +21,9 @@ Override the default ports when necessary:
 GITOPSCTR_DEMO_REGISTRY_PORT=5001 GITOPSCTR_DEMO_APP_PORT=18081 mise run demo-docker run
 ```
 
-The acceptance flow starts empty, deploys the Stack, proves a second convergence runs no drivers and moves no refs,
-removes the authored Stack, and finalizes its generated Units before the Stack root:
+The acceptance flow starts empty, applies and deploys the Stack, proves a second application and convergence are
+no-ops, removes the Stack from the explicitly applied partition, and finalizes its generated Units before the Stack
+root:
 
 ```console
 mise run demo-docker acceptance

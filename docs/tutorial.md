@@ -15,7 +15,8 @@ The demo source is under `demo/docker/repository/`:
 - `gitopsctr.yaml` declares the `Project` and its environment directory.
 - `deployment/environments/dev/environment.yaml` declares the `dev` environment.
 - `deployment/stack-templates/application.yaml` declares reusable image and deployment Unit templates.
-- `deployment/environments/dev/stacks/application.yaml` instantiates them as one source-tracked Stack.
+- `deployment/environments/dev/stacks/application.yaml` instantiates them as one Stack in the `application` apply
+  partition.
 
 The service obtains the immutable image URI from the image unit:
 
@@ -48,10 +49,10 @@ mise run sync
 mise run demo-docker run
 ```
 
-The runner creates an isolated Git repository, starts a local registry, then runs `converge`. Convergence advances
-`gitopsctr/desired/dev`, expands the Stack, reconciles `application--image`, publishes its receipt and artifact to
-`gitopsctr/observed/dev`, advances the Stack projection with the resolved image URI, and finally reconciles
-`application--deploy`.
+The runner creates an isolated Git repository, starts a local registry, then runs `converge` with the Stack file and
+partition as explicit inputs. Convergence applies the Stack to `gitopsctr/desired/dev`, reconciles
+`application--image`, publishes its receipt and artifact to `gitopsctr/observed/dev`, reapplies the same input to
+resolve the image URI, and finally reconciles `application--deploy`.
 
 The command finishes with the application URL and response. Verify it directly:
 
@@ -66,33 +67,35 @@ Change into the demo's isolated repository:
 ```console
 cd .docker-demo-state/repository
 uv run gitopsctr status --environment dev
-uv run gitopsctr list units --environment dev
-uv run gitopsctr show desired --environment dev application--deploy
-uv run gitopsctr show receipt --environment dev application--image
-uv run gitopsctr show receipt --environment dev application--image --artifact containers
+uv run gitopsctr get environments
+uv run gitopsctr get units --environment dev
+uv run gitopsctr get stacks --environment dev
+uv run gitopsctr get unit application--deploy --environment dev -o yaml
+uv run gitopsctr get receipt application--image --environment dev -o yaml
+uv run gitopsctr get receipt application--image --environment dev --artifact containers
 git log --all --oneline --decorate
 ```
 
-The source commit contains authored resources. `gitopsctr/desired/dev` contains resolved desired units;
-`gitopsctr/observed/dev` contains
-receipts and artifacts proving what was applied. See [Concepts](concepts.md) for the full state model.
+The source commit contains authored resources. `gitopsctr/desired/dev` contains resolved desired Units, Stacks, and
+StackTemplates; `gitopsctr/observed/dev` contains Receipts and Artifacts proving what was applied. The default Unit
+table combines those planes into an operational summary, but `-o yaml` returns the exact desired Unit and exact
+Receipt as separate resources. See [Concepts](concepts.md) for the full state model.
 
-## Source-tracked and directly managed resources
+## Partitions and independent resources
 
-This tutorial uses a source-tracked Stack: source YAML declares the Stack root, and `advance-desired` controls its
-lifecycle and that of its generated Units. Preview CI can instead create a directly managed Stack in the desired ref:
+This tutorial applies one authoritative partition. If the Stack is removed from the next application of that
+partition, gitopsctr begins deletion of the Stack and its generated Units:
 
 ```console
-gitopsctr create stack --in=state --or-update \
-  --environment preview --name pr-123 --template preview \
-  --source-revision "$GITHUB_SHA" \
-  --request-id "github:example/application#123:sync:$GITHUB_SHA"
+gitopsctr apply --environment dev \
+  --partition application \
+  --file deployment/environments/dev/stacks \
+  --source-revision HEAD
 ```
 
-The command is safe to retry with the same request ID and inputs. A later
-source revision is a new mutation and needs a new request ID. Reusing an ID
-with different inputs is rejected. See [Preview environments](preview-environments.md)
-for deletion and finalization.
+Applying without `--partition` updates only explicitly supplied roots. Existing resources keep their partition; new
+resources remain unpartitioned. See [Preview environments](preview-environments.md) for the unpartitioned preview
+workflow and deletion/finalization.
 
 ## Prove clean convergence
 

@@ -1,19 +1,10 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import pytest
 
 from gitopsctr import controller
-from gitopsctr.contracts import (
-    DesiredLifecycle,
-    DesiredOwnerReference,
-    DesiredResourceMetadata,
-    LifecycleManagement,
-)
 from gitopsctr.errors import OperationError
-from gitopsctr.resources import ResourceMetadata, validate_desired_resource_graph
+from gitopsctr.resources import PARTITION_LABEL, ResourceMetadata, validate_desired_resource_graph
 
 
 def authored_terraform(name: str) -> dict[str, object]:
@@ -25,54 +16,16 @@ def authored_terraform(name: str) -> dict[str, object]:
     }
 
 
-def legacy_desired(name: str, revision: str = "a" * 40) -> dict[str, object]:
+def desired_terraform(
+    name: str,
+    *,
+    uid: str,
+    metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
     return {
-        "name": name,
-        "driver": "terraform",
-        "source": {
-            "path": ".",
-            "revision": revision,
-            "inputHash": "sha256:inputs",
-            "driverVersion": controller.DRIVER_VERSIONS["terraform"],
-        },
-    }
-
-
-def test_desired_round_trip_assigns_canonical_identity_and_authority():
-    parsed = controller.parse_desired_unit_document(legacy_desired("infra"), "infra")
-
-    assert parsed.is_legacy_compatibility
-    with pytest.raises(OperationError, match="must be canonical"):
-        controller.serialize_unit_document(parsed)
-
-    adopted = parsed.with_metadata(ResourceMetadata.new_source_tracked(parsed.name))
-    document = controller.serialize_unit_document(adopted)
-    assert document["metadata"]["uid"]
-    assert document["metadata"]["lifecycle"] == {"management": {"mode": "sourceTracked"}}
-
-    round_tripped = controller.parse_desired_unit_document(document, "infra")
-    assert not round_tripped.is_legacy_compatibility
-    assert round_tripped.metadata.uid == document["metadata"]["uid"]
-
-
-def test_authored_metadata_rejects_lifecycle_fields():
-    document = authored_terraform("infra")
-    document["metadata"] = {
-        "name": "infra",
-        "uid": "uid-1",
-        "lifecycle": {"management": {"mode": "sourceTracked"}},
-    }
-
-    with pytest.raises(OperationError, match="authored unit metadata may contain only name"):
-        controller.parse_authored_unit_document(document, "infra")
-
-
-@pytest.mark.parametrize("field", ["uid", "lifecycle"])
-def test_desired_metadata_rejects_explicit_null_lifecycle_fields(field):
-    document = {
         "apiVersion": "unit.gitopsctr.io/v1",
         "kind": "Terraform",
-        "metadata": {"name": "infra", field: None},
+        "metadata": {"name": name, "uid": uid, **(metadata or {})},
         "spec": {
             "source": {
                 "path": ".",
@@ -83,53 +36,81 @@ def test_desired_metadata_rejects_explicit_null_lifecycle_fields(field):
         },
     }
 
-    with pytest.raises(OperationError, match="null values"):
-        controller.parse_desired_unit_document(document, "infra")
+
+def test_desired_round_trip_preserves_canonical_identity_and_partition() -> None:
+    document = desired_terraform(
+        "infra",
+        uid="d1-infra",
+        metadata={"labels": {"team": "platform", PARTITION_LABEL: "application"}},
+    )
+
+    parsed = controller.parse_desired_unit_document(document, "infra")
+    round_tripped = controller.serialize_unit_document(parsed)
+
+    assert round_tripped["metadata"] == document["metadata"]
+    assert parsed.metadata.is_root
+    assert parsed.metadata.partition == "application"
 
 
-def test_lifecycle_model_requires_exactly_one_authority():
-    with pytest.raises(ValueError, match="exactly one"):
-        DesiredResourceMetadata(name="resource", uid="uid-resource", lifecycle=DesiredLifecycle())
-    with pytest.raises(ValueError, match="exactly one"):
-        DesiredResourceMetadata(
-            name="resource",
-            uid="uid-resource",
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
-            ownerReferences=[
-                DesiredOwnerReference(
-                    apiVersion="unit.gitopsctr.io/v1",
-                    kind="Terraform",
-                    name="owner",
-                    uid="uid-owner",
-                )
-            ],
+@pytest.mark.parametrize("profile", ["authored", "desired"])
+def test_unit_parsers_require_canonical_resource_envelopes(profile: str) -> None:
+    parse = controller.parse_authored_unit_document if profile == "authored" else controller.parse_desired_unit_document
+    with pytest.raises(OperationError, match="unit envelope requires apiVersion, kind, and metadata"):
+        parse(
+            {
+                "name": "infra",
+                "driver": "terraform",
+                "source": {"path": ".", "revision": "a" * 40, "driverVersion": 2},
+            },
+            "infra",
         )
 
 
-def test_owner_uid_fencing_and_cycles_are_validated():
-    owner_resource = controller.parse_desired_unit_document(legacy_desired("owner"), "owner").with_metadata(
-        ResourceMetadata.new_source_tracked("owner")
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"name": "infra", "uid": "uid-1"},
+        {"name": "infra", "labels": {PARTITION_LABEL: "application"}},
+        {"name": "infra", "uid": "uid-1", "lifecycle": {"management": {"mode": "sourceTracked"}}},
+    ],
+)
+def test_authored_metadata_rejects_controller_owned_fields(metadata: dict[str, object]) -> None:
+    document = authored_terraform("infra")
+    document["metadata"] = metadata
+
+    with pytest.raises(OperationError, match="authored unit metadata may contain only name"):
+        controller.parse_authored_unit_document(document, "infra")
+
+
+@pytest.mark.parametrize("field", ["uid", "labels", "ownerReferences", "deletion"])
+def test_desired_metadata_rejects_explicit_null_fields(field: str) -> None:
+    document = desired_terraform("infra", uid="uid-infra")
+    document["metadata"][field] = None  # type: ignore[index]
+
+    with pytest.raises(OperationError, match="invalid metadata"):
+        controller.parse_desired_unit_document(document, "infra")
+
+
+def test_owner_uid_fencing_and_cycles_are_validated() -> None:
+    owner_document = desired_terraform(
+        "owner",
+        uid="uid-owner",
+        metadata={"labels": {PARTITION_LABEL: "application"}},
     )
-    owner_document = controller.serialize_unit_document(owner_resource)
-    owner_uid = owner_document["metadata"]["uid"]
-    child_document = {
-        **legacy_desired("child"),
-        "apiVersion": "unit.gitopsctr.io/v1",
-        "kind": "Terraform",
-        "metadata": {
-            "name": "child",
-            "uid": "uid-child",
+    child_document = desired_terraform(
+        "child",
+        uid="uid-child",
+        metadata={
             "ownerReferences": [
                 {
                     "apiVersion": "unit.gitopsctr.io/v1",
                     "kind": "Terraform",
                     "name": "owner",
-                    "uid": owner_uid,
+                    "uid": "uid-owner",
                 }
-            ],
+            ]
         },
-        "spec": {"source": {"path": ".", "revision": "a" * 40, "driverVersion": 2}},
-    }
+    )
     owner_resource = controller.parse_desired_unit_document(owner_document, "owner")
     child_resource = controller.parse_desired_unit_document(child_document, "child")
     validate_desired_resource_graph(
@@ -139,16 +120,20 @@ def test_owner_uid_fencing_and_cycles_are_validated():
         }
     )
 
-    bad_child = dict(child_document)
-    bad_child["metadata"] = {
-        **child_document["metadata"],
-        "ownerReferences": [
-            {
-                **child_document["metadata"]["ownerReferences"][0],
-                "uid": "uid-wrong",
-            }
-        ],
-    }
+    bad_child = desired_terraform(
+        "child",
+        uid="uid-child",
+        metadata={
+            "ownerReferences": [
+                {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "name": "owner",
+                    "uid": "uid-wrong",
+                }
+            ]
+        },
+    )
     with pytest.raises(ValueError, match="different UID"):
         validate_desired_resource_graph(
             {
@@ -159,190 +144,33 @@ def test_owner_uid_fencing_and_cycles_are_validated():
             }
         )
 
-    cycle_document = dict(child_document)
-    cycle_document["metadata"] = {
-        **child_document["metadata"],
-        "ownerReferences": [
-            {
-                **child_document["metadata"]["ownerReferences"][0],
-                "name": "child",
-                "uid": "uid-child",
-            }
-        ],
-    }
+    cycle = desired_terraform(
+        "child",
+        uid="uid-child",
+        metadata={
+            "ownerReferences": [
+                {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "name": "child",
+                    "uid": "uid-child",
+                }
+            ]
+        },
+    )
     with pytest.raises(ValueError, match="acyclic"):
         validate_desired_resource_graph(
-            {
-                ("unit.gitopsctr.io/v1", "Terraform", "child"): controller.parse_desired_unit_document(
-                    cycle_document, "child"
-                )
-            }
+            {("unit.gitopsctr.io/v1", "Terraform", "child"): controller.parse_desired_unit_document(cycle, "child")}
         )
 
     with pytest.raises(ValueError, match="mapping key"):
         validate_desired_resource_graph({("wrong", "Terraform", "owner"): owner_resource})
 
-    duplicate_owner = owner_resource.with_metadata(ResourceMetadata.new_source_tracked("owner"))
+    duplicate_owner = owner_resource.with_metadata(ResourceMetadata.new_root("owner"))
     with pytest.raises(ValueError, match="duplicate desired resource identity"):
         validate_desired_resource_graph(
             {
                 ("unit.gitopsctr.io/v1", "Terraform", "owner"): owner_resource,
                 ("wrong", "Terraform", "duplicate"): duplicate_owner,
             }
-        )
-
-
-def test_legacy_resources_are_compatibility_roots_but_not_owner_targets():
-    legacy_owner = controller.parse_desired_unit_document(legacy_desired("owner"), "owner")
-    validate_desired_resource_graph({("unit.gitopsctr.io/v1", "Terraform", "owner"): legacy_owner})
-
-    child_document = legacy_desired("child")
-    child_document["apiVersion"] = "unit.gitopsctr.io/v1"
-    child_document["kind"] = "Terraform"
-    child_document["spec"] = {"source": child_document.pop("source")}
-    child_document["metadata"] = {
-        "name": "child",
-        "uid": "uid-child",
-        "ownerReferences": [
-            {
-                "apiVersion": "unit.gitopsctr.io/v1",
-                "kind": "Terraform",
-                "name": "owner",
-                "uid": "uid-legacy-owner",
-            }
-        ],
-    }
-    child = controller.parse_desired_unit_document(child_document, "child")
-    with pytest.raises(ValueError, match="legacy compatibility root"):
-        validate_desired_resource_graph(
-            {
-                ("unit.gitopsctr.io/v1", "Terraform", "owner"): legacy_owner,
-                ("unit.gitopsctr.io/v1", "Terraform", "child"): child,
-            }
-        )
-
-
-def test_build_candidate_retains_uid_and_source_absent_cleanup_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    source_root = tmp_path / "source"
-    current = tmp_path / "current"
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    source_root.mkdir()
-    (source_root / "gitopsctr.yaml").write_text(
-        json.dumps(
-            {
-                "apiVersion": "gitopsctr.io/v1",
-                "kind": "Project",
-                "metadata": {"name": "test"},
-                "spec": {"effectLease": None},
-            }
-        )
-    )
-    current_units = current / "units"
-    current_units.mkdir(parents=True)
-    observed.mkdir()
-
-    existing = controller.parse_desired_unit_document(legacy_desired("infra"), "infra")
-    existing_document = controller.serialize_unit_document(
-        existing.with_metadata(ResourceMetadata.new_source_tracked(existing.name))
-    )
-    (current_units / "infra.json").write_text(json.dumps(existing_document))
-    (current_units / "orphan.json").write_text(json.dumps(legacy_desired("orphan")))
-    existing_uid = existing_document["metadata"]["uid"]
-
-    authored = controller.parse_authored_unit_document(authored_terraform("infra"), "infra")
-    monkeypatch.setattr(controller, "load_environment_specifications", lambda *_args: {"infra": authored})
-    monkeypatch.setattr(
-        controller,
-        "resolved_unit_source",
-        lambda *_args: controller.ResolvedUnitSourceResult(
-            source=controller.DesiredSource(
-                path=".",
-                revision="b" * 40,
-                inputHash="sha256:inputs",
-                driverVersion=controller.DRIVER_VERSIONS["terraform"],
-            ),
-            inputs_changed=False,
-        ),
-    )
-
-    result = controller.build_desired_candidate(
-        "dev",
-        source_root,
-        "b" * 40,
-        current,
-        observed,
-        None,
-        candidate,
-        verbose=False,
-    )
-
-    retained = controller.load_desired_unit(candidate / "units/infra.json", "infra")
-    orphan = controller.load_desired_unit(candidate / "units/orphan.json", "orphan")
-    assert retained.metadata.uid == existing_uid
-    assert orphan.metadata.lifecycle is not None
-    assert orphan.metadata.lifecycle.management is not None
-    assert "orphan" in result.cleanup_inputs
-
-    repeated_candidate = tmp_path / "candidate-repeat"
-    controller.build_desired_candidate(
-        "dev",
-        source_root,
-        "b" * 40,
-        current,
-        observed,
-        None,
-        repeated_candidate,
-        verbose=False,
-    )
-    assert controller.directory_files(candidate) == controller.directory_files(repeated_candidate)
-
-
-def test_direct_same_name_resource_is_not_adopted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    source_root = tmp_path / "source"
-    current = tmp_path / "current"
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    source_root.mkdir()
-    (source_root / "gitopsctr.yaml").write_text(
-        json.dumps(
-            {
-                "apiVersion": "gitopsctr.io/v1",
-                "kind": "Project",
-                "metadata": {"name": "test"},
-                "spec": {"effectLease": None},
-            }
-        )
-    )
-    current_units = current / "units"
-    current_units.mkdir(parents=True)
-    observed.mkdir()
-    direct = legacy_desired("infra")
-    direct.update(
-        {
-            "apiVersion": "unit.gitopsctr.io/v1",
-            "kind": "KubernetesManifests",
-            "metadata": {
-                "name": "infra",
-                "uid": "uid-direct",
-                "lifecycle": {"management": {"mode": "direct"}},
-            },
-            "spec": {"source": {"path": ".", "revision": "a" * 40, "driverVersion": 2}},
-        }
-    )
-    (current_units / "infra.json").write_text(json.dumps(direct))
-    authored = controller.parse_authored_unit_document(authored_terraform("infra"), "infra")
-    monkeypatch.setattr(controller, "load_environment_specifications", lambda *_args: {"infra": authored})
-    monkeypatch.setattr(
-        controller,
-        "resolved_unit_source",
-        lambda *_args: (
-            controller.DesiredSource(path=".", revision="b" * 40, inputHash="sha256:inputs", driverVersion=2),
-            False,
-        ),
-    )
-
-    with pytest.raises(OperationError, match="directly managed"):
-        controller.build_desired_candidate(
-            "dev", source_root, "b" * 40, current, observed, None, candidate, verbose=False
         )

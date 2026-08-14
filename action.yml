@@ -1,9 +1,9 @@
 name: gitopsctr
-description: Prepare, reconcile, advance, promote, or roll back Git-backed deployment state
+description: Apply, converge, reconcile, promote, or roll back Git-backed deployment state
 
 inputs:
   operation:
-    description: Operation to run (prepare, reconcile, advance, promote, or rollback)
+    description: Operation to run (prepare, apply, converge, reconcile, promote, or rollback)
     required: true
   package-source:
     description: Install from pypi, this action revision, or an explicit git repository
@@ -26,11 +26,19 @@ inputs:
     required: false
     default: .
   environment:
-    description: Deployment environment for prepare, reconcile, advance, or rollback
+    description: Deployment environment for prepare, apply, converge, reconcile, or rollback
     required: false
     default: ""
   unit:
-    description: Deployment unit for reconcile
+    description: Deployment unit for reconcile or converge
+    required: false
+    default: ""
+  files:
+    description: Newline-separated explicit input paths for apply, converge, or promote
+    required: false
+    default: ""
+  partition:
+    description: Authoritative apply or promotion partition, or converge selection shorthand
     required: false
     default: ""
   from-environment:
@@ -54,7 +62,7 @@ inputs:
     required: false
     default: ""
   source-revision:
-    description: Source revision for reconcile, advance, or promotion source desired state
+    description: Source revision for apply/converge, or promotion source desired state
     required: false
     default: ""
   specification-revision:
@@ -81,12 +89,8 @@ inputs:
     description: Required operator reason for rollback
     required: false
     default: ""
-  advance:
-    description: Advance desired state as part of reconcile
-    required: false
-    default: "false"
   dry:
-    description: Preview controller writes for prepare, advance, or rollback
+    description: Preview controller writes for apply or rollback
     required: false
     default: "false"
   plan:
@@ -118,15 +122,9 @@ outputs:
   active:
     description: Whether prepare selected a desired revision that is still eligible
     value: ${{ steps.run.outputs.active }}
-  advance-after-reconcile:
-    description: Whether reconciliation should continue advancing desired state
-    value: ${{ steps.run.outputs.advance_after_reconcile }}
   reconciled:
     description: Whether reconcile published a receipt
     value: ${{ steps.run.outputs.reconciled }}
-  desired-changed:
-    description: Whether desired state advanced
-    value: ${{ steps.run.outputs.desired_changed }}
   desired-revision:
     description: Resulting desired revision
     value: ${{ steps.run.outputs.desired_revision }}
@@ -166,12 +164,12 @@ runs:
       id: run
       shell: bash
       env:
-        ADVANCE: ${{ inputs.advance }}
         CANDIDATE_REF: ${{ inputs.candidate-ref }}
         DESIRED_REF: ${{ inputs.desired-ref }}
         DESIRED_REVISION: ${{ inputs.desired-revision }}
         DRY: ${{ inputs.dry }}
         ENVIRONMENT: ${{ inputs.environment }}
+        FILES: ${{ inputs.files }}
         FROM_ENVIRONMENT: ${{ inputs.from-environment }}
         GH_TOKEN: ${{ inputs.github-token || github.token }}
         GITOPSCTR_GIT_AUTHOR_EMAIL: ${{ inputs.git-author-email }}
@@ -179,6 +177,7 @@ runs:
         OBSERVED_REF: ${{ inputs.observed-ref }}
         OPERATION: ${{ inputs.operation }}
         PLAN: ${{ inputs.plan }}
+        PARTITION: ${{ inputs.partition }}
         REAPPLY: ${{ inputs.reapply }}
         REPORT: ${{ inputs.report }}
         REQUIRE_SOURCE_REF: ${{ inputs.require-source-ref }}

@@ -1,4 +1,4 @@
-"""Acceptance-level coverage for Stack lifecycle recovery and ordering."""
+"""Acceptance-level coverage for Stack recovery and ordering."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import pytest
 
 from gitopsctr import controller
 from gitopsctr.errors import OperationError
-from gitopsctr.state import ControllerPin, ControllerPinClaim
+from gitopsctr.state import ControllerPin
 from tests.stack_deletion_support import deletion_args as _args
 from tests.stack_deletion_support import fake_git as _fake_git
 from tests.stack_deletion_support import stack_tree as _stack_tree
@@ -249,77 +249,6 @@ def test_from_promotion_loads_exact_source_and_projects_subset(tmp_path: Path, m
     assert dev_stack.spec.resolvedSource == stack.spec.resolvedSource
 
 
-def test_source_tracked_stack_cleanup_is_durable_across_restart(tmp_path: Path):
-    source = tmp_path / "source"
-    environment = project_repository(source)
-    write_stack_source(environment)
-    initial = tmp_path / "initial"
-    projection = controller.project_stack_resources(source, "dev", "a" * 40, initial, source)
-    initial_stack = controller.RESOURCE_CATALOG.parse_stack(
-        controller.RESOURCE_CATALOG.load_document(next((initial / "stacks").glob("web.*"))),
-        profile="desired",
-        expected_name="web",
-    )
-
-    write_projected_units(initial, projection, source)
-    controller.load_desired_resource_graph(initial)
-
-    (environment / "stacks/web.json").unlink()
-    observed = tmp_path / "observed"
-    observed.mkdir()
-    candidate = tmp_path / "candidate"
-    first = controller.build_desired_candidate(
-        "dev",
-        source,
-        "b" * 40,
-        initial,
-        observed,
-        None,
-        candidate,
-        verbose=False,
-    )
-
-    assert first.blocked == {}
-    assert initial_stack.metadata.uid is not None
-    deleting_stack = controller.RESOURCE_CATALOG.parse_stack(
-        controller.RESOURCE_CATALOG.load_document(next((candidate / "stacks").glob("web.*"))),
-        profile="desired",
-        expected_name="web",
-    )
-    deleting_unit = controller.load_desired_unit(candidate / "units/web--preview-app.json", "web--preview-app")
-    assert deleting_stack.metadata.deletion is not None
-    assert deleting_stack.metadata.deletion.generation == 1
-    assert deleting_stack.metadata.uid == initial_stack.metadata.uid
-    assert deleting_unit.metadata.deletion is not None
-    assert deleting_unit.metadata.ownerReferences is not None
-    assert deleting_unit.metadata.ownerReferences[0].uid == initial_stack.metadata.uid
-
-    restarted = tmp_path / "restarted"
-    second = controller.build_desired_candidate(
-        "dev",
-        source,
-        "c" * 40,
-        candidate,
-        observed,
-        None,
-        restarted,
-        verbose=False,
-    )
-
-    assert second.blocked == {}
-    second_stack = controller.RESOURCE_CATALOG.parse_stack(
-        controller.RESOURCE_CATALOG.load_document(next((restarted / "stacks").glob("web.*"))),
-        profile="desired",
-        expected_name="web",
-    )
-    assert second_stack.metadata.deletion == deleting_stack.metadata.deletion
-    retained_unit = controller.load_desired_unit(restarted / "units/web--preview-app.json", "web--preview-app")
-    assert retained_unit.metadata.uid == "d1-web--preview-app"
-    assert retained_unit.metadata.ownerReferences is not None
-    assert retained_unit.metadata.ownerReferences[0].uid == initial_stack.metadata.uid
-    assert controller.load_desired_resource_graph(restarted)
-
-
 def test_two_stacks_from_one_template_have_independent_generated_units(tmp_path: Path):
     source = tmp_path / "source"
     environment = project_repository(source)
@@ -347,35 +276,20 @@ def test_two_stacks_from_one_template_have_independent_generated_units(tmp_path:
     assert ("unit.gitopsctr.io/v1", "Terraform", "web--preview-app") in graph
 
 
-def test_direct_stack_finalization_retries_after_injected_publication_failure(tmp_path: Path, monkeypatch):
+def test_stack_finalization_retries_after_injected_publication_failure(tmp_path: Path, monkeypatch):
     current = tmp_path / "current"
     stack_uid, unit_name = _stack_tree(current)
     published: list[Path] = []
     released: list[tuple[str, str]] = []
-    deleted_claims: list[tuple[str, str]] = []
     pin = ControllerPin(
-        "stacks/dev/preview/d1-stack-direct",
-        "refs/heads/gitopsctr/pins/stacks/dev/preview/d1-stack-direct",
+        f"stacks/dev/preview/d1-stack-preview/{'a' * 40}",
+        f"refs/heads/gitopsctr/pins/stacks/dev/preview/d1-stack-preview/{'a' * 40}",
         "a" * 40,
     )
-    claim = ControllerPinClaim(
-        environment="dev",
-        stack_name="preview",
-        uid=stack_uid,
-        pin_name=pin.name,
-        pin_revision=pin.revision,
-        target_ref="deploy/dev",
-        target_revision="c" * 40,
-        candidate_ref="candidate/dev",
-        candidate_revision=None,
-        state="active",
-        revision="e" * 40,
-    )
     store = SimpleNamespace(
-        create_controller_pin=lambda _name, _revision: pin,
+        create_controller_pins=lambda _revisions: (pin,),
+        list_controller_pins=lambda: (pin,),
         release_controller_pin=lambda name, revision: released.append((name, revision)) or True,
-        read_controller_pin_claim=lambda _name: claim,
-        delete_controller_pin_claim=lambda name, revision: deleted_claims.append((name, revision)) or True,
     )
 
     monkeypatch.setattr(controller, "REPOSITORY_ROOT", tmp_path)
@@ -424,15 +338,14 @@ def test_direct_stack_finalization_retries_after_injected_publication_failure(tm
     monkeypatch.setattr(controller, "publish_desired_change", publish)
     assert controller.command_finalize(_args()) is True
     assert not list((published[-1] / "stacks").glob("preview.*"))
-    assert released == [("stacks/dev/preview/d1-stack-direct", "a" * 40)]
-    assert deleted_claims == [("stacks/dev/preview/d1-stack-direct", "e" * 40)]
+    assert released == [(pin.name, "a" * 40)]
 
 
 def test_dependencies_cli_preserves_explicit_stack_order_after_restart(tmp_path: Path, monkeypatch, capsys):
     source = tmp_path / "source"
     environment = project_repository(source)
     write_stack_source(environment)
-    template_path = environment / "stack-templates/preview.json"
+    template_path = environment.parents[1] / "stack-templates/preview.json"
     template = json.loads(template_path.read_text())
     template["spec"]["unitTemplates"]["preview-db"] = {
         "apiVersion": "unit.gitopsctr.io/v1",

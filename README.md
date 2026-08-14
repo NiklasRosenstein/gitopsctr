@@ -14,7 +14,14 @@ uv tool install gitopsctr
 gitopsctr --help
 ```
 
-The CLI is the same in local use, CI, and the composite GitHub Action.
+The CLI is the same in local use, CI, and the composite GitHub Action. `gitopsctr get` is the primary resource
+inspection utility; `status` provides higher-level diagnosis.
+
+```console
+gitopsctr get environments
+gitopsctr get units --environment dev
+gitopsctr apply --environment dev --partition application -f deployment/application/
+```
 
 ## Documentation
 

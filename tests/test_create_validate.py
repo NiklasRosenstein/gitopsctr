@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 from pathlib import Path
 
 import pytest
@@ -161,47 +160,6 @@ def test_create_stack_and_stacktemplate_write_source_resources(tmp_path: Path, c
     assert capsys.readouterr().out.splitlines()[-1].endswith("application.yaml")
 
 
-def test_create_unit_state_uses_the_desired_document(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    create_project(tmp_path)
-    controller.REPOSITORY_ROOT = tmp_path
-    desired = tmp_path / "unit.json"
-    desired.write_text(
-        json.dumps(
-            {
-                "apiVersion": "unit.gitopsctr.io/v1",
-                "kind": "Terraform",
-                "metadata": {
-                    "name": "preview",
-                    "uid": "d1-preview",
-                    "lifecycle": {"management": {"mode": "direct"}},
-                },
-                "spec": {
-                    "source": {"path": ".", "revision": "a" * 40},
-                    "terraform": {"backend": {}, "variables": {}, "observeOutputs": []},
-                },
-            }
-        )
-    )
-    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("desired/dev", "observed/dev"))
-    monkeypatch.setattr(controller, "fetch_ref", lambda _ref: "b" * 40)
-    monkeypatch.setattr(controller, "materialize_revision", lambda _revision, output: output.mkdir(parents=True))
-    published: list[Path] = []
-
-    def publish(_environment, candidate, *_args, **_kwargs):
-        snapshot = tmp_path / f"published-{len(published)}"
-        shutil.copytree(candidate, snapshot)
-        published.append(snapshot)
-        return "c" * 40, None
-
-    monkeypatch.setattr(controller, "publish_desired_change", publish)
-    monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
-
-    run_command(tmp_path, ["create", "unit", "--in=state", "--environment", "dev", "--file", str(desired)])
-
-    preview_path = next((published[0] / "units").glob("preview.*"))
-    assert controller.load_desired_unit(preview_path, "preview").metadata.uid == "d1-preview"
-
-
 def test_create_project_validates_before_writing_and_requires_force(tmp_path: Path):
     with pytest.raises(controller.OperationError, match="does not match"):
         create_project(tmp_path, name="Not_Valid")
@@ -258,26 +216,26 @@ def test_project_source_revision_policy_defaults_and_parses(tmp_path: Path):
     write_yaml(tmp_path / "gitopsctr.yaml", project_document())
     policy = controller.load_project_config(tmp_path).source_revision_policy
     assert policy.unavailable_when.value == "outside-candidate-history"
-    assert policy.when_unavailable_during_advance.value == "refresh"
+    assert policy.when_unavailable_during_apply.value == "refresh"
     assert policy.when_unavailable_during_plan.value == "error"
 
     document = project_document()
     document["spec"]["sourceRevisionPolicy"] = {
         "unavailableWhen": "missing",
-        "whenUnavailableDuringAdvance": "error",
+        "whenUnavailableDuringApply": "error",
         "whenUnavailableDuringPlan": "refresh",
     }
     write_yaml(tmp_path / "gitopsctr.yaml", document)
     policy = controller.load_project_config(tmp_path).source_revision_policy
     assert policy.unavailable_when.value == "missing"
-    assert policy.when_unavailable_during_advance.value == "error"
+    assert policy.when_unavailable_during_apply.value == "error"
     assert policy.when_unavailable_during_plan.value == "refresh"
 
     document["spec"]["sourceRevisionPolicy"] = {"whenUnavailableDuringPlan": "refresh"}
     write_yaml(tmp_path / "gitopsctr.yaml", document)
     policy = controller.load_project_config(tmp_path).source_revision_policy
     assert policy.unavailable_when.value == "outside-candidate-history"
-    assert policy.when_unavailable_during_advance.value == "refresh"
+    assert policy.when_unavailable_during_apply.value == "refresh"
     assert policy.when_unavailable_during_plan.value == "refresh"
 
 
@@ -484,13 +442,12 @@ def test_validate_rejects_duplicate_unit_representations(tmp_path: Path):
     create_project(tmp_path)
     create_environment(tmp_path)
     units = tmp_path / "deployment/environments/dev/units"
-    document = controller.serialize_unit_document(
-        controller.parse_authored_unit_document(
-            {"name": "infra", "driver": "terraform", **UNIT_DRIVERS["terraform"].scaffold_unit_spec("infra", ".")},
-            "infra",
-        ),
-        profile="authored",
-    )
+    document = {
+        "apiVersion": UNIT_DRIVERS["terraform"].api_version,
+        "kind": UNIT_DRIVERS["terraform"].kind,
+        "metadata": {"name": "infra"},
+        "spec": UNIT_DRIVERS["terraform"].scaffold_unit_spec("infra", "."),
+    }
     write_yaml(units / "infra.yaml", document)
     (units / "infra.json").write_text(json.dumps(document))
 
@@ -505,15 +462,19 @@ def test_validate_applies_cross_unit_observation_rules(tmp_path: Path, capsys: p
     create_environment(tmp_path)
     units = tmp_path / "deployment/environments/dev/units"
     producer = {
-        "name": "manifests",
-        "driver": "kubernetes-manifests",
-        **UNIT_DRIVERS["kubernetes-manifests"].scaffold_unit_spec("manifests", "kubernetes"),
+        "apiVersion": UNIT_DRIVERS["kubernetes-manifests"].api_version,
+        "kind": UNIT_DRIVERS["kubernetes-manifests"].kind,
+        "metadata": {"name": "manifests"},
+        "spec": UNIT_DRIVERS["kubernetes-manifests"].scaffold_unit_spec("manifests", "kubernetes"),
     }
     consumer = {
-        "name": "consumer",
-        "driver": "terraform",
-        **UNIT_DRIVERS["terraform"].scaffold_unit_spec("consumer", "terraform"),
-        "inputs": {"value": {"fromReceipt": {"unit": "manifests"}}},
+        "apiVersion": UNIT_DRIVERS["terraform"].api_version,
+        "kind": UNIT_DRIVERS["terraform"].kind,
+        "metadata": {"name": "consumer"},
+        "spec": {
+            **UNIT_DRIVERS["terraform"].scaffold_unit_spec("consumer", "terraform"),
+            "inputs": {"value": {"fromReceipt": {"unit": "manifests"}}},
+        },
     }
     write_yaml(
         units / "manifests.yaml",

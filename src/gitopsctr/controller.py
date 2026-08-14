@@ -10,7 +10,6 @@ import argparse
 import fcntl
 import glob as globlib
 import hashlib
-import io
 import json
 import os
 import re
@@ -21,7 +20,7 @@ import sys
 import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -32,6 +31,7 @@ from typing import Any, Literal, TextIO, TypedDict, cast
 
 import yaml
 
+from gitopsctr import operational
 from gitopsctr.api import GVK, ApiError
 from gitopsctr.artifacts import require_artifact_api
 from gitopsctr.contracts import (
@@ -40,19 +40,16 @@ from gitopsctr.contracts import (
     ArtifactImport,
     AuthoredSource,
     DeletionMetadata,
-    DesiredLifecycle,
     DesiredOwnerReference,
     DesiredSource,
     DesiredStackSpec,
     DesiredStackTemplateSpec,
     GitSourceRequest,
-    LifecycleManagement,
     MaterializationDocument,
     ReceiptDesired,
     ResolvedArtifactImport,
     ResolvedGitSource,
     ResolvedStackTemplateSource,
-    StackInstantiationProvenance,
     StackSpec,
     StackTemplateFromGit,
     StackTemplateFromPromotion,
@@ -70,7 +67,6 @@ from gitopsctr.dependencies import (
     convergence_scope,
     dependency_graph,
     desired_observation_reference_units,
-    downstream_unit_closure,
     observation_reference_units,
 )
 from gitopsctr.document import ContractError, DocumentContract, JsonObject, JsonObjectValue, require_json_value
@@ -114,6 +110,8 @@ from gitopsctr.formats import (
     validate_project_document,
     write_document,
 )
+from gitopsctr.inspection import command_get as inspect_resources
+from gitopsctr.inspection import inspectable_selectors
 from gitopsctr.registry import (
     API_KINDS,
     DRIVER_GVKS,
@@ -149,7 +147,7 @@ from gitopsctr.resources import (
     validate_desired_resource_graph,
 )
 from gitopsctr.schemas import encoded_schema, export_schemas, resource_schema_url, show_schema
-from gitopsctr.state import ControllerPin, ControllerPinClaim, GatedCandidate, GitStateStore
+from gitopsctr.state import ControllerPin, GatedCandidate, GitStateStore
 from gitopsctr.templates import (
     ArtifactReference as ArtifactReferenceExpression,
 )
@@ -211,15 +209,6 @@ class PromotionContext:
 
 
 @dataclass(frozen=True)
-class RefAdvance:
-    kind: str
-    ref: str
-    before: str | None
-    after: str
-    unit: str | None = None
-
-
-@dataclass(frozen=True)
 class UnitChangeExplanation:
     previous_desired_revision: str
     previous_source_revision: str | None
@@ -233,38 +222,6 @@ class UnitChangeExplanation:
 class RevisionSnapshot(TypedDict):
     ref: str
     revision: str | None
-
-
-class CompatibilityFinding(TypedDict):
-    code: str
-    path: str
-    unit: str
-    message: str
-
-
-class CompatibilityAuditResult(TypedDict):
-    environment: str
-    ref: str | None
-    revision: str | None
-    clean: bool
-    findings: list[CompatibilityFinding]
-
-
-class UnitStatusSnapshot(TypedDict):
-    unit: str
-    status: str
-    reason: str
-
-
-class EnvironmentSnapshot(TypedDict):
-    desired: RevisionSnapshot
-    observed: RevisionSnapshot
-    statuses: list[UnitStatusSnapshot]
-
-
-class EnvironmentRow(EnvironmentSnapshot):
-    environment: str
-    counts: dict[str, int]
 
 
 ANSI_RESET = "\x1b[0m"
@@ -642,7 +599,6 @@ def load_receipt(path: Path, expected_unit: str | None = None) -> ReceiptResourc
 
 resource_documents_enabled = RESOURCE_CATALOG.resource_documents_enabled
 unit_document_path = RESOURCE_CATALOG.unit_document_path
-strict_resource_documents = RESOURCE_CATALOG.strict_resource_documents
 
 
 def load_authored_unit(path: Path, expected_name: str | None = None) -> UnitResource[Any]:
@@ -657,9 +613,6 @@ def persisted_unit_driver_name(path: Path) -> str | None:
     """Inspect only envelope identity when an obsolete payload cannot be parsed."""
 
     document = RESOURCE_CATALOG.load_document(path)
-    if document.get("apiVersion") is None:
-        value = document.get("driver")
-        return value if isinstance(value, str) else None
     api_version, kind = document.get("apiVersion"), document.get("kind")
     if not isinstance(api_version, str) or not isinstance(kind, str):
         return None
@@ -674,10 +627,10 @@ class PersistedUnitSourceIdentity:
 
 
 def persisted_unit_source_identity(path: Path) -> PersistedUnitSourceIdentity:
-    """Read legacy-compatible source identity without treating it as a desired model."""
+    """Read persisted source identity without parsing the driver-specific desired payload."""
 
     document = RESOURCE_CATALOG.load_document(path)
-    specification = document.get("spec", document)
+    specification = document.get("spec")
     source = specification.get("source") if isinstance(specification, dict) else None
     revision = source.get("revision") if isinstance(source, dict) else None
     input_hash = source.get("inputHash") if isinstance(source, dict) else None
@@ -697,7 +650,7 @@ def write_unit(path: Path, unit: UnitResource[Any], project_root: Path) -> Path:
 
 
 def write_desired_candidate_unit(path: Path, unit: UnitResource[Any], project_root: Path) -> Path:
-    """Write canonical desired state while retaining legacy-path format when unconfigured."""
+    """Write a canonical desired Unit using the configured repository format."""
 
     if resource_documents_enabled(project_root):
         return write_unit(path, unit, project_root)
@@ -792,8 +745,7 @@ def load_desired_resource_graph(
                 and isinstance(stack_resource, StackResource)
                 and isinstance(stack_resource.spec, DesiredStackSpec)
                 and stack_resource.spec.resolvedProjection is not None
-                and stack_resource.metadata.lifecycle is not None
-                and stack_resource.metadata.lifecycle.management is not None
+                and stack_resource.metadata.is_root
                 and resource_owner_reference(stack_resource) is None
                 and unit_name not in _current_desired_unit_paths(root)
             ):
@@ -1015,61 +967,15 @@ def directory_files(directory: Path) -> dict[str, bytes]:
 
 
 def unit_requires_reconciliation(unit: UnitResource[Any]) -> bool:
-    plugin = unit.driver
-    if not isinstance(plugin, ReconciliationCapability):
-        return False
-    try:
-        return plugin.reconciliation_required(unit.spec)
-    except DriverError as exc:
-        raise OperationError(str(exc)) from exc
+    return operational.unit_requires_reconciliation(unit)
 
 
 def materialization_tree_digest(root: Path) -> str:
-    if not root.is_dir() or root.is_symlink():
-        raise OperationError("materialization output must be a directory")
-    entries: list[dict[str, str]] = []
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            raise OperationError(f"materialization output contains a symbolic link: {path.relative_to(root)}")
-        if path.is_dir():
-            continue
-        if not path.is_file():
-            raise OperationError(f"materialization output contains a non-file: {path.relative_to(root)}")
-        content = path.read_bytes()
-        entries.append(
-            {
-                "path": path.relative_to(root).as_posix(),
-                "mode": "100755" if path.stat().st_mode & 0o111 else "100644",
-                "contentHash": hashlib.sha256(content).hexdigest(),
-            }
-        )
-    if not entries:
-        raise OperationError("materialization output is empty")
-    payload = {"materializationHashVersion": 1, "files": entries}
-    return f"sha256:{hashlib.sha256(canonical_json(payload)).hexdigest()}"
+    return operational.materialization_tree_digest(root)
 
 
 def validate_unit_materialization(desired_root: Path, unit_name: str, unit: UnitResource[Any]) -> None:
-    plugin_name = unit.driver_name
-    expects_materialization = plugin_name in MATERIALIZATION_DRIVERS
-    descriptor = getattr(unit.spec, "materialization", None)
-    if not expects_materialization:
-        if descriptor is not None:
-            raise OperationError(f"{unit_name} records materialization for a plugin without that capability")
-        return
-    if descriptor is None:
-        raise OperationError(f"{unit_name} has an invalid materialization descriptor")
-    expected_path = f"materialized/{unit_name}"
-    if descriptor.path != expected_path:
-        raise OperationError(f"{unit_name} materialization path must be {expected_path}")
-    digest = descriptor.digest
-    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-        raise OperationError(f"{unit_name} has an invalid materialization digest")
-    if not descriptor.mediaType:
-        raise OperationError(f"{unit_name} has an invalid materialization media type")
-    actual = materialization_tree_digest(desired_root / expected_path)
-    if actual != digest:
-        raise OperationError(f"{unit_name} materialized payload does not match its digest")
+    operational.validate_unit_materialization(desired_root, unit_name, unit)
 
 
 def copy_unit_materialization(source: Path, destination: Path, unit_name: str, unit: UnitResource[Any]) -> None:
@@ -1133,7 +1039,6 @@ def commit_is_ancestor(previous: str, candidate: str) -> bool:
 def prior_unit_source(
     unit_name: str,
     current_desired: Path,
-    legacy: dict[str, Any] | None,
 ) -> tuple[str, str] | None:
     current_path = unit_document_path(current_desired, unit_name)
     if current_path.is_file():
@@ -1142,15 +1047,6 @@ def prior_unit_source(
         input_hash = source.input_hash
         if isinstance(revision, str) and isinstance(input_hash, str):
             return revision, input_hash
-    if legacy is not None and unit_name in {"application-images", "aws-application"}:
-        section = "terraform" if unit_name == "aws-application" else ""
-        revision = (
-            legacy.get(section, {}).get("revision")
-            if section
-            else legacy.get("source_revision") or legacy.get("application_revision")
-        )
-        if isinstance(revision, str):
-            return revision, ""
     return None
 
 
@@ -1252,8 +1148,6 @@ def validate_desired_resource_transition(
     current, raw_opaque_units = _load_transition_resources(current_root)
     candidate = load_desired_resource_graph(candidate_root, validate=False)
     for key, previous in current.items():
-        if previous.is_legacy_compatibility:
-            continue
         next_resource = candidate.get(key)
         previous_deletion = resource_deletion(previous)
         if next_resource is None:
@@ -1358,11 +1252,7 @@ def deletion_reason(resource: UnitResource[Any] | StackResource) -> str:
     deletion = resource_deletion(resource)
     if deletion is None:
         raise OperationError(f"desired resource {resource.name!r} is not marked for deletion")
-    return (
-        f"deletion pending finalization (UID {resource.metadata.uid}, generation {deletion.generation}); "
-        f"run finalize {resource.gvk.kind} --name {resource.name} --uid {resource.metadata.uid} "
-        f"--deletion-generation {deletion.generation}"
-    )
+    return f"deletion pending finalization (UID {resource.metadata.uid}, generation {deletion.generation})"
 
 
 def artifact_document_path(root: Path, unit_name: str, artifact_name: str) -> Path:
@@ -1425,14 +1315,10 @@ def validate_artifact_output_identity(
         parse_artifact_document(artifact_api, document, f"{driver_name} artifact {name}")
         metadata = document.get("metadata")
         producer = document.get("producer")
-        if isinstance(metadata, dict) and metadata.get("name") != name:
-            log_status(
-                "WARN",
-                f"{driver_name} artifact {name!r} has resource name {metadata.get('name')!r}",
-            )
+        if not isinstance(metadata, dict) or metadata.get("name") != name:
+            raise DriverError(f"{driver_name} artifact {name!r} has the wrong resource identity")
         if (
-            not isinstance(metadata, dict)
-            or not isinstance(producer, dict)
+            not isinstance(producer, dict)
             or producer.get("apiVersion") != driver.api_version
             or producer.get("kind") != driver.kind
             or producer.get("name") != unit.name
@@ -1493,14 +1379,10 @@ def load_artifact_document(
     producer = document.get("producer")
     metadata = document.get("metadata")
     source = getattr(unit.spec, "source", None)
-    if isinstance(metadata, dict) and metadata.get("name") != artifact_name:
-        log_status(
-            "WARN",
-            f"persisted {driver_name} artifact {artifact_name!r} has resource name {metadata.get('name')!r}",
-        )
+    if not isinstance(metadata, dict) or metadata.get("name") != artifact_name:
+        raise ReferenceUnavailable(f"artifact {artifact_name!r} has the wrong resource identity")
     if (
-        not isinstance(metadata, dict)
-        or not isinstance(producer, dict)
+        not isinstance(producer, dict)
         or not isinstance(source, DesiredSource)
         or (
             producer.get("apiVersion") != UNIT_DRIVERS[driver_name].api_version
@@ -1820,27 +1702,14 @@ class ResolvedUnitSourceResult:
     """Resolved source plus the explicit input and provenance disposition."""
 
     source: DesiredSource | None
-    # Retained as a compatibility input for callers constructing this result directly.
-    inputs_changed: bool | None = None
     refresh_reason: str | None = None
-    disposition: SourceResolutionDisposition | None = None
-
-    def __post_init__(self) -> None:
-        disposition = self.disposition
-        if disposition is None:
-            disposition = (
-                SourceResolutionDisposition.INPUTS_CHANGED
-                if self.inputs_changed
-                else SourceResolutionDisposition.UNCHANGED
-            )
-        object.__setattr__(self, "disposition", disposition)
-        object.__setattr__(self, "inputs_changed", disposition is SourceResolutionDisposition.INPUTS_CHANGED)
+    disposition: SourceResolutionDisposition = SourceResolutionDisposition.UNCHANGED
 
 
 class SourceRevisionUnavailableError(OperationError):
     """A retained source revision is unavailable under the selected project policy."""
 
-    def __init__(self, unit_name: str, revision: str, operation: Literal["advance", "plan"]) -> None:
+    def __init__(self, unit_name: str, revision: str, operation: Literal["apply", "plan"]) -> None:
         self.unit_name = unit_name
         self.revision = revision
         self.operation = operation
@@ -1852,9 +1721,8 @@ def resolved_unit_source(
     source_root: Path,
     source_revision: str,
     current_desired: Path,
-    legacy: dict[str, Any] | None,
     source_revision_policy: SourceRevisionPolicy | None = None,
-    source_revision_operation: Literal["advance", "plan"] = "advance",
+    source_revision_operation: Literal["apply", "plan"] = "apply",
 ) -> ResolvedUnitSourceResult:
     source_revision_policy = source_revision_policy or SourceRevisionPolicy()
     driver, source = require_unit_specification(specification)
@@ -1862,7 +1730,7 @@ def resolved_unit_source(
         return ResolvedUnitSourceResult(source=None, disposition=SourceResolutionDisposition.UNCHANGED)
     input_hash = unit_input_hash(specification, source_root)
     revision = source_revision
-    prior = prior_unit_source(specification.name, current_desired, legacy)
+    prior = prior_unit_source(specification.name, current_desired)
     disposition = SourceResolutionDisposition.INPUTS_CHANGED if prior is None else SourceResolutionDisposition.UNCHANGED
     refresh_reason: str | None = None
     if prior is not None:
@@ -1893,7 +1761,7 @@ def resolved_unit_source(
                 action = (
                     source_revision_policy.when_unavailable_during_plan
                     if source_revision_operation == "plan"
-                    else source_revision_policy.when_unavailable_during_advance
+                    else source_revision_policy.when_unavailable_during_apply
                 )
                 if action is SourceRevisionAction.ERROR:
                     raise SourceRevisionUnavailableError(specification.name, prior_revision, source_revision_operation)
@@ -1930,8 +1798,6 @@ def load_environment(source_root: Path, environment_name: str) -> dict[str, Any]
     if len(environment_paths) != 1:
         raise OperationError(f"expected exactly one environment document for {environment_name}")
     environment_document = load_json(environment_paths[0])
-    if environment_document.get("apiVersion") is None:
-        raise OperationError(f"legacy environment document is not valid in a Project: {environment_paths[0]}")
     environment = normalize_environment_document(environment_document, environment_name)
     if environment.get("name") != environment_name:
         raise OperationError(f"invalid environment specification: {environment_name}")
@@ -1978,21 +1844,6 @@ def allowed_promotion_sources(source_root: Path, environment_name: str) -> set[s
 def minimum_promotion_evidence(source_root: Path, environment_name: str) -> str:
     policy = load_environment(source_root, environment_name).get("promotionPolicy")
     return str(policy["minimumEvidence"]) if policy is not None else "reconciled"
-
-
-def resolve_advance_source_revision(
-    source_root: Path,
-    environment_name: str,
-    source_revision: str | None,
-) -> str | None:
-    promoted = load_environment(source_root, environment_name).get("promotion") is not None
-    if promoted:
-        if source_revision is not None:
-            raise OperationError(f"promotion-tracked environment {environment_name} does not accept --source-revision")
-        return None
-    if source_revision is None:
-        raise OperationError(f"source-tracked environment {environment_name} requires --source-revision")
-    return git("rev-parse", f"{source_revision}^{{commit}}").stdout.strip()
 
 
 def deployment_refs(
@@ -2062,9 +1913,7 @@ def candidate_identifier(
         "promotion",
         "rollback",
         "finalize",
-        "instantiate-stack",
-        "update-direct-stack",
-        "apply-unit",
+        "apply",
         "delete",
         "resolve-opaque-unit",
     ],
@@ -2097,9 +1946,7 @@ def resolve_candidate_ref(
         "promotion",
         "rollback",
         "finalize",
-        "instantiate-stack",
-        "update-direct-stack",
-        "apply-unit",
+        "apply",
         "delete",
         "resolve-opaque-unit",
     ],
@@ -2198,18 +2045,12 @@ def _document_paths(directory: Path) -> dict[str, Path]:
 def _load_authored_stack_resources(
     source_root: Path, environment_name: str
 ) -> tuple[dict[str, StackResource], dict[str, StackResource]]:
-    """Load project-level templates and environment-local Stack resources.
-
-    The environment-local template directory remains a compatibility fallback
-    for pre-migration projects.
-    """
+    """Load project-level templates and environment-local Stack resources."""
 
     environment_root = project_environment_root(source_root, environment_name)
     templates: dict[str, StackResource] = {}
     project = load_project_config(source_root)
     template_root = source_root.joinpath(*project.stack_templates_path.parts)
-    if not template_root.is_dir():
-        template_root = environment_root / "stack-templates"
     for name, path in _document_paths(template_root).items():
         templates[name] = RESOURCE_CATALOG.parse_stack_template(
             RESOURCE_CATALOG.load_document(path), profile="authored", expected_name=name
@@ -2233,6 +2074,7 @@ class StackProjection:
     owners: dict[str, DesiredOwnerReference]
     dependencies: dict[str, tuple[str, ...]]
     artifact_imports: dict[str, tuple[ArtifactImport, ...]] = field(default_factory=dict)
+    applied_stacks: frozenset[str] = frozenset()
 
 
 def _write_desired_stack_resource(path: Path, resource: StackResource, project_root: Path) -> Path:
@@ -2321,6 +2163,37 @@ def _load_pinned_stack_template(source: ResolvedStackTemplateSource, template_na
         )
 
 
+def _fetch_repository_local_stack_template_pin(
+    promotion: PromotionContext,
+    source_stack: StackResource,
+    source: ResolvedStackTemplateSource,
+) -> None:
+    """Fetch and verify the controller pin retaining a repository-local source."""
+
+    pin = source.fromGit
+    if pin.path is None:
+        return
+    if source_stack.metadata.uid is None:
+        raise OperationError(f"promoted source Stack {source_stack.name!r} has no UID")
+    name = _stack_source_pin_name(
+        promotion.source_environment,
+        source_stack.name,
+        source_stack.metadata.uid,
+        pin.commit,
+    )
+    try:
+        matching = [candidate for candidate in state_store().list_controller_pins() if candidate.name == name]
+    except OperationError as exc:
+        raise OperationError(f"Git commit {pin.commit!r} is not available for pinned StackTemplate source") from exc
+    if len(matching) != 1 or matching[0].revision != pin.commit:
+        raise OperationError(
+            f"promoted source Stack {source_stack.name!r} controller pin is unavailable or does not match {pin.commit}"
+        )
+    fetched = state_store().git("fetch", "--no-tags", "origin", matching[0].ref, check=False)
+    if fetched.returncode != 0 or not commit_is_available(pin.commit):
+        raise OperationError(f"Git commit {pin.commit!r} is not available from controller pin {matching[0].ref!r}")
+
+
 def _resolve_stack_template(
     source_root: Path,
     template_ref: StackTemplateReference,
@@ -2352,6 +2225,10 @@ def _resolve_stack_template(
             )
         if source_stack.spec.resolvedSource is None:
             raise OperationError("promoted source Stack has no resolved source")
+        if source_stack.spec.resolvedSource.fromGit.path is not None and not commit_is_available(
+            source_stack.spec.resolvedSource.fromGit.commit
+        ):
+            _fetch_repository_local_stack_template_pin(promotion, source_stack, source_stack.spec.resolvedSource)
         return (
             _load_pinned_stack_template(source_stack.spec.resolvedSource, template_ref.name),
             source_stack.spec.resolvedSource,
@@ -2455,6 +2332,7 @@ def _stack_root_metadata(
     name: str,
     source_revision: str,
     current_desired: Path | None = None,
+    partition: str | None = None,
 ) -> ResourceMetadata:
     if current_desired is not None:
         existing_path = _current_desired_stack_paths(current_desired, kind).get(name)
@@ -2469,30 +2347,32 @@ def _stack_root_metadata(
                 )
             )
             existing.metadata.validate_desired()
-            lifecycle = existing.metadata.lifecycle
-            if lifecycle is None or lifecycle.management is None or lifecycle.management.mode != "sourceTracked":
-                raise OperationError(
-                    f"source-authored {kind} {name!r} collides with a non-source-tracked desired resource"
-                )
-            return existing.metadata
+            if not existing.metadata.is_root:
+                raise OperationError(f"applied {kind} {name!r} collides with an owned desired resource")
+            if resource_deletion(existing) is not None:
+                raise OperationError(f"desired {kind} {name!r} is deleting and cannot be applied")
+            if partition is not None and existing.metadata.partition not in {None, partition}:
+                raise OperationError(f"desired {kind} {name!r} belongs to partition {existing.metadata.partition!r}")
+            return existing.metadata.with_partition(partition, preserve_existing=partition is None)
     provenance = json.dumps(
         {"apiVersion": CORE_API_VERSION, "kind": kind, "name": name, "sourceRevision": source_revision},
         sort_keys=True,
         separators=(",", ":"),
     )
-    metadata = ResourceMetadata.source_tracked_from_provenance(name, provenance)
+    metadata = ResourceMetadata.root_from_provenance(name, provenance, partition=partition)
     if current_desired is not None:
         previous_tombstone = load_resource_incarnation_tombstones(current_desired).get((CORE_API_VERSION, kind, name))
         if previous_tombstone is not None and metadata.uid == previous_tombstone.uid:
-            metadata = ResourceMetadata.source_tracked_from_provenance(
+            metadata = ResourceMetadata.root_from_provenance(
                 name,
                 provenance + "\0reincarnation:" + previous_tombstone.uid,
+                partition=partition,
             )
     return metadata
 
 
 def _stack_owned_metadata(name: str, owner: DesiredOwnerReference) -> ResourceMetadata:
-    root = ResourceMetadata.source_tracked_from_provenance(
+    root = ResourceMetadata.root_from_provenance(
         name,
         json.dumps(
             {
@@ -2509,7 +2389,6 @@ def _stack_owned_metadata(name: str, owner: DesiredOwnerReference) -> ResourceMe
     return ResourceMetadata(
         name=name,
         uid=root.uid,
-        lifecycle=None,
         ownerReferences=[
             DesiredOwnerReference(
                 apiVersion=owner.apiVersion,
@@ -2529,6 +2408,7 @@ def project_stack_resources(
     project_root: Path,
     current_desired: Path | None = None,
     promotion: PromotionContext | None = None,
+    partition: str | None = None,
 ) -> StackProjection:
     """Persist Stack roots and expand concrete Stacks into authored Unit inputs."""
 
@@ -2539,45 +2419,40 @@ def project_stack_resources(
     owners: dict[str, DesiredOwnerReference] = {}
     dependencies: dict[str, tuple[str, ...]] = {}
     artifact_imports: dict[str, tuple[ArtifactImport, ...]] = {}
-    for name, template in templates.items():
-        authored_template_spec = cast(StackTemplateSpec, template.spec)
-        template_candidates = document_candidates(
-            source_root.joinpath(*load_project_config(source_root).stack_templates_path.parts), name
-        )
-        template_path = template_candidates[0] if len(template_candidates) == 1 else None
-        template_spec = DesiredStackTemplateSpec(
-            parameters=authored_template_spec.parameters,
-            unitTemplates=authored_template_spec.unitTemplates,
-            resources=authored_template_spec.resources,
-            requestedSource=StackTemplateFromGit(fromGit=GitSourceRequest(path=".")),
-            resolvedSource=ResolvedStackTemplateSource(
-                fromGit=ResolvedGitSource(
-                    path=".",
-                    commit=source_revision,
-                    resourcePath=(
-                        template_path.relative_to(source_root).as_posix()
-                        if template_path is not None
-                        else f"stack-templates/{name}.yaml"
-                    ),
-                    digest=hashlib.sha256(template_path.read_bytes() if template_path else b"").hexdigest(),
-                )
-            ),
-        )
-        desired = StackResource(
-            template.gvk,
-            _stack_root_metadata("StackTemplate", name, source_revision, current_desired),
-            template_spec,
-        )
-        _write_desired_stack_resource(candidate / "stack-templates" / f"{name}.json", desired, project_root)
+    selected_resource_templates: set[str] = set()
     for name, authored_stack in stacks.items():
         assert isinstance(authored_stack.spec, StackSpec)
         template_ref = _stack_template_reference(authored_stack.spec)
         template, resolved_source = _resolve_stack_template(
             source_root, template_ref, templates, source_revision, promotion
         )
+        if isinstance(template_ref.source, StackTemplateFromResource):
+            selected_resource_templates.add(template_ref.name)
+            authored_template_spec = cast(StackTemplateSpec, template.spec)
+            desired_template = StackResource(
+                template.gvk,
+                _stack_root_metadata(
+                    "StackTemplate",
+                    template_ref.name,
+                    source_revision,
+                    current_desired,
+                    partition,
+                ),
+                DesiredStackTemplateSpec(
+                    parameters=authored_template_spec.parameters,
+                    unitTemplates=authored_template_spec.unitTemplates,
+                    requestedSource=StackTemplateFromGit(fromGit=GitSourceRequest(path=".")),
+                    resolvedSource=resolved_source,
+                ),
+            )
+            _write_desired_stack_resource(
+                candidate / "stack-templates" / f"{template_ref.name}.json",
+                desired_template,
+                project_root,
+            )
         stack = StackResource(
             authored_stack.gvk,
-            _stack_root_metadata("Stack", name, source_revision, current_desired),
+            _stack_root_metadata("Stack", name, source_revision, current_desired, partition),
             DesiredStackSpec(
                 template=template_ref,
                 parameters=authored_stack.spec.parameters,
@@ -2683,7 +2558,7 @@ def project_stack_resources(
     # child-first finalization removes the resources.
     if current_desired is not None:
         for kind in ("StackTemplate", "Stack"):
-            source_names = set(templates if kind == "StackTemplate" else stacks)
+            source_names = selected_resource_templates if kind == "StackTemplate" else set(stacks)
             for name, previous_path in _current_desired_stack_paths(current_desired, kind).items():
                 if name in source_names:
                     continue
@@ -2697,15 +2572,16 @@ def project_stack_resources(
                         RESOURCE_CATALOG.load_document(previous_path), profile="desired", expected_name=name
                     )
                 )
-                lifecycle = previous.metadata.lifecycle
-                if (
-                    lifecycle is not None
-                    and lifecycle.management is not None
-                    and lifecycle.management.mode == "sourceTracked"
-                ):
+                if partition is not None and previous.metadata.partition == partition:
                     previous = cast(StackResource, mark_resource_for_deletion(previous))
                 _write_desired_stack_resource(target, previous, project_root)
-    return StackProjection(generated, owners, dependencies, artifact_imports)
+    return StackProjection(
+        generated,
+        owners,
+        dependencies,
+        artifact_imports,
+        applied_stacks=frozenset(stacks),
+    )
 
 
 def load_convergence_specifications(
@@ -2718,9 +2594,7 @@ def load_convergence_specifications(
     """Load source and desired-only Units participating in convergence.
 
     Source Unit documents remain the authored authority. Stack-generated and
-    directly managed Units are added from the desired snapshot so the normal
-    driver path can reconcile them without pretending that they are authored
-    source roots.
+    already-applied Units are added from the desired snapshot for inspection.
     """
 
     specifications = load_environment_specifications(source_root, environment_name)
@@ -2736,16 +2610,9 @@ def load_convergence_specifications(
                 continue
             if resource.name in transition_blocks:
                 continue
-            lifecycle = resource.metadata.lifecycle
             owner = resource_owner_reference(resource)
             is_stack_owned = owner is not None and owner.kind == "Stack"
-            is_direct_root = (
-                owner is None
-                and lifecycle is not None
-                and lifecycle.management is not None
-                and lifecycle.management.mode == "direct"
-            )
-            if not (is_stack_owned or is_direct_root):
+            if not (is_stack_owned or owner is None):
                 continue
             existing = specifications.get(resource.name)
             if existing is not None and existing.gvk != resource.gvk:
@@ -2793,37 +2660,53 @@ def reconciliation_statuses(unit_names: Sequence[str], desired: Path, observed: 
         unit_path = unit_document_path(desired, unit_name)
         receipt_path = unit_document_path(observed, unit_name)
         if unit_name in deleting:
-            statuses.append((unit_name, "WAIT", deletion_reason(deleting[unit_name])))
+            state = operational.classify_before_observation(
+                desired,
+                unit_name,
+                None,
+                deleting[unit_name],
+            )
+            assert state is not None
+            statuses.append((unit_name, state.reconciliation.value, state.reason))
             continue
         if unit_name in transition_blocks:
-            statuses.append((unit_name, "WAIT", transition_blocks[unit_name]))
+            state = operational.classify_before_observation(
+                desired,
+                unit_name,
+                None,
+                None,
+                transition_blocks[unit_name],
+            )
+            assert state is not None
+            statuses.append((unit_name, state.reconciliation.value, state.reason))
             continue
         if not unit_path.is_file():
-            statuses.append((unit_name, "WAIT", "desired inputs are not materialized"))
+            state = operational.classify_before_observation(desired, unit_name, None, None)
+            assert state is not None
+            statuses.append((unit_name, state.reconciliation.value, state.reason))
             continue
-        if raw_unit_contains_reference(load_json(unit_path)):
-            statuses.append((unit_name, "WAIT", "desired inputs are not materialized"))
+        document = load_json(unit_path)
+        if raw_unit_contains_reference(document):
+            state = operational.classify_before_observation(desired, unit_name, document, None)
+            assert state is not None
+            statuses.append((unit_name, state.reconciliation.value, state.reason))
             continue
         unit = load_desired_unit(unit_path, unit_name)
-        validate_unit_materialization(desired, unit_name, unit)
-        if not unit_requires_reconciliation(unit):
-            statuses.append((unit_name, "MATERIALIZED", "desired payload is published for external delivery"))
+        state = operational.classify_before_observation(desired, unit_name, document, unit)
+        if state is not None:
+            statuses.append((unit_name, state.reconciliation.value, state.reason))
             continue
         if not receipt_path.is_file():
-            statuses.append((unit_name, "READY", "no observation receipt"))
+            state = operational.classify_observation(operational.ObservationEvidence.MISSING)
+            statuses.append((unit_name, state.reconciliation.value, state.reason))
             continue
         receipt = load_receipt(receipt_path, unit_name)
         if receipt.spec.desired.unitBlob == file_blob(unit_path):
             validate_receipt_artifacts(observed, unit, receipt)
-            statuses.append((unit_name, "CLEAN", "observation matches desired state"))
+            state = operational.classify_observation(operational.ObservationEvidence.CURRENT)
         else:
-            statuses.append(
-                (
-                    unit_name,
-                    "READY",
-                    "desired inputs changed since its last receipt",
-                )
-            )
+            state = operational.classify_observation(operational.ObservationEvidence.STALE)
+        statuses.append((unit_name, state.reconciliation.value, state.reason))
     return statuses
 
 
@@ -2846,16 +2729,7 @@ def desired_cleanup_root_paths(root: Path) -> tuple[Path, ...]:
 
 
 def load_desired_transition_blocks(root: Path) -> dict[str, str]:
-    path = root / DESIRED_TRANSITION_BLOCKS_PATH
-    if not path.is_file():
-        return {}
-    document = load_json(path)
-    blocks = document.get("blocks")
-    if not isinstance(blocks, dict) or not all(
-        isinstance(name, str) and isinstance(reason, str) for name, reason in blocks.items()
-    ):
-        raise OperationError("invalid desired transition-block document")
-    return cast(dict[str, str], blocks)
+    return operational.load_desired_transition_blocks(root)
 
 
 def write_desired_transition_blocks(root: Path, blocks: Mapping[str, str]) -> None:
@@ -3559,11 +3433,7 @@ class EffectLease:
             or not re.fullmatch(r"[0-9a-f]{40}", desired_revision)
         ):
             raise ValueError("invalid effect lease fence")
-        ResourceMetadata(
-            name=expected_name,
-            uid=uid,
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
-        ).validate_desired()
+        ResourceMetadata(name=expected_name, uid=uid).validate_desired()
         snapshot = EffectLeaseSnapshot.from_document(document["snapshot"]) if "snapshot" in document else None
         return cls(
             unit_name=expected_name,
@@ -3787,11 +3657,7 @@ class TeardownEvidence:
             or not isinstance(raw_details, dict)
         ):
             raise ValueError("invalid teardown evidence envelope")
-        ResourceMetadata(
-            name=expected_name,
-            uid=raw_uid,
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
-        ).validate_desired()
+        ResourceMetadata(name=expected_name, uid=raw_uid).validate_desired()
         if not re.fullmatch(r"[0-9a-f]{40}", raw_revision):
             raise ValueError("invalid teardown evidence desired revision")
         try:
@@ -4302,10 +4168,7 @@ def load_teardown_evidence(
             evidence = TeardownEvidence.from_document(load_json(path), unit_name)
         except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
             raise OperationError(f"invalid teardown evidence for {unit_name!r}") from exc
-        legacy_filename = f"{unit_name}{path.suffix}"
-        if path.name != legacy_filename and path.name != teardown_evidence_filename(
-            unit_name, evidence.uid, evidence.deletion_generation
-        ):
+        if path.name != teardown_evidence_filename(unit_name, evidence.uid, evidence.deletion_generation):
             raise OperationError(f"teardown evidence filename does not match its fence for {unit_name!r}")
         if uid is not None and deletion_generation is not None:
             if evidence.uid == uid and evidence.deletion_generation == deletion_generation:
@@ -4313,14 +4176,7 @@ def load_teardown_evidence(
         else:
             selected.append(path)
     if len(selected) > 1:
-        legacy = [
-            path for path in selected if path.name in {f"{unit_name}.json", f"{unit_name}.yaml", f"{unit_name}.yml"}
-        ]
-        keyed = [path for path in selected if path not in legacy]
-        if len(legacy) == 1 and len(keyed) == 1:
-            selected = keyed
-        else:
-            raise OperationError(f"multiple teardown evidence fences exist for {unit_name!r}")
+        raise OperationError(f"multiple teardown evidence fences exist for {unit_name!r}")
     if not selected:
         return None
     try:
@@ -4379,15 +4235,6 @@ def publish_teardown_observation_cas(
                 desired_revision=desired_revision,
                 details=evidence_details,
             )
-            legacy_evidence_removed = False
-            for legacy_path in document_candidates(observed / OBSERVED_TEARDOWN_EVIDENCE_PATH, unit_name):
-                try:
-                    legacy_evidence = TeardownEvidence.from_document(load_json(legacy_path), unit_name)
-                except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
-                    raise OperationError(f"invalid teardown evidence for {unit_name!r}") from exc
-                if legacy_evidence.uid == uid and legacy_evidence.deletion_generation == deletion_generation:
-                    legacy_path.unlink()
-                    legacy_evidence_removed = True
             receipt_paths = document_candidates(observed / "units", unit_name)
             artifact_path = observed / "artifacts" / unit_name
             had_active_observation = bool(receipt_paths) or artifact_path.exists()
@@ -4421,12 +4268,7 @@ def publish_teardown_observation_cas(
                         details=evidence_details,
                     )
             write_document(evidence_path, evidence.document(), format=DocumentFormat.JSON)
-            if (
-                existing is not None
-                and not legacy_evidence_removed
-                and not had_active_observation
-                and observed_revision is not None
-            ):
+            if existing is not None and not had_active_observation and observed_revision is not None:
                 return observed_revision
             try:
                 return publish_tree(
@@ -4461,7 +4303,7 @@ def desired_uid_provenance(
     )
 
 
-def source_tracked_metadata_for_resource(
+def root_metadata_for_resource(
     unit: UnitResource[Any],
     source: DesiredSource | None = None,
     source_revision: str | None = None,
@@ -4470,7 +4312,7 @@ def source_tracked_metadata_for_resource(
     retained_source = source if source is not None else getattr(unit.spec, "source", None)
     if retained_source is not None and not isinstance(retained_source, DesiredSource):
         retained_source = None
-    return ResourceMetadata.source_tracked_from_provenance(
+    return ResourceMetadata.root_from_provenance(
         unit.name,
         desired_uid_provenance(unit, retained_source, source_revision, previous_finalized_uid),
     )
@@ -4554,11 +4396,8 @@ def opaque_cleanup_metadata(name: str, payload: object, source_revision: str) ->
                 metadata.validate_desired()
             except (KeyError, TypeError, ValueError) as exc:
                 raise OperationError(f"opaque cleanup metadata for {name!r} is invalid") from exc
-            lifecycle = metadata.lifecycle
-            if metadata.ownerReferences or (
-                lifecycle is not None and lifecycle.management is not None and lifecycle.management.mode == "direct"
-            ):
-                raise OperationError(f"desired unit {name!r} collides with a directly managed or UID-owned resource")
+            if metadata.ownerReferences:
+                raise OperationError(f"desired unit {name!r} collides with a UID-owned resource")
             if metadata.uid is None:
                 raise OperationError(f"opaque cleanup metadata for {name!r} has no canonical UID")
             return metadata
@@ -4567,7 +4406,7 @@ def opaque_cleanup_metadata(name: str, payload: object, source_revision: str) ->
         sort_keys=True,
         separators=(",", ":"),
     )
-    return ResourceMetadata.source_tracked_from_provenance(name, provenance)
+    return ResourceMetadata.root_from_provenance(name, provenance)
 
 
 def load_desired_cleanup_roots(root: Path) -> dict[str, OpaqueCleanupRoot]:
@@ -4596,14 +4435,8 @@ def load_desired_cleanup_roots(root: Path) -> dict[str, OpaqueCleanupRoot]:
             raise OperationError(f"invalid opaque cleanup metadata for {name!r}") from exc
         if metadata.name != name:
             raise OperationError(f"opaque cleanup metadata for {name!r} has a mismatched name")
-        lifecycle = metadata.lifecycle
-        if (
-            metadata.is_legacy_compatibility
-            or lifecycle is None
-            or lifecycle.management is None
-            or lifecycle.management.mode != "sourceTracked"
-        ):
-            raise OperationError(f"opaque cleanup metadata for {name!r} must be sourceTracked")
+        if not metadata.is_root:
+            raise OperationError(f"opaque cleanup metadata for {name!r} must be a root")
         roots[name] = OpaqueCleanupRoot(
             path=path,
             payload=payload,
@@ -4632,15 +4465,12 @@ def write_opaque_cleanup_root(root: Path, name: str, opaque: OpaqueCleanupRoot) 
     return path
 
 
-def source_tracked_metadata_for_uid(
-    name: str, uid: str, owner: DesiredOwnerReference | None = None
-) -> ResourceMetadata:
+def root_metadata_for_uid(name: str, uid: str, owner: DesiredOwnerReference | None = None) -> ResourceMetadata:
     """Build canonical recovery metadata without accepting authority from opaque payload bytes."""
 
     metadata = ResourceMetadata(
         name=name,
         uid=uid,
-        lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")) if owner is None else None,
         ownerReferences=[owner] if owner is not None else None,
     )
     metadata.validate_desired()
@@ -4662,16 +4492,10 @@ def parse_opaque_recovery_unit(
         parsed = parse_desired_unit_document(cast(dict[str, Any], opaque.payload), unit_name)
     except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError) as exc:
         raise OperationError(f"opaque cleanup payload for {unit_name!r} is not parseable: {exc}") from exc
-    if not parsed.is_legacy_compatibility and parsed.metadata.uid != uid:
-        raise OperationError(f"opaque cleanup payload for {unit_name!r} has a conflicting lifecycle identity")
-    lifecycle = parsed.metadata.lifecycle
-    if lifecycle is None and not parsed.is_legacy_compatibility:
-        raise OperationError(f"opaque cleanup payload for {unit_name!r} has no lifecycle authority")
-    if lifecycle is not None:
-        if lifecycle.management is not None and lifecycle.management.mode == "direct":
-            raise OperationError(f"opaque cleanup payload for {unit_name!r} has direct lifecycle authority")
-        if resource_owner_reference(parsed) is not None:
-            raise OperationError(f"opaque cleanup payload for {unit_name!r} has an unvalidated owner identity")
+    if parsed.metadata.uid != uid:
+        raise OperationError(f"opaque cleanup payload for {unit_name!r} has a conflicting identity")
+    if resource_owner_reference(parsed) is not None:
+        raise OperationError(f"opaque cleanup payload for {unit_name!r} has an unvalidated owner identity")
     return parsed
 
 
@@ -4752,17 +4576,16 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
                     )
                 ):
                     raise OperationError(f"opaque cleanup payload for {args.unit!r} conflicts with source identity")
-                if not transition and not parsed.is_legacy_compatibility:
+                if not transition:
                     payload_revision = payload_source.revision if isinstance(payload_source, DesiredSource) else None
                     if payload_revision != args.source_revision:
                         raise OperationError(
-                            f"authoritative source for {args.unit!r} changed after opaque cleanup was retained; "
-                            "run advance-desired before recovery"
+                            f"authoritative source for {args.unit!r} changed after opaque cleanup was retained"
                         )
             else:
                 transition = False
 
-            restored = parsed.with_metadata(source_tracked_metadata_for_uid(args.unit, args.uid))
+            restored = parsed.with_metadata(root_metadata_for_uid(args.unit, args.uid))
             if opaque_deletion is not None or not source_present or transition:
                 restored = cast(
                     UnitResource[Any],
@@ -4979,32 +4802,26 @@ def desired_metadata_for_candidate(
     source: DesiredSource | None = None,
     source_revision: str | None = None,
     previous_finalized_uid: str | None = None,
+    partition: str | None = None,
 ) -> ResourceMetadata:
     """Select a durable desired identity without reusing a colliding incarnation."""
 
     if previous is None:
-        return source_tracked_metadata_for_resource(authored, source, source_revision, previous_finalized_uid)
-    if previous.is_legacy_compatibility:
-        return source_tracked_metadata_for_resource(previous)
+        return root_metadata_for_resource(authored, source, source_revision, previous_finalized_uid).with_partition(
+            partition
+        )
     previous.metadata.validate_desired()
-    lifecycle = previous.metadata.lifecycle
-    if lifecycle is None and resource_owner_reference(previous) is None:
-        raise OperationError(f"{authored.name} has no desired lifecycle authority")
     if resource_owner_reference(previous) is not None:
         raise OperationError(
             f"desired unit {authored.name!r} collides with a UID-fenced owned resource; refusing source adoption"
         )
-    assert lifecycle is not None
-    assert lifecycle.management is not None
-    if lifecycle.management.mode != "sourceTracked":
-        raise OperationError(
-            f"desired unit {authored.name!r} collides with a directly managed resource; refusing source adoption"
-        )
+    if resource_deletion(previous) is not None:
+        raise OperationError(f"desired unit {authored.name!r} is deleting and cannot be applied")
+    if partition is not None and previous.metadata.partition not in {None, partition}:
+        raise OperationError(f"desired unit {authored.name!r} belongs to partition {previous.metadata.partition!r}")
     if previous.gvk != authored.gvk or previous.driver_name != authored.driver_name:
-        raise OperationError(
-            f"desired unit {authored.name!r} changes GVK/driver; retain the previous source-tracked resource first"
-        )
-    return previous.metadata
+        raise OperationError(f"desired unit {authored.name!r} changes GVK/driver; delete the previous resource first")
+    return previous.metadata.with_partition(partition, preserve_existing=partition is None)
 
 
 def _current_desired_unit_paths(current_desired: Path) -> dict[str, Path]:
@@ -5034,8 +4851,9 @@ def build_desired_candidate(
     dry: bool = False,
     verbose: bool = True,
     source_revision_policy: SourceRevisionPolicy | None = None,
-    source_revision_operation: Literal["advance", "plan"] = "advance",
+    source_revision_operation: Literal["apply", "plan"] = "apply",
     preserve_stack_owned_metadata: bool = False,
+    partition: str | None = None,
 ) -> BuildDesiredResult:
     if verbose:
         log_heading(f"Resolve desired state for {style_environment(environment_name)}")
@@ -5045,8 +4863,6 @@ def build_desired_candidate(
             "OBSERVED",
             f"revision {describe_revision(observed_revision)}" if observed_revision else "no observations yet",
         )
-    legacy_path = current_desired / "release.json"
-    legacy = load_json(legacy_path) if legacy_path.is_file() else None
     specifications = load_environment_specifications(source_root, environment_name)
     candidate_units = candidate / "units"
     candidate_units.mkdir(parents=True)
@@ -5061,72 +4877,10 @@ def build_desired_candidate(
         source_root,
         current_desired,
         promotion,
+        partition,
     )
-    current_template_paths = _current_desired_stack_paths(current_desired, "StackTemplate")
-    candidate_template_paths = _current_desired_stack_paths(candidate, "StackTemplate")
-    for template_name, current_template_path in current_template_paths.items():
-        if template_name in candidate_template_paths:
-            continue
-        current_template = RESOURCE_CATALOG.parse_stack_template(
-            RESOURCE_CATALOG.load_document(current_template_path),
-            profile="desired",
-            expected_name=template_name,
-        )
-        target = candidate / "stack-templates" / current_template_path.name
-        _write_desired_resource(target, mark_resource_for_deletion(current_template))
     imported_artifact_fingerprints: dict[str, dict[str, str]] = {}
     imported_artifact_evidence: dict[str, dict[str, ResolvedArtifactImport]] = {}
-    # Direct Stacks are controller-owned roots, so they must survive source
-    # advances just like direct Units. Deletion metadata is retained with the
-    # same root until finalization removes it explicitly.
-    source_stack_paths = _document_paths(project_environment_root(source_root, environment_name) / "stacks")
-    current_stack_resources: dict[tuple[str, str, str], UnitResource[Any] | StackResource] = {}
-    if _current_desired_stack_paths(current_desired, "Stack"):
-        try:
-            current_stack_resources = load_desired_resource_graph(current_desired)
-        except OperationError:
-            # Existing Unit compatibility/opaque-root handling below remains
-            # authoritative when the current tree cannot be parsed as a
-            # complete Stack graph. Do not make unrelated legacy cleanup
-            # depend on Stack-only inspection.
-            current_stack_resources = {}
-    for stack_name, current_stack_path in _current_desired_stack_paths(current_desired, "Stack").items():
-        current_stack = RESOURCE_CATALOG.parse_stack(
-            RESOURCE_CATALOG.load_document(current_stack_path), profile="desired", expected_name=stack_name
-        )
-        lifecycle = current_stack.metadata.lifecycle
-        is_direct = (
-            lifecycle is not None
-            and resource_owner_reference(current_stack) is None
-            and lifecycle.management is not None
-            and lifecycle.management.mode == "direct"
-        )
-        is_source_tracked = (
-            lifecycle is not None
-            and resource_owner_reference(current_stack) is None
-            and lifecycle.management is not None
-            and lifecycle.management.mode == "sourceTracked"
-        )
-        if not is_direct and not is_source_tracked:
-            continue
-        if is_direct and stack_name in source_stack_paths:
-            raise OperationError(f"source Stack {stack_name!r} collides with a directly managed desired Stack")
-        if is_source_tracked and stack_name in source_stack_paths:
-            # The current source-authored Stack was already projected above.
-            # Do not overwrite a refreshed source projection with its previous copy.
-            continue
-        target = candidate / "stacks" / current_stack_path.name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(current_stack_path, target)
-        if is_source_tracked and stack_name not in source_stack_paths:
-            marked_stack = mark_resource_for_deletion(current_stack)
-            _write_desired_resource(target, marked_stack)
-            current_stack_resources = current_stack_resources or load_desired_resource_graph(current_desired)
-            for child in _owned_resource_closure(current_stack_resources, current_stack):
-                if child.name == current_stack.name:
-                    continue
-                child_path = _desired_resource_path(candidate, child)
-                _write_desired_resource(child_path, mark_resource_for_deletion(child))
     for unit_name, generated_unit in stack_projection.generated_units.items():
         if unit_name in specifications:
             raise OperationError(f"generated Stack Unit {unit_name!r} collides with a source Unit")
@@ -5144,7 +4898,11 @@ def build_desired_candidate(
     retained_transitions: dict[str, UnitResource[Any]] = {}
     opaque_transitions = load_desired_cleanup_roots(current_desired)
     opaque_transitions = {
-        name: mark_opaque_cleanup_for_deletion(opaque) if name not in specifications else opaque
+        name: (
+            mark_opaque_cleanup_for_deletion(opaque)
+            if partition is not None and opaque.metadata.partition == partition and name not in specifications
+            else opaque
+        )
         for name, opaque in opaque_transitions.items()
     }
     blocked_transitions = load_desired_transition_blocks(current_desired)
@@ -5179,26 +4937,16 @@ def build_desired_candidate(
                         f"{style_unit(unit_name)}: unavailable previous unit; retain opaque cleanup root",
                     )
                 continue
-        if previous is not None and not previous.is_legacy_compatibility:
+        if previous is not None:
             previous.metadata.validate_desired()
-            lifecycle = previous.metadata.lifecycle
             owner = resource_owner_reference(previous)
-            is_direct = (
-                lifecycle is not None and lifecycle.management is not None and lifecycle.management.mode == "direct"
-            )
-            if owner is not None or is_direct:
+            if owner is not None:
                 if previous.gvk != specification.gvk or previous.driver_name != specification.driver_name:
-                    raise OperationError(
-                        f"desired unit {unit_name!r} collides with a directly managed or UID-owned resource"
-                    )
+                    raise OperationError(f"desired unit {unit_name!r} collides with a UID-owned resource")
         if previous is not None and (
             previous.gvk != specification.gvk or previous.driver_name != specification.driver_name
         ):
-            retained = (
-                previous.with_metadata(source_tracked_metadata_for_resource(previous))
-                if previous.is_legacy_compatibility
-                else previous
-            )
+            retained = previous
             retained_transitions[unit_name] = retained
             blocked_transitions[unit_name] = "desired resource identity changed; previous cleanup root retained"
             if verbose:
@@ -5212,7 +4960,6 @@ def build_desired_candidate(
             source_root,
             source_revision,
             current_desired,
-            legacy,
             source_revision_policy,
             source_revision_operation,
         )
@@ -5307,6 +5054,7 @@ def build_desired_candidate(
                         resolved_source,
                         source_revision,
                         previous_incarnation.uid if previous_incarnation is not None else None,
+                        partition,
                     )
                 )
             candidate_unit = write_desired_candidate_unit(candidate_units / f"{unit_name}.json", resolved, source_root)
@@ -5383,7 +5131,11 @@ def build_desired_candidate(
                 and previous_owner.kind == "Stack"
                 and previous_owner.name == stack_owner.name
                 else desired_metadata_for_candidate(
-                    authored, previous_resource, source_resolution.source, source_revision
+                    authored,
+                    previous_resource,
+                    source_resolution.source,
+                    source_revision,
+                    partition=partition,
                 )
             )
             retained = previous_resource.with_metadata(retained_metadata)
@@ -5444,24 +5196,24 @@ def build_desired_candidate(
             previous = load_desired_unit(previous_path, unit_name)
         except Exception:
             opaque_payload = opaque_document_payload(previous_path)
-            opaque_transitions[unit_name] = mark_opaque_cleanup_for_deletion(
-                OpaqueCleanupRoot(
-                    path=previous_path,
-                    payload=opaque_payload,
-                    metadata=opaque_cleanup_metadata(unit_name, opaque_payload, source_revision),
-                    source=raw_document_source(opaque_payload),
-                )
+            opaque_transitions[unit_name] = OpaqueCleanupRoot(
+                path=previous_path,
+                payload=opaque_payload,
+                metadata=opaque_cleanup_metadata(unit_name, opaque_payload, source_revision),
+                source=raw_document_source(opaque_payload),
             )
-            blocked_transitions[unit_name] = "source absent; opaque cleanup root retained"
+            blocked_transitions[unit_name] = "opaque desired root retained"
             continue
         retained = previous
-        if previous.is_legacy_compatibility:
-            retained = previous.with_metadata(source_tracked_metadata_for_resource(previous))
         write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
         if getattr(retained.spec, "materialization", None) is not None:
             copy_unit_materialization(current_desired, candidate, unit_name, previous)
-        lifecycle = retained.metadata.lifecycle
-        if lifecycle is not None and lifecycle.management is not None and lifecycle.management.mode == "sourceTracked":
+        owner = resource_owner_reference(retained)
+        removed_from_applied_stack = (
+            owner is not None and owner.kind == "Stack" and owner.name in stack_projection.applied_stacks
+        )
+        omitted_partition_root = partition is not None and owner is None and retained.metadata.partition == partition
+        if removed_from_applied_stack or omitted_partition_root:
             retained = cast(UnitResource[Any], mark_resource_for_deletion(retained))
             write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
             cleanup_inputs[unit_name] = DesiredCleanupInput(
@@ -5667,186 +5419,6 @@ def promotion_lineage(desired: Path) -> dict[str, Any] | None:
     return normalize_promotion_document(load_json(paths[0])) if paths else None
 
 
-def advance_desired(
-    environment: str,
-    source_revision: str | None,
-    desired_ref: str | None = None,
-    observed_ref: str | None = None,
-    require_source_ref: str | None = None,
-    dry: bool = False,
-    summarize: bool = True,
-    verbose: bool = True,
-    warn_uncommitted: bool = False,
-) -> tuple[str | None, bool]:
-    desired_override = desired_ref
-    observed_override = observed_ref
-    requested_source_revision = resolve_advance_source_revision(REPOSITORY_ROOT, environment, source_revision)
-    if require_source_ref and requested_source_revision is None:
-        raise OperationError("--require-source-ref applies only to source-tracked environments")
-    if verbose:
-        log_heading(f"Advance desired state for {style_environment(environment)}")
-        log_status(
-            "START",
-            (
-                f"environment {style_environment(environment)} from {describe_revision(requested_source_revision)}"
-                if requested_source_revision is not None
-                else f"environment {style_environment(environment)} from its merged promotion"
-            ),
-        )
-    if warn_uncommitted:
-        warn_if_source_revision_excludes_changes(requested_source_revision)
-    if requested_source_revision is None:
-        desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, environment, desired_ref, observed_ref)
-    else:
-        with tempfile.TemporaryDirectory() as probe_directory:
-            probe_root = Path(probe_directory) / "source"
-            materialize_revision(requested_source_revision, probe_root)
-            desired_ref, observed_ref = deployment_refs(probe_root, environment, desired_ref, observed_ref)
-    configured_lease_ref = effect_lease_ref(environment, desired_ref)
-    lease_ref = configured_lease_ref if configured_lease_ref != desired_ref else desired_ref
-    if verbose:
-        log_status("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
-    for attempt in range(5):
-        if attempt and verbose:
-            log_status("RETRY", f"desired-state publish attempt {attempt + 1}/5")
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            temporary = Path(temporary_directory)
-            current_desired = temporary / "current"
-            observed = temporary / "observed"
-            candidate = temporary / "candidate"
-            current_revision = observed_tree(desired_ref, current_desired)
-            if current_revision is not None:
-                lease_root = current_desired
-                lease_temporary_directory = None
-                if lease_ref != desired_ref:
-                    lease_temporary_directory = tempfile.TemporaryDirectory()
-                    lease_root, lease_revision = _effect_lease_store_root(
-                        desired_ref,
-                        current_revision,
-                        current_desired,
-                        lease_ref,
-                        Path(lease_temporary_directory.name) / "leases",
-                    )
-                active_leases = [
-                    lease for lease in load_desired_effect_leases(lease_root).values() if effect_lease_active(lease)
-                ]
-                if lease_temporary_directory is not None:
-                    lease_temporary_directory.cleanup()
-                if active_leases:
-                    if verbose:
-                        log_status(
-                            "WAIT",
-                            "desired state is leased for effect: "
-                            + ", ".join(f"{lease.unit_name} by {lease.owner}" for lease in active_leases),
-                        )
-                    return current_revision, False
-            promotion = load_promotion_context(current_desired, temporary)
-            if requested_source_revision is None and promotion is None:
-                raise OperationError(f"promotion-tracked environment {environment} requires a merged promotion")
-            if requested_source_revision is not None and promotion is not None:
-                raise OperationError(f"source-tracked environment {environment} contains promotion state")
-            effective_source_revision = (
-                promotion.specification_revision if promotion is not None else requested_source_revision
-            )
-            assert effective_source_revision is not None
-            if promotion is not None and verbose:
-                log_status(
-                    "PIN",
-                    f"use reviewed specification {describe_revision(effective_source_revision)} from promotion",
-                )
-            if require_source_ref:
-                required_head = fetch_ref(require_source_ref)
-                if required_head != requested_source_revision:
-                    log_status("SKIP", f"source revision is superseded by {require_source_ref}")
-                    return None, False
-            source_root = temporary / "source"
-            materialize_revision(effective_source_revision, source_root)
-            pinned_refs = deployment_refs(source_root, environment, desired_override, observed_override)
-            if pinned_refs != (desired_ref, observed_ref):
-                raise OperationError("reviewed specification changes deployment refs")
-            if promotion is not None and promotion.source_environment not in allowed_promotion_sources(
-                source_root, environment
-            ):
-                raise OperationError(
-                    f"{promotion.source_environment} is not an allowed promotion source for {environment}"
-                )
-            observed_revision = observed_tree(observed_ref, observed)
-            candidate_result = build_desired_candidate(
-                environment,
-                source_root,
-                effective_source_revision,
-                current_desired,
-                observed,
-                observed_revision,
-                candidate,
-                promotion=promotion,
-                dry=dry,
-                verbose=verbose,
-                source_revision_operation="advance",
-            )
-            validate_effect_leases_preserved(
-                desired_ref,
-                current_revision,
-                candidate,
-                current_desired,
-                lease_ref=lease_ref,
-            )
-            if candidate_result is not None:
-                for unit_name, reason in sorted(candidate_result.blocked_transitions.items()):
-                    if verbose:
-                        log_status("WAIT", f"{style_unit(unit_name)}: {reason}")
-            load_desired_resource_graph(candidate)
-            if current_revision and directory_files(current_desired) == directory_files(candidate):
-                if verbose:
-                    log_status(
-                        "KEEP",
-                        f"{style_branch(desired_ref)} already resolved at {describe_revision(current_revision)}",
-                    )
-                if summarize:
-                    log_reconciliation_summary(environment, source_root, candidate, observed)
-                return current_revision, False
-            if dry:
-                if verbose:
-                    log_status("DRY", f"{style_branch(desired_ref)} would be updated")
-                if summarize:
-                    log_reconciliation_summary(environment, source_root, candidate, observed)
-                return current_revision, True
-            try:
-                revision = publish_tree(
-                    desired_ref,
-                    candidate,
-                    current_revision,
-                    f"Desired {environment} state from {effective_source_revision}",
-                )
-                if verbose:
-                    log_status("UPDATE", f"{style_branch(desired_ref)} advanced to {describe_revision(revision)}")
-                if summarize:
-                    log_reconciliation_summary(environment, source_root, candidate, observed)
-                return revision, True
-            except subprocess.CalledProcessError as exc:
-                if attempt == 4 or not retryable_push_failure(exc):
-                    raise
-    raise OperationError(f"could not advance {desired_ref} after concurrent updates")
-
-
-def command_advance_desired(args: argparse.Namespace) -> None:
-    revision, changed = advance_desired(
-        args.environment,
-        args.source_revision,
-        args.desired_ref,
-        args.observed_ref,
-        args.require_source_ref,
-        args.dry,
-        warn_uncommitted=True,
-    )
-    if revision:
-        print(revision)
-    if output := os.environ.get("GITHUB_OUTPUT"):
-        with Path(output).open("a") as stream:
-            stream.write(f"desired_changed={'true' if changed else 'false'}\n")
-            stream.write(f"desired_revision={revision or ''}\n")
-
-
 def validate_effect_leases_preserved(
     target_ref: str,
     target_revision: str | None,
@@ -6040,6 +5612,30 @@ def write_change_outputs(
             stream.write(f"change_url={change_url}\n")
 
 
+def _initialize_gated_desired_ref(
+    source_root: Path,
+    environment: str,
+    desired_ref: str,
+    current: Path,
+) -> str:
+    """Create the inert parent required by a first pull-request-gated publication."""
+
+    baseline = current.parent / f"{current.name}-baseline"
+    baseline_environment = {"name": environment, "state": "unpromoted"}
+    if resource_documents_enabled(source_root):
+        write_document(
+            baseline / f"environment{load_project_config(source_root).write_format.suffix}",
+            serialize_environment_document(baseline_environment),
+            format=load_project_config(source_root).write_format,
+        )
+    else:
+        write_json(baseline / "environment.json", baseline_environment)
+    revision = publish_tree(desired_ref, baseline, None, f"Initialize desired {environment} state")
+    shutil.copytree(baseline, current, dirs_exist_ok=True)
+    log_status("INIT", f"created inert {style_branch(desired_ref)} at {describe_revision(revision)}")
+    return revision
+
+
 def command_promote(args: argparse.Namespace) -> None:
     specification_revision = git("rev-parse", f"{args.specification_revision or 'HEAD'}^{{commit}}").stdout.strip()
     log_heading(f"Promote {style_environment(args.from_environment)} to {style_environment(args.to_environment)}")
@@ -6081,28 +5677,11 @@ def command_promote(args: argparse.Namespace) -> None:
         target_observed_revision = observed_tree(target_observed_ref, target_observed)
         gate = change_gate(source_root, args.to_environment)
         if target_revision is None and gate == "pullRequest":
-            baseline = temporary / "target-baseline"
-            baseline_environment = {
-                "name": args.to_environment,
-                "state": "unpromoted",
-            }
-            if resource_documents_enabled(source_root):
-                write_document(
-                    baseline / f"environment{load_project_config(source_root).write_format.suffix}",
-                    serialize_environment_document(baseline_environment),
-                    format=load_project_config(source_root).write_format,
-                )
-            else:
-                write_json(baseline / "environment.json", baseline_environment)
-            target_revision = publish_tree(
+            target_revision = _initialize_gated_desired_ref(
+                source_root,
+                args.to_environment,
                 target_desired_ref,
-                baseline,
-                None,
-                f"Initialize desired {args.to_environment} state",
-            )
-            log_status(
-                "INIT",
-                f"created inert {style_branch(target_desired_ref)} at {describe_revision(target_revision)}",
+                current_target,
             )
         promotion = PromotionContext(
             source_environment=args.from_environment,
@@ -6114,16 +5693,28 @@ def command_promote(args: argparse.Namespace) -> None:
             desired_root=source_desired,
             observed_root=source_observed,
         )
+        explicit_documents = _load_apply_documents(args.files)
+        explicit_source = temporary / "explicit-target"
+        _copy_apply_source_base(source_root, explicit_source, args.to_environment)
+        authored_units, authored_stacks = _write_apply_authored_documents(
+            explicit_source, args.to_environment, explicit_documents
+        )
+        if any(_document_is_canonical_desired(document) for _origin, document in explicit_documents):
+            raise OperationError("promote accepts authored target input only")
         build_desired_candidate(
             args.to_environment,
-            source_root,
+            explicit_source,
             specification_revision,
             current_target,
             target_observed,
             target_observed_revision,
             candidate,
             promotion=promotion,
+            partition=args.partition,
         )
+        applied = _applied_root_closure(candidate, [*authored_units, *authored_stacks])
+        _copy_unrelated_desired_resources(current_target, candidate, applied, args.partition)
+        _prune_omitted_partition_resources(current_target, candidate, applied, args.partition)
         load_desired_resource_graph(candidate)
         target_lease_ref = effect_lease_ref(args.to_environment, target_desired_ref)
         if target_lease_ref == target_desired_ref:
@@ -6242,7 +5833,7 @@ def publish_desired_change(
     environment: str,
     candidate: Path,
     target_ref: str,
-    target_revision: str,
+    target_revision: str | None,
     candidate_ref: str,
     commit_message: str,
     title: str,
@@ -6268,8 +5859,11 @@ def publish_desired_change(
     gate = change_gate(REPOSITORY_ROOT, environment)
     if dry:
         log_status("DRY", f"{style_branch(target_ref)} would receive {title.lower()}")
-        return target_revision, None
+        return target_revision or "", None
+    _ensure_stack_source_pins(environment, candidate)
     if gate == "pullRequest":
+        if target_revision is None:
+            raise OperationError("pull-request publication requires an initialized desired ref")
         revision, outcome = publish_change_candidate(
             candidate,
             candidate_ref,
@@ -6293,29 +5887,62 @@ def publish_desired_change(
     return revision, None
 
 
-def validate_materialized_desired(
-    environment: str,
+@dataclass(frozen=True)
+class RollbackDesiredInventory:
+    """Validated, self-contained Unit inventory from one desired snapshot."""
+
+    units: dict[str, UnitResource[Any]]
+    dependencies: dict[str, tuple[str, ...]]
+
+
+def validate_rollback_desired_inventory(
     desired_revision: str,
     desired: Path,
-    source: Path,
     description: str,
-) -> tuple[dict[str, UnitResource[Any]], list[str]]:
-    specifications = load_environment_specifications(source, environment)
-    expected_units = sorted(specifications)
-    desired_units = sorted(
-        {path.stem for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}}
-    )
-    if desired_units != expected_units:
-        raise OperationError(f"{description} {describe_revision(desired_revision)} is not fully materialized")
-    for unit_name in desired_units:
-        unit = load_desired_unit(unit_document_path(desired, unit_name), unit_name)
-        if unit_contains_reference(unit):
-            raise OperationError(f"{description} unit {unit_name} contains unresolved inputs")
-        driver, _source = require_unit(unit, unit_name)
-        validate_unit_materialization(desired, unit_name, unit)
-        if driver != specifications[unit_name].driver_name:
-            raise OperationError(f"{description} unit {unit_name} does not match its specification driver")
-    return specifications, desired_units
+) -> RollbackDesiredInventory:
+    resources = load_desired_resource_graph(desired)
+    units: dict[str, UnitResource[Any]] = {}
+    for resource in resources.values():
+        if not isinstance(resource, UnitResource):
+            continue
+        if resource_deletion(resource) is not None:
+            raise OperationError(f"{description} unit {resource.name!r} is deleting")
+        if unit_contains_reference(resource):
+            raise OperationError(f"{description} unit {resource.name!r} contains unresolved inputs")
+        require_unit(resource, resource.name)
+        validate_unit_materialization(desired, resource.name, resource)
+        units[resource.name] = resource
+    stack_dependencies = stack_dependency_edges(resources)
+    dependencies = {
+        name: tuple(sorted(desired_observation_reference_units(unit) | set(stack_dependencies.get(name, ()))))
+        for name, unit in units.items()
+    }
+    for name, required in dependencies.items():
+        missing = sorted(set(required) - units.keys())
+        if missing:
+            raise OperationError(
+                f"{description} {describe_revision(desired_revision)} unit {name!r} "
+                f"depends on missing Unit(s): {', '.join(missing)}"
+            )
+    return RollbackDesiredInventory(units, dependencies)
+
+
+def _downstream_desired_unit_closure(
+    inventory: RollbackDesiredInventory,
+    selected: Sequence[str],
+) -> tuple[str, ...]:
+    consumers = {name: set() for name in inventory.units}
+    for consumer, dependencies in inventory.dependencies.items():
+        for producer in dependencies:
+            consumers[producer].add(consumer)
+    closure: set[str] = set()
+    pending = list(selected)
+    while pending:
+        for consumer in consumers[pending.pop()]:
+            if consumer not in closure and consumer not in selected:
+                closure.add(consumer)
+                pending.append(consumer)
+    return tuple(sorted(closure))
 
 
 def canonicalize_rollback_unit(
@@ -6328,21 +5955,19 @@ def canonicalize_rollback_unit(
     historical = load_desired_unit(candidate_path, candidate_path.stem)
     current = load_desired_unit(current_path, current_path.stem) if current_path.is_file() else None
     if current is not None:
-        metadata = (
-            source_tracked_metadata_for_resource(current) if current.is_legacy_compatibility else current.metadata
-        )
+        metadata = current.metadata
     elif finalized_incarnation is not None:
         historical_source = getattr(historical.spec, "source", None)
         if not isinstance(historical_source, DesiredSource):
             historical_source = None
-        metadata = source_tracked_metadata_for_resource(
+        metadata = root_metadata_for_resource(
             historical,
             source=historical_source,
             source_revision=historical_source.revision if historical_source is not None else None,
             previous_finalized_uid=finalized_incarnation.uid,
         )
-    elif historical.is_legacy_compatibility:
-        metadata = source_tracked_metadata_for_resource(historical)
+        if historical.metadata.is_root:
+            metadata = metadata.with_partition(historical.metadata.partition)
     else:
         historical.metadata.validate_desired()
         metadata = historical.metadata
@@ -6359,10 +5984,7 @@ def copy_current_blocked_unit(current: Path, candidate: Path, unit_name: str) ->
 
     current_path = unit_document_path(current, unit_name)
     current_unit = load_desired_unit(current_path, unit_name)
-    if current_unit.is_legacy_compatibility:
-        current_unit = current_unit.with_metadata(source_tracked_metadata_for_resource(current_unit))
-    else:
-        current_unit.metadata.validate_desired()
+    current_unit.metadata.validate_desired()
     for unit_path in document_candidates(candidate / "units", unit_name):
         unit_path.unlink()
     selected = DocumentFormat.YAML if current_path.suffix in {".yaml", ".yml"} else DocumentFormat.JSON
@@ -6494,83 +6116,38 @@ def command_rollback(args: argparse.Namespace) -> None:
             raise OperationError("rollback target is not ancestral to the current desired head")
         materialize_revision(target_revision, target)
 
-        current_specification_revision = desired_specification_revision(
-            current_revision,
-            current,
-            temporary / "current-promotion",
+        target_inventory = validate_rollback_desired_inventory(target_revision, target, "rollback target")
+        current_inventory = (
+            validate_rollback_desired_inventory(current_revision, current, "current desired state")
+            if mode == "units"
+            else None
         )
-        target_specification_revision = desired_specification_revision(
-            target_revision,
-            target,
-            temporary / "target-promotion",
-        )
-        current_source = temporary / "current-source"
-        target_source = temporary / "target-source"
-        materialize_revision(current_specification_revision, current_source)
-        materialize_revision(target_specification_revision, target_source)
-        target_specifications, target_units = validate_materialized_desired(
-            args.environment,
-            target_revision,
-            target,
-            target_source,
-            "rollback target",
-        )
-        if mode == "units":
-            current_specifications, _current_units = validate_materialized_desired(
-                args.environment,
-                current_revision,
-                current,
-                current_source,
-                "current desired state",
-            )
-        else:
-            current_specifications = load_environment_specifications(current_source, args.environment)
-        current_environment = load_environment(current_source, args.environment)
-        target_environment = load_environment(target_source, args.environment)
-        current_promotion = promotion_lineage(current)
-        target_promotion = promotion_lineage(target)
-        current_promoted = current_environment.get("promotion") is not None
-        target_promoted = target_environment.get("promotion") is not None
-        if current_promoted != (current_promotion is not None):
-            raise OperationError("current desired state has an incompatible environment mode")
-        if target_promoted != (target_promotion is not None):
-            raise OperationError("rollback target has an incompatible environment mode")
-        current_refs = deployment_refs(
-            current_source,
-            args.environment,
-            args.desired_ref,
-            args.observed_ref,
-        )
-        target_refs = deployment_refs(
-            target_source,
-            args.environment,
-            args.desired_ref,
-            args.observed_ref,
-        )
-        if current_refs != (desired_ref, observed_ref):
-            raise OperationError("current specification changes deployment refs")
+        target_units = sorted(target_inventory.units)
         requested_units = sorted(set(args.unit or target_units))
-        unknown = sorted(
-            (set(requested_units) - set(current_specifications)) | (set(requested_units) - set(target_units))
+        unknown = (
+            sorted((set(requested_units) - set(current_inventory.units)) | (set(requested_units) - set(target_units)))
+            if current_inventory is not None
+            else []
         )
         if unknown:
             raise OperationError("unknown rollback unit(s): " + ", ".join(unknown))
-        if mode == "full" and set(current_specifications) != set(target_units):
-            raise OperationError("full-tree rollback requires the current and target unit sets to match")
-        if mode == "full" and (current_promoted != target_promoted or current_refs != target_refs):
-            raise OperationError("full-tree rollback cannot change environment revision mode or deployment refs")
-        downstream = downstream_unit_closure(current_specifications, requested_units) if mode == "units" else []
+        downstream = (
+            _downstream_desired_unit_closure(current_inventory, requested_units)
+            if current_inventory is not None
+            else []
+        )
         materialized_units = sorted(set(requested_units) | set(downstream)) if mode == "units" else target_units
         missing_from_target = sorted(set(materialized_units) - set(target_units))
         if missing_from_target:
             raise OperationError("rollback target is missing downstream unit(s): " + ", ".join(missing_from_target))
-        for unit_name in materialized_units:
-            current_driver = current_specifications[unit_name].driver_name
-            target_driver = target_specifications[unit_name].driver_name
-            if current_driver != target_driver:
-                raise OperationError(
-                    f"rollback unit {unit_name} changes driver from {current_driver} to {target_driver}"
-                )
+        if current_inventory is not None:
+            for unit_name in materialized_units:
+                current_driver = current_inventory.units[unit_name].driver_name
+                target_driver = target_inventory.units[unit_name].driver_name
+                if current_driver != target_driver:
+                    raise OperationError(
+                        f"rollback unit {unit_name} changes driver from {current_driver} to {target_driver}"
+                    )
 
         observed_revision = find_clean_observed_snapshot(
             observed_ref,
@@ -6582,10 +6159,8 @@ def command_rollback(args: argparse.Namespace) -> None:
             "environment": args.environment,
             "reason": reason,
             "fromDesiredRevision": current_revision,
-            "fromSpecificationRevision": current_specification_revision,
             "targetDesiredRevision": target_revision,
             "targetObservedRevision": observed_revision,
-            "targetSpecificationRevision": target_specification_revision,
             "requestedUnits": "all" if mode == "full" else requested_units,
             "materializedUnits": materialized_units,
         }
@@ -6633,10 +6208,8 @@ def command_rollback(args: argparse.Namespace) -> None:
         commit_message = (
             f"Rollback {args.environment} to {target_revision}\n\n"
             f"From-Desired-Revision: {current_revision}\n"
-            f"From-Specification-Revision: {current_specification_revision}\n"
             f"Target-Desired-Revision: {target_revision}\n"
             f"Target-Observed-Revision: {observed_revision}\n"
-            f"Target-Specification-Revision: {target_specification_revision}\n"
             f"Requested-Units: {requested_label}\n"
             f"Materialized-Units: {materialized_label}\n"
             f"Reason: {reason}"
@@ -6684,773 +6257,10 @@ def command_rollback(args: argparse.Namespace) -> None:
         write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
 
 
-def _command_instantiate_stack(args: argparse.Namespace) -> bool:
-    _resource_name(args.environment, "environment name")
-    _resource_name(args.stack, "Stack name")
-    _resource_name(args.template, "StackTemplate name")
-    requested_units = getattr(args, "units", None)
-    parameters = _parse_stack_parameters(args.parameters)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/#!-]{0,127}", args.request_id):
-        raise OperationError("--request-id has an invalid format")
-    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
-    current_revision = fetch_ref(desired_ref)
-    if current_revision is None:
-        raise OperationError(f"desired ref {desired_ref!r} has no state")
-    source_revision_result = git("rev-parse", f"{args.source_revision}^{{commit}}", check=False)
-    if source_revision_result.returncode != 0:
-        raise OperationError(f"source revision {args.source_revision!r} is not a valid Git commit")
-    source_revision = source_revision_result.stdout.strip()
-
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        temporary = Path(temporary_directory)
-        current = temporary / "current"
-        observed = temporary / "observed"
-        source = temporary / "source"
-        synthetic_source = temporary / "synthetic-source"
-        candidate = temporary / "candidate"
-        materialize_revision(current_revision, current)
-
-        existing_paths = _current_desired_stack_paths(current, "Stack").get(args.stack)
-        if existing_paths is not None:
-            existing = RESOURCE_CATALOG.parse_stack(
-                RESOURCE_CATALOG.load_document(existing_paths), profile="desired", expected_name=args.stack
-            )
-            lifecycle = existing.metadata.lifecycle
-            if lifecycle is None or lifecycle.management is None or lifecycle.management.mode != "direct":
-                raise OperationError(f"desired Stack {args.stack!r} already exists and is not directly managed")
-            if not isinstance(existing.spec, DesiredStackSpec) or existing.spec.provenance is None:
-                raise OperationError(f"desired Stack {args.stack!r} is missing direct instantiation provenance")
-            provenance = existing.spec.provenance
-            if (
-                provenance.requestIdentity == args.request_id
-                and provenance.templateRevision == source_revision
-                and (
-                    existing.spec.template == args.template
-                    or (
-                        isinstance(existing.spec.template, StackTemplateReference)
-                        and existing.spec.template.name == args.template
-                    )
-                )
-                and existing.spec.parameters == parameters
-            ):
-                return False
-            raise OperationError(f"desired Stack {args.stack!r} already exists with a different instantiation request")
-
-        materialize_revision(source_revision, source)
-        template_root = source.joinpath(*load_project_config(source).stack_templates_path.parts)
-        if not template_root.is_dir():
-            template_root = project_environment_root(source, args.environment) / "stack-templates"
-        template_paths = document_candidates(template_root, args.template)
-        if len(template_paths) != 1:
-            raise OperationError(f"expected exactly one StackTemplate document for {args.template!r}")
-        template_path = template_paths[0]
-        template = RESOURCE_CATALOG.parse_stack_template(
-            RESOURCE_CATALOG.load_document(template_path), profile="authored", expected_name=args.template
-        )
-        if not isinstance(template.spec, StackTemplateSpec):
-            raise OperationError(f"StackTemplate {args.template!r} has an invalid specification")
-        selected_template_resources = _selected_stack_template_resources(
-            args.stack, template.spec.expand(parameters), requested_units
-        )
-        expanded = scope_stack_template_resources(args.stack, selected_template_resources)
-        template_provenance = StackInstantiationProvenance(
-            templateRevision=source_revision,
-            templatePath=template_path.relative_to(source).as_posix(),
-            templateDigest=hashlib.sha256(template_path.read_bytes()).hexdigest(),
-            requestIdentity=args.request_id,
-        )
-
-        shutil.copytree(source, synthetic_source)
-        synthetic_environment = project_environment_root(synthetic_source, args.environment)
-        source_stacks = _document_paths(synthetic_environment / "stacks")
-        if args.stack in source_stacks:
-            raise OperationError(f"Stack {args.stack!r} is source-authored; direct instantiation would collide")
-        project = load_project_config(synthetic_source)
-        synthetic_stack_path = synthetic_environment / "stacks" / f"{args.stack}{project.write_format.suffix}"
-        synthetic_spec: dict[str, Any] = {"template": args.template, "parameters": dict(parameters)}
-        if requested_units is not None:
-            synthetic_spec["units"] = [resource.name for resource in selected_template_resources]
-        write_document(
-            synthetic_stack_path,
-            {
-                "apiVersion": CORE_API_VERSION,
-                "kind": "Stack",
-                "metadata": {"name": args.stack},
-                "spec": synthetic_spec,
-            },
-            format=project.write_format,
-        )
-
-        observed_revision = observed_tree(observed_ref, observed)
-        build_desired_candidate(
-            args.environment,
-            synthetic_source,
-            source_revision,
-            current,
-            observed,
-            observed_revision,
-            candidate,
-            dry=args.dry,
-            preserve_stack_owned_metadata=True,
-        )
-        # The desired head is part of the incarnation identity. Retries against
-        # the same head remain replay-idempotent, while a same-name request
-        # after a finalized root has a new desired head and cannot
-        # reuse the old UID or its teardown evidence.
-        previous_tombstone = load_resource_incarnation_tombstones(current).get((CORE_API_VERSION, "Stack", args.stack))
-        direct_uid = _direct_stack_uid(
-            args.environment,
-            args.stack,
-            args.request_id,
-            current_revision,
-            previous_tombstone.uid if previous_tombstone is not None else None,
-        )
-        direct_metadata = ResourceMetadata(
-            name=args.stack,
-            uid=direct_uid,
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
-        )
-        # Keep the complete logical projection, including Units that are not
-        # yet materialized because an input is still unavailable.  The desired
-        # graph uses this record to distinguish a blocked generated Unit from
-        # an invalid Stack expansion.
-        resolved_projection = JsonObjectValue(
-            {
-                "units": {
-                    resource.name: {
-                        "apiVersion": resource.apiVersion,
-                        "kind": resource.kind,
-                        "spec": cast(JsonObjectValue, dump_template_value(cast(TemplateValue, resource.spec))),
-                        "dependsOn": list(resource.dependsOn),
-                    }
-                    for resource in _selected_stack_template_resources(
-                        args.stack, template.spec.expand(parameters), requested_units
-                    )
-                }
-            }
-        )
-        direct_spec = DesiredStackSpec(
-            template=StackTemplateReference(name=args.template),
-            parameters=parameters,
-            units=[resource.name for resource in selected_template_resources] if requested_units is not None else None,
-            provenance=template_provenance,
-            resolvedSource=ResolvedStackTemplateSource(
-                fromGit=ResolvedGitSource(
-                    path=".",
-                    commit=source_revision,
-                    resourcePath=template_path.relative_to(source).as_posix(),
-                    digest=template_provenance.templateDigest,
-                )
-            ),
-            resolvedProjection=resolved_projection,
-        )
-        direct_stack = StackResource(GVK(CORE_API_VERSION, "Stack"), direct_metadata, direct_spec)
-        stack_path = _current_desired_stack_paths(candidate, "Stack").get(args.stack)
-        if stack_path is None:
-            raise OperationError(f"instantiated Stack {args.stack!r} was not projected into desired state")
-        _write_desired_stack_resource(stack_path, direct_stack, REPOSITORY_ROOT)
-        owner = DesiredOwnerReference(
-            apiVersion=CORE_API_VERSION,
-            kind="Stack",
-            name=args.stack,
-            uid=direct_uid,
-        )
-        for resource in expanded:
-            unit_path = unit_document_path(candidate, resource.name)
-            if not unit_path.is_file():
-                if load_desired_transition_blocks(candidate).get(resource.name):
-                    continue
-                raise OperationError(f"generated Unit {resource.name!r} is unresolved in the desired candidate")
-            unit = load_desired_unit(unit_path, resource.name)
-            if unit_contains_reference(unit):
-                raise OperationError(f"generated Unit {resource.name!r} is unresolved in the desired candidate")
-            previous_path = unit_document_path(current, resource.name)
-            previous_unit = load_desired_unit(previous_path, resource.name) if previous_path.is_file() else None
-            owned_metadata = _stack_owned_metadata(resource.name, owner)
-            if previous_unit is not None and previous_unit.metadata.uid is not None:
-                owned_metadata = ResourceMetadata(
-                    name=resource.name,
-                    uid=previous_unit.metadata.uid,
-                    ownerReferences=owned_metadata.ownerReferences,
-                )
-            write_desired_candidate_unit(
-                unit_path,
-                unit.with_metadata(owned_metadata),
-                REPOSITORY_ROOT,
-            )
-        load_desired_resource_graph(candidate)
-        candidate_id = candidate_identifier(
-            "instantiate-stack",
-            args.environment,
-            candidate,
-            desired_ref,
-            current_revision,
-            {
-                "stack": args.stack,
-                "template": args.template,
-                "requestIdentity": args.request_id,
-                "templateRevision": source_revision,
-            },
-        )
-        candidate_ref = resolve_candidate_ref(
-            REPOSITORY_ROOT,
-            args.environment,
-            "instantiate-stack",
-            candidate_id,
-            args.candidate_ref,
-        )
-        pin_name = _stack_pin_name(args.environment, args.stack, direct_uid)
-        store = state_store()
-        claim = _stack_pin_claim(
-            args.environment,
-            args.stack,
-            direct_uid,
-            source_revision,
-            desired_ref,
-            current_revision,
-            candidate_ref,
-        )
-        if not args.dry:
-            create_claim = getattr(store, "create_controller_pin_claim", None)
-            if create_claim is not None:
-                try:
-                    claim = create_claim(claim)
-                except OperationError:
-                    read_claim = getattr(store, "read_controller_pin_claim", None)
-                    existing_claim = read_claim(pin_name) if read_claim is not None else None
-                    if (
-                        existing_claim is None
-                        or existing_claim.state == "reaping"
-                        or existing_claim.pin_revision != claim.pin_revision
-                        or existing_claim.target_ref != claim.target_ref
-                        or existing_claim.target_revision != claim.target_revision
-                        or existing_claim.candidate_ref != claim.candidate_ref
-                    ):
-                        raise
-                    claim = existing_claim
-            store.create_controller_pin(pin_name, source_revision)
-        try:
-            revision, outcome = publish_desired_change(
-                args.environment,
-                candidate,
-                desired_ref,
-                current_revision,
-                candidate_ref,
-                f"Instantiate direct Stack {args.stack}",
-                f"Instantiate direct Stack {args.stack}",
-                f"Create a UID-fenced direct Stack `{args.stack}` from StackTemplate `{args.template}`.",
-                args.dry,
-                current,
-                request_change=False,
-            )
-        except OperationError:
-            # A pin created for a candidate that was never published is not a
-            # cleanup source. Release it only when both target and candidate
-            # refs still prove that no desired Stack became reachable.
-            if not args.dry:
-                candidate_exists = fetch_ref(candidate_ref) is not None
-                target_unchanged = fetch_ref(desired_ref) == current_revision
-                if not candidate_exists and target_unchanged:
-                    released = False
-                    try:
-                        store.release_controller_pin(pin_name, source_revision)
-                        released = True
-                    except OperationError:
-                        pass
-                    if released and claim.revision is not None:
-                        delete_claim = getattr(store, "delete_controller_pin_claim", None)
-                        if delete_claim is not None:
-                            try:
-                                delete_claim(claim.ref.removeprefix("gitopsctr/pin-claims/"), claim.revision)
-                            except OperationError:
-                                pass
-            raise
-        if args.dry:
-            return False
-        update_claim = getattr(store, "update_controller_pin_claim", None)
-        if update_claim is not None and claim.revision is not None:
-            update_claim(
-                _stack_pin_claim(
-                    args.environment,
-                    args.stack,
-                    direct_uid,
-                    source_revision,
-                    desired_ref,
-                    current_revision,
-                    candidate_ref,
-                    state="active",
-                    candidate_revision=revision,
-                ),
-                claim.revision,
-            )
-        print(revision)
-        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
-        return True
-
-
-def command_instantiate_stack(args: argparse.Namespace) -> bool:
-    with unit_effect_lock(args.environment, f"stack-{getattr(args, 'stack', '<invalid>')}"):
-        return _command_instantiate_stack(args)
-
-
-def _direct_stack_update_replay_matches(
-    stack: StackResource,
-    uid: str,
-    template: str,
-    source_revision: str,
-    parameters: JsonObjectValue,
-    request_id: str,
-) -> bool:
-    lifecycle = stack.metadata.lifecycle
-    if (
-        stack.metadata.uid != uid
-        or lifecycle is None
-        or resource_owner_reference(stack) is not None
-        or lifecycle.management is None
-        or lifecycle.management.mode != "direct"
-        or not isinstance(stack.spec, DesiredStackSpec)
-        or stack.spec.provenance is None
-    ):
-        return False
-    stack_template = stack.spec.template
-    stack_template_name = stack_template.name if isinstance(stack_template, StackTemplateReference) else stack_template
-    return (
-        stack_template_name == template
-        and stack.spec.parameters == parameters
-        and stack.spec.provenance.templateRevision == source_revision
-        and stack.spec.provenance.requestIdentity == request_id
-    )
-
-
-def _repair_direct_stack_update_fences(
-    args: argparse.Namespace,
-    source_revision: str,
-    desired_ref: str,
-    desired_revision: str,
-) -> None:
-    """Repair pin and claim state after a published update was interrupted."""
-
-    pin_name = _stack_pin_name(args.environment, args.stack, args.uid)
-    store = state_store()
-    actual_pin = _controller_pin_revision(pin_name)
-    if actual_pin is None:
-        store.create_controller_pin(pin_name, source_revision)
-    elif actual_pin != source_revision:
-        _replace_controller_pin(pin_name, actual_pin, source_revision)
-    read_claim = getattr(store, "read_controller_pin_claim", None)
-    update_claim = getattr(store, "update_controller_pin_claim", None)
-    if not callable(read_claim) or not callable(update_claim):
-        return
-    claim = read_claim(pin_name)
-    if claim is None:
-        create_claim = getattr(store, "create_controller_pin_claim", None)
-        if callable(create_claim):
-            create_claim(
-                _stack_pin_claim(
-                    args.environment,
-                    args.stack,
-                    args.uid,
-                    source_revision,
-                    desired_ref,
-                    desired_revision,
-                    desired_ref,
-                    state="active",
-                    candidate_revision=desired_revision,
-                )
-            )
-        return
-    if claim.revision is None:
-        return
-    if claim.pin_revision == source_revision and claim.state == "active" and claim.target_revision == desired_revision:
-        return
-    update_claim(
-        replace(
-            claim,
-            pin_revision=source_revision,
-            target_ref=desired_ref,
-            target_revision=desired_revision,
-            state="active",
-        ),
-        claim.revision,
-    )
-
-
-def _command_update_direct_stack(args: argparse.Namespace) -> bool:
-    _resource_name(args.environment, "environment name")
-    _resource_name(args.stack, "Stack name")
-    _resource_name(args.template, "StackTemplate name")
-    if not isinstance(args.uid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args.uid):
-        raise OperationError("update-direct-stack requires a valid --uid")
-    if not isinstance(args.desired_revision, str) or not re.fullmatch(r"[0-9a-f]{40}", args.desired_revision):
-        raise OperationError("update-direct-stack requires an exact full --desired-revision")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/#!-]{0,127}", args.request_id):
-        raise OperationError("--request-id has an invalid format")
-    parameters = _parse_stack_parameters(args.parameters)
-    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
-    current_revision = fetch_ref(desired_ref)
-    if current_revision is None:
-        raise OperationError(f"desired ref {desired_ref!r} has no state")
-
-    source_revision_result = git("rev-parse", f"{args.source_revision}^{{commit}}", check=False)
-    if source_revision_result.returncode != 0:
-        raise OperationError(f"source revision {args.source_revision!r} is not a valid Git commit")
-    source_revision = source_revision_result.stdout.strip()
-
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        temporary = Path(temporary_directory)
-        current = temporary / "current"
-        observed = temporary / "observed"
-        source = temporary / "source"
-        synthetic_source = temporary / "synthetic-source"
-        build_current = temporary / "build-current"
-        candidate = temporary / "candidate"
-        materialize_revision(current_revision, current)
-
-        stack_path = _current_desired_stack_paths(current, "Stack").get(args.stack)
-        if stack_path is None:
-            raise OperationError(f"desired Stack {args.stack!r} is not present")
-        existing = RESOURCE_CATALOG.parse_stack(
-            RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name=args.stack
-        )
-        lifecycle = existing.metadata.lifecycle
-        if lifecycle is None or resource_owner_reference(existing) is not None or lifecycle.management is None:
-            raise OperationError(f"desired Stack {args.stack!r} is not a root resource")
-        if lifecycle.management.mode != "direct":
-            raise OperationError(f"desired Stack {args.stack!r} is source-tracked, not directly managed")
-        if existing.metadata.uid != args.uid:
-            raise OperationError(f"stale desired Stack UID fence for {args.stack!r}")
-        if not isinstance(existing.spec, DesiredStackSpec) or existing.spec.provenance is None:
-            raise OperationError(f"desired Stack {args.stack!r} is missing direct instantiation provenance")
-        existing_template = existing.spec.template
-        existing_template_name = (
-            existing_template.name if isinstance(existing_template, StackTemplateReference) else existing_template
-        )
-        if existing_template_name != args.template:
-            raise OperationError("direct Stack update cannot change the StackTemplate identity")
-        if resource_deletion(existing) is not None:
-            raise OperationError(f"desired Stack {args.stack!r} is marked for deletion")
-
-        if current_revision != args.desired_revision:
-            if _direct_stack_update_replay_matches(
-                existing, args.uid, args.template, source_revision, parameters, args.request_id
-            ):
-                _repair_direct_stack_update_fences(args, source_revision, desired_ref, current_revision)
-                return False
-            raise OperationError(
-                f"stale desired Stack head for {args.stack!r}: expected {args.desired_revision}, found {current_revision}"
-            )
-        if existing.spec.provenance.requestIdentity == args.request_id:
-            if _direct_stack_update_replay_matches(
-                existing, args.uid, args.template, source_revision, parameters, args.request_id
-            ):
-                _repair_direct_stack_update_fences(args, source_revision, desired_ref, current_revision)
-                return False
-            raise OperationError(f"Stack {args.stack!r} already uses request identity {args.request_id!r}")
-
-        materialize_revision(source_revision, source)
-        template_root = source.joinpath(*load_project_config(source).stack_templates_path.parts)
-        if not template_root.is_dir():
-            template_root = project_environment_root(source, args.environment) / "stack-templates"
-        template_paths = document_candidates(template_root, args.template)
-        if len(template_paths) != 1:
-            raise OperationError(f"expected exactly one StackTemplate document for {args.template!r}")
-        template_path = template_paths[0]
-        template = RESOURCE_CATALOG.parse_stack_template(
-            RESOURCE_CATALOG.load_document(template_path), profile="authored", expected_name=args.template
-        )
-        if not isinstance(template.spec, StackTemplateSpec):
-            raise OperationError(f"StackTemplate {args.template!r} has an invalid specification")
-        if any(
-            isinstance(value, dict)
-            and any(
-                key in value
-                for key in ("fromParameter", "fromReceipt", "fromArtifact", "fromPromotion", "fromEnvironment")
-            )
-            for value in _parameter_values(parameters)
-        ):
-            raise OperationError("update-direct-stack requires concrete parameters without template references")
-        try:
-            expanded_template = template.spec.expand(parameters)
-        except (TemplateError, TypeError, ValueError) as exc:
-            raise OperationError(f"StackTemplate parameters are unsafe: {exc}") from exc
-        selection = getattr(args, "units", None)
-        if selection is None and existing.spec.units is not None:
-            selection = ",".join(existing.spec.units)
-        expanded_template = _selected_stack_template_resources(
-            args.stack,
-            expanded_template,
-            selection,
-        )
-        expanded = scope_stack_template_resources(
-            args.stack,
-            expanded_template,
-        )
-
-        shutil.copytree(source, synthetic_source)
-        synthetic_environment = project_environment_root(synthetic_source, args.environment)
-        source_stacks = _document_paths(synthetic_environment / "stacks")
-        if args.stack in source_stacks:
-            raise OperationError(f"Stack {args.stack!r} is source-authored; direct update would collide")
-        project = load_project_config(synthetic_source)
-        synthetic_stack_path = synthetic_environment / "stacks" / f"{args.stack}{project.write_format.suffix}"
-        synthetic_spec: dict[str, Any] = {"template": args.template, "parameters": dict(parameters)}
-        selected_units = tuple(resource.name for resource in expanded_template)
-        if selected_units != tuple(resource.name for resource in template.spec.expand(parameters)):
-            synthetic_spec["units"] = list(selected_units)
-        if existing.spec.artifactImports:
-            synthetic_spec["artifactImports"] = [item.to_dict() for item in existing.spec.artifactImports]
-        write_document(
-            synthetic_stack_path,
-            {
-                "apiVersion": CORE_API_VERSION,
-                "kind": "Stack",
-                "metadata": {"name": args.stack},
-                "spec": synthetic_spec,
-            },
-            format=project.write_format,
-        )
-
-        # Let the normal desired builder resolve every generated Unit, but hide
-        # the direct root while it projects the synthetic source Stack. The
-        # direct root and UID-owned closure are restored below.
-        shutil.copytree(current, build_current)
-        for path in document_candidates(build_current / "stacks", args.stack):
-            path.unlink()
-        observed_revision = observed_tree(observed_ref, observed)
-        build_desired_candidate(
-            args.environment,
-            synthetic_source,
-            source_revision,
-            build_current,
-            observed,
-            observed_revision,
-            candidate,
-            dry=args.dry,
-            verbose=False,
-            preserve_stack_owned_metadata=True,
-        )
-        candidate_stack_path = _current_desired_stack_paths(candidate, "Stack").get(args.stack)
-        if candidate_stack_path is None:
-            raise OperationError(f"updated Stack {args.stack!r} was not projected into desired state")
-        projected = RESOURCE_CATALOG.parse_stack(
-            RESOURCE_CATALOG.load_document(candidate_stack_path), profile="desired", expected_name=args.stack
-        )
-        if not isinstance(projected.spec, DesiredStackSpec) or projected.spec.resolvedProjection is None:
-            raise OperationError(f"updated Stack {args.stack!r} has no generated Unit projection")
-        if resource_deletion(existing) is not None:
-            raise OperationError(f"Stack {args.stack!r} is deleting and cannot be updated")
-        template_provenance = StackInstantiationProvenance(
-            templateRevision=source_revision,
-            templatePath=template_path.relative_to(source).as_posix(),
-            templateDigest=hashlib.sha256(template_path.read_bytes()).hexdigest(),
-            requestIdentity=args.request_id,
-        )
-        direct_stack = StackResource(
-            GVK(CORE_API_VERSION, "Stack"),
-            ResourceMetadata(
-                name=args.stack,
-                uid=args.uid,
-                lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
-            ),
-            DesiredStackSpec(
-                template=StackTemplateReference(name=args.template),
-                parameters=parameters,
-                units=list(selected_units),
-                artifactImports=existing.spec.artifactImports,
-                provenance=template_provenance,
-                resolvedSource=ResolvedStackTemplateSource(
-                    fromGit=ResolvedGitSource(
-                        path=".",
-                        commit=source_revision,
-                        resourcePath=template_path.relative_to(source).as_posix(),
-                        digest=template_provenance.templateDigest,
-                    )
-                ),
-                resolvedProjection=projected.spec.resolvedProjection,
-                resolvedArtifactImports=projected.spec.resolvedArtifactImports,
-            ),
-        )
-        _write_desired_stack_resource(candidate_stack_path, direct_stack, REPOSITORY_ROOT)
-        owner = DesiredOwnerReference(
-            apiVersion=CORE_API_VERSION,
-            kind="Stack",
-            name=args.stack,
-            uid=args.uid,
-        )
-        projected_unit_names = {resource.name for resource in expanded}
-        transition_blocks = load_desired_transition_blocks(candidate)
-        for previous_name, previous_path in _current_desired_unit_paths(current).items():
-            previous_unit = load_desired_unit(previous_path, previous_name)
-            previous_owner = resource_owner_reference(previous_unit)
-            if (
-                previous_owner is None
-                or previous_owner.kind != "Stack"
-                or previous_owner.name != args.stack
-                or previous_owner.uid != args.uid
-                or previous_name in projected_unit_names
-            ):
-                continue
-            retained = cast(UnitResource[Any], mark_resource_for_deletion(previous_unit))
-            write_desired_candidate_unit(unit_document_path(candidate, previous_name), retained, REPOSITORY_ROOT)
-        write_desired_transition_blocks(candidate, transition_blocks)
-        for resource in expanded:
-            unit_path = unit_document_path(candidate, resource.name)
-            if not unit_path.is_file():
-                if load_desired_transition_blocks(candidate).get(resource.name):
-                    continue
-                raise OperationError(f"generated Unit {resource.name!r} is unresolved in the desired candidate")
-            unit = load_desired_unit(unit_path, resource.name)
-            if unit_contains_reference(unit):
-                raise OperationError(f"generated Unit {resource.name!r} is unresolved in the desired candidate")
-            previous_path = unit_document_path(current, resource.name)
-            previous_unit = load_desired_unit(previous_path, resource.name) if previous_path.is_file() else None
-            owned_metadata = _stack_owned_metadata(resource.name, owner)
-            if previous_unit is not None and previous_unit.metadata.uid is not None:
-                if previous_unit.gvk != unit.gvk or previous_unit.driver_name != unit.driver_name:
-                    raise OperationError(
-                        f"direct Stack update changes the GVK or driver of generated Unit {resource.name!r}; "
-                        "delete and recreate the Stack"
-                    )
-                owned_metadata = ResourceMetadata(
-                    name=resource.name,
-                    uid=previous_unit.metadata.uid,
-                    ownerReferences=owned_metadata.ownerReferences,
-                )
-            write_desired_candidate_unit(
-                unit_path,
-                unit.with_metadata(owned_metadata),
-                REPOSITORY_ROOT,
-            )
-        load_desired_resource_graph(candidate)
-        candidate_id = candidate_identifier(
-            "update-direct-stack",
-            args.environment,
-            candidate,
-            desired_ref,
-            current_revision,
-            {
-                "stack": args.stack,
-                "uid": args.uid,
-                "template": args.template,
-                "requestIdentity": args.request_id,
-                "templateRevision": source_revision,
-                "parameters": parameters,
-            },
-        )
-        candidate_ref = resolve_candidate_ref(
-            REPOSITORY_ROOT,
-            args.environment,
-            "update-direct-stack",
-            candidate_id,
-            args.candidate_ref,
-        )
-        if candidate_ref in {desired_ref, observed_ref}:
-            raise OperationError("direct Stack update candidate ref conflicts with deployment state")
-
-        old_source_revision = existing.spec.provenance.templateRevision
-        pin_name = _stack_pin_name(args.environment, args.stack, args.uid)
-        store = state_store()
-        existing_claim = None
-        read_claim = getattr(store, "read_controller_pin_claim", None)
-        if callable(read_claim):
-            existing_claim = read_claim(pin_name)
-            if existing_claim is not None and (
-                existing_claim.uid != args.uid
-                or existing_claim.pin_revision != old_source_revision
-                or existing_claim.pin_name != pin_name
-            ):
-                raise OperationError(f"Stack {args.stack!r} has a conflicting source-pin claim")
-        try:
-            revision, outcome = publish_desired_change(
-                args.environment,
-                candidate,
-                desired_ref,
-                current_revision,
-                candidate_ref,
-                f"Update direct Stack {args.stack}",
-                f"Update direct Stack {args.stack}",
-                f"Update UID-fenced direct Stack `{args.stack}` from StackTemplate `{args.template}`.",
-                args.dry,
-                current,
-                request_change=False,
-            )
-        except OperationError:
-            raise
-        if args.dry:
-            return False
-        pin_revision = old_source_revision
-        if outcome is None:
-            if hasattr(store, "git"):
-                _replace_controller_pin(pin_name, old_source_revision, source_revision)
-            else:
-                create_pin = getattr(store, "create_controller_pin", None)
-                if not callable(create_pin):
-                    raise OperationError(f"Stack {args.stack!r} source pin cannot be updated safely")
-                create_pin(pin_name, source_revision)
-            pin_revision = source_revision
-        update_claim = getattr(store, "update_controller_pin_claim", None)
-        if existing_claim is not None and callable(update_claim) and existing_claim.revision is not None:
-            update_claim(
-                _stack_pin_claim(
-                    args.environment,
-                    args.stack,
-                    args.uid,
-                    pin_revision,
-                    desired_ref,
-                    current_revision,
-                    candidate_ref,
-                    state="active" if outcome is None else "preparing",
-                    candidate_revision=revision,
-                ),
-                existing_claim.revision,
-            )
-        elif existing_claim is None:
-            create_claim = getattr(store, "create_controller_pin_claim", None)
-            if callable(create_claim):
-                create_claim(
-                    _stack_pin_claim(
-                        args.environment,
-                        args.stack,
-                        args.uid,
-                        pin_revision,
-                        desired_ref,
-                        current_revision,
-                        candidate_ref,
-                        state="active" if outcome is None else "preparing",
-                        candidate_revision=revision,
-                    )
-                )
-        print(revision)
-        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
-        return True
-
-
-def command_update_direct_stack(args: argparse.Namespace) -> bool:
-    with unit_effect_lock(args.environment, f"stack-{getattr(args, 'stack', '<invalid>')}"):
-        return _command_update_direct_stack(args)
-
-
 def _release_stack_pin(environment: str, stack: StackResource) -> None:
-    if not isinstance(stack.spec, DesiredStackSpec) or stack.spec.provenance is None:
-        return
     if stack.metadata.uid is None:
         raise OperationError(f"Stack {stack.name!r} has no UID")
-    pin_name = _stack_pin_name(environment, stack.name, stack.metadata.uid)
-    pin_revision = stack.spec.provenance.templateRevision
-    store = state_store()
-    read_claim = getattr(store, "read_controller_pin_claim", None)
-    delete_claim = getattr(store, "delete_controller_pin_claim", None)
-    claim = read_claim(pin_name) if callable(read_claim) else None
-    if claim is not None:
-        if claim.uid != stack.metadata.uid or claim.pin_revision != pin_revision:
-            raise OperationError(f"Stack {stack.name!r}: controller pin claim fence does not match the Stack")
-        if not callable(delete_claim) or claim.revision is None:
-            raise OperationError(f"Stack {stack.name!r}: controller pin claim cannot be released safely")
-    store.release_controller_pin(pin_name, pin_revision)
-    if claim is not None:
-        cast(Callable[[str, str], object], delete_claim)(
-            claim.ref.removeprefix("gitopsctr/pin-claims/"), claim.revision
-        )
+    _release_stack_source_pins(environment, stack.name, stack.metadata.uid)
 
 
 def _release_finalized_stack_pin(
@@ -7463,20 +6273,7 @@ def _release_finalized_stack_pin(
     tombstone = load_resource_incarnation_tombstones(desired_root).get((CORE_API_VERSION, "Stack", name))
     if tombstone is None or tombstone.uid != uid or tombstone.deletion_generation != deletion_generation:
         return False
-    pin_name = _stack_pin_name(environment, name, uid)
-    store = state_store()
-    read_claim = getattr(store, "read_controller_pin_claim", None)
-    claim = read_claim(pin_name) if callable(read_claim) else None
-    if claim is None:
-        return False
-    if claim.environment != environment or claim.stack_name != name or claim.uid != uid:
-        raise OperationError(f"Stack {name!r}: controller pin claim fence does not match the finalized Stack")
-    delete_claim = getattr(store, "delete_controller_pin_claim", None)
-    if not callable(delete_claim) or claim.revision is None:
-        raise OperationError(f"Stack {name!r}: controller pin claim cannot be released safely")
-    store.release_controller_pin(claim.pin_name, claim.pin_revision)
-    cast(Callable[[str, str], object], delete_claim)(claim.ref.removeprefix("gitopsctr/pin-claims/"), claim.revision)
-    return True
+    return _release_stack_source_pins(environment, name, uid)
 
 
 def _release_finalized_unit_lease(
@@ -7823,19 +6620,6 @@ def command_resolve_desired(args: argparse.Namespace) -> None:
     print(revision)
 
 
-def _direct_stack_uid(
-    environment: str,
-    stack_name: str,
-    request_identity: str,
-    desired_revision: str,
-    previous_uid: str | None = None,
-) -> str:
-    digest = hashlib.sha256(
-        f"gitopsctr/direct-stack-uid/v3\0{environment}\0{stack_name}\0{request_identity}\0{desired_revision}\0{previous_uid or ''}".encode()
-    ).hexdigest()[:32]
-    return f"d1-{digest}"
-
-
 def _selected_stack_template_resources(
     stack_name: str,
     resources: Sequence[StackTemplateResource],
@@ -7863,93 +6647,67 @@ def _selected_stack_template_resources(
     return tuple(resource for resource in resources if resource.name in selected_names)
 
 
-def _stack_pin_name(environment: str, stack_name: str, uid: str) -> str:
-    return f"stacks/{environment}/{stack_name}/{uid}"
+def _stack_source_pin_prefix(environment: str, stack_name: str, uid: str) -> str:
+    """Return the controller-pin namespace owned by one Stack incarnation."""
+
+    return f"stacks/{environment}/{stack_name}/{uid}/"
 
 
-def _stack_pin_claim(
-    environment: str,
-    stack_name: str,
-    uid: str,
-    pin_revision: str,
-    target_ref: str,
-    target_revision: str,
-    candidate_ref: str,
-    *,
-    state: Literal["preparing", "active", "reaping"] = "preparing",
-    candidate_revision: str | None = None,
-) -> ControllerPinClaim:
-    return ControllerPinClaim(
-        environment=environment,
-        stack_name=stack_name,
-        uid=uid,
-        pin_name=_stack_pin_name(environment, stack_name, uid),
-        pin_revision=pin_revision,
-        target_ref=target_ref,
-        target_revision=target_revision,
-        candidate_ref=candidate_ref,
-        candidate_revision=candidate_revision,
-        state=state,
-    )
+def _stack_source_pin_name(environment: str, stack_name: str, uid: str, revision: str) -> str:
+    """Name one immutable repository-local StackTemplate source pin."""
+
+    return f"{_stack_source_pin_prefix(environment, stack_name, uid)}{revision}"
 
 
-def _controller_pin_revision(pin_name: str) -> str | None:
-    """Read one controller pin without changing the local repository."""
+def _required_stack_source_pins(environment: str, desired_root: Path) -> tuple[tuple[str, str], ...]:
+    """Collect exact local source commits referenced by desired Stacks.
 
-    ref = f"refs/heads/gitopsctr/pins/{pin_name}"
-    result = state_store().git("ls-remote", "--exit-code", "--refs", "origin", ref, check=False)
-    if result.returncode == 2:
-        return None
-    if result.returncode != 0:
-        raise OperationError(result.stderr.strip() or f"could not inspect controller pin {pin_name!r}")
-    lines = result.stdout.splitlines()
-    if len(lines) != 1 or len(lines[0].split()) != 2:
-        raise OperationError(f"controller pin {pin_name!r} inspection returned an invalid result")
-    revision, actual_ref = lines[0].split()
-    if actual_ref != ref or not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise OperationError(f"controller pin {pin_name!r} inspection returned an invalid identity")
-    return revision
+    Remote Git sources cannot be retained by refs in the deployment repository;
+    their recorded remote and commit remain the external durability contract.
+    """
 
-
-def _replace_controller_pin(pin_name: str, expected_revision: str, revision: str) -> ControllerPin:
-    """Advance a Stack source pin with an exact remote-head fence."""
-
-    store = state_store()
-    if expected_revision == revision:
-        actual = _controller_pin_revision(pin_name)
-        if actual is None:
-            store.create_controller_pin(pin_name, revision)
-        elif actual != revision:
-            raise OperationError(
-                f"controller pin {pin_name!r} changed before update: expected {expected_revision}, found {actual}"
+    required: set[tuple[str, str]] = set()
+    for resource in load_desired_resource_graph(desired_root, validate=False).values():
+        if not isinstance(resource, StackResource) or resource.gvk.kind != "Stack":
+            continue
+        if not isinstance(resource.spec, DesiredStackSpec) or resource.spec.resolvedSource is None:
+            continue
+        source = resource.spec.resolvedSource.fromGit
+        if source.path is None:
+            continue
+        if resource.metadata.uid is None:
+            raise OperationError(f"Stack {resource.name!r} has no UID")
+        required.add(
+            (
+                _stack_source_pin_name(environment, resource.name, resource.metadata.uid, source.commit),
+                source.commit,
             )
-        return ControllerPin(pin_name, f"refs/heads/gitopsctr/pins/{pin_name}", revision)
-    replace_pin = getattr(store, "replace_controller_pin", None)
-    if callable(replace_pin):
-        return cast(ControllerPin, replace_pin(pin_name, expected_revision, revision))
-    ref = f"refs/heads/gitopsctr/pins/{pin_name}"
-    actual = _controller_pin_revision(pin_name)
-    if actual != expected_revision:
-        raise OperationError(
-            f"controller pin {pin_name!r} changed before update: expected {expected_revision}, found {actual}"
         )
-    pushed = store.git(
-        "push",
-        f"--force-with-lease={ref}:{expected_revision}",
-        "origin",
-        f"{revision}:{ref}",
-        check=False,
-    )
-    actual = _controller_pin_revision(pin_name)
-    if actual != revision:
-        raise OperationError(pushed.stderr.strip() or f"controller pin {pin_name!r} changed during update")
-    return ControllerPin(pin_name, ref, revision)
+    return tuple(sorted(required))
 
 
-def _restore_controller_pin(pin_name: str, expected_revision: str, revision: str) -> None:
-    """Best-effort rollback for a pin changed before failed candidate publication."""
+def _ensure_stack_source_pins(environment: str, desired_root: Path) -> tuple[ControllerPin, ...]:
+    """Retain every repository-local template commit before desired publication."""
 
-    _replace_controller_pin(pin_name, expected_revision, revision)
+    required = _required_stack_source_pins(environment, desired_root)
+    if not required:
+        return ()
+    return state_store().create_controller_pins(dict(required))
+
+
+def _release_stack_source_pins(environment: str, stack_name: str, uid: str) -> bool:
+    """Release all exact source pins owned by one finalized Stack incarnation."""
+
+    prefix = _stack_source_pin_prefix(environment, stack_name, uid)
+    store = state_store()
+    pins = tuple(pin for pin in store.list_controller_pins() if pin.name.startswith(prefix))
+    for pin in pins:
+        suffix = pin.name.removeprefix(prefix)
+        if not re.fullmatch(r"[0-9a-f]{40}", suffix) or suffix != pin.revision:
+            raise OperationError(f"Stack {stack_name!r}: controller source pin has an invalid identity")
+    for pin in pins:
+        store.release_controller_pin(pin.name, pin.revision)
+    return bool(pins)
 
 
 def _parse_stack_parameters(raw: str) -> JsonObjectValue:
@@ -7971,334 +6729,26 @@ def _parameter_values(value: object) -> list[object]:
     return [value]
 
 
-def _compatibility_finding(code: str, path: str, unit: str, message: str) -> CompatibilityFinding:
-    return {"code": code, "path": path, "unit": unit, "message": message}
-
-
-def _compatibility_path(root: Path, path: Path) -> str:
-    return path.relative_to(root).as_posix()
-
-
-def _compatibility_document_paths(root: Path, relative_directory: PurePosixPath) -> tuple[Path, ...]:
-    directory = root.joinpath(*relative_directory.parts)
-    if not directory.is_dir():
-        return ()
-    return tuple(
-        sorted(path for path in directory.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"})
-    )
-
-
-def _compatibility_partial_unit(document: object) -> bool:
-    if not isinstance(document, dict) or document.get("apiVersion") is None:
-        return False
-    metadata = document.get("metadata")
-    if not isinstance(metadata, dict):
-        return False
-    has_uid = "uid" in metadata
-    has_lifecycle = "lifecycle" in metadata
-    return has_uid != has_lifecycle or (has_uid and (metadata.get("uid") is None or metadata.get("lifecycle") is None))
-
-
-def _audit_desired_compatibility(root: Path) -> list[CompatibilityFinding]:
-    findings: list[CompatibilityFinding] = []
-    unit_paths = _compatibility_document_paths(root, PurePosixPath("units"))
-    unit_parse_failed = False
-    by_unit: dict[str, list[Path]] = {}
-    for path in unit_paths:
-        by_unit.setdefault(path.stem, []).append(path)
-
-    for unit_name, paths in sorted(by_unit.items()):
-        if len(paths) > 1:
-            for path in paths:
-                findings.append(
-                    _compatibility_finding(
-                        "ambiguous-unit-state",
-                        _compatibility_path(root, path),
-                        unit_name,
-                        "multiple desired Unit documents use the same name",
-                    )
-                )
-            unit_parse_failed = True
-            continue
-        path = paths[0]
-        try:
-            document = load_json(path)
-        except Exception:
-            findings.append(
-                _compatibility_finding(
-                    "unparseable-unit",
-                    _compatibility_path(root, path),
-                    unit_name,
-                    "desired Unit document cannot be read",
-                )
-            )
-            unit_parse_failed = True
-            continue
-        try:
-            unit = parse_desired_unit_document(document, unit_name)
-        except Exception:
-            code = "partial-unit" if _compatibility_partial_unit(document) else "unparseable-unit"
-            findings.append(
-                _compatibility_finding(
-                    code,
-                    _compatibility_path(root, path),
-                    unit_name,
-                    "desired Unit lifecycle state is incomplete"
-                    if code == "partial-unit"
-                    else "desired Unit is invalid",
-                )
-            )
-            unit_parse_failed = True
-            continue
-        if unit.is_legacy_compatibility:
-            findings.append(
-                _compatibility_finding(
-                    "legacy-unit",
-                    _compatibility_path(root, path),
-                    unit_name,
-                    "desired Unit has no lifecycle identity",
-                )
-            )
-            unit_parse_failed = True
-
-    if unit_paths and not unit_parse_failed:
-        try:
-            load_desired_resource_graph(root)
-        except Exception:
-            findings.append(
-                _compatibility_finding(
-                    "unparseable-resource-graph",
-                    "",
-                    "",
-                    "desired resource graph is invalid",
-                )
-            )
-
-    cleanup_paths = _compatibility_document_paths(root, DESIRED_CLEANUP_UNITS_PATH)
-    cleanup_by_unit: dict[str, list[Path]] = {}
-    for path in cleanup_paths:
-        cleanup_by_unit.setdefault(path.stem, []).append(path)
-    for unit_name, paths in sorted(cleanup_by_unit.items()):
-        if len(paths) > 1:
-            findings.append(
-                _compatibility_finding(
-                    "ambiguous-cleanup-state",
-                    _compatibility_path(root, paths[0].parent),
-                    unit_name,
-                    "multiple opaque cleanup documents use the same name",
-                )
-            )
-            continue
-        path = paths[0]
-        try:
-            load_desired_cleanup_roots(root)
-        except Exception:
-            findings.append(
-                _compatibility_finding(
-                    "unparseable-cleanup-state",
-                    _compatibility_path(root, path),
-                    unit_name,
-                    "opaque cleanup state is invalid",
-                )
-            )
-            break
-        findings.append(
-            _compatibility_finding(
-                "opaque-cleanup-root",
-                _compatibility_path(root, path),
-                unit_name,
-                "opaque cleanup root requires migration or explicit recovery",
-            )
-        )
-
-    return sorted(findings, key=lambda finding: (finding["path"], finding["code"], finding["unit"]))
-
-
-def _audit_desired_compatibility_ref(desired_ref: str) -> tuple[str | None, list[CompatibilityFinding]]:
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        desired = Path(temporary_directory) / "desired"
-        try:
-            revision = observed_tree(desired_ref, desired)
-        except Exception:
-            revision = None
-            findings = [
-                _compatibility_finding(
-                    "unavailable-ref",
-                    "",
-                    "",
-                    "desired ref cannot be inspected",
-                )
-            ]
-        else:
-            if revision is None:
-                findings = [
-                    _compatibility_finding(
-                        "missing-ref",
-                        "",
-                        "",
-                        "desired ref does not exist",
-                    )
-                ]
-            else:
-                findings = _audit_desired_compatibility(desired)
-    return revision, findings
-
-
-def _compatibility_audit_result(
-    environment: str,
-    desired_ref: str | None,
-) -> CompatibilityAuditResult:
-    if desired_ref is None:
-        findings = [
-            _compatibility_finding(
-                "unavailable-ref",
-                "",
-                "",
-                "environment desired ref cannot be resolved",
-            )
-        ]
-        return {
-            "environment": environment,
-            "ref": None,
-            "revision": None,
-            "clean": False,
-            "findings": findings,
-        }
-    revision, findings = _audit_desired_compatibility_ref(desired_ref)
-    return {
-        "environment": environment,
-        "ref": desired_ref,
-        "revision": revision,
-        "clean": not findings,
-        "findings": findings,
-    }
-
-
-def _aggregate_compatibility_report() -> dict[str, Any]:
-    top_level_findings: list[CompatibilityFinding] = []
-    try:
-        project = load_project_config(REPOSITORY_ROOT)
-    except Exception:
-        project = None
-        top_level_findings.append(
-            _compatibility_finding(
-                "unavailable-project",
-                "",
-                "",
-                "Project configuration cannot be read",
-            )
-        )
-
-    if project is None:
-        environments: list[str] = []
-    else:
-        environments_root = REPOSITORY_ROOT.joinpath(*project.environments_path.parts)
-        if not environments_root.is_dir():
-            top_level_findings.append(
-                _compatibility_finding(
-                    "unavailable-environments-path",
-                    project.environments_path.as_posix(),
-                    "",
-                    "Project environmentsPath does not exist",
-                )
-            )
-            environments = []
-        else:
-            environments = sorted(path.name for path in environments_root.iterdir() if path.is_dir())
-
-    resolved: list[tuple[str, str | None]] = []
-    for environment in environments:
-        try:
-            desired_ref, _observed_ref = deployment_refs(REPOSITORY_ROOT, environment)
-        except Exception:
-            desired_ref = None
-        resolved.append((environment, desired_ref))
-
-    by_ref: dict[str, list[str]] = {}
-    for environment, desired_ref in resolved:
-        if desired_ref is not None:
-            by_ref.setdefault(desired_ref, []).append(environment)
-
-    cache: dict[str, tuple[str | None, list[CompatibilityFinding]]] = {}
-    results: list[CompatibilityAuditResult] = []
-    for environment, desired_ref in resolved:
-        if desired_ref is None:
-            result = _compatibility_audit_result(environment, None)
-        else:
-            if desired_ref not in cache:
-                cache[desired_ref] = _audit_desired_compatibility_ref(desired_ref)
-            revision, findings = cache[desired_ref]
-            result = cast(
-                CompatibilityAuditResult,
-                {
-                    "environment": environment,
-                    "ref": desired_ref,
-                    "revision": revision,
-                    "clean": not findings,
-                    "findings": list(findings),
-                },
-            )
-            owners = by_ref[desired_ref]
-            if len(owners) > 1:
-                result["findings"].append(
-                    _compatibility_finding(
-                        "duplicate-desired-ref",
-                        "",
-                        "",
-                        "desired ref is configured for multiple environments: " + ", ".join(owners),
-                    )
-                )
-                result["findings"].sort(key=lambda finding: (finding["path"], finding["code"], finding["unit"]))
-                result["clean"] = False
-        results.append(result)
-
-    clean = not top_level_findings and all(result["clean"] for result in results)
-    return {
-        "schema": 1,
-        "mode": "all",
-        "clean": clean,
-        "environments": results,
-        "findings": sorted(top_level_findings, key=lambda finding: (finding["path"], finding["code"])),
-    }
-
-
-def command_audit_desired_compatibility(args: argparse.Namespace) -> None:
-    """Audit desired refs without publishing or invoking a driver."""
-
-    if getattr(args, "all", False):
-        if args.environment or args.desired_ref:
-            raise OperationError("--all cannot be combined with --environment or --desired-ref")
-        result = _aggregate_compatibility_report()
-        print(json.dumps(result, indent=2, sort_keys=True))
-        if not result["clean"]:
-            raise OperationError("aggregate desired compatibility audit found unsafe state")
-        return
-
-    if not isinstance(args.environment, str) or not args.environment:
-        raise OperationError("audit-desired-compatibility requires --all or --environment with --desired-ref")
-    _resource_name(args.environment, "environment name")
-    if not isinstance(args.desired_ref, str) or not args.desired_ref:
-        raise OperationError("audit-desired-compatibility requires --desired-ref")
-    revision, findings = _audit_desired_compatibility_ref(args.desired_ref)
-
-    result = {
-        "schema": 1,
-        "environment": args.environment,
-        "ref": args.desired_ref,
-        "revision": revision,
-        "clean": not findings,
-        "findings": findings,
-    }
-    print(json.dumps(result, indent=2, sort_keys=True))
-    if findings:
-        raise OperationError(f"desired compatibility audit found {len(findings)} finding(s)")
-
-
 def command_status(args: argparse.Namespace) -> None:
     if args.environment is None:
         if args.unit or args.desired_ref or args.desired_revision or args.observed_ref or args.verbose:
             raise OperationError("status options other than --environment are only available for one environment")
-        command_list_environments(argparse.Namespace(json=False))
+        inspect_resources(
+            REPOSITORY_ROOT,
+            argparse.Namespace(
+                selector="environments",
+                name=None,
+                environment=None,
+                all_environments=False,
+                desired_ref=None,
+                desired_revision=None,
+                observed_ref=None,
+                observed_revision=None,
+                output="table",
+                artifact=None,
+                artifacts=False,
+            ),
+        )
         return
     desired_ref, observed_ref = deployment_refs(
         REPOSITORY_ROOT,
@@ -8353,141 +6803,8 @@ def command_status(args: argparse.Namespace) -> None:
         )
 
 
-def _environment_names() -> list[str]:
-    project = load_project_config(REPOSITORY_ROOT)
-    root = REPOSITORY_ROOT.joinpath(*project.environments_path.parts)
-    if not root.is_dir():
-        return []
-    return sorted(path.name for path in root.iterdir() if path.is_dir())
-
-
-def _unit_status_snapshot(environment: str, desired_ref: str, observed_ref: str) -> EnvironmentSnapshot:
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        temporary = Path(temporary_directory)
-        desired = temporary / "desired"
-        observed = temporary / "observed"
-        desired_revision = observed_tree(desired_ref, desired)
-        observed_revision = observed_tree(observed_ref, observed)
-        specifications = load_environment_specifications(REPOSITORY_ROOT, environment)
-        statuses = reconciliation_statuses(
-            sorted(set(specifications) | set(desired_unit_names(desired))),
-            desired,
-            observed,
-        )
-        return {
-            "desired": {"ref": desired_ref, "revision": desired_revision},
-            "observed": {"ref": observed_ref, "revision": observed_revision},
-            "statuses": [{"unit": unit, "status": status, "reason": reason} for unit, status, reason in statuses],
-        }
-
-
-def print_inspection_document(document: dict[str, Any], *, force_json: bool = False, force_yaml: bool = False) -> None:
-    """Print one inspection document using the project's configured format."""
-    selected = (
-        DocumentFormat.JSON
-        if force_json
-        else DocumentFormat.YAML
-        if force_yaml
-        else load_project_config(REPOSITORY_ROOT).write_format
-    )
-    if selected is DocumentFormat.JSON:
-        print(json.dumps(document, indent=2, sort_keys=True))
-        return
-    yaml_document = dict(document)
-    schema_hint = yaml_document.pop("$schema", None)
-    text = yaml.safe_dump(yaml_document, sort_keys=False, default_flow_style=False, allow_unicode=False)
-    if isinstance(schema_hint, str):
-        text = f"# yaml-language-server: $schema={schema_hint}\n{text}"
-    print(text, end="")
-
-
-def command_list_environments(args: argparse.Namespace) -> None:
-    rows: list[EnvironmentRow] = []
-    for environment in _environment_names():
-        desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, environment)
-        snapshot = _unit_status_snapshot(environment, desired_ref, observed_ref)
-        statuses = snapshot["statuses"]
-        counts = {
-            status: sum(item["status"] == status for item in statuses)
-            for status in ("CLEAN", "READY", "WAIT", "MATERIALIZED")
-        }
-        rows.append({"environment": environment, **snapshot, "counts": counts})
-
-    if args.json:
-        print(json.dumps({"schema": 1, "environments": rows}, indent=2, sort_keys=True))
-        return
-    log_heading("Environments")
-    for index, row in enumerate(rows):
-        if index:
-            print(file=sys.stderr)
-        desired = describe_revision(row["desired"]["revision"], sys.stderr) if row["desired"]["revision"] else "none"
-        observed = describe_revision(row["observed"]["revision"], sys.stderr) if row["observed"]["revision"] else "none"
-        counts = ", ".join(f"{name.lower()}={count}" for name, count in row["counts"].items() if count)
-        log_status("ENV", style_environment(row["environment"]))
-        log_status("DESIRED", f"{style_branch(row['desired']['ref'])} at {desired}")
-        log_status("OBSERVED", f"{style_branch(row['observed']['ref'])} at {observed}")
-        log_status("UNITS", counts or "no units")
-
-
-def command_list_units(args: argparse.Namespace) -> None:
-    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment)
-    snapshot = _unit_status_snapshot(args.environment, desired_ref, observed_ref)
-    result = {"schema": 1, "environment": args.environment, **snapshot}
-    if args.json:
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return
-    log_heading(f"Units for {style_environment(args.environment)}")
-    for item in snapshot["statuses"]:
-        log_status(item["status"], f"{style_unit(item['unit'])}: {item['reason']}")
-
-
-def command_show_desired(args: argparse.Namespace) -> None:
-    desired_ref, _ = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref)
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        desired = Path(temporary_directory) / "desired"
-        revision = resolve_ref(desired_ref, args.desired_revision)
-        materialize_revision(revision, desired)
-        path = unit_document_path(desired, args.unit)
-        if not path.is_file():
-            raise OperationError(f"{desired_ref} has no desired unit {args.unit}")
-        document = load_json(path)
-        unit = load_desired_unit(path, args.unit)
-        validate_unit_materialization(desired, args.unit, unit)
-    print_inspection_document(document, force_json=args.json, force_yaml=args.yaml)
-
-
-def command_show_receipt(args: argparse.Namespace) -> None:
-    _, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, observed_override=args.observed_ref)
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        observed = Path(temporary_directory) / "observed"
-        observed_tree(observed_ref, observed)
-        path = unit_document_path(observed, args.unit)
-        if not path.is_file():
-            raise OperationError(f"{observed_ref} has no receipt for {args.unit}")
-        document = load_json(path)
-        receipt = load_receipt(path, args.unit)
-        artifacts: dict[str, Any] = {}
-        for name, descriptor in (receipt.status.artifacts or {}).items():
-            if not isinstance(descriptor.path, str):
-                raise OperationError(f"receipt for {args.unit} has an invalid artifact descriptor {name!r}")
-            artifact_relative = PurePosixPath(descriptor.path)
-            if artifact_relative.is_absolute() or ".." in artifact_relative.parts:
-                raise OperationError(f"receipt artifact {name!r} has an unsafe path")
-            artifact_path = observed.joinpath(*artifact_relative.parts)
-            if not artifact_path.is_file():
-                raise OperationError(f"receipt artifact {name!r} is missing at {descriptor.path}")
-            artifacts[name] = load_json(artifact_path)
-    if args.artifact is not None:
-        if args.artifact not in artifacts:
-            available = ", ".join(sorted(artifacts)) or "none"
-            raise OperationError(
-                f"{observed_ref} receipt for {args.unit} has no artifact {args.artifact!r}; available: {available}"
-            )
-        print_inspection_document(artifacts[args.artifact], force_json=args.json, force_yaml=args.yaml)
-    elif args.artifacts:
-        print_inspection_document(artifacts, force_json=args.json, force_yaml=args.yaml)
-    else:
-        print_inspection_document(document, force_json=args.json, force_yaml=args.yaml)
+def command_get(args: argparse.Namespace) -> None:
+    inspect_resources(REPOSITORY_ROOT, args)
 
 
 def command_verify(args: argparse.Namespace) -> None:
@@ -8673,9 +6990,7 @@ def unit_contains_reference(unit: UnitResource[Any]) -> bool:
 def raw_unit_contains_reference(document: object) -> bool:
     """Check an untrusted persisted unit before requiring its final desired contract."""
 
-    if isinstance(document, dict) and isinstance(document.get("spec"), dict):
-        return contains_reference(document["spec"])
-    return contains_reference(document)
+    return operational.raw_unit_contains_reference(document)
 
 
 def reference_paths(
@@ -8926,20 +7241,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         if verbose:
             log_status(status, message)
 
-    configured_environment = load_environment(REPOSITORY_ROOT, args.environment)
-    promoted_environment = configured_environment.get("promotion") is not None
-    if args.advance:
-        source_revision = resolve_advance_source_revision(REPOSITORY_ROOT, args.environment, args.source_revision)
-    elif args.source_revision is not None:
-        if promoted_environment:
-            raise OperationError(f"promotion-tracked environment {args.environment} does not accept --source-revision")
-        if not args.plan:
-            raise OperationError("--source-revision requires --advance or --plan")
-        source_revision = git("rev-parse", f"{args.source_revision}^{{commit}}").stdout.strip()
-    else:
-        source_revision = None
-    if args.require_source_ref and source_revision is None:
-        raise OperationError("--require-source-ref requires --source-revision")
+    load_environment(REPOSITORY_ROOT, args.environment)
     if verbose:
         log_heading(f"Reconcile {style_unit(args.unit)}")
         log_status("START", f"environment {style_environment(args.environment)}")
@@ -8951,101 +7253,17 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         temporary = Path(temporary_directory)
         desired = temporary / "desired"
         observed = temporary / "observed"
-        if not args.plan and args.require_source_ref:
-            required_head = fetch_ref(args.require_source_ref)
-            if required_head != source_revision:
-                if verbose:
-                    log_status("SKIP", f"source revision is superseded by {args.require_source_ref}")
-                    log_status("DONE", f"{style_unit(args.unit)}: no changes")
-                else:
-                    log_reconcile_outcome(
-                        "SKIP",
-                        f"Source revision is superseded by {args.require_source_ref}",
-                        "No reconciliation performed",
-                        [],
-                    )
-                write_reconcile_outputs(False)
-                return False
-        warn_if_source_revision_excludes_changes(source_revision)
-        candidate_source_root: Path | None = None
-        if source_revision and args.plan:
-            candidate_source_root = temporary / "candidate-source"
-            materialize_revision(source_revision, candidate_source_root)
-        ref_source_root = candidate_source_root or REPOSITORY_ROOT
         desired_ref, observed_ref = deployment_refs(
-            ref_source_root,
+            REPOSITORY_ROOT,
             args.environment,
             args.desired_ref,
             args.observed_ref,
         )
         lease_ref = effect_lease_ref(args.environment, desired_ref)
-        if args.plan or (args.advance and not args.desired_revision):
-            require_environment_unit(ref_source_root, args.environment, args.unit)
         detail("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
-
-        def advance_for_reconcile() -> tuple[str | None, bool]:
-            arguments = (
-                args.environment,
-                source_revision,
-                desired_ref,
-                observed_ref,
-                args.require_source_ref,
-            )
-            if verbose:
-                return advance_desired(*arguments)
-            with redirect_stderr(io.StringIO()):
-                return advance_desired(*arguments)
-
-        pre_advance = not args.plan and args.advance and not args.desired_revision
-        pre_advanced_revision = ""
-        if pre_advance:
-            advanced, changed = advance_for_reconcile()
-            if advanced is None:
-                if verbose:
-                    log_status("DONE", f"{style_unit(args.unit)}: source revision is no longer eligible")
-                else:
-                    log_reconcile_outcome(
-                        "SKIP",
-                        "Source revision is no longer eligible",
-                        "No reconciliation performed",
-                        [],
-                    )
-                write_reconcile_outputs(False)
-                return False
-            desired_revision = advanced
-            if changed:
-                pre_advanced_revision = advanced
-            detail("PIN", f"reconcile advanced desired state at {describe_revision(advanced)}")
         observed_revision = observed_tree(observed_ref, observed)
-        if args.plan and candidate_source_root is not None:
-            assert source_revision is not None
-            current_desired = temporary / "current-desired"
-            observed_tree(desired_ref, current_desired)
-            candidate_result = build_desired_candidate(
-                args.environment,
-                candidate_source_root,
-                source_revision,
-                current_desired,
-                observed,
-                observed_revision,
-                desired,
-                dry=True,
-                verbose=verbose,
-                source_revision_operation="plan",
-            )
-            if not verbose:
-                for unit_name, reason in sorted(candidate_result.refreshes.items()):
-                    log_status("REFRESH", f"{style_unit(unit_name)}: {reason}")
-            if args.unit in candidate_result.blocked:
-                log_status("WAIT", candidate_result.blocked[args.unit])
-                log_status("DONE", f"{style_unit(args.unit)}: no changes")
-                write_reconcile_outputs(False)
-                return False
-            desired_revision = f"dry:{source_revision}"
-        elif not pre_advance:
-            desired_revision = resolve_ref(desired_ref, args.desired_revision)
-        if candidate_source_root is None:
-            materialize_revision(desired_revision, desired)
+        desired_revision = resolve_ref(desired_ref, args.desired_revision)
+        materialize_revision(desired_revision, desired)
         detail("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(desired_revision)}")
         detail(
             "OBSERVED",
@@ -9073,15 +7291,6 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             write_reconcile_outputs(False)
             return False
         unit = load_desired_unit(unit_path, args.unit)
-        if unit.is_legacy_compatibility:
-            log_status(
-                "WAIT",
-                "legacy desired Unit has no lifecycle identity; run advance-desired against an authoritative "
-                "source revision to adopt it before reconciliation",
-            )
-            log_status("DONE", f"{style_unit(args.unit)}: no changes")
-            write_reconcile_outputs(False)
-            return False
         ensure_desired_units_materialized(desired)
         load_desired_resource_graph(desired)
         if raw_unit_contains_reference(load_json(unit_path)):
@@ -9102,18 +7311,8 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         if not unit_requires_reconciliation(unit):
             log_status("SKIP", "unit is complete after desired-state materialization")
             log_status("DONE", f"{style_unit(args.unit)}: materialized for external delivery")
-            write_reconcile_outputs(False, pre_advanced_revision)
+            write_reconcile_outputs(False)
             return False
-
-        def advance_if_requested() -> str:
-            if not args.advance:
-                return ""
-            advanced, changed = advance_for_reconcile()
-            if changed and advanced:
-                return advanced
-            if advanced:
-                detail("KEEP", f"{style_branch(desired_ref)} did not change after observation")
-            return ""
 
         unit_blob = file_blob(unit_path)
         receipt_path = unit_document_path(observed, args.unit)
@@ -9128,33 +7327,18 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 validate_receipt_artifacts(observed, unit, receipt)
             if not getattr(args, "reapply", False) and skip_clean_unit and receipt_is_current:
                 detail("KEEP", "observation already matches desired state")
-                if args.plan:
-                    advanced_revision = ""
-                elif pre_advance:
-                    advanced_revision = pre_advanced_revision
-                else:
-                    advanced_revision = advance_if_requested()
                 if verbose:
                     log_status("DONE", f"{style_unit(args.unit)}: clean")
                 else:
-                    effects = []
-                    if advanced_revision:
-                        effects.append(
-                            (
-                                "UPDATED",
-                                f"Desired state {style_branch(desired_ref)} to {describe_revision(advanced_revision)}",
-                            )
-                        )
                     log_reconcile_outcome(
                         "UP TO DATE",
                         "Observation matches desired state",
                         "No reconciliation needed",
-                        effects,
+                        [],
                     )
-                    displayed_desired_revision = advanced_revision or desired_revision
                     log_status(
                         "DESIRED",
-                        f"{style_branch(desired_ref)} at {describe_revision(displayed_desired_revision)}",
+                        f"{style_branch(desired_ref)} at {describe_revision(desired_revision)}",
                     )
                     log_status(
                         "OBSERVED",
@@ -9165,7 +7349,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                         log_status("SOURCE", f"{describe_revision(source.revision)} ({source.path})")
                     else:
                         log_status("SOURCE", "none (source-less unit)")
-                write_reconcile_outputs(False, advanced_revision)
+                write_reconcile_outputs(False)
                 return False
 
         source_root = temporary / "source" if source is not None else None
@@ -9413,11 +7597,11 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 )
             except OperationError as exc:
                 log_status("WAIT", f"{style_unit(args.unit)}: effect lease release pending expiry: {exc}")
-                write_reconcile_outputs(True, pre_advanced_revision)
+                write_reconcile_outputs(True)
                 if verbose:
-                    log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully; desired advance deferred")
+                    log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully; lease release deferred")
                 else:
-                    log_status("APPLY", "SUCCEEDED; desired advance deferred")
+                    log_status("APPLY", "SUCCEEDED; lease release deferred")
                     observation_status = "UPDATED" if revision != observed_revision else "UNCHANGED"
                     log_status(
                         observation_status,
@@ -9427,8 +7611,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                     for effect_status, message in artifact_effects:
                         log_status(effect_status, message)
                 return True
-        advanced_revision = advance_if_requested() or pre_advanced_revision
-        write_reconcile_outputs(True, advanced_revision)
+        write_reconcile_outputs(True)
         if verbose:
             log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully")
         else:
@@ -9441,31 +7624,16 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             )
             for effect_status, message in artifact_effects:
                 log_status(effect_status, message)
-            if advanced_revision:
-                log_status(
-                    "UPDATED",
-                    f"Desired state {style_branch(desired_ref)} to {describe_revision(advanced_revision)}",
-                )
-            else:
-                log_status(
-                    "UNCHANGED",
-                    f"Desired state {style_branch(desired_ref)} at {describe_revision(desired_revision)}",
-                )
+            log_status(
+                "UNCHANGED",
+                f"Desired state {style_branch(desired_ref)} at {describe_revision(desired_revision)}",
+            )
         return True
 
 
 def command_reconcile(args: argparse.Namespace) -> bool:
     with unit_effect_lock(args.environment, getattr(args, "unit", "<invalid>")):
         return _command_reconcile(args)
-
-
-def log_ref_advance(advance: RefAdvance) -> None:
-    attribution = f" after {style_unit(advance.unit)}" if advance.unit else ""
-    log_status(
-        "ADVANCE",
-        f"{style_branch(advance.ref)} {describe_revision(advance.before)} -> "
-        f"{describe_revision(advance.after)}{attribution}",
-    )
 
 
 def require_reconciliation_approval(unit_name: str) -> None:
@@ -9486,60 +7654,18 @@ def log_compact_convergence_summary(
     environment: str,
     scope: Sequence[str],
     steps: list[str],
-    advances: list[RefAdvance],
     result: str,
     unselected: list[tuple[str, str, str]] | None = None,
 ) -> None:
     log_heading(f"Convergence result for {style_environment(environment)}")
     if result == "CLEAN":
         driver_summary = f"drivers ran for {style_units(steps)}" if steps else "no drivers ran"
-        ref_summary = f"{len(advances)} ref movement{'s' if len(advances) != 1 else ''}"
-        log_status("RESULT", f"CLEAN: {len(scope)}/{len(scope)} units; {driver_summary}; {ref_summary}")
+        log_status("RESULT", f"CLEAN: {len(scope)}/{len(scope)} units; {driver_summary}")
     else:
         log_status("RESULT", result)
     for unit_name, status, reason in unselected or []:
         if status not in {"CLEAN", "MATERIALIZED"}:
             log_status("UNSCOPED", f"{style_unit(unit_name)}: {status.lower()}; {reason}")
-
-
-def log_convergence_summary(
-    environment: str,
-    targets: Sequence[str],
-    scope: Sequence[str],
-    steps: list[str],
-    advances: list[RefAdvance],
-    start_heads: tuple[str | None, str | None],
-    end_heads: tuple[str | None, str | None],
-    result: str,
-    unselected: list[tuple[str, str, str]] | None = None,
-) -> None:
-    log_heading(f"Convergence summary for {style_environment(environment)}")
-    log_status("TARGET", style_units(targets))
-    log_status("SCOPE", style_units(scope))
-    log_status("STEPS", style_units(steps) if steps else "no reconciliation drivers ran")
-    if advances:
-        for index, advance in enumerate(advances, 1):
-            attribution = f" ({style_unit(advance.unit)})" if advance.unit else ""
-            log_status(
-                "MOVE",
-                f"{index}. {advance.kind} {style_branch(advance.ref)} "
-                f"{describe_revision(advance.before)} -> "
-                f"{describe_revision(advance.after)}{attribution}",
-            )
-    else:
-        log_status("MOVE", "no desired or observed ref advances")
-    log_status(
-        "DESIRED",
-        f"{describe_revision(start_heads[0])} -> {describe_revision(end_heads[0])}",
-    )
-    log_status(
-        "OBSERVED",
-        f"{describe_revision(start_heads[1])} -> {describe_revision(end_heads[1])}",
-    )
-    for unit_name, status, reason in unselected or []:
-        if status not in {"CLEAN", "MATERIALIZED"}:
-            log_status("UNSCOPED", f"{style_unit(unit_name)}: {status.lower()}; {reason}")
-    log_status("RESULT", result)
 
 
 def command_dependencies(args: argparse.Namespace) -> None:
@@ -9586,288 +7712,122 @@ def command_dependencies(args: argparse.Namespace) -> None:
         print("\n".join(graph.render_tree(target, lambda unit_name: style_unit(unit_name, sys.stdout))))
 
 
+def _partition_unit_names(desired: Path, partition: str) -> list[str]:
+    resources = load_desired_resource_graph(desired)
+    selected: set[tuple[str, str, str]] = set()
+    for resource in resources.values():
+        if resource_owner_reference(resource) is None and resource.metadata.partition == partition:
+            selected.update(
+                (item.gvk.api_version, item.gvk.kind, item.name)
+                for item in _owned_resource_closure(resources, resource)
+            )
+    return sorted(
+        resource.name
+        for key, resource in resources.items()
+        if key in selected and isinstance(resource, UnitResource) and resource_deletion(resource) is None
+    )
+
+
+def _desired_convergence_model(
+    desired: Path,
+) -> tuple[dict[str, UnitResource[Any]], dict[str, tuple[str, ...]]]:
+    resources = load_desired_resource_graph(desired)
+    units = {
+        resource.name: resource
+        for resource in resources.values()
+        if isinstance(resource, UnitResource) and resource_deletion(resource) is None
+    }
+    return units, stack_dependency_edges(resources)
+
+
 def command_converge(args: argparse.Namespace) -> None:
+    """Converge persisted desired Units, optionally reapplying one input snapshot."""
+
     if args.max_steps is not None and args.max_steps < 1:
         raise OperationError("--max-steps must be a positive integer")
-    source_revision = resolve_advance_source_revision(REPOSITORY_ROOT, args.environment, args.source_revision)
-    if args.require_source_ref and source_revision is None:
-        raise OperationError("--require-source-ref applies only to source-tracked environments")
+    if args.partition is not None:
+        _resource_name(args.partition, "partition name")
+    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
+    apply_arguments = None
+    if args.files:
+        apply_arguments = argparse.Namespace(
+            environment=args.environment,
+            files=list(args.files),
+            partition=args.partition,
+            source_revision=args.source_revision,
+            desired_ref=desired_ref,
+            observed_ref=observed_ref,
+            candidate_ref=args.candidate_ref,
+            dry=False,
+            verbose=args.verbose,
+        )
     log_heading(f"Converge {style_environment(args.environment)}")
-    log_status(
-        "SOURCE",
-        describe_revision(source_revision) if source_revision else "merged promotion",
-    )
-    warn_if_source_revision_excludes_changes(source_revision)
-
-    with tempfile.TemporaryDirectory() as temporary_directory:
+    steps: list[str] = []
+    previous_ready: set[str] = set()
+    max_steps = args.max_steps
+    iteration = 0
+    with tempfile.TemporaryDirectory(prefix="gitopsctr-converge-") as temporary_directory:
         temporary = Path(temporary_directory)
-        probe_source = temporary / "probe-source"
-        if source_revision is None:
-            desired_ref, observed_ref = deployment_refs(
-                REPOSITORY_ROOT,
-                args.environment,
-                args.desired_ref,
-                args.observed_ref,
-            )
-        else:
-            materialize_revision(source_revision, probe_source)
-            desired_ref, observed_ref = deployment_refs(
-                probe_source,
-                args.environment,
-                args.desired_ref,
-                args.observed_ref,
-            )
-        current_desired = temporary / "current-desired"
-        start_desired = observed_tree(desired_ref, current_desired)
-        start_observed = fetch_ref(observed_ref)
-        promotion = load_promotion_context(current_desired, temporary)
-        if source_revision is None and promotion is None:
-            source_root = REPOSITORY_ROOT
-            effective_source_revision = None
-        elif promotion is not None:
-            effective_source_revision = promotion.specification_revision
-            source_root = temporary / "reviewed-source"
-            materialize_revision(effective_source_revision, source_root)
-            if deployment_refs(
-                source_root,
-                args.environment,
-                args.desired_ref,
-                args.observed_ref,
-            ) != (desired_ref, observed_ref):
-                raise OperationError("reviewed specification changes deployment refs")
-            log_status("PIN", f"reviewed specification {describe_revision(effective_source_revision)}")
-        else:
-            assert source_revision is not None
-            effective_source_revision = source_revision
-            source_root = probe_source
-        projection_revision = (
-            effective_source_revision or start_desired or git("rev-parse", "HEAD^{commit}").stdout.strip()
-        )
-        specifications, stack_dependencies = load_convergence_specifications(
-            source_root,
-            args.environment,
-            current_desired,
-            projection_revision,
-            temporary / "stack-projection",
-        )
-        selection = convergence_scope(specifications, args.unit, additional_dependencies=stack_dependencies)
-        targets, scope = selection.targets, selection.scope
-        order = convergence_order(specifications, scope, stack_dependencies)
-        if args.verbose:
-            log_status("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
-            log_status("TARGET", style_units(targets))
-            log_status("SCOPE", style_units(scope))
-            log_dependency_graph(dependency_graph(specifications, scope, stack_dependencies).dependencies)
-        else:
-            log_status("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(start_desired)}")
-            log_status("OBSERVED", f"{style_branch(observed_ref)} at {describe_revision(start_observed)}")
-            if targets != scope:
-                log_status("TARGET", style_units(targets))
-                log_status("SCOPE", style_units(scope))
-
-        advances: list[RefAdvance] = []
-        steps: list[str] = []
-        last_desired = start_desired
-        last_observed = start_observed
-        max_steps = args.max_steps or max(2, 2 * len(scope))
-        iterations = 0
-        previous_plan: list[tuple[str, str, str]] | None = None
-
-        promotion_units = sorted(
-            unit_name
-            for unit_name in scope
-            if reference_paths(
-                specifications[unit_name].driver.unit_contract.dump(specifications[unit_name].spec),
-                "fromPromotion",
-                current_unit=unit_name,
-            )
-        )
-        if promotion_units and promotion is None:
-            result = "FAILED: review gate requires a merged promotion for " + ", ".join(promotion_units)
-            log_status("REVIEW", result.removeprefix("FAILED: "))
+        while True:
+            iteration += 1
+            if apply_arguments is not None:
+                applied_revision = command_apply(apply_arguments)
+                target_revision = fetch_ref(desired_ref)
+                if applied_revision is not None and applied_revision != target_revision:
+                    raise OperationError(
+                        "apply produced a reviewed candidate; merge it before converging the target desired state"
+                    )
+            desired_revision = fetch_ref(desired_ref)
+            if desired_revision is None:
+                raise OperationError(f"desired ref {desired_ref!r} has no state; apply resources first")
+            desired = temporary / f"desired-{iteration}"
+            observed = temporary / f"observed-{iteration}"
+            materialize_revision(desired_revision, desired)
+            observed_tree(observed_ref, observed)
+            specifications, stack_dependencies = _desired_convergence_model(desired)
+            selected_units = _partition_unit_names(desired, args.partition) if args.partition is not None else args.unit
+            if args.partition is not None and not selected_units:
+                raise OperationError(f"partition {args.partition!r} selects no desired Units")
+            selection = convergence_scope(specifications, selected_units, additional_dependencies=stack_dependencies)
+            scope = selection.scope
+            order = convergence_order(specifications, scope, stack_dependencies)
+            if max_steps is None:
+                max_steps = max(2, 2 * len(scope))
+            statuses = reconciliation_statuses(scope, desired, observed)
             if args.verbose:
-                log_convergence_summary(
-                    args.environment,
-                    targets,
-                    scope,
-                    steps,
-                    advances,
-                    (start_desired, start_observed),
-                    (last_desired, last_observed),
-                    result,
-                )
-            else:
-                log_compact_convergence_summary(args.environment, scope, steps, advances, result)
-            raise OperationError(result.removeprefix("FAILED: "))
-
-        try:
-            while True:
-                iterations += 1
-                before_desired = fetch_ref(desired_ref)
-                desired_revision, _changed = advance_desired(
-                    args.environment,
-                    args.source_revision,
-                    desired_ref,
-                    observed_ref,
-                    args.require_source_ref,
-                    summarize=False,
+                log_reconciliation_status(args.environment, statuses, desired_revision, desired, observed, True)
+            if all(status in {"CLEAN", "MATERIALIZED"} for _, status, _ in statuses):
+                log_compact_convergence_summary(args.environment, scope, steps, "CLEAN")
+                return
+            ready = [
+                name for name in order if dict((name, status) for name, status, _ in statuses).get(name) == "READY"
+            ]
+            if args.fail_on_repeat and any(name in previous_ready for name in ready):
+                repeated = sorted(name for name in ready if name in previous_ready)
+                raise OperationError("convergence heuristic detected repeated ready unit(s): " + ", ".join(repeated))
+            previous_ready.update(ready)
+            if not ready:
+                waiting = [f"{name} ({reason})" for name, status, reason in statuses if status == "WAIT"]
+                raise OperationError("convergence stalled with no ready unit: " + ", ".join(waiting))
+            if len(steps) >= max_steps:
+                raise OperationError(f"convergence did not finish within {max_steps} reconciliation steps")
+            unit_name = ready[0]
+            if not args.yes:
+                require_reconciliation_approval(unit_name)
+            command_reconcile(
+                argparse.Namespace(
+                    unit=unit_name,
+                    environment=args.environment,
+                    desired_ref=desired_ref,
+                    desired_revision=desired_revision,
+                    observed_ref=observed_ref,
+                    plan=False,
+                    report=None,
+                    reapply=False,
                     verbose=args.verbose,
                 )
-                if desired_revision is None:
-                    raise OperationError("source revision is no longer eligible")
-                last_desired = desired_revision
-                if before_desired != desired_revision:
-                    movement = RefAdvance("desired", desired_ref, before_desired, desired_revision)
-                    advances.append(movement)
-                    if args.verbose:
-                        log_ref_advance(movement)
-                    else:
-                        log_status(
-                            "DESIRED",
-                            f"{style_branch(desired_ref)} {describe_revision(before_desired)} -> "
-                            f"{describe_revision(desired_revision)} (advanced)",
-                        )
-
-                state = temporary / f"state-{iterations}"
-                desired = state / "desired"
-                observed = state / "observed"
-                materialize_revision(desired_revision, desired)
-                last_observed = observed_tree(observed_ref, observed)
-                statuses = reconciliation_statuses(scope, desired, observed)
-                status_by_unit = {unit_name: status for unit_name, status, _ in statuses}
-                if args.verbose:
-                    log_reconciliation_status(
-                        args.environment,
-                        statuses,
-                        desired_revision,
-                        desired,
-                        observed,
-                        args.verbose,
-                    )
-
-                if all(status in {"CLEAN", "MATERIALIZED"} for _, status, _ in statuses):
-                    all_statuses = reconciliation_statuses(sorted(specifications), desired, observed)
-                    unselected = [item for item in all_statuses if item[0] not in set(scope)]
-                    materialized_count = sum(status == "MATERIALIZED" for _, status, _ in statuses)
-                    result = (
-                        "CLEAN"
-                        if materialized_count == 0
-                        else f"COMPLETE: {len(scope) - materialized_count} clean; {materialized_count} materialized"
-                    )
-                    if args.verbose:
-                        log_convergence_summary(
-                            args.environment,
-                            targets,
-                            scope,
-                            steps,
-                            advances,
-                            (start_desired, start_observed),
-                            (last_desired, last_observed),
-                            result,
-                            unselected,
-                        )
-                    else:
-                        log_compact_convergence_summary(
-                            args.environment,
-                            scope,
-                            steps,
-                            advances,
-                            result,
-                            unselected,
-                        )
-                    return
-
-                repeated = [
-                    unit_name for unit_name in order if status_by_unit.get(unit_name) == "READY" and unit_name in steps
-                ]
-                if args.fail_on_repeat and repeated:
-                    raise OperationError(
-                        "convergence heuristic detected repeated ready unit(s): " + ", ".join(repeated)
-                    )
-                ready = [unit_name for unit_name in order if status_by_unit.get(unit_name) == "READY"]
-                if not ready:
-                    waiting = [f"{unit_name} ({reason})" for unit_name, status, reason in statuses if status == "WAIT"]
-                    raise OperationError("convergence stalled with no ready unit: " + ", ".join(waiting))
-                if len(steps) >= max_steps:
-                    raise OperationError(f"convergence did not finish within {max_steps} reconciliation steps")
-
-                unit_name = ready[0]
-                plan = convergence_plan_rows(statuses, order)
-                if not args.verbose:
-                    log_convergence_plan(plan, previous_plan)
-                    previous_plan = plan
-                reason_by_unit = {name: reason for name, _status, reason in statuses}
-                log_convergence_action(
-                    unit_name,
-                    reason_by_unit[unit_name],
-                    desired_revision,
-                    desired,
-                    observed,
-                    observed_ref,
-                )
-                if not args.yes:
-                    require_reconciliation_approval(unit_name)
-                if args.verbose:
-                    log_heading(f"Convergence step {len(steps) + 1} (limit {max_steps}): {style_unit(unit_name)}")
-                else:
-                    log_status("RUN", style_unit(unit_name))
-                before_observed = last_observed
-                ran = command_reconcile(
-                    argparse.Namespace(
-                        unit=unit_name,
-                        environment=args.environment,
-                        desired_ref=desired_ref,
-                        desired_revision=desired_revision,
-                        observed_ref=observed_ref,
-                        plan=False,
-                        report=None,
-                        source_revision=None,
-                        advance=False,
-                        require_source_ref=None,
-                        reapply=False,
-                        verbose=args.verbose,
-                    )
-                )
-                after_observed = fetch_ref(observed_ref)
-                last_observed = after_observed
-                if ran:
-                    steps.append(unit_name)
-                if before_observed != after_observed and after_observed is not None:
-                    movement = RefAdvance(
-                        "observed",
-                        observed_ref,
-                        before_observed,
-                        after_observed,
-                        unit_name,
-                    )
-                    advances.append(movement)
-                    if args.verbose:
-                        log_ref_advance(movement)
-                    else:
-                        log_status(
-                            "OBSERVED",
-                            f"{style_branch(observed_ref)} {describe_revision(before_observed)} -> "
-                            f"{describe_revision(after_observed)} ({style_unit(unit_name)})",
-                        )
-        except (DriverError, OperationError, subprocess.CalledProcessError) as exc:
-            detail = (
-                (exc.stderr or "").strip() or str(exc) if isinstance(exc, subprocess.CalledProcessError) else str(exc)
             )
-            result = f"FAILED: {detail}"
-            if args.verbose:
-                log_convergence_summary(
-                    args.environment,
-                    targets,
-                    scope,
-                    steps,
-                    advances,
-                    (start_desired, start_observed),
-                    (last_desired, last_observed),
-                    result,
-                )
-            else:
-                log_compact_convergence_summary(args.environment, scope, steps, advances, result)
-            raise
+            steps.append(unit_name)
 
 
 def _resource_name(value: str, description: str) -> str:
@@ -9919,25 +7879,312 @@ def _parse_optional_units(value: str | None) -> list[str] | None:
     return units
 
 
-def _stack_operation_namespace(args: argparse.Namespace) -> argparse.Namespace:
-    return argparse.Namespace(
-        environment=args.environment,
-        stack=args.name,
-        template=args.template,
-        units=getattr(args, "units", None),
-        source_revision=args.source_revision,
-        parameters=args.parameters,
-        request_id=args.request_id,
-        desired_ref=getattr(args, "desired_ref", None),
-        observed_ref=getattr(args, "observed_ref", None),
-        candidate_ref=getattr(args, "candidate_ref", None),
-        dry=getattr(args, "dry", False),
-    )
+def _load_apply_documents(files: Sequence[str]) -> list[tuple[str, JsonObject]]:
+    """Load a deterministic resource stream from files, directories, or stdin."""
+
+    if not files:
+        raise OperationError("apply requires at least one --file")
+    if files.count("-") > 1:
+        raise OperationError("standard input may be specified only once")
+    loaded: list[tuple[str, JsonObject]] = []
+    paths: list[Path] = []
+    for value in files:
+        if value == "-":
+            try:
+                values = list(yaml.safe_load_all(sys.stdin.read()))
+            except yaml.YAMLError as exc:
+                raise OperationError(f"standard input is invalid YAML: {exc}") from exc
+            for index, value_document in enumerate(values, 1):
+                if value_document is None:
+                    continue
+                try:
+                    document = require_json_value(value_document)
+                except ValueError as exc:
+                    raise OperationError(f"standard input document {index} is invalid: {exc}") from exc
+                if not isinstance(document, dict):
+                    raise OperationError(f"standard input document {index} must be a resource mapping")
+                loaded.append((f"stdin#{index}", document))
+            continue
+        path = Path(value)
+        if not path.is_absolute():
+            path = REPOSITORY_ROOT / path
+        if not path.exists():
+            raise OperationError(f"apply input does not exist: {value}")
+        if path.is_dir():
+            paths.extend(
+                child
+                for child in sorted(path.rglob("*"))
+                if child.is_file() and child.suffix.lower() in {".json", ".yaml", ".yml"}
+            )
+        elif path.suffix.lower() in {".json", ".yaml", ".yml"}:
+            paths.append(path)
+        else:
+            raise OperationError(f"apply input must be YAML or JSON: {value}")
+    for path in paths:
+        try:
+            loaded.append((str(path), RESOURCE_CATALOG.load_document(path)))
+        except (DocumentFormatError, OperationError) as exc:
+            raise OperationError(f"{path}: {exc}") from exc
+    identities: dict[tuple[str, str], str] = {}
+    for origin, document in loaded:
+        api_version = document.get("apiVersion")
+        kind = document.get("kind")
+        metadata = document.get("metadata")
+        name = metadata.get("name") if isinstance(metadata, dict) else None
+        if not all(isinstance(value, str) and value for value in (api_version, kind, name)):
+            raise OperationError(f"{origin}: resource requires apiVersion, kind, and metadata.name")
+        family = "stack" if kind == "Stack" else ("stacktemplate" if kind == "StackTemplate" else "unit")
+        identity = (family, cast(str, name))
+        if previous := identities.get(identity):
+            raise OperationError(f"duplicate apply resource {identity!r}: {previous} and {origin}")
+        identities[identity] = origin
+    return loaded
+
+
+def _document_is_canonical_desired(document: JsonObject) -> bool:
+    """Discriminate desired input structurally by controller identity fields."""
+
+    metadata = document.get("metadata")
+    return isinstance(metadata, dict) and "uid" in metadata
+
+
+def _copy_apply_source_base(source: Path, destination: Path, environment: str) -> None:
+    """Keep the selected source payload while excluding implicit environment resources."""
+
+    source_environment = project_environment_root(source, environment)
+    environment_paths = document_candidates(source_environment, "environment")
+    if len(environment_paths) != 1:
+        raise OperationError(f"expected exactly one environment document for {environment}")
+    shutil.copytree(source, destination)
+    target_environment = project_environment_root(destination, environment)
+    for collection in ("units", "stacks"):
+        shutil.rmtree(target_environment / collection, ignore_errors=True)
+
+
+def _write_apply_authored_documents(
+    source: Path,
+    environment: str,
+    documents: Sequence[tuple[str, JsonObject]],
+) -> tuple[list[UnitResource[Any]], list[StackResource]]:
+    environment_root = project_environment_root(source, environment)
+    environment_root.mkdir(parents=True, exist_ok=True)
+    units: list[UnitResource[Any]] = []
+    stacks: list[StackResource] = []
+    for origin, document in documents:
+        if _document_is_canonical_desired(document):
+            continue
+        kind = document.get("kind")
+        metadata = document.get("metadata")
+        assert isinstance(metadata, dict)
+        name = cast(str, metadata["name"])
+        if kind == "Stack":
+            resource = RESOURCE_CATALOG.parse_stack(document, profile="authored", expected_name=name)
+            stacks.append(resource)
+            directory = environment_root / "stacks"
+        elif kind == "StackTemplate":
+            raise OperationError(f"{origin}: apply StackTemplate directly is not supported; apply a Stack")
+        else:
+            resource = RESOURCE_CATALOG.parse_unit(document, profile="authored", expected_name=name)
+            units.append(resource)
+            directory = environment_root / "units"
+        write_document(directory / f"{name}.yaml", document, format=DocumentFormat.YAML)
+    return units, stacks
+
+
+def _applied_root_closure(
+    candidate: Path,
+    roots: Sequence[UnitResource[Any] | StackResource],
+) -> frozenset[tuple[str, str, str]]:
+    """Return physical roots applied by this request, including selected resource templates."""
+
+    candidate_resources = load_desired_resource_graph(candidate, validate=False)
+    applied = {(resource.gvk.api_version, resource.gvk.kind, resource.name) for resource in roots}
+    for resource in roots:
+        if not isinstance(resource, StackResource) or resource.gvk.kind != "Stack":
+            continue
+        projected = candidate_resources.get((resource.gvk.api_version, resource.gvk.kind, resource.name))
+        if not isinstance(projected, StackResource) or not isinstance(projected.spec, DesiredStackSpec):
+            raise OperationError(f"applied Stack {resource.name!r} was not projected into desired state")
+        template = cast(StackTemplateReference, projected.spec.template)
+        if not isinstance(template.source, StackTemplateFromResource):
+            continue
+        template_key = (CORE_API_VERSION, "StackTemplate", template.name)
+        selected_template = candidate_resources.get(template_key)
+        if not isinstance(selected_template, StackResource) or selected_template.gvk.kind != "StackTemplate":
+            raise OperationError(
+                f"applied Stack {resource.name!r} selected StackTemplate {template.name!r}, but it was not persisted"
+            )
+        applied.add(template_key)
+    return frozenset(applied)
+
+
+def _copy_unrelated_desired_resources(
+    current: Path,
+    candidate: Path,
+    applied: frozenset[tuple[str, str, str]],
+    partition: str | None,
+) -> None:
+    current_resources = load_desired_resource_graph(current) if any(current.iterdir()) else {}
+    candidate_resources = load_desired_resource_graph(candidate, validate=False)
+    copied: set[tuple[str, str, str]] = set()
+    for key, resource in current_resources.items():
+        if key in copied or key in applied or resource_owner_reference(resource) is not None:
+            continue
+        if partition is not None and resource.metadata.partition == partition:
+            continue
+        for selected in _owned_resource_closure(current_resources, resource):
+            selected_key = (selected.gvk.api_version, selected.gvk.kind, selected.name)
+            copied.add(selected_key)
+            if selected_key in candidate_resources:
+                continue
+            source_path = _desired_resource_path(current, selected)
+            target = candidate / source_path.relative_to(current)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, target)
+            if isinstance(selected, UnitResource) and getattr(selected.spec, "materialization", None) is not None:
+                copy_unit_materialization(current, candidate, selected.name, selected)
+
+
+def _prune_omitted_partition_resources(
+    current: Path,
+    candidate: Path,
+    applied: frozenset[tuple[str, str, str]],
+    partition: str | None,
+) -> None:
+    """Retain omitted partition roots and their closure as deletion requests."""
+
+    if partition is None or not any(current.iterdir()):
+        return
+    current_resources = load_desired_resource_graph(current)
+    candidate_resources = load_desired_resource_graph(candidate, validate=False)
+    for key, resource in current_resources.items():
+        if resource_owner_reference(resource) is not None or resource.metadata.partition != partition or key in applied:
+            continue
+        for selected in _owned_resource_closure(current_resources, resource):
+            selected_target = candidate_resources.get(
+                (selected.gvk.api_version, selected.gvk.kind, selected.name), selected
+            )
+            _write_desired_resource(
+                candidate / _desired_resource_path(current, selected).relative_to(current),
+                mark_resource_for_deletion(selected_target),
+            )
+
+
+def command_apply(args: argparse.Namespace) -> str | None:
+    """Resolve explicit resources and atomically publish one desired snapshot."""
+
+    _resource_name(args.environment, "environment name")
+    partition = _resource_name(args.partition, "partition name") if args.partition is not None else None
+    documents = _load_apply_documents(args.files)
+    source_revision = git("rev-parse", f"{args.source_revision or 'HEAD'}^{{commit}}").stdout.strip()
+    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
+    with tempfile.TemporaryDirectory(prefix="gitopsctr-apply-") as temporary_directory:
+        temporary = Path(temporary_directory)
+        source = temporary / "source"
+        apply_source = temporary / "apply-source"
+        current = temporary / "current"
+        observed = temporary / "observed"
+        candidate = temporary / "candidate"
+        materialize_revision(source_revision, source)
+        _copy_apply_source_base(source, apply_source, args.environment)
+        authored_units, authored_stacks = _write_apply_authored_documents(apply_source, args.environment, documents)
+        current_revision = observed_tree(desired_ref, current)
+        observed_revision = observed_tree(observed_ref, observed)
+        if current_revision is None and change_gate(source, args.environment) == "pullRequest" and not args.dry:
+            current_revision = _initialize_gated_desired_ref(source, args.environment, desired_ref, current)
+        build_desired_candidate(
+            args.environment,
+            apply_source,
+            source_revision,
+            current,
+            observed,
+            observed_revision,
+            candidate,
+            dry=args.dry,
+            verbose=getattr(args, "verbose", False),
+            partition=partition,
+        )
+        applied = set(_applied_root_closure(candidate, [*authored_units, *authored_stacks]))
+        for origin, document in documents:
+            if not _document_is_canonical_desired(document):
+                continue
+            kind = cast(str, document["kind"])
+            metadata = cast(dict[str, Any], document["metadata"])
+            name = cast(str, metadata["name"])
+            if kind in {"Stack", "StackTemplate"}:
+                resource = (
+                    RESOURCE_CATALOG.parse_stack(document, profile="desired", expected_name=name)
+                    if kind == "Stack"
+                    else RESOURCE_CATALOG.parse_stack_template(document, profile="desired", expected_name=name)
+                )
+            else:
+                resource = RESOURCE_CATALOG.parse_unit(document, profile="desired", expected_name=name)
+                if getattr(resource.spec, "materialization", None) is not None:
+                    raise OperationError(
+                        f"{origin}: canonical materialized Unit input is not supported because --file cannot "
+                        "carry its persisted materialization tree; apply the authored Unit instead"
+                    )
+            if resource_owner_reference(resource) is not None or resource_deletion(resource) is not None:
+                raise OperationError(f"{origin}: apply accepts only non-deleting root resources")
+            previous = (
+                load_desired_resource_graph(current).get((resource.gvk.api_version, resource.gvk.kind, resource.name))
+                if current_revision
+                else None
+            )
+            if previous is not None:
+                if resource_deletion(previous) is not None:
+                    raise OperationError(f"desired resource {name!r} is deleting and cannot be applied")
+                if partition is not None and previous.metadata.partition not in {None, partition}:
+                    raise OperationError(
+                        f"desired resource {name!r} belongs to partition {previous.metadata.partition!r}"
+                    )
+                metadata_value = previous.metadata.with_partition(partition, preserve_existing=partition is None)
+            else:
+                metadata_value = ResourceMetadata.root_from_provenance(
+                    name, hashlib.sha256(canonical_json(document)).hexdigest(), partition=partition
+                )
+            resource = resource.with_metadata(metadata_value)
+            target_directory = (
+                "units"
+                if isinstance(resource, UnitResource)
+                else ("stack-templates" if resource.gvk.kind == "StackTemplate" else "stacks")
+            )
+            _write_desired_resource(candidate / target_directory / f"{name}.json", resource)
+            applied.add((resource.gvk.api_version, resource.gvk.kind, resource.name))
+        _copy_unrelated_desired_resources(current, candidate, frozenset(applied), partition)
+        _prune_omitted_partition_resources(current, candidate, frozenset(applied), partition)
+        load_desired_resource_graph(candidate)
+        if current_revision is not None and directory_files(current) == directory_files(candidate):
+            if not args.dry:
+                _ensure_stack_source_pins(args.environment, current)
+            log_status("KEEP", f"{style_branch(desired_ref)} is already resolved")
+            return current_revision
+        candidate_id = candidate_identifier(
+            "apply", args.environment, candidate, desired_ref, current_revision or "", {"partition": partition}
+        )
+        candidate_ref = resolve_candidate_ref(
+            REPOSITORY_ROOT, args.environment, "apply", candidate_id, args.candidate_ref
+        )
+        revision, outcome = publish_desired_change(
+            args.environment,
+            candidate,
+            desired_ref,
+            current_revision,
+            candidate_ref,
+            f"Apply desired resources to {args.environment}",
+            f"Apply desired resources to {args.environment}",
+            f"Apply explicit resources{f' in partition `{partition}`' if partition else ''}.",
+            args.dry,
+            current if current_revision is not None else None,
+            request_change=False,
+        )
+        if not args.dry:
+            print(revision)
+            write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
+        return revision
 
 
 def command_create_stacktemplate(args: argparse.Namespace) -> None:
-    if args.input_location != "source":
-        raise OperationError("StackTemplate state creation is not supported; use source-authored StackTemplates")
     _resource_name(args.name, "StackTemplate name")
     project = load_project_config(REPOSITORY_ROOT)
     source = Path(args.file)
@@ -9960,14 +8207,6 @@ def command_create_stacktemplate(args: argparse.Namespace) -> None:
 
 
 def command_create_stack(args: argparse.Namespace) -> None:
-    if args.input_location == "state":
-        if not args.source_revision or not args.request_id:
-            raise OperationError("state Stack creation requires --source-revision and --request-id")
-        operation = _stack_operation_namespace(args)
-        if args.or_update:
-            return command_apply_stack(operation)
-        command_instantiate_stack(operation)
-        return
     _resource_name(args.name, "Stack name")
     project = load_project_config(REPOSITORY_ROOT)
     environment_root = project_environment_root(REPOSITORY_ROOT, args.environment)
@@ -9994,116 +8233,6 @@ def command_create_stack(args: argparse.Namespace) -> None:
         format=_document_format_for_path(target),
     )
     _print_created(written)
-
-
-def command_apply_stack(args: argparse.Namespace) -> None:
-    operation = args if hasattr(args, "stack") else _stack_operation_namespace(args)
-    operation.input_location = "state"
-    desired_ref, _observed_ref = deployment_refs(REPOSITORY_ROOT, operation.environment, operation.desired_ref, None)
-    current_revision = fetch_ref(desired_ref)
-    if current_revision is None:
-        raise OperationError(f"desired ref {desired_ref!r} has no state")
-    current = Path(tempfile.mkdtemp(prefix="gitopsctr-apply-stack-"))
-    try:
-        materialize_revision(current_revision, current)
-        path = _current_desired_stack_paths(current, "Stack").get(operation.stack)
-        if path is None:
-            command_instantiate_stack(operation)
-            return
-        existing = RESOURCE_CATALOG.parse_stack(
-            RESOURCE_CATALOG.load_document(path), profile="desired", expected_name=operation.stack
-        )
-        lifecycle = existing.metadata.lifecycle
-        if (
-            lifecycle is None
-            or lifecycle.management is None
-            or lifecycle.management.mode != "direct"
-            or existing.metadata.uid is None
-        ):
-            raise OperationError(f"desired Stack {operation.stack!r} is not directly managed")
-        operation.uid = getattr(args, "uid", None) or existing.metadata.uid
-        operation.desired_revision = getattr(args, "desired_revision", None) or current_revision
-        command_update_direct_stack(operation)
-    finally:
-        shutil.rmtree(current, ignore_errors=True)
-
-
-def command_apply_unit(args: argparse.Namespace) -> None:
-    if args.input_location != "state":
-        raise OperationError("apply only supports --in=state; edit and commit source YAML directly")
-    if not args.file:
-        raise OperationError("apply unit requires --file")
-    _resource_name(args.environment, "environment name")
-    document = RESOURCE_CATALOG.load_document(Path(args.file))
-    unit = RESOURCE_CATALOG.parse_unit(document, profile="desired")
-    if unit.metadata.lifecycle is None or unit.metadata.lifecycle.management is None:
-        raise OperationError("apply unit requires desired lifecycle metadata")
-    if resource_owner_reference(unit) is not None or unit.metadata.lifecycle.management.mode != "direct":
-        raise OperationError("apply unit requires a directly managed root Unit")
-    if unit.metadata.uid is None:
-        raise OperationError("apply unit requires a Unit UID")
-    if resource_deletion(unit) is not None:
-        raise OperationError("apply unit cannot set deletion metadata; use delete unit --in=state")
-    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, None)
-    current_revision = fetch_ref(desired_ref)
-    if current_revision is None:
-        raise OperationError(f"desired ref {desired_ref!r} has no state")
-    with tempfile.TemporaryDirectory(prefix="gitopsctr-apply-unit-") as temporary_directory:
-        current = Path(temporary_directory) / "current"
-        candidate = Path(temporary_directory) / "candidate"
-        materialize_revision(current_revision, current)
-        existing_path = unit_document_path(current, unit.name, REPOSITORY_ROOT)
-        if existing_path.is_file():
-            if not getattr(args, "or_update", True):
-                raise OperationError(f"desired Unit {unit.name!r} already exists")
-            existing = load_desired_unit(existing_path, unit.name)
-            if existing.metadata.uid != unit.metadata.uid:
-                raise OperationError(f"stale desired Unit UID for {unit.name!r}")
-            if args.uid is not None and args.uid != unit.metadata.uid:
-                raise OperationError(f"stale desired Unit UID for {unit.name!r}")
-            if args.desired_revision is not None and args.desired_revision != current_revision:
-                raise OperationError(f"stale desired head for {unit.name!r}")
-        elif args.uid is not None:
-            raise OperationError(f"desired Unit {unit.name!r} is not present")
-        else:
-            finalized = load_resource_incarnation_tombstones(current)
-            if any(
-                tombstone.name == unit.name and tombstone.uid == unit.metadata.uid for tombstone in finalized.values()
-            ):
-                raise OperationError(f"finalized desired Unit UID cannot be reused for {unit.name!r}")
-        shutil.copytree(current, candidate)
-        write_desired_candidate_unit(candidate / "units" / existing_path.name, unit, REPOSITORY_ROOT)
-        load_desired_resource_graph(candidate)
-        request_id = args.request_id or f"apply:{args.environment}/{unit.name}:{unit.metadata.uid}"
-        candidate_id = candidate_identifier(
-            "apply-unit",
-            args.environment,
-            candidate,
-            desired_ref,
-            current_revision,
-            {"unit": unit.name, "request": request_id},
-        )
-        candidate_ref = resolve_candidate_ref(
-            REPOSITORY_ROOT, args.environment, "apply-unit", candidate_id, args.candidate_ref
-        )
-        if candidate_ref in {desired_ref, observed_ref}:
-            raise OperationError("apply candidate ref conflicts with deployment state")
-        revision, outcome = publish_desired_change(
-            args.environment,
-            candidate,
-            desired_ref,
-            current_revision,
-            candidate_ref,
-            f"Apply direct Unit {unit.name}",
-            f"Apply direct Unit {unit.name}",
-            f"Apply request `{request_id}`.",
-            args.dry,
-            current,
-        )
-        if args.dry:
-            return
-        print(revision)
-        write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
 
 
 def _desired_resource_path(root: Path, resource: UnitResource[Any] | StackResource) -> Path:
@@ -10220,17 +8349,7 @@ def _command_delete_state_resource(args: argparse.Namespace) -> bool:
 
 
 def command_delete_resource(args: argparse.Namespace) -> None:
-    if args.input_location == "state":
-        _command_delete_state_resource(args)
-        return
-    project = load_project_config(REPOSITORY_ROOT)
-    target = _source_resource_path(args.kind, args.name, args.environment, project)
-    candidates = document_candidates(target.parent, args.name)
-    if not candidates:
-        raise OperationError(f"source {args.kind} {args.name!r} does not exist")
-    for path in candidates:
-        path.unlink()
-    print(f"deleted {args.kind} {args.name}")
+    _command_delete_state_resource(args)
 
 
 def command_create_project(args: argparse.Namespace) -> None:
@@ -10295,11 +8414,6 @@ def command_create_environment(args: argparse.Namespace) -> None:
 
 
 def command_create_unit(args: argparse.Namespace) -> None:
-    if getattr(args, "input_location", "source") == "state":
-        if not args.file:
-            raise OperationError("create unit --in=state requires --file")
-        command_apply_unit(args)
-        return
     if not args.name or not args.driver:
         raise OperationError("source Unit creation requires --name and --driver")
     _resource_name(args.name, "unit name")
@@ -10553,9 +8667,6 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
         (
             "Deployment",
             (
-                "advance-desired",
-                "instantiate-stack",
-                "update-direct-stack",
                 "promote",
                 "rollback",
                 "recover-effect-lease",
@@ -10572,7 +8683,7 @@ class GroupedHelpFormatter(argparse.HelpFormatter):
         ),
         (
             "Inspection",
-            ("status", "list", "show", "verify", "dependencies", "audit-desired-compatibility"),
+            ("get", "status", "verify", "dependencies"),
         ),
         ("Reconciliation", ("reconcile", "converge")),
         ("Git data", ("read-tree", "publish-tree")),
@@ -10616,10 +8727,9 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
 
-    create = commands.add_parser("create", help="create a source or directly managed resource")
+    create = commands.add_parser("create", help="scaffold a source resource")
     create_commands = create.add_subparsers(dest="create_command", required=True)
     create_project = create_commands.add_parser("project", help="create the repository Project resource")
-    create_project.add_argument("--in", dest="input_location", choices=("source",), default="source")
     create_project.add_argument("--name", required=True, help="DNS-1123 project name")
     create_project.add_argument("--write-format", choices=("yaml", "json"), default="yaml")
     create_project.add_argument(
@@ -10646,14 +8756,12 @@ def build_parser() -> argparse.ArgumentParser:
     create_project.set_defaults(handler=command_create_project)
 
     create_environment = create_commands.add_parser("environment", help="create an authored Environment resource")
-    create_environment.add_argument("--in", dest="input_location", choices=("source",), default="source")
     create_environment.add_argument("--name", required=True)
     create_environment.add_argument("--change-gate", choices=("none", "pullRequest"), default="none")
     create_environment.add_argument("--force", action="store_true", help="replace an existing Environment resource")
     create_environment.set_defaults(handler=command_create_environment)
 
     create_unit = create_commands.add_parser("unit", help="create a driver-specific authored Unit resource")
-    create_unit.add_argument("--in", dest="input_location", choices=("source", "state"), default="source")
     create_unit.add_argument("--environment", required=True)
     create_unit.add_argument("--name")
     create_unit.add_argument("--driver", choices=tuple(sorted(UNIT_DRIVERS)))
@@ -10663,90 +8771,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="path relative to the root of the selected source revision",
     )
     create_unit.add_argument("--force", action="store_true", help="replace an existing Unit resource")
-    create_unit.add_argument("--file", help="desired Unit document when using --in=state")
-    create_unit.add_argument("--or-update", action="store_true", help="update an existing state Unit")
-    create_unit.add_argument("--uid", help="expected direct Unit UID when updating state")
-    create_unit.add_argument("--desired-revision", help="expected desired-state head when updating state")
-    create_unit.add_argument(
-        "--request-id",
-        help="opaque idempotency key; reuse for the same mutation and change for a new mutation",
-    )
-    create_unit.add_argument("--desired-ref", help="override the environment's desired ref")
-    create_unit.add_argument("--candidate-ref", help="override the candidate ref")
-    create_unit.add_argument("--dry", action="store_true")
     create_unit.set_defaults(handler=command_create_unit)
 
     create_template = create_commands.add_parser(
         "stacktemplate", help="create a source-authored StackTemplate from a document"
     )
-    create_template.add_argument("--in", dest="input_location", choices=("source",), default="source")
     create_template.add_argument("--name", required=True)
     create_template.add_argument("--file", required=True, help="authored StackTemplate document")
     create_template.add_argument("--or-update", action="store_true", help="replace an existing source document")
     create_template.set_defaults(handler=command_create_stacktemplate)
 
-    create_stack = create_commands.add_parser("stack", help="create a source or directly managed Stack")
-    create_stack.add_argument("--in", dest="input_location", choices=("source", "state"), default="source")
+    create_stack = create_commands.add_parser("stack", help="create a source Stack")
     create_stack.add_argument("--environment", required=True)
     create_stack.add_argument("--name", required=True)
     create_stack.add_argument("--template", required=True)
     create_stack.add_argument("--units", help="comma-separated Unit template names")
     create_stack.add_argument("--parameters", default="{}", help="Stack parameters as a JSON object")
-    create_stack.add_argument("--source-revision", help="trusted full Git revision or ref for state creation")
-    create_stack.add_argument(
-        "--request-id",
-        help="opaque idempotency key; reuse for the same mutation and change for a new mutation",
-    )
     create_stack.add_argument("--or-update", action="store_true", help="update an existing resource")
-    create_stack.add_argument("--desired-ref")
-    create_stack.add_argument("--observed-ref")
-    create_stack.add_argument("--candidate-ref")
-    create_stack.add_argument("--dry", action="store_true")
     create_stack.set_defaults(handler=command_create_stack)
 
-    apply = commands.add_parser("apply", help="create or update a directly managed state resource")
-    apply_commands = apply.add_subparsers(dest="apply_kind", required=True)
-    apply_stack = apply_commands.add_parser("stack", help="apply a directly managed Stack")
-    apply_stack.add_argument("--in", dest="input_location", choices=("state",), default="state")
-    apply_stack.add_argument("--environment", required=True)
-    apply_stack.add_argument("--name", required=True)
-    apply_stack.add_argument("--template", required=True)
-    apply_stack.add_argument("--units")
-    apply_stack.add_argument("--parameters", default="{}")
-    apply_stack.add_argument("--source-revision", required=True)
-    apply_stack.add_argument(
-        "--request-id",
-        required=True,
-        help="opaque idempotency key; reuse for the same mutation and change for a new mutation",
-    )
-    apply_stack.add_argument("--uid")
-    apply_stack.add_argument("--desired-revision")
-    apply_stack.add_argument("--desired-ref")
-    apply_stack.add_argument("--observed-ref")
-    apply_stack.add_argument("--candidate-ref")
-    apply_stack.add_argument("--dry", action="store_true")
-    apply_stack.set_defaults(handler=command_apply_stack)
+    apply = commands.add_parser("apply", help="resolve explicit resources into desired state")
+    apply.add_argument("--environment", required=True)
+    apply.add_argument("-f", "--file", dest="files", action="append", required=True)
+    apply.add_argument("--partition", help="authoritative management partition")
+    apply.add_argument("--source-revision", help="source commit used for source pins; defaults to HEAD")
+    apply.add_argument("--desired-ref")
+    apply.add_argument("--observed-ref")
+    apply.add_argument("--candidate-ref")
+    apply.add_argument("--dry", action="store_true")
+    apply.add_argument("--verbose", action="store_true")
+    apply.set_defaults(handler=command_apply)
 
-    apply_unit = apply_commands.add_parser("unit", help="apply a directly managed Unit document")
-    apply_unit.add_argument("--in", dest="input_location", choices=("state",), default="state")
-    apply_unit.add_argument("--environment", required=True)
-    apply_unit.add_argument("--file", required=True)
-    apply_unit.add_argument("--uid")
-    apply_unit.add_argument("--desired-revision")
-    apply_unit.add_argument("--request-id")
-    apply_unit.add_argument("--desired-ref")
-    apply_unit.add_argument("--candidate-ref")
-    apply_unit.add_argument("--dry", action="store_true")
-    apply_unit.set_defaults(handler=command_apply_unit)
-
-    delete = commands.add_parser("delete", help="delete a source or directly managed state resource")
+    delete = commands.add_parser("delete", help="mark a desired resource for deletion")
     delete_commands = delete.add_subparsers(dest="delete_kind", required=True)
     for delete_name, delete_kind in (("stack", "Stack"), ("unit", "Unit"), ("stacktemplate", "StackTemplate")):
         delete_parser = delete_commands.add_parser(delete_name, help=f"delete a {delete_kind}")
-        delete_parser.add_argument("--in", dest="input_location", choices=("source", "state"), default="source")
-        delete_parser.add_argument("--environment")
+        delete_parser.add_argument("--environment", required=True)
         delete_parser.add_argument("--name", required=True)
-        delete_parser.add_argument("--uid")
+        delete_parser.add_argument("--uid", required=True, help="expected desired resource UID fence")
         delete_parser.add_argument("--desired-ref")
         delete_parser.add_argument("--candidate-ref")
         delete_parser.add_argument("--dry", action="store_true")
@@ -10793,84 +8855,14 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--message", required=True)
     publish.set_defaults(handler=command_publish_tree)
 
-    advance = commands.add_parser(
-        "advance-desired",
-        help="advance desired state with ready units",
-    )
-    advance.add_argument("--environment", required=True)
-    advance.add_argument("--source-revision")
-    advance.add_argument("--desired-ref", help="override the environment's desired ref")
-    advance.add_argument("--observed-ref", help="override the environment's observed ref")
-    advance.add_argument("--require-source-ref")
-    advance.add_argument("--dry", action="store_true")
-    advance.set_defaults(handler=command_advance_desired)
-
-    instantiate_stack = commands.add_parser(
-        "instantiate-stack",
-        help="instantiate a directly managed Stack from a trusted StackTemplate revision",
-    )
-    instantiate_stack.add_argument("--environment", required=True)
-    instantiate_stack.add_argument("--stack", required=True)
-    instantiate_stack.add_argument("--template", required=True)
-    instantiate_stack.add_argument(
-        "--units",
-        help="comma-separated Unit template names to instantiate; defaults to all Units",
-    )
-    instantiate_stack.add_argument("--source-revision", required=True, help="trusted full Git revision or ref")
-    instantiate_stack.add_argument("--parameters", required=True, help="concrete Stack parameters as a JSON object")
-    instantiate_stack.add_argument(
-        "--request-id",
-        required=True,
-        help="opaque idempotency key; reuse for the same mutation and change for a new mutation",
-    )
-    instantiate_stack.add_argument("--desired-ref", help="override the environment's desired ref")
-    instantiate_stack.add_argument("--observed-ref", help="override the environment's observed ref")
-    instantiate_stack.add_argument(
-        "--candidate-ref",
-        help="exact candidate ref override when the environment uses a pull-request change gate",
-    )
-    instantiate_stack.add_argument("--dry", action="store_true")
-    instantiate_stack.set_defaults(handler=command_instantiate_stack)
-
-    update_direct_stack = commands.add_parser(
-        "update-direct-stack",
-        help="update an existing directly managed Stack from a trusted StackTemplate revision",
-    )
-    update_direct_stack.add_argument("--environment", required=True)
-    update_direct_stack.add_argument("--stack", required=True)
-    update_direct_stack.add_argument("--uid", required=True, help="exact current direct Stack UID fence")
-    update_direct_stack.add_argument(
-        "--desired-revision",
-        required=True,
-        help="exact current desired-state head used to fence this update",
-    )
-    update_direct_stack.add_argument("--template", required=True)
-    update_direct_stack.add_argument(
-        "--units",
-        help="comma-separated Unit template names to instantiate; defaults to the current selection",
-    )
-    update_direct_stack.add_argument("--source-revision", required=True, help="trusted full Git revision or ref")
-    update_direct_stack.add_argument("--parameters", required=True, help="concrete Stack parameters as a JSON object")
-    update_direct_stack.add_argument(
-        "--request-id",
-        required=True,
-        help="opaque idempotency key; reuse for the same mutation and change for a new mutation",
-    )
-    update_direct_stack.add_argument("--desired-ref", help="override the environment's desired ref")
-    update_direct_stack.add_argument("--observed-ref", help="override the environment's observed ref")
-    update_direct_stack.add_argument(
-        "--candidate-ref",
-        help="exact candidate ref override when the environment uses a pull-request change gate",
-    )
-    update_direct_stack.add_argument("--dry", action="store_true")
-    update_direct_stack.set_defaults(handler=command_update_direct_stack)
-
     promote = commands.add_parser(
         "promote",
         help="promote reviewed desired state",
     )
     promote.add_argument("--from-environment", required=True)
     promote.add_argument("--to-environment", required=True)
+    promote.add_argument("-f", "--file", dest="files", action="append", required=True)
+    promote.add_argument("--partition")
     promote.add_argument(
         "--source-desired-revision",
         help="exact source desired commit; defaults to the source desired ref head",
@@ -11006,19 +8998,6 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--desired-revision")
     resolve.set_defaults(handler=command_resolve_desired)
 
-    audit_compatibility = commands.add_parser(
-        "audit-desired-compatibility",
-        help="audit one or all desired refs before retiring legacy compatibility",
-    )
-    audit_compatibility.add_argument("--environment")
-    audit_compatibility.add_argument("--desired-ref")
-    audit_compatibility.add_argument(
-        "--all",
-        action="store_true",
-        help="audit every environment configured by Project.environmentsPath",
-    )
-    audit_compatibility.set_defaults(handler=command_audit_desired_compatibility)
-
     status = commands.add_parser(
         "status",
         help="show deployment status",
@@ -11034,42 +9013,30 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--verbose", action="store_true")
     status.set_defaults(handler=command_status)
 
-    list_command = commands.add_parser("list", help="list environments or units")
-    list_commands = list_command.add_subparsers(dest="list_command", required=True)
-    list_environments = list_commands.add_parser("environments", help="list environments and their deployment summary")
-    list_environments.add_argument("--json", action="store_true", help="emit one machine-readable document")
-    list_environments.set_defaults(handler=command_list_environments)
-    list_units = list_commands.add_parser("units", help="list units and their reconciliation status")
-    list_units.add_argument("--environment", required=True)
-    list_units.add_argument("--json", action="store_true", help="emit one machine-readable document")
-    list_units.set_defaults(handler=command_list_units)
-
-    show = commands.add_parser("show", help="show desired state or a receipt")
-    show_commands = show.add_subparsers(dest="show_command", required=True)
-    desired = show_commands.add_parser("desired", aliases=("desired-unit",), help="show one desired unit")
-    desired.add_argument("--environment", required=True)
-    desired.add_argument("unit")
-    desired.add_argument("--desired-ref", help="override the environment's desired ref")
-    desired.add_argument("--desired-revision", help="exact desired commit; defaults to the current desired ref head")
-    desired_format = desired.add_mutually_exclusive_group()
-    desired_format.add_argument("--json", action="store_true", help="force JSON instead of the project format")
-    desired_format.add_argument("--yaml", action="store_true", help="force YAML instead of the project format")
-    desired.set_defaults(handler=command_show_desired)
-    receipt = show_commands.add_parser("receipt", help="show one observation receipt and its artifacts")
-    receipt.add_argument("--environment", required=True)
-    receipt.add_argument("unit")
-    receipt.add_argument("--observed-ref", help="override the environment's observed ref")
-    receipt_format = receipt.add_mutually_exclusive_group()
-    receipt_format.add_argument("--json", action="store_true", help="force JSON instead of the project format")
-    receipt_format.add_argument("--yaml", action="store_true", help="force YAML instead of the project format")
-    receipt_artifacts = receipt.add_mutually_exclusive_group()
-    receipt_artifacts.add_argument("--artifact", help="show one named artifact instead of the receipt")
-    receipt_artifacts.add_argument(
+    get = commands.add_parser("get", help="inspect persisted resources")
+    get.add_argument("selector", choices=inspectable_selectors(), help="singular or plural resource selector")
+    get.add_argument("name", nargs="?", help="exact resource name; omit to list the selected family")
+    get_scope = get.add_mutually_exclusive_group()
+    get_scope.add_argument("--environment", help="environment namespace to inspect")
+    get_scope.add_argument(
+        "-A",
+        "--all-environments",
+        action="store_true",
+        help="inspect every authored environment",
+    )
+    get.add_argument("--desired-ref", help="override the environment's desired ref")
+    get.add_argument("--desired-revision", help="exact desired commit; defaults to the desired ref head")
+    get.add_argument("--observed-ref", help="override the environment's observed ref")
+    get.add_argument("--observed-revision", help="exact observed commit; defaults to the observed ref head")
+    get.add_argument("-o", "--output", choices=("table", "yaml", "json"), default="table")
+    get_artifacts = get.add_mutually_exclusive_group()
+    get_artifacts.add_argument("--artifact", help="show one validated Artifact described by the Receipt")
+    get_artifacts.add_argument(
         "--artifacts",
         action="store_true",
-        help="show all artifacts as an object keyed by artifact name",
+        help="show all validated Artifacts described by the Receipt",
     )
-    receipt.set_defaults(handler=command_show_receipt)
+    get.set_defaults(handler=command_get)
 
     verify = commands.add_parser(
         "verify",
@@ -11103,13 +9070,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--report",
         help="directory where the selected driver may write its report artifacts",
     )
-    reconcile.add_argument(
-        "--source-revision",
-        help="source commit used for plan resolution or post-reconcile advancement",
-    )
     reconcile.add_argument("--environment", required=True)
-    reconcile.add_argument("--advance", action="store_true")
-    reconcile.add_argument("--require-source-ref")
     reconcile.add_argument(
         "--reapply",
         action="store_true",
@@ -11158,14 +9119,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     converge.add_argument("--environment", required=True)
     converge.add_argument("--source-revision")
-    converge.add_argument(
+    converge_selection = converge.add_mutually_exclusive_group()
+    converge_selection.add_argument(
         "--unit",
         action="append",
         help="target unit to converge; repeat for multiple targets (defaults to all units)",
     )
+    converge_selection.add_argument(
+        "--partition",
+        help="select every Unit in the partition, including owned descendants",
+    )
+    converge.add_argument("-f", "--file", dest="files", action="append", default=[])
     converge.add_argument("--desired-ref", help="override the environment's desired ref")
     converge.add_argument("--observed-ref", help="override the environment's observed ref")
-    converge.add_argument("--require-source-ref")
+    converge.add_argument("--candidate-ref")
     converge.add_argument(
         "--max-steps",
         type=int,
@@ -11204,18 +9171,7 @@ def main() -> int:
             f"{style_unit(exc.unit_name)}: desired source {describe_revision(exc.revision)} "
             "is unavailable under project policy",
         )
-        if exc.operation == "plan":
-            print(
-                "      Run advance-desired from a durable source revision before planning.",
-                file=sys.stderr,
-                flush=True,
-            )
-        else:
-            print(
-                "      Run advance-desired from a durable source revision before retrying.",
-                file=sys.stderr,
-                flush=True,
-            )
+        print("      Re-run apply with an available source revision.", file=sys.stderr, flush=True)
         return 1
     except (DriverError, OperationError, subprocess.CalledProcessError) as exc:
         if isinstance(exc, subprocess.CalledProcessError):

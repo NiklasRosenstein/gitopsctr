@@ -98,9 +98,9 @@ They also store the expanded projection, so reconciliation does not rebuild a St
 
 ## Promotion and template selection
 
-Environment promotion and Stack template selection are separate decisions. A target Environment becomes
-promotion-tracked through `Environment.spec.promotion.allowedSources`; `gitopsctr promote` then pins the source
-desired revision, source observed revision, and target specification revision in a
+Environment promotion and Stack template selection are separate decisions. A target Environment permits sources
+through `Environment.spec.promotion.allowedSources`; promotion then pins the source desired revision, source observed
+revision, and target specification revision in a
 [`Promotion`](promotion.md) resource.
 
 The target Stack chooses its template source explicitly:
@@ -184,13 +184,26 @@ Stack may participate in the same promotion transaction without consuming any so
 
 ## Desired-state records
 
-Desired StackTemplate and Stack documents are controller-owned projections. Their metadata records lifecycle
-authority and stable identity. A desired Stack additionally records its requested and resolved template source,
+Desired StackTemplate and Stack documents are controller-owned projections. Their metadata records stable identity;
+a root may also carry `gitopsctr.io/partition` when it belongs to an authoritative apply set. A desired Stack
+additionally records its requested and resolved template source,
 expanded Unit projection, and resolved promoted-artifact lineage. Generated Units carry a UID-fenced owner reference
 to the Stack so updates and child-first deletion cannot cross Stack incarnations.
 
 `resolvedProjection` is the immutable expanded record used for reconciliation, dependency and graph validation, and
 teardown. Template selection never reconstructs a parameterized StackTemplate from another Stack's projection.
+
+Inspect these desired representations independently of their authored source forms:
+
+```console
+gitopsctr get stacks --environment staging
+gitopsctr get stack application --environment staging -o yaml
+gitopsctr get stacktemplates --environment staging
+gitopsctr get stacktemplate application --environment staging -o yaml
+```
+
+Use `-A/--all-environments` instead of `--environment` to inspect the desired representations across every
+Environment. Raw YAML or JSON is the exact persisted desired document; the default table is an inspection view.
 
 Do not author or edit desired Stack resources manually. The complete structural contracts are the StackTemplate
 [authored](../schemas/apis/gitopsctr.io/v1/StackTemplate/authored.schema.json) and

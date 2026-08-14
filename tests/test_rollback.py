@@ -21,26 +21,32 @@ def _specification(name: str, producer: str | None = None) -> dict:
             "fromReceipt": {"unit": producer, "pointer": "/outputs/value"},
         }
     return {
-        "schema": 1,
-        "name": name,
-        "driver": "terraform",
-        "source": {"path": "infra/deploy"},
-        **({"inputs": inputs} if inputs else {}),
+        "apiVersion": "unit.gitopsctr.io/v1",
+        "kind": "Terraform",
+        "metadata": {"name": name},
+        "spec": {
+            "source": {"path": "infra/deploy"},
+            **({"inputs": inputs} if inputs else {}),
+        },
     }
 
 
 def _desired_unit(name: str, revision: str, value: str) -> dict:
     return {
-        "schema": 1,
-        "name": name,
-        "driver": "terraform",
-        "source": {
-            "path": "infra/deploy",
-            "revision": revision,
-            "inputHash": f"sha256:{value}",
-            "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"],
+        "apiVersion": "unit.gitopsctr.io/v1",
+        "kind": "Terraform",
+        "metadata": deploy_release.ResourceMetadata.root_from_provenance(
+            name, f"rollback-test:{value}:{name}", partition="application"
+        ).document(profile="desired"),
+        "spec": {
+            "source": {
+                "path": "infra/deploy",
+                "revision": revision,
+                "inputHash": f"sha256:{value}",
+                "driverVersion": deploy_release.DRIVER_VERSIONS["terraform"],
+            },
+            "terraform": {"backend": {}, "variables": {"value": value}, "observeOutputs": []},
         },
-        "terraform": {"variables": {"value": value}},
     }
 
 
@@ -51,38 +57,44 @@ def _materialized_specification(name: str, producer: str | None = None) -> dict:
             "fromReceipt": {"unit": producer, "pointer": "/outputs/value"},
         }
     return {
-        "schema": 1,
-        "name": name,
-        "driver": "kubernetes-manifests",
-        "source": {"path": "manifests"},
-        "materialize": {
-            "type": "helm",
-            "releaseName": name,
-            "namespace": "default",
-            "values": values,
+        "apiVersion": "unit.gitopsctr.io/v1",
+        "kind": "KubernetesManifests",
+        "metadata": {"name": name},
+        "spec": {
+            "source": {"path": "manifests"},
+            "materialize": {
+                "type": "helm",
+                "releaseName": name,
+                "namespace": "default",
+                "values": values,
+            },
+            "delivery": {"mode": "direct", "kubeContext": "test"},
         },
-        "delivery": {"mode": "direct", "kubeContext": "test"},
     }
 
 
 def _materialized_desired_unit(name: str, revision: str, value: str) -> dict:
     return {
-        "schema": 1,
-        "name": name,
-        "driver": "kubernetes-manifests",
-        "source": {
-            "path": "manifests",
-            "revision": revision,
-            "inputHash": f"sha256:{value}",
-            "driverVersion": deploy_release.DRIVER_VERSIONS["kubernetes-manifests"],
+        "apiVersion": "unit.gitopsctr.io/v1",
+        "kind": "KubernetesManifests",
+        "metadata": deploy_release.ResourceMetadata.root_from_provenance(
+            name, f"rollback-test:{value}:{name}", partition="application"
+        ).document(profile="desired"),
+        "spec": {
+            "source": {
+                "path": "manifests",
+                "revision": revision,
+                "inputHash": f"sha256:{value}",
+                "driverVersion": deploy_release.DRIVER_VERSIONS["kubernetes-manifests"],
+            },
+            "materialize": {
+                "type": "helm",
+                "releaseName": name,
+                "namespace": "default",
+                "values": {"value": value},
+            },
+            "delivery": {"mode": "direct", "kubeContext": "test"},
         },
-        "materialize": {
-            "type": "helm",
-            "releaseName": name,
-            "namespace": "default",
-            "values": {"value": value},
-        },
-        "delivery": {"mode": "direct", "kubeContext": "test"},
     }
 
 
@@ -97,34 +109,42 @@ def _receipt(unit_path: Path, unit_name: str, revision: str) -> dict:
 
 def _promotion_document(revision: str) -> dict:
     return {
-        "schema": 1,
-        "source": {
-            "environment": "staging",
-            "desiredRef": "deploy/staging",
-            "desiredRevision": revision,
-            "observedRef": "observed/staging",
-            "observedRevision": revision,
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "Promotion",
+        "metadata": {"name": "staging"},
+        "spec": {
+            "source": {
+                "environment": "staging",
+                "desiredRef": "deploy/staging",
+                "desiredRevision": revision,
+                "observedRef": "observed/staging",
+                "observedRevision": revision,
+            },
+            "specificationRevision": revision,
         },
-        "specificationRevision": revision,
     }
 
 
 def test_downstream_unit_closure_is_transitive_and_excludes_selected_units():
-    documents = {
-        "base": _specification("base"),
-        "application": _specification("application", "base"),
-        "frontend": _specification("frontend", "application"),
-        "unrelated": _specification("unrelated"),
+    units = {
+        name: deploy_release.parse_desired_unit_document(_desired_unit(name, "a" * 40, name), name)
+        for name in ("base", "application", "frontend", "unrelated")
     }
-    specifications = {
-        name: deploy_release.parse_authored_unit_document(document, name) for name, document in documents.items()
-    }
+    inventory = deploy_release.RollbackDesiredInventory(
+        units,
+        {
+            "base": (),
+            "application": ("base",),
+            "frontend": ("application",),
+            "unrelated": (),
+        },
+    )
 
-    assert deploy_release.downstream_unit_closure(specifications, ["base"]) == (
+    assert deploy_release._downstream_desired_unit_closure(inventory, ["base"]) == (
         "application",
         "frontend",
     )
-    assert deploy_release.downstream_unit_closure(specifications, ["application"]) == ("frontend",)
+    assert deploy_release._downstream_desired_unit_closure(inventory, ["application"]) == ("frontend",)
 
 
 def test_clean_rollback_target_requires_one_matching_observed_snapshot(tmp_path, monkeypatch):
@@ -204,26 +224,16 @@ def test_rollback_parser_supports_full_or_repeated_unit_scope():
     assert args.dry is True
 
 
-def test_mixed_rollback_requires_a_fully_materialized_current_tree(tmp_path):
-    source = tmp_path / "source"
+def test_targeted_rollback_rejects_missing_persisted_dependency(tmp_path):
     desired = tmp_path / "desired"
-    _write_json(
-        source / "deployment/environments/dev/environment.json",
-        {"schema": 1, "name": "dev"},
-    )
-    _write_json(source / "deployment/environments/dev/units/base.json", _specification("base"))
-    _write_json(
-        source / "deployment/environments/dev/units/consumer.json",
-        _specification("consumer", "base"),
-    )
-    _write_json(desired / "units/base.json", _desired_unit("base", "a" * 40, "current"))
+    consumer = _desired_unit("consumer", "a" * 40, "current")
+    consumer["spec"]["resolvedInputs"] = {"receipts": {"base": "receipt-blob"}}
+    _write_json(desired / "units/consumer.json", consumer)
 
-    with pytest.raises(deploy_release.OperationError, match="current desired state.*not fully"):
-        deploy_release.validate_materialized_desired(
-            "dev",
+    with pytest.raises(deploy_release.OperationError, match="depends on missing Unit.*base"):
+        deploy_release.validate_rollback_desired_inventory(
             "b" * 40,
             desired,
-            source,
             "current desired state",
         )
 
@@ -273,13 +283,15 @@ def _install_rollback_simulation(
                 if materialized_payloads
                 else _desired_unit(name, revision, value)
             )
+            if name == "consumer":
+                unit["spec"]["resolvedInputs"] = {"receipts": {"base": f"receipt:{value}"}}
             if materialized_payloads:
                 payload = output / f"materialized/{name}"
                 payload.mkdir(parents=True, exist_ok=True)
                 (payload / "rendered.yaml").write_text(f"unit: {name}\nvalue: {value}\n")
                 if value == "current":
                     (payload / "stale.yaml").write_text("stale: true\n")
-                unit["materialization"] = {
+                unit["spec"]["materialization"] = {
                     "path": f"materialized/{name}",
                     "digest": deploy_release.materialization_tree_digest(payload),
                     "mediaType": "application/yaml",
@@ -294,8 +306,8 @@ def _install_rollback_simulation(
                 historical = deploy_release.parse_desired_unit_document(unit, name)
                 unit = deploy_release.serialize_unit_document(
                     historical.with_metadata(
-                        deploy_release.ResourceMetadata.source_tracked_from_provenance(
-                            name, f"rollback-test:{value}:{name}"
+                        deploy_release.ResourceMetadata.root_from_provenance(
+                            name, f"rollback-test:{value}:{name}", partition="application"
                         )
                     )
                 )
@@ -317,8 +329,8 @@ def _install_rollback_simulation(
                     {
                         "schema": 1,
                         "kind": "OpaqueCleanupRoot",
-                        "metadata": deploy_release.ResourceMetadata.source_tracked_from_provenance(
-                            "unrelated", "rollback-target-cleanup"
+                        "metadata": deploy_release.ResourceMetadata.root_from_provenance(
+                            "unrelated", "rollback-target-cleanup", partition="application"
                         ).document(profile="desired"),
                         "payload": {"name": "unrelated", "driver": "terraform"},
                     },
@@ -349,8 +361,8 @@ def _install_rollback_simulation(
                 base_path,
                 deploy_release.serialize_unit_document(
                     base.with_metadata(
-                        deploy_release.ResourceMetadata.source_tracked_from_provenance(
-                            "base", "rollback-current-blocked"
+                        deploy_release.ResourceMetadata.root_from_provenance(
+                            "base", "rollback-current-blocked", partition="application"
                         )
                     )
                 ),
@@ -361,13 +373,14 @@ def _install_rollback_simulation(
             )
         if current_cleanup:
             cleanup_payload = _desired_unit("base", revisions["current_specification"], "current-cleanup")
+            (output / "units/base.json").unlink()
             _write_json(
                 output / ".gitopsctr/cleanup/units/base.json",
                 {
                     "schema": 1,
                     "kind": "OpaqueCleanupRoot",
-                    "metadata": deploy_release.ResourceMetadata.source_tracked_from_provenance(
-                        "base", "rollback-current-cleanup"
+                    "metadata": deploy_release.ResourceMetadata.root_from_provenance(
+                        "base", "rollback-current-cleanup", partition="application"
                     ).document(profile="desired"),
                     "payload": cleanup_payload,
                 },
@@ -466,7 +479,7 @@ def test_rollback_publishes_complete_forward_desired_state(
         document = json.loads(publication["files"][f"units/{unit}.json"])
         assert document["apiVersion"] == "unit.gitopsctr.io/v1"
         assert document["metadata"]["uid"]
-        assert document["metadata"]["lifecycle"] == {"management": {"mode": "sourceTracked"}}
+        assert document["metadata"]["labels"] == {"gitopsctr.io/partition": "application"}
         assert "driver" not in document
         assert document["spec"]["terraform"]["variables"]["value"] == value
     message = publication["message"]
@@ -536,11 +549,11 @@ def test_rollback_preserves_current_canonical_identity_over_historical_identity(
     capsys.readouterr()
     for name in ("base", "consumer", "unrelated"):
         document = json.loads(publications[0]["files"][f"units/{name}.json"])
-        current_uid = deploy_release.ResourceMetadata.source_tracked_from_provenance(
-            name, f"rollback-test:current:{name}"
+        current_uid = deploy_release.ResourceMetadata.root_from_provenance(
+            name, f"rollback-test:current:{name}", partition="application"
         ).uid
-        historical_uid = deploy_release.ResourceMetadata.source_tracked_from_provenance(
-            name, f"rollback-test:rollback:{name}"
+        historical_uid = deploy_release.ResourceMetadata.root_from_provenance(
+            name, f"rollback-test:rollback:{name}", partition="application"
         ).uid
         assert document["metadata"]["uid"] == current_uid
         assert document["metadata"]["uid"] != historical_uid
@@ -575,9 +588,7 @@ def test_rollback_restores_historical_payload_with_new_uid_after_finalization(tm
 
     restored = deploy_release.load_desired_unit(historical_path, "application")
     assert restored.metadata.uid != finalized.uid
-    assert restored.metadata.lifecycle is not None
-    assert restored.metadata.lifecycle.management is not None
-    assert restored.metadata.lifecycle.management.mode == "sourceTracked"
+    assert restored.metadata.partition == "application"
     assert (
         deploy_release.load_resource_incarnation_tombstones(candidate)[("unit.gitopsctr.io/v1", "Test", "application")]
         == finalized
@@ -604,7 +615,7 @@ def test_full_rollback_preserves_current_opaque_cleanup_root(monkeypatch, capsys
     files = publications[0]["files"]
     assert "units/base.json" not in files
     cleanup = json.loads(files[".gitopsctr/cleanup/units/base.json"])
-    assert cleanup["payload"]["source"]["revision"] == revisions["current_specification"]
+    assert cleanup["payload"]["spec"]["source"]["revision"] == revisions["current_specification"]
     assert json.loads(files[".gitopsctr/transition-blocks.json"])["blocks"]["base"] == (
         "current opaque cleanup root retained"
     )
@@ -636,7 +647,9 @@ def test_full_rollback_preserves_current_parseable_blocked_unit_and_materializat
     base = json.loads(files["units/base.json"])
     assert (
         base["metadata"]["uid"]
-        == deploy_release.ResourceMetadata.source_tracked_from_provenance("base", "rollback-current-blocked").uid
+        == deploy_release.ResourceMetadata.root_from_provenance(
+            "base", "rollback-current-blocked", partition="application"
+        ).uid
     )
     assert base["spec"]["materialization"]["path"] == "materialized/base"
     assert files["materialized/base/rendered.yaml"] == b"unit: base\nvalue: current\n"
@@ -673,7 +686,7 @@ def test_rollback_keeps_the_promotion_that_drives_its_resulting_tree(units, expe
     args.handler(args)
 
     promotion = json.loads(publications[0]["files"]["promotion.json"])
-    assert promotion["specificationRevision"] == revisions[expected_promotion]
+    assert promotion["spec"]["specificationRevision"] == revisions[expected_promotion]
 
 
 def test_pull_request_gate_routes_rollback_through_candidate_submission(tmp_path, monkeypatch):
@@ -684,7 +697,7 @@ def test_pull_request_gate_routes_rollback_through_candidate_submission(tmp_path
     _write_json(
         candidate / "units/base.json",
         deploy_release.serialize_unit_document(
-            candidate_unit.with_metadata(deploy_release.ResourceMetadata.new_source_tracked("base"))
+            candidate_unit.with_metadata(deploy_release.ResourceMetadata.new_root("base", partition="application"))
         ),
     )
     captured = []
@@ -819,53 +832,6 @@ def test_rollback_rechecks_target_ancestry_against_captured_current_head(monkeyp
     )
 
     with pytest.raises(deploy_release.OperationError, match="not ancestral"):
-        args.handler(args)
-
-
-def test_full_rollback_rejects_environment_revision_mode_change(monkeypatch):
-    revisions, _publications = _install_rollback_simulation(
-        monkeypatch,
-        current_promoted=True,
-        target_promoted=False,
-    )
-    args = deploy_release.build_parser().parse_args(
-        [
-            "rollback",
-            "--environment",
-            "dev",
-            "--to-desired-revision",
-            revisions["target"],
-            "--reason",
-            "Known-bad release",
-        ]
-    )
-
-    with pytest.raises(deploy_release.OperationError, match="revision mode"):
-        args.handler(args)
-
-
-def test_full_rollback_rejects_historical_deployment_ref_change(monkeypatch):
-    revisions, _publications = _install_rollback_simulation(monkeypatch)
-
-    def refs(source_root, *_args, **_kwargs):
-        if Path(source_root).name == "target-source":
-            return "deploy/legacy", "observed/legacy"
-        return "deploy/dev", "observed/dev"
-
-    monkeypatch.setattr(deploy_release, "deployment_refs", refs)
-    args = deploy_release.build_parser().parse_args(
-        [
-            "rollback",
-            "--environment",
-            "dev",
-            "--to-desired-revision",
-            revisions["target"],
-            "--reason",
-            "Known-bad release",
-        ]
-    )
-
-    with pytest.raises(deploy_release.OperationError, match="deployment refs"):
         args.handler(args)
 
 

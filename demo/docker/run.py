@@ -1,4 +1,4 @@
-"""Run the source-tracked Stack demo with Docker and Terraform."""
+"""Run the partitioned Stack demo with Docker and Terraform."""
 
 from __future__ import annotations
 
@@ -128,6 +128,10 @@ def converge(registry_port: int, app_port: int, *, expect_clean: bool = False) -
         "converge",
         "--environment",
         "dev",
+        "--partition",
+        "application",
+        "--file",
+        "deployment/environments/dev/stacks",
         "--source-revision",
         "HEAD",
         "--yes",
@@ -194,13 +198,23 @@ def _owned_units(desired: Path, stack_uid: str) -> list[tuple[str, str, int]]:
     return sorted(records, key=lambda item: (not item[0].endswith("--deploy"), item[0]))
 
 
-def remove_and_finalize_source_stack() -> None:
+def remove_and_finalize_partitioned_stack() -> None:
     stack_path = WORKTREE / "deployment/environments/dev/stacks/application.yaml"
     stack_path.unlink()
     run("git", "add", str(stack_path.relative_to(WORKTREE)), cwd=WORKTREE)
     run("git", "commit", "-m", "Remove Docker application Stack", cwd=WORKTREE)
     run("git", "push", "origin", "main", cwd=WORKTREE)
-    _run_controller("advance-desired", "--environment", "dev", "--source-revision", "HEAD")
+    _run_controller(
+        "apply",
+        "--environment",
+        "dev",
+        "--partition",
+        "application",
+        "--file",
+        "deployment/environments/dev/stacks",
+        "--source-revision",
+        "HEAD",
+    )
 
     desired = _desired_tree("deleting")
     stack_metadata = _desired_metadata(desired, "stacks", STACK_NAME)
@@ -256,8 +270,8 @@ def acceptance(registry_port: int, app_port: int) -> None:
         converge(registry_port, app_port, expect_clean=True)
         if deployment_heads() != first_heads:
             raise RuntimeError("clean Docker convergence moved desired or observed refs")
-        remove_and_finalize_source_stack()
-        print("Acceptance passed: source-tracked Docker Stack converged cleanly and finalized child-first.")
+        remove_and_finalize_partitioned_stack()
+        print("Acceptance passed: partitioned Docker Stack converged cleanly and finalized child-first.")
     finally:
         clean(registry)
 

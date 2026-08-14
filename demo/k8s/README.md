@@ -1,11 +1,11 @@
 # Kubernetes Stack demo
 
-This demo uses one `StackTemplate` to contrast two lifecycle models:
+This demo uses one `StackTemplate` in two explicit-input workflows:
 
-- Normal mode projects a source-tracked Stack in `dev`, then promotes its exact image artifact into a source-tracked
-  `staging` Stack.
-- `--preview` directly instantiates the same template in the `preview` environment. Acceptance also updates the pinned
-  template revision and requests UID-fenced deletion.
+- Normal mode applies the `dev` Stack as the authoritative `application` partition, then promotes its exact image
+  artifact into the explicitly selected `staging` Stack.
+- `--preview` applies an unpartitioned Stack in the `preview` environment. Acceptance also reapplies it at a newer
+  source revision and requests UID-fenced deletion.
 
 Normal mode combines three pinned inputs rather than copying dev's entire desired tree:
 
@@ -38,7 +38,7 @@ mise run demo-k8s clean
 GITOPSCTR_K8S_PROVIDER=minikube mise run demo-k8s run
 ```
 
-Run the direct preview lifecycle with:
+Run the unpartitioned preview workflow with:
 
 ```console
 mise run demo-k8s run --preview

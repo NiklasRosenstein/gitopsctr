@@ -33,7 +33,6 @@ ARGO_NAMESPACE = "argocd"
 ARGO_GIT_SERVICE = "gitopsctr-demo-git"
 ARGOCD_VERSION = "v3.4.2"
 GIT_DAEMON_IMAGE = "alpine:3.20.3"
-STACK_TEMPLATE = "application"
 SOURCE_STACK = "application"
 PREVIEW_STACK = "preview"
 EXPECTED_RESPONSE = "Hello from a gitopsctr-managed Kubernetes container!"
@@ -45,7 +44,7 @@ WORKLOADS = {
 MESSAGES = {
     "dev": "rendered and reconciled in dev",
     "staging": "promoted from dev to staging",
-    "preview": "directly instantiated preview",
+    "preview": "unpartitioned preview",
 }
 
 
@@ -292,10 +291,16 @@ def converge(
     source_revision: str | None = None,
     expect_clean: bool = False,
     allow_stall: bool = False,
+    files: tuple[str, ...] = (),
+    partition: str | None = None,
 ) -> None:
     arguments = ["converge", "--environment", environment, "--yes"]
     if source_revision is not None:
         arguments.extend(("--source-revision", source_revision))
+    if partition is not None:
+        arguments.extend(("--partition", partition))
+    for path in files:
+        arguments.extend(("--file", path))
     for attempt in range(4):
         result = run_controller(
             provider,
@@ -561,6 +566,8 @@ def run_promotion_story(
         delivery,
         remote=remote,
         source_revision="HEAD",
+        files=("deployment/environments/dev/stacks/application.yaml",),
+        partition="application",
         expect_clean=expect_clean,
     )
     dev_image = verify_workload(provider, "dev", delivery, remote=remote)
@@ -572,6 +579,10 @@ def run_promotion_story(
             "dev",
             "--to-environment",
             "staging",
+            "--file",
+            "deployment/environments/staging/stacks/application.yaml",
+            "--partition",
+            "application",
             delivery=delivery,
             remote=remote,
         )
@@ -585,30 +596,6 @@ def run_promotion_story(
     )
 
 
-def initialize_preview_desired(worktree: Path, revision: str) -> None:
-    store = GitStateStore(worktree)
-    if store.fetch("gitopsctr/desired/preview").revision is not None:
-        return
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        initial = Path(temporary_directory) / "desired"
-        controller_module.project_stack_resources(worktree, "preview", revision, initial, worktree)
-        store.publish("gitopsctr/desired/preview", initial, None, "Initialize preview StackTemplate state")
-
-
-def preview_parameters(provider: Provider, delivery: Delivery) -> str:
-    return json.dumps(
-        {
-            "workload-name": WORKLOADS["preview"],
-            "workload-resource": f"deployment/{WORKLOADS['preview']}",
-            "message": MESSAGES["preview"],
-            "cluster-name": cluster_name(delivery),
-            "kube-context": kube_context(provider, delivery),
-            "argocd-application": WORKLOADS["preview"],
-        },
-        separators=(",", ":"),
-    )
-
-
 def desired_stack(worktree: Path) -> tuple[str, str, str]:
     store = GitStateStore(worktree)
     revision = store.fetch("gitopsctr/desired/preview").revision
@@ -619,98 +606,17 @@ def desired_stack(worktree: Path) -> tuple[str, str, str]:
         store.materialize(revision, root)
         paths = controller_module.document_candidates(root / "stacks", PREVIEW_STACK)
         if len(paths) != 1:
-            raise RuntimeError("direct preview Stack is missing")
+            raise RuntimeError("unpartitioned preview Stack is missing")
         stack = controller_module.RESOURCE_CATALOG.parse_stack(
             controller_module.RESOURCE_CATALOG.load_document(paths[0]),
             profile="desired",
             expected_name=PREVIEW_STACK,
         )
-        lifecycle = stack.metadata.lifecycle
-        if (
-            stack.metadata.uid is None
-            or lifecycle is None
-            or lifecycle.management is None
-            or lifecycle.management.mode != "direct"
-        ):
-            raise RuntimeError("preview Stack is not a directly managed root")
-        if not isinstance(stack.spec, controller_module.DesiredStackSpec) or stack.spec.provenance is None:
-            raise RuntimeError("preview Stack has no direct instantiation provenance")
-        return revision, stack.metadata.uid, stack.spec.provenance.templateRevision
-
-
-def instantiate_preview(
-    provider: Provider,
-    delivery: Delivery,
-    revision: str,
-    *,
-    remote: str | None = None,
-) -> bool:
-    worktree = repository(provider, delivery, preview=True, remote=remote).worktree
-    initialize_preview_desired(worktree, revision)
-    try:
-        desired_revision, uid, template_revision = desired_stack(worktree)
-    except RuntimeError:
-        run_controller(
-            provider,
-            "instantiate-stack",
-            "--environment",
-            "preview",
-            "--stack",
-            PREVIEW_STACK,
-            "--template",
-            STACK_TEMPLATE,
-            "--source-revision",
-            revision,
-            "--parameters",
-            preview_parameters(provider, delivery),
-            "--request-id",
-            f"demo:k8s-preview:instantiate:{revision}",
-            delivery=delivery,
-            preview=True,
-            remote=remote,
-        )
-        return True
-    if template_revision == revision:
-        return False
-    update_preview(provider, delivery, revision, desired_revision, uid, remote=remote)
-    return True
-
-
-def update_preview(
-    provider: Provider,
-    delivery: Delivery,
-    revision: str,
-    desired_revision: str | None = None,
-    uid: str | None = None,
-    *,
-    remote: str | None = None,
-) -> None:
-    worktree = repository(provider, delivery, preview=True, remote=remote).worktree
-    if desired_revision is None or uid is None:
-        desired_revision, uid, _template_revision = desired_stack(worktree)
-    run_controller(
-        provider,
-        "update-direct-stack",
-        "--environment",
-        "preview",
-        "--stack",
-        PREVIEW_STACK,
-        "--uid",
-        uid,
-        "--desired-revision",
-        desired_revision,
-        "--template",
-        STACK_TEMPLATE,
-        "--source-revision",
-        revision,
-        "--parameters",
-        preview_parameters(provider, delivery),
-        "--request-id",
-        f"demo:k8s-preview:update:{revision}:{desired_revision[:12]}",
-        delivery=delivery,
-        preview=True,
-        remote=remote,
-    )
+        if stack.metadata.uid is None or stack.metadata.partition is not None:
+            raise RuntimeError("preview Stack is not an unpartitioned root")
+        if not isinstance(stack.spec, controller_module.DesiredStackSpec) or stack.spec.resolvedSource is None:
+            raise RuntimeError("preview Stack has no resolved template source")
+        return revision, stack.metadata.uid, stack.spec.resolvedSource.fromGit.commit
 
 
 def run_preview_story(
@@ -722,19 +628,6 @@ def run_preview_story(
 ) -> tuple[RefHeads, str]:
     worktree = repository(provider, delivery, preview=True, remote=remote).worktree
     revision = source_revision(worktree)
-    if not expect_clean:
-        changed = instantiate_preview(provider, delivery, revision, remote=remote)
-        if changed:
-            converge(
-                provider,
-                "preview",
-                delivery,
-                preview=True,
-                remote=remote,
-                source_revision=revision,
-                allow_stall=True,
-            )
-            update_preview(provider, delivery, revision, remote=remote)
     converge(
         provider,
         "preview",
@@ -742,13 +635,14 @@ def run_preview_story(
         preview=True,
         remote=remote,
         source_revision=revision,
+        files=("deployment/environments/preview/stacks/preview.yaml",),
         expect_clean=expect_clean,
     )
     image = verify_workload(provider, "preview", delivery, preview=True, remote=remote)
     return deployment_heads(provider, "preview", delivery, preview=True, remote=remote), image
 
 
-def advance_preview_source(worktree: Path) -> str:
+def publish_preview_source(worktree: Path) -> str:
     path = worktree / "app.py"
     content = path.read_text()
     marker = "# acceptance revision R2\n"
@@ -773,7 +667,6 @@ def request_preview_deletion(
         provider,
         "delete",
         "stack",
-        "--in=state",
         "--environment",
         "preview",
         "--name",
@@ -802,10 +695,9 @@ def execute_story(
         if acceptance:
             clean_heads, _image = run_preview_story(provider, delivery, remote=remote, expect_clean=True)
             if clean_heads != first_heads:
-                raise RuntimeError("clean direct-preview convergence moved desired or observed refs")
+                raise RuntimeError("clean preview convergence moved desired or observed refs")
             worktree = repository(provider, delivery, preview=True, remote=remote).worktree
-            revision = advance_preview_source(worktree)
-            update_preview(provider, delivery, revision, remote=remote)
+            revision = publish_preview_source(worktree)
             converge(
                 provider,
                 "preview",
@@ -813,9 +705,9 @@ def execute_story(
                 preview=True,
                 remote=remote,
                 source_revision=revision,
+                files=("deployment/environments/preview/stacks/preview.yaml",),
                 allow_stall=True,
             )
-            update_preview(provider, delivery, revision, remote=remote)
             converge(
                 provider,
                 "preview",
@@ -823,12 +715,13 @@ def execute_story(
                 preview=True,
                 remote=remote,
                 source_revision=revision,
+                files=("deployment/environments/preview/stacks/preview.yaml",),
             )
             second_image = verify_workload(provider, "preview", delivery, preview=True, remote=remote)
             if second_image == first_image:
-                raise RuntimeError("direct preview update did not publish a new image")
+                raise RuntimeError("preview application did not publish a new image")
             request_preview_deletion(provider, delivery, remote=remote)
-            print("Acceptance passed: direct preview instantiated, converged, updated, and entered deletion.")
+            print("Acceptance passed: unpartitioned preview applied, converged, updated, and entered deletion.")
         return
 
     first_heads = run_promotion_story(provider, delivery, remote=remote)
@@ -855,7 +748,7 @@ def run_demo(provider: Provider, delivery: Delivery, *, preview: bool, acceptanc
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("operation", choices=("run", "clean", "acceptance"), nargs="?", default="run")
-    parser.add_argument("--preview", action="store_true", help="use a directly managed preview Stack")
+    parser.add_argument("--preview", action="store_true", help="apply an unpartitioned preview Stack")
     parser.add_argument("--delivery", choices=("direct", "argocd"), default="direct")
     args = parser.parse_args()
     try:

@@ -27,13 +27,10 @@ def _terraform_unit(
     metadata = controller.ResourceMetadata(
         name=name,
         uid=uid,
-        lifecycle=(
-            None
-            if owner is not None
-            else controller.DesiredLifecycle(management=controller.LifecycleManagement(mode="sourceTracked"))
-        ),
         ownerReferences=[owner] if owner is not None else None,
     )
+    if owner is None:
+        metadata = metadata.with_partition("application")
     return {
         "apiVersion": "unit.gitopsctr.io/v1",
         "kind": "Terraform",
@@ -166,38 +163,6 @@ def _mark(document: dict[str, object], name: str = "application") -> dict[str, o
     return result
 
 
-def test_source_absence_marks_retained_unit_and_retries_without_legacy_artifacts(tmp_path):
-    source = tmp_path / "source"
-    current = tmp_path / "current"
-    observed = tmp_path / "observed"
-    candidate = tmp_path / "candidate"
-    repeated = tmp_path / "repeated"
-    _write(
-        source / "gitopsctr.yaml",
-        {
-            "apiVersion": "gitopsctr.io/v1",
-            "kind": "Project",
-            "metadata": {"name": "test-project"},
-            "spec": {"effectLease": None},
-        },
-    )
-    _write(source / "deployment/environments/dev/environment.json", {"schema": 1, "name": "dev"})
-    _write(current / "units/application.yaml", _terraform_unit("application", "d1-application"))
-    observed.mkdir()
-
-    controller.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate, verbose=False)
-    retained = controller.load_desired_unit(candidate / "units/application.yaml", "application")
-    deletion = controller.resource_deletion(retained)
-    assert deletion is not None
-    assert deletion.generation == 1
-    assert deletion.resourceDigest == controller.resource_content_digest(retained)
-    assert controller.deletion_reason(retained).startswith("deletion pending finalization")
-    assert not any("deletion" in path.name for path in candidate.rglob("*"))
-
-    controller.build_desired_candidate("dev", source, "c" * 40, candidate, observed, None, repeated, verbose=False)
-    assert (repeated / "units/application.yaml").read_bytes() == (candidate / "units/application.yaml").read_bytes()
-
-
 def test_finalize_runs_teardown_records_observed_evidence_and_removes_unit(tmp_path, monkeypatch):
     document = _mark(_terraform_unit("application", "d1-application"))
     desired, observed, publications, teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
@@ -317,6 +282,20 @@ def test_finalize_retries_from_observed_evidence_without_repeating_teardown(tmp_
     assert not (desired / "units/application.json").exists()
 
 
+def test_teardown_evidence_requires_uid_and_generation_in_filename(tmp_path):
+    evidence = controller.TeardownEvidence(
+        unit_name="application",
+        uid="d1-application",
+        deletion_generation=1,
+        desired_revision="a" * 40,
+        details={},
+    )
+    _write(tmp_path / ".gitopsctr/teardowns/units/application.json", evidence.document())
+
+    with pytest.raises(OperationError, match="filename does not match its fence"):
+        controller.load_teardown_evidence(tmp_path, "application", "d1-application", 1)
+
+
 def test_finalize_rejects_stale_uid_generation_and_digest_fences(tmp_path, monkeypatch):
     document = _mark(_terraform_unit("application", "d1-application"))
     desired, _observed, _publications, _teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
@@ -405,10 +384,7 @@ def test_opaque_cleanup_resolution_remains_supported(tmp_path, monkeypatch):
                 metadata=controller.ResourceMetadata(
                     name="application",
                     uid=uid,
-                    lifecycle=controller.DesiredLifecycle(
-                        management=controller.LifecycleManagement(mode="sourceTracked")
-                    ),
-                ),
+                ).with_partition("application"),
                 source=None,
             )
         ),

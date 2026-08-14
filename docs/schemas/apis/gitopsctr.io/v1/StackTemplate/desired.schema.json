@@ -1,66 +1,5 @@
 {
   "$defs": {
-    "ParameterTemplateValue": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "fromParameter": {
-              "additionalProperties": false,
-              "properties": {
-                "name": {
-                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "name"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "fromParameter"
-          ],
-          "type": "object"
-        },
-        {
-          "type": "null"
-        },
-        {
-          "type": "boolean"
-        },
-        {
-          "type": "number"
-        },
-        {
-          "type": "string"
-        },
-        {
-          "items": {
-            "$ref": "#/$defs/ParameterTemplateValue"
-          },
-          "type": "array"
-        },
-        {
-          "additionalProperties": {
-            "$ref": "#/$defs/ParameterTemplateValue"
-          },
-          "propertyNames": {
-            "not": {
-              "enum": [
-                "fromArtifact",
-                "fromEnvironment",
-                "fromParameter",
-                "fromPromotion",
-                "fromReceipt"
-              ]
-            }
-          },
-          "type": "object"
-        }
-      ]
-    },
     "TemplateValue": {
       "oneOf": [
         {
@@ -279,28 +218,19 @@
     },
     "metadata": {
       "additionalProperties": false,
-      "oneOf": [
-        {
-          "not": {
+      "not": {
+        "properties": {
+          "labels": {
             "required": [
-              "ownerReferences"
+              "gitopsctr.io/partition"
             ]
-          },
-          "required": [
-            "lifecycle"
-          ]
+          }
         },
-        {
-          "not": {
-            "required": [
-              "lifecycle"
-            ]
-          },
-          "required": [
-            "ownerReferences"
-          ]
-        }
-      ],
+        "required": [
+          "ownerReferences",
+          "labels"
+        ]
+      },
       "properties": {
         "deletion": {
           "additionalProperties": false,
@@ -321,30 +251,19 @@
           "title": "DeletionMetadata",
           "type": "object"
         },
-        "lifecycle": {
-          "additionalProperties": false,
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
           "properties": {
-            "management": {
-              "additionalProperties": false,
-              "properties": {
-                "mode": {
-                  "enum": [
-                    "sourceTracked",
-                    "direct"
-                  ]
-                }
-              },
-              "required": [
-                "mode"
-              ],
-              "title": "LifecycleManagement",
-              "type": "object"
+            "gitopsctr.io/partition": {
+              "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+              "type": "string"
             }
           },
-          "required": [
-            "management"
-          ],
-          "title": "DesiredLifecycle",
+          "propertyNames": {
+            "type": "string"
+          },
           "type": "object"
         },
         "name": {
@@ -427,59 +346,209 @@
           },
           "type": "array"
         },
-        "resources": {
+        "requestedSource": {
           "anyOf": [
             {
-              "items": {
-                "additionalProperties": false,
-                "properties": {
-                  "apiVersion": {
-                    "pattern": "^[^/]+/[^/]+$",
-                    "type": "string"
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromResource": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "name": {
+                          "anyOf": [
+                            {
+                              "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        },
+                        "uid": {
+                          "anyOf": [
+                            {
+                              "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        }
+                      },
+                      "title": "StackTemplateResourceReference",
+                      "type": "object"
+                    }
                   },
-                  "dependsOn": {
-                    "items": {
-                      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                  "title": "StackTemplateFromResource",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromGit": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "commit": {
+                          "anyOf": [
+                            {
+                              "pattern": "^[0-9a-f]{40}$",
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        },
+                        "path": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        },
+                        "ref": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        },
+                        "remote": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        }
+                      },
+                      "title": "GitSourceRequest",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromGit"
+                  ],
+                  "title": "StackTemplateFromGit",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromPromotion": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "stack": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "stack"
+                      ],
+                      "title": "StackTemplatePromotionReference",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromPromotion"
+                  ],
+                  "title": "StackTemplateFromPromotion",
+                  "type": "object"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "resolvedSource": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "fromGit": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "commit": {
+                      "pattern": "^[0-9a-f]{40}$",
                       "type": "string"
                     },
-                    "type": "array"
-                  },
-                  "kind": {
-                    "pattern": "^[A-Z][A-Za-z0-9]*$",
-                    "type": "string"
-                  },
-                  "name": {
-                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                    "type": "string"
-                  },
-                  "spec": {
-                    "additionalProperties": {
-                      "$ref": "#/$defs/ParameterTemplateValue"
+                    "digest": {
+                      "pattern": "^[0-9a-f]{64}$",
+                      "type": "string"
                     },
-                    "propertyNames": {
-                      "not": {
-                        "enum": [
-                          "fromArtifact",
-                          "fromEnvironment",
-                          "fromParameter",
-                          "fromPromotion",
-                          "fromReceipt"
-                        ]
-                      }
+                    "path": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
                     },
-                    "type": "object"
-                  }
-                },
-                "required": [
-                  "apiVersion",
-                  "kind",
-                  "name",
-                  "spec"
-                ],
-                "title": "StackTemplateResource",
-                "type": "object"
+                    "ref": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "remote": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "resourcePath": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "commit",
+                    "resourcePath",
+                    "digest"
+                  ],
+                  "title": "ResolvedGitSource",
+                  "type": "object"
+                }
               },
-              "type": "array"
+              "required": [
+                "fromGit"
+              ],
+              "title": "ResolvedStackTemplateSource",
+              "type": "object"
             },
             {
               "type": "null"
@@ -488,63 +557,55 @@
           "default": null
         },
         "unitTemplates": {
-          "anyOf": [
-            {
-              "additionalProperties": {
-                "additionalProperties": false,
-                "properties": {
-                  "apiVersion": {
-                    "pattern": "^[^/]+/[^/]+$",
-                    "type": "string"
-                  },
-                  "dependsOn": {
-                    "items": {
-                      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  "kind": {
-                    "pattern": "^[A-Z][A-Za-z0-9]*$",
-                    "type": "string"
-                  },
-                  "spec": {
-                    "additionalProperties": {
-                      "$ref": "#/$defs/TemplateValue"
-                    },
-                    "propertyNames": {
-                      "not": {
-                        "enum": [
-                          "fromArtifact",
-                          "fromEnvironment",
-                          "fromParameter",
-                          "fromPromotion",
-                          "fromReceipt"
-                        ]
-                      }
-                    },
-                    "type": "object"
-                  }
-                },
-                "required": [
-                  "apiVersion",
-                  "kind",
-                  "spec"
-                ],
-                "title": "StackTemplateUnitTemplate",
-                "type": "object"
-              },
-              "propertyNames": {
-                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+          "additionalProperties": {
+            "additionalProperties": false,
+            "properties": {
+              "apiVersion": {
+                "pattern": "^[^/]+/[^/]+$",
                 "type": "string"
               },
-              "type": "object"
+              "dependsOn": {
+                "items": {
+                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "pattern": "^[A-Z][A-Za-z0-9]*$",
+                "type": "string"
+              },
+              "spec": {
+                "additionalProperties": {
+                  "$ref": "#/$defs/TemplateValue"
+                },
+                "propertyNames": {
+                  "not": {
+                    "enum": [
+                      "fromArtifact",
+                      "fromEnvironment",
+                      "fromParameter",
+                      "fromPromotion",
+                      "fromReceipt"
+                    ]
+                  }
+                },
+                "type": "object"
+              }
             },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
+            "required": [
+              "apiVersion",
+              "kind",
+              "spec"
+            ],
+            "title": "StackTemplateUnitTemplate",
+            "type": "object"
+          },
+          "propertyNames": {
+            "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+            "type": "string"
+          },
+          "type": "object"
         }
       },
       "type": "object"

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -215,7 +214,7 @@ def _setup_import_fixture(tmp_path: Path, monkeypatch, *, promoted_template: boo
     desired = tmp_path / "dev-desired"
     projection = controller.project_stack_resources(source, "dev", source_revision, desired, source)
     observed = tmp_path / "dev-observed"
-    monkeypatch.setattr(controller, "file_blob", lambda path: hashlib.sha256(path.read_bytes()).hexdigest())
+    monkeypatch.setattr(controller, "file_blob", lambda _path: "f" * 40)
     _write_source_observation(source, desired, observed, projection, source_revision)
     current = tmp_path / "empty-current"
     current.mkdir()

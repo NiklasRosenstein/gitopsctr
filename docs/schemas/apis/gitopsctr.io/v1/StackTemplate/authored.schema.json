@@ -1,66 +1,5 @@
 {
   "$defs": {
-    "ParameterTemplateValue": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "fromParameter": {
-              "additionalProperties": false,
-              "properties": {
-                "name": {
-                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "name"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "fromParameter"
-          ],
-          "type": "object"
-        },
-        {
-          "type": "null"
-        },
-        {
-          "type": "boolean"
-        },
-        {
-          "type": "number"
-        },
-        {
-          "type": "string"
-        },
-        {
-          "items": {
-            "$ref": "#/$defs/ParameterTemplateValue"
-          },
-          "type": "array"
-        },
-        {
-          "additionalProperties": {
-            "$ref": "#/$defs/ParameterTemplateValue"
-          },
-          "propertyNames": {
-            "not": {
-              "enum": [
-                "fromArtifact",
-                "fromEnvironment",
-                "fromParameter",
-                "fromPromotion",
-                "fromReceipt"
-              ]
-            }
-          },
-          "type": "object"
-        }
-      ]
-    },
     "TemplateValue": {
       "oneOf": [
         {
@@ -321,124 +260,56 @@
           },
           "type": "array"
         },
-        "resources": {
-          "anyOf": [
-            {
-              "items": {
-                "additionalProperties": false,
-                "properties": {
-                  "apiVersion": {
-                    "pattern": "^[^/]+/[^/]+$",
-                    "type": "string"
-                  },
-                  "dependsOn": {
-                    "items": {
-                      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  "kind": {
-                    "pattern": "^[A-Z][A-Za-z0-9]*$",
-                    "type": "string"
-                  },
-                  "name": {
-                    "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                    "type": "string"
-                  },
-                  "spec": {
-                    "additionalProperties": {
-                      "$ref": "#/$defs/ParameterTemplateValue"
-                    },
-                    "propertyNames": {
-                      "not": {
-                        "enum": [
-                          "fromArtifact",
-                          "fromEnvironment",
-                          "fromParameter",
-                          "fromPromotion",
-                          "fromReceipt"
-                        ]
-                      }
-                    },
-                    "type": "object"
-                  }
-                },
-                "required": [
-                  "apiVersion",
-                  "kind",
-                  "name",
-                  "spec"
-                ],
-                "title": "StackTemplateResource",
-                "type": "object"
-              },
-              "type": "array"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
         "unitTemplates": {
-          "anyOf": [
-            {
-              "additionalProperties": {
-                "additionalProperties": false,
-                "properties": {
-                  "apiVersion": {
-                    "pattern": "^[^/]+/[^/]+$",
-                    "type": "string"
-                  },
-                  "dependsOn": {
-                    "items": {
-                      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                      "type": "string"
-                    },
-                    "type": "array"
-                  },
-                  "kind": {
-                    "pattern": "^[A-Z][A-Za-z0-9]*$",
-                    "type": "string"
-                  },
-                  "spec": {
-                    "additionalProperties": {
-                      "$ref": "#/$defs/TemplateValue"
-                    },
-                    "propertyNames": {
-                      "not": {
-                        "enum": [
-                          "fromArtifact",
-                          "fromEnvironment",
-                          "fromParameter",
-                          "fromPromotion",
-                          "fromReceipt"
-                        ]
-                      }
-                    },
-                    "type": "object"
-                  }
-                },
-                "required": [
-                  "apiVersion",
-                  "kind",
-                  "spec"
-                ],
-                "title": "StackTemplateUnitTemplate",
-                "type": "object"
-              },
-              "propertyNames": {
-                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+          "additionalProperties": {
+            "additionalProperties": false,
+            "properties": {
+              "apiVersion": {
+                "pattern": "^[^/]+/[^/]+$",
                 "type": "string"
               },
-              "type": "object"
+              "dependsOn": {
+                "items": {
+                  "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "pattern": "^[A-Z][A-Za-z0-9]*$",
+                "type": "string"
+              },
+              "spec": {
+                "additionalProperties": {
+                  "$ref": "#/$defs/TemplateValue"
+                },
+                "propertyNames": {
+                  "not": {
+                    "enum": [
+                      "fromArtifact",
+                      "fromEnvironment",
+                      "fromParameter",
+                      "fromPromotion",
+                      "fromReceipt"
+                    ]
+                  }
+                },
+                "type": "object"
+              }
             },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
+            "required": [
+              "apiVersion",
+              "kind",
+              "spec"
+            ],
+            "title": "StackTemplateUnitTemplate",
+            "type": "object"
+          },
+          "propertyNames": {
+            "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+            "type": "string"
+          },
+          "type": "object"
         }
       },
       "type": "object"

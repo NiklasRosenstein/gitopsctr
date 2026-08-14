@@ -110,11 +110,11 @@ PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
                                 "the candidate revision's history."
                             ),
                         },
-                        "whenUnavailableDuringAdvance": {
+                        "whenUnavailableDuringApply": {
                             "type": "string",
                             "enum": ["refresh", "error"],
                             "default": "refresh",
-                            "description": "Action when an unavailable retained source is found during advancement.",
+                            "description": "Action when an unavailable retained source is found during apply.",
                         },
                         "whenUnavailableDuringPlan": {
                             "type": "string",
@@ -216,7 +216,7 @@ class EffectLeaseBranch:
 @dataclass(frozen=True)
 class SourceRevisionPolicy:
     unavailable_when: SourceRevisionUnavailableWhen = SourceRevisionUnavailableWhen.OUTSIDE_CANDIDATE_HISTORY
-    when_unavailable_during_advance: SourceRevisionAction = SourceRevisionAction.REFRESH
+    when_unavailable_during_apply: SourceRevisionAction = SourceRevisionAction.REFRESH
     when_unavailable_during_plan: SourceRevisionAction = SourceRevisionAction.ERROR
 
 
@@ -300,8 +300,8 @@ def validate_project_document(value: object, path: Path) -> Project:
                     "unavailableWhen", SourceRevisionUnavailableWhen.OUTSIDE_CANDIDATE_HISTORY
                 )
             ),
-            when_unavailable_during_advance=SourceRevisionAction(
-                source_revision_policy_document.get("whenUnavailableDuringAdvance", SourceRevisionAction.REFRESH)
+            when_unavailable_during_apply=SourceRevisionAction(
+                source_revision_policy_document.get("whenUnavailableDuringApply", SourceRevisionAction.REFRESH)
             ),
             when_unavailable_during_plan=SourceRevisionAction(
                 source_revision_policy_document.get("whenUnavailableDuringPlan", SourceRevisionAction.ERROR)

@@ -4,21 +4,27 @@ import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from gitopsctr import controller
 from gitopsctr.contracts import (
-    DesiredLifecycle,
     DesiredOwnerReference,
     DesiredStackSpec,
-    LifecycleManagement,
-    StackInstantiationProvenance,
+    GitSourceRequest,
+    StackSpec,
+    StackTemplateFromGit,
+    StackTemplateFromPromotion,
+    StackTemplatePromotionReference,
+    StackTemplateReference,
+    StackTemplateSource,
+    StackTemplateSpec,
+    StackTemplateUnitTemplate,
 )
+from gitopsctr.document import JsonObjectValue
 from gitopsctr.errors import OperationError
 from gitopsctr.resources import ResourceMetadata, StackResource, validate_desired_resource_graph
-from gitopsctr.state import ControllerPin, ControllerPinClaim
+from gitopsctr.templates import TemplateObject
 from tests.stack_support import project_repository, write_projected_units, write_stack_source
 
 
@@ -154,70 +160,11 @@ def test_resource_incarnation_lookup_uses_full_gvk(tmp_path: Path):
     )
 
 
-def test_source_absent_stack_root_is_retained_for_owned_unit_cleanup(tmp_path: Path):
-    source = tmp_path / "source"
-    environment = project_repository(source)
-    write_stack_source(environment)
-    initial = tmp_path / "initial"
-    controller.project_stack_resources(source, "dev", "a" * 40, initial, source)
-    initial_stack = controller.RESOURCE_CATALOG.parse_stack(
-        controller.RESOURCE_CATALOG.load_document(next((initial / "stacks").glob("web.*"))),
-        profile="desired",
-        expected_name="web",
-    )
-    current = tmp_path / "current"
-    shutil.copytree(initial, current)
-
-    (environment / "stacks/web.json").unlink()
-    next_candidate = tmp_path / "next"
-    projection = controller.project_stack_resources(source, "dev", "b" * 40, next_candidate, source, current)
-
-    assert not projection.generated_units
-    retained_stack = controller.RESOURCE_CATALOG.parse_stack(
-        controller.RESOURCE_CATALOG.load_document(next((next_candidate / "stacks").glob("web.*"))),
-        profile="desired",
-        expected_name="web",
-    )
-    assert retained_stack.metadata.uid == initial_stack.metadata.uid
-    assert retained_stack.metadata.deletion is not None
-    assert list((next_candidate / "stack-templates").glob("preview.*"))
-
-
-def test_source_absent_stack_template_is_retained_for_finalization(tmp_path: Path):
-    source = tmp_path / "source"
-    environment = project_repository(source)
-    write_stack_source(environment)
-    initial = tmp_path / "initial"
-    controller.project_stack_resources(source, "dev", "a" * 40, initial, source)
-    initial_template_path = next((initial / "stack-templates").glob("preview.*"))
-    initial_template = controller.RESOURCE_CATALOG.parse_stack_template(
-        controller.RESOURCE_CATALOG.load_document(initial_template_path),
-        profile="desired",
-        expected_name="preview",
-    )
-    current = tmp_path / "current"
-    shutil.copytree(initial, current)
-
-    (environment / "stacks/web.json").unlink()
-    (environment / "stack-templates/preview.json").unlink()
-    candidate = tmp_path / "candidate"
-    controller.project_stack_resources(source, "dev", "b" * 40, candidate, source, current)
-
-    retained_path = next((candidate / "stack-templates").glob("preview.*"))
-    retained = controller.RESOURCE_CATALOG.parse_stack_template(
-        controller.RESOURCE_CATALOG.load_document(retained_path),
-        profile="desired",
-        expected_name="preview",
-    )
-    assert retained.metadata.uid == initial_template.metadata.uid
-    assert retained.metadata.deletion is not None
-
-
 def test_expanded_stack_dependencies_are_retained_and_validated(tmp_path: Path):
     source = tmp_path / "source"
     environment = project_repository(source)
     write_stack_source(environment)
-    template_path = environment / "stack-templates/preview.json"
+    template_path = environment.parents[1] / "stack-templates/preview.json"
     template = json.loads(template_path.read_text())
     template["spec"]["unitTemplates"]["preview-db"] = {
         "apiVersion": "unit.gitopsctr.io/v1",
@@ -250,6 +197,118 @@ def test_expanded_stack_dependencies_are_retained_and_validated(tmp_path: Path):
     next(path for path in (candidate / "units").glob("web--preview-db.*")).unlink()
     with pytest.raises(OperationError, match="dependency 'web--preview-db' is absent"):
         controller.load_desired_resource_graph(candidate)
+
+
+NON_RESOURCE_TEMPLATE_SOURCES = (
+    StackTemplateFromGit(fromGit=GitSourceRequest(path=".")),
+    StackTemplateFromPromotion(fromPromotion=StackTemplatePromotionReference(stack="web")),
+)
+
+
+def _non_resource_stack_graph(tmp_path: Path, source: StackTemplateSource):
+    repository = tmp_path / "source"
+    environment = project_repository(repository)
+    write_stack_source(
+        environment,
+        unit_templates={
+            "preview-db": {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "Terraform",
+                "spec": {"source": {"path": "."}},
+            },
+            "preview-app": {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "Terraform",
+                "spec": {"source": {"path": "."}},
+                "dependsOn": ["preview-db"],
+            },
+        },
+    )
+    candidate = tmp_path / "candidate"
+    projection = controller.project_stack_resources(repository, "dev", "a" * 40, candidate, repository)
+    write_projected_units(candidate, projection, repository)
+    graph = controller.load_desired_resource_graph(candidate)
+    stack_key = (controller.CORE_API_VERSION, "Stack", "web")
+    stack = graph[stack_key]
+    assert isinstance(stack, StackResource)
+    assert isinstance(stack.spec, DesiredStackSpec)
+    template_reference = StackTemplateReference(name="preview", source=source)
+    graph[stack_key] = replace(
+        stack,
+        spec=replace(stack.spec, template=template_reference, requestedSource=source),
+    )
+    return graph, stack_key
+
+
+@pytest.mark.parametrize("source", NON_RESOURCE_TEMPLATE_SOURCES, ids=("from-git", "from-promotion"))
+def test_non_resource_stack_sources_validate_resolved_projection_and_ignore_sibling_template(
+    tmp_path: Path, source: StackTemplateSource
+) -> None:
+    graph, _stack_key = _non_resource_stack_graph(tmp_path, source)
+    template_key = (controller.CORE_API_VERSION, "StackTemplate", "preview")
+    template = graph[template_key]
+    assert isinstance(template, StackResource)
+    graph[template_key] = replace(
+        template,
+        spec=StackTemplateSpec(
+            unitTemplates={
+                "unrelated": StackTemplateUnitTemplate(
+                    apiVersion=controller.UNIT_API_VERSION,
+                    kind="Terraform",
+                    spec=TemplateObject({"source": {"path": "elsewhere"}}),
+                )
+            }
+        ),
+    )
+
+    validate_desired_resource_graph(graph)
+
+
+@pytest.mark.parametrize("source", NON_RESOURCE_TEMPLATE_SOURCES, ids=("from-git", "from-promotion"))
+def test_non_resource_stack_sources_reject_missing_and_stale_projected_units(
+    tmp_path: Path, source: StackTemplateSource
+) -> None:
+    graph, stack_key = _non_resource_stack_graph(tmp_path, source)
+    missing_key = (controller.UNIT_API_VERSION, "Terraform", "web--preview-db")
+    missing = graph.pop(missing_key)
+    with pytest.raises(ValueError, match="missing generated Unit 'web--preview-db'"):
+        validate_desired_resource_graph(graph)
+
+    graph[missing_key] = missing
+    stack = graph[stack_key]
+    assert isinstance(stack, StackResource)
+    assert isinstance(stack.spec, DesiredStackSpec)
+    assert stack.spec.resolvedProjection is not None
+    units = dict(stack.spec.resolvedProjection["units"])  # type: ignore[arg-type]
+    app = dict(units["preview-app"])  # type: ignore[arg-type]
+    app["dependsOn"] = ["absent"]
+    units["preview-app"] = app
+    graph[stack_key] = replace(
+        stack,
+        spec=replace(stack.spec, resolvedProjection=JsonObjectValue({"units": units})),
+    )
+    with pytest.raises(ValueError, match="depends on missing generated Unit 'web--absent'"):
+        validate_desired_resource_graph(graph)
+
+
+@pytest.mark.parametrize("source", NON_RESOURCE_TEMPLATE_SOURCES, ids=("from-git", "from-promotion"))
+def test_non_resource_stack_sources_reject_wrong_gvk_and_unexpected_owned_units(
+    tmp_path: Path, source: StackTemplateSource
+) -> None:
+    graph, _stack_key = _non_resource_stack_graph(tmp_path, source)
+    app_key = (controller.UNIT_API_VERSION, "Terraform", "web--preview-app")
+    app = graph.pop(app_key)
+    wrong_key = (controller.UNIT_API_VERSION, "KubernetesManifests", "web--preview-app")
+    graph[wrong_key] = replace(app, gvk=controller.GVK(*wrong_key[:2]))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="has GVK .*KubernetesManifests, expected .*Terraform"):
+        validate_desired_resource_graph(graph)
+
+    graph.pop(wrong_key)
+    graph[app_key] = app
+    extra = replace(app, metadata=replace(app.metadata, name="web--stale"))  # type: ignore[arg-type]
+    graph[(extra.gvk.api_version, extra.gvk.kind, extra.name)] = extra
+    with pytest.raises(ValueError, match="unexpected generated Units: web--stale"):
+        validate_desired_resource_graph(graph)
 
 
 def test_desired_graph_loads_stack_roots_and_uid_fenced_generated_unit(tmp_path: Path):
@@ -307,25 +366,24 @@ def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
         profile="authored",
         expected_name="web",
     )
+    assert isinstance(authored_stack.spec, StackSpec)
     desired = tmp_path / "desired"
     projection = controller.project_stack_resources(source, "dev", "a" * 40, desired, source)
+    projected_stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(desired / "stacks/web.json"),
+        profile="desired",
+        expected_name="web",
+    )
+    assert isinstance(projected_stack.spec, DesiredStackSpec)
     (environment / "stacks/web.json").unlink()
     stack = StackResource(
         controller.GVK(controller.CORE_API_VERSION, "Stack"),
-        ResourceMetadata(
-            name="web",
-            uid="d1-stack-web",
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
-        ),
+        ResourceMetadata(name="web", uid="d1-stack-web").with_partition("application"),
         DesiredStackSpec(
             template="preview",
-            parameters=authored_stack.spec.parameters,  # type: ignore[union-attr]
-            provenance=StackInstantiationProvenance(
-                templateRevision="a" * 40,
-                templatePath="deployment/environments/dev/stack-templates/preview.json",
-                templateDigest="b" * 64,
-                requestIdentity="pull-123",
-            ),
+            parameters=authored_stack.spec.parameters,
+            resolvedSource=projected_stack.spec.resolvedSource,
+            resolvedProjection=projected_stack.spec.resolvedProjection,
         ),
     )
     for path in controller.document_candidates(desired / "stacks", "web"):
@@ -356,8 +414,8 @@ def test_convergence_discovers_desired_only_stack_units(tmp_path: Path):
         "a" * 40,
         tmp_path / "projection",
     )
-    assert specifications["web--preview-app"].metadata.lifecycle is None
     assert specifications["web--preview-app"].metadata.ownerReferences is not None
+    assert specifications["web--preview-app"].metadata.labels is None
     assert dependencies == {"web--preview-app": ()}
 
 
@@ -379,120 +437,3 @@ def test_stack_rejects_missing_template_during_projection(tmp_path: Path):
 
     with pytest.raises(OperationError, match="missing StackTemplate"):
         controller.project_stack_resources(source, "dev", "a" * 40, tmp_path / "candidate", source)
-
-
-def test_instantiate_stack_publishes_direct_uid_fenced_owner_graph(tmp_path: Path, monkeypatch):
-    source = tmp_path / "source"
-    environment = project_repository(source)
-    write_stack_source(environment)
-    (environment / "stacks/web.json").unlink()
-    current = tmp_path / "current"
-    current.mkdir()
-    published: list[Path] = []
-    events: list[str] = []
-    source_revision = "a" * 40
-
-    def materialize(revision: str, output: Path) -> None:
-        shutil.copytree(source if revision == source_revision else current, output)
-
-    def fake_build(_environment, source_root, revision, _current, _observed, _observed_revision, candidate, **_kwargs):
-        projection = controller.project_stack_resources(source_root, "dev", revision, candidate, source_root)
-        for name in projection.generated_units:
-            unit_document = {
-                "apiVersion": "unit.gitopsctr.io/v1",
-                "kind": "Terraform",
-                "metadata": {
-                    "name": name,
-                    "uid": "d1-generated-unit",
-                    "lifecycle": {"management": {"mode": "sourceTracked"}},
-                },
-                "spec": {
-                    "source": {
-                        "path": ".",
-                        "revision": source_revision,
-                        "inputHash": "sha256:" + "0" * 64,
-                        "driverVersion": controller.DRIVER_VERSIONS["terraform"],
-                    },
-                    "terraform": {"backend": {}, "variables": {}, "observeOutputs": []},
-                },
-            }
-            unit = controller.RESOURCE_CATALOG.parse_unit(unit_document, profile="desired", expected_name=name)
-            controller.write_desired_candidate_unit(candidate / "units" / f"{name}.json", unit, source_root)
-
-    def publish(_environment, candidate, *_args, **kwargs):
-        assert kwargs["request_change"] is False
-        events.append("publish")
-        snapshot = tmp_path / "published"
-        shutil.copytree(candidate, snapshot)
-        published.append(snapshot)
-        return "c" * 40, None
-
-    monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
-    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
-    monkeypatch.setattr(controller, "fetch_ref", lambda ref: "b" * 40 if ref == "deploy/dev" else None)
-    monkeypatch.setattr(controller, "materialize_revision", materialize)
-    monkeypatch.setattr(controller, "observed_tree", lambda _ref, output: output.mkdir(parents=True) or None)
-    monkeypatch.setattr(
-        controller, "git", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=source_revision + "\n")
-    )
-    monkeypatch.setattr(controller, "build_desired_candidate", fake_build)
-    monkeypatch.setattr(controller, "publish_desired_change", publish)
-    monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
-
-    def create_claim(claim: ControllerPinClaim) -> ControllerPinClaim:
-        events.append("claim")
-        return replace(claim, revision="d" * 40)
-
-    def create_pin(name: str, revision: str) -> ControllerPin:
-        events.append("pin")
-        return ControllerPin(name, f"refs/heads/gitopsctr/pins/{name}", revision)
-
-    def update_claim(claim: ControllerPinClaim, expected_revision: str) -> ControllerPinClaim:
-        assert expected_revision == "d" * 40
-        assert claim.state == "active"
-        events.append("activate")
-        return replace(claim, revision="e" * 40)
-
-    store = SimpleNamespace(
-        create_controller_pin_claim=create_claim,
-        create_controller_pin=create_pin,
-        update_controller_pin_claim=update_claim,
-    )
-    monkeypatch.setattr(
-        controller,
-        "state_store",
-        lambda: store,
-    )
-
-    args = controller.build_parser().parse_args(
-        [
-            "instantiate-stack",
-            "--environment",
-            "dev",
-            "--stack",
-            "web",
-            "--template",
-            "preview",
-            "--source-revision",
-            source_revision,
-            "--parameters",
-            '{"source-path":"."}',
-            "--request-id",
-            "pull-123",
-        ]
-    )
-    assert controller.command_instantiate_stack(args) is True
-    assert events == ["claim", "pin", "publish", "activate"]
-    candidate = published[0]
-    stack_path = next((candidate / "stacks").glob("web.*"))
-    stack = controller.RESOURCE_CATALOG.parse_stack(
-        controller.RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name="web"
-    )
-    assert stack.metadata.lifecycle is not None
-    assert stack.metadata.lifecycle.management is not None
-    assert stack.metadata.lifecycle.management.mode == "direct"
-    assert isinstance(stack.spec, controller.DesiredStackSpec)
-    assert stack.spec.provenance is not None
-    unit = controller.load_desired_unit(next((candidate / "units").glob("web--preview-app.*")), "web--preview-app")
-    assert unit.metadata.ownerReferences is not None
-    assert unit.metadata.ownerReferences[0].uid == stack.metadata.uid

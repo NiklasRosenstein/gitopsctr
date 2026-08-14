@@ -1,4 +1,4 @@
-"""Shared desired-state fixtures for direct Stack deletion tests."""
+"""Shared desired-state fixtures for Stack deletion tests."""
 
 from __future__ import annotations
 
@@ -10,53 +10,48 @@ from types import SimpleNamespace
 
 from gitopsctr import controller
 from gitopsctr.contracts import (
-    DesiredLifecycle,
-    LifecycleManagement,
-    StackInstantiationProvenance,
-    StackTemplateResource,
+    ResolvedGitSource,
+    ResolvedStackTemplateSource,
     StackTemplateSpec,
+    StackTemplateUnitTemplate,
 )
 from gitopsctr.document import JsonObjectValue
 from gitopsctr.resources import ResourceMetadata, StackResource
-from gitopsctr.templates import ParameterTemplateObject
+from gitopsctr.templates import TemplateObject
 
 
 def stack_tree(root: Path) -> tuple[str, str]:
-    """Create a direct Stack with one UID-owned generated Unit."""
-    stack_uid = "d1-stack-direct"
+    """Create a partitioned Stack with one UID-owned generated Unit."""
+    stack_uid = "d1-stack-preview"
     template = StackResource(
         controller.GVK(controller.CORE_API_VERSION, "StackTemplate"),
-        ResourceMetadata(
-            name="preview",
-            uid="d1-template",
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="sourceTracked")),
-        ),
+        ResourceMetadata(name="preview", uid="d1-template").with_partition("preview"),
         StackTemplateSpec(
             parameters=[],
-            resources=[
-                StackTemplateResource(
+            unitTemplates={
+                "preview-app": StackTemplateUnitTemplate(
                     apiVersion=controller.UNIT_API_VERSION,
                     kind="Terraform",
-                    name="preview-app",
-                    spec=ParameterTemplateObject({}),
+                    spec=TemplateObject({}),
                 ),
-            ],
+            },
         ),
-    )
-    provenance = StackInstantiationProvenance(
-        templateRevision="a" * 40,
-        templatePath="deployment/environments/dev/stack-templates/preview.yaml",
-        templateDigest="b" * 64,
-        requestIdentity="pull-123",
     )
     stack = StackResource(
         controller.GVK(controller.CORE_API_VERSION, "Stack"),
-        ResourceMetadata(
-            name="preview",
-            uid=stack_uid,
-            lifecycle=DesiredLifecycle(management=LifecycleManagement(mode="direct")),
+        ResourceMetadata(name="preview", uid=stack_uid).with_partition("preview"),
+        controller.DesiredStackSpec(
+            template="preview",
+            parameters=JsonObjectValue({}),
+            resolvedSource=ResolvedStackTemplateSource(
+                fromGit=ResolvedGitSource(
+                    path=".",
+                    commit="a" * 40,
+                    resourcePath="deployment/stack-templates/preview.yaml",
+                    digest="b" * 64,
+                )
+            ),
         ),
-        controller.DesiredStackSpec(template="preview", parameters=JsonObjectValue({}), provenance=provenance),
     )
     root.mkdir(parents=True)
     (root / "stack-templates").mkdir()
@@ -101,14 +96,13 @@ def stack_tree(root: Path) -> tuple[str, str]:
 
 
 def deletion_args(**overrides: object) -> Namespace:
-    """Build standard direct Stack deletion command arguments."""
+    """Build standard Stack deletion command arguments."""
     values = {
         "environment": "dev",
         "stack": "preview",
         "name": "preview",
         "kind": "Stack",
-        "input_location": "state",
-        "uid": "d1-stack-direct",
+        "uid": "d1-stack-preview",
         "desired_ref": "deploy/dev",
         "observed_ref": None,
         "candidate_ref": None,

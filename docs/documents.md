@@ -23,8 +23,10 @@ deployment/environments/
         └── application.yaml
 ```
 
-`spec.environmentsPath` may change the authored environment directory. Generated desired and observed refs always use
-top-level `units/`, with artifacts under `artifacts/<unit>/` and materialized payloads under `materialized/<unit>/`.
+`spec.environmentsPath` may change the authored environment directory. An Environment is the namespace boundary for
+environment-scoped resources. Generated desired and observed refs use logical collections registered for their
+resource families; for example, desired Units and observed Receipts use `units/`, artifacts use
+`artifacts/<unit>/`, and materialized payloads use `materialized/<unit>/`.
 
 Create and validate authored resources with:
 
@@ -38,6 +40,18 @@ gitopsctr validate
 Creation follows the Project's configured document format and never replaces an existing resource unless `--force` is
 explicit. See [Project configuration](project-configuration.md) and [Operations](operations.md).
 
+## Resource definitions and representations
+
+The typed resource registry is the semantic catalog for gitopsctr's API kinds. A resource family defines its
+singular and plural selectors, and each placement defines one allowed representation in the source, desired, or
+observed plane. A family can have multiple representations: an authored Unit and its resolved desired Unit are the
+same API family in different planes, not unrelated kinds.
+
+Relationship definitions connect otherwise independent resources. In particular, a Receipt observes a desired Unit
+by subject identity and desired-unit blob, while its artifact descriptors refer to separately stored Artifact
+resources. Those definitions are invariants; each YAML or JSON document is a concrete instance. See the generated
+[resource model](resource-model.md) for the complete built-in placement matrix and relationships.
+
 ## Controller resources
 
 Controller resources use `gitopsctr.io/v1`.
@@ -47,9 +61,9 @@ Controller resources use `gitopsctr.io/v1`.
 | [Project](project-configuration.md) | User-authored repository identity, document format, environment path, and ref defaults | `gitopsctr.yaml` |
 | [Environment](apis/environment.md) | User-authored refs, change gate, promotion sources, and evidence policy | `<environmentsPath>/<name>/environment.*` |
 | [StackTemplate](apis/stacks.md) | User-authored, parameterized collection of Unit templates | `<stackTemplatesPath>/<name>.*`; resolved copy on the desired ref |
-| [Stack](apis/stacks.md) | Source-authored or directly managed instance of a StackTemplate | `<environment>/stacks/<name>.*`; resolved copy on the desired ref |
+| [Stack](apis/stacks.md) | Authored or canonical desired instance of a StackTemplate | `<environment>/stacks/<name>.*`; resolved copy on the desired ref |
 | [Promotion](apis/promotion.md) | Controller-owned lineage pinning source desired, observed, and specification revisions | `promotion.*` on the target desired ref |
-| [Receipt](apis/receipt.md) | Controller- and driver-owned evidence for one exact desired unit | `units/<name>.*` on the observed ref |
+| [Receipt](apis/receipt.md) | Separate controller- and driver-owned observation of one exact desired Unit | `units/<name>.*` on the observed ref |
 
 ## Unit resources
 
@@ -64,9 +78,10 @@ controller, and implemented by its registered unit driver.
 | `FrontendS3Cloudfront` | User-authored publication; the driver deploys a bundle to S3 and CloudFront | Authored below `<environment>/units/`; resolved at `units/<name>.*` | [Frontend S3/CloudFront](drivers/frontend-s3-cloudfront.md) |
 | `KubernetesManifests` | User-authored delivery; the driver renders and optionally applies Kubernetes resources | Authored below `<environment>/units/`; resolved at `units/<name>.*` | [Kubernetes manifests](drivers/kubernetes-manifests.md) |
 
-Each kind publishes `authored`, `desired`, and `receipt` schema profiles. These are lifecycle views of the unit and its
-generic receipt, not separate unit GVKs. Use the authored schema in source repositories; desired units and receipts are
-controller-owned. The [unit kind overview](drivers.md) compares their capabilities.
+Each kind publishes `authored`, `desired`, and `receipt` contract profiles. The authored and desired profiles are Unit
+representations. The receipt profile specializes the separate Receipt resource for that subject kind; it is not a
+third Unit representation or embedded Unit status. Use the authored schema in source repositories; desired Units and
+Receipts are controller-owned. The [unit kind overview](drivers.md) compares their capabilities.
 
 ## Artifact resources
 

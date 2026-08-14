@@ -47,7 +47,7 @@ def write_stack_source(
     template_name: str = "preview",
 ) -> None:
     """Write a canonical unitTemplates StackTemplate and a Stack using it."""
-    templates = environment / "stack-templates"
+    templates = environment.parents[1] / "stack-templates"
     stacks = environment / "stacks"
     templates.mkdir(parents=True, exist_ok=True)
     stacks.mkdir(parents=True, exist_ok=True)
