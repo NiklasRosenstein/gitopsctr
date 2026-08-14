@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from gitopsctr import controller as deploy_release
+from gitopsctr.errors import OperationError
 from tests.conftest import receipt_document, write_test_document
 from tests.stack_deletion_support import stack_tree
 
@@ -661,26 +662,53 @@ def test_rollback_restores_historical_payload_with_new_uid_after_finalization(tm
         deletion_generation=1,
     )
     deploy_release.write_resource_incarnation_tombstone(current, finalized)
+    second_finalized = deploy_release.ResourceIncarnationTombstone(
+        api_version="unit.gitopsctr.io/v1",
+        kind="Test",
+        name="application",
+        uid="d1-second-finalized-application",
+        deletion_generation=1,
+    )
+    deploy_release.write_resource_incarnation_tombstone(current, second_finalized)
 
     deploy_release.merge_current_cleanup_state(current, candidate)
     deploy_release.canonicalize_rollback_unit(
         historical_path,
         current / "units/application.json",
-        deploy_release.finalized_incarnation_for_resource(
-            deploy_release.load_resource_incarnation_tombstones(candidate),
-            "unit.gitopsctr.io/v1",
-            "Test",
-            "application",
+        tuple(
+            tombstone
+            for tombstone in deploy_release.load_resource_incarnation_evidence(candidate)
+            if tombstone.name == "application"
         ),
     )
 
     restored = deploy_release.load_desired_unit(historical_path, "application")
     assert restored.metadata.uid != finalized.uid
+    assert restored.metadata.uid != second_finalized.uid
     assert restored.metadata.partition == "application"
-    assert (
-        deploy_release.load_resource_incarnation_tombstones(candidate)[("unit.gitopsctr.io/v1", "Test", "application")]
-        == finalized
+    assert deploy_release.load_resource_incarnation_tombstones(candidate)[
+        ("unit.gitopsctr.io/v1", "Test", "application")
+    ] in {finalized, second_finalized}
+
+
+def test_desired_graph_rejects_reuse_of_finalized_uid(tmp_path):
+    desired = tmp_path / "desired"
+    _write_json(desired / "units/application.json", _desired_unit("application", "b" * 40, "active"))
+    unit = deploy_release.load_desired_unit(desired / "units/application.json", "application")
+    assert unit.metadata.uid is not None
+    deploy_release.write_resource_incarnation_tombstone(
+        desired,
+        deploy_release.ResourceIncarnationTombstone(
+            api_version=unit.gvk.api_version,
+            kind=unit.gvk.kind,
+            name=unit.name,
+            uid=unit.metadata.uid,
+            deletion_generation=1,
+        ),
     )
+
+    with pytest.raises(OperationError, match="reuses finalized UID"):
+        deploy_release.load_desired_resource_graph(desired)
 
 
 def test_full_rollback_preserves_current_opaque_cleanup_root(monkeypatch, capsys):

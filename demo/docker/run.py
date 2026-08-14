@@ -10,11 +10,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
 from pathlib import Path
 
 from demo.utils import DemoRepository, RefHeads, docker_platform, remove_docker_images, require_commands, run
-from gitopsctr import controller
 from gitopsctr.state import GitStateStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -157,50 +155,7 @@ def _desired_tree(label: str) -> Path:
     return output
 
 
-def _desired_metadata(desired: Path, directory: str, name: str) -> Mapping[str, object]:
-    paths = controller.document_candidates(desired / directory, name)
-    if len(paths) != 1:
-        raise RuntimeError(f"expected one desired {directory[:-1]} named {name}")
-    document = controller.RESOURCE_CATALOG.load_document(paths[0])
-    metadata = document.get("metadata")
-    if not isinstance(metadata, dict):
-        raise RuntimeError(f"desired {directory[:-1]} {name} has no metadata")
-    return metadata
-
-
-def _deletion_generation(metadata: Mapping[str, object], name: str) -> int:
-    deletion = metadata.get("deletion")
-    if not isinstance(deletion, dict) or not isinstance(deletion.get("generation"), int):
-        raise RuntimeError(f"desired resource {name} has no deletion metadata")
-    return deletion["generation"]
-
-
-def _owned_units(desired: Path, stack_uid: str) -> list[tuple[str, str, int]]:
-    records: list[tuple[str, str, int]] = []
-    for path in sorted((desired / "units").iterdir()):
-        if not path.is_file():
-            continue
-        document = controller.RESOURCE_CATALOG.load_document(path)
-        metadata = document.get("metadata")
-        if not isinstance(metadata, dict):
-            continue
-        owners = metadata.get("ownerReferences")
-        if not isinstance(owners, list) or not any(
-            isinstance(owner, dict)
-            and owner.get("kind") == "Stack"
-            and owner.get("name") == STACK_NAME
-            and owner.get("uid") == stack_uid
-            for owner in owners
-        ):
-            continue
-        name, uid = metadata.get("name"), metadata.get("uid")
-        if not isinstance(name, str) or not isinstance(uid, str):
-            raise RuntimeError(f"owned Unit in {path} has no name or UID")
-        records.append((name, uid, _deletion_generation(metadata, name)))
-    return sorted(records, key=lambda item: (not item[0].endswith("--deploy"), item[0]))
-
-
-def remove_and_finalize_partitioned_stack() -> None:
+def remove_and_converge_partitioned_stack() -> None:
     stack_path = WORKTREE / "deployment/environments/dev/stacks/application.yaml"
     stack_path.unlink()
     run("git", "add", str(stack_path.relative_to(WORKTREE)), cwd=WORKTREE)
@@ -218,39 +173,17 @@ def remove_and_finalize_partitioned_stack() -> None:
         "HEAD",
     )
 
-    desired = _desired_tree("deleting")
-    stack_metadata = _desired_metadata(desired, "stacks", STACK_NAME)
-    stack_uid = stack_metadata.get("uid")
-    if not isinstance(stack_uid, str):
-        raise RuntimeError("deleting Stack has no UID")
-    stack_generation = _deletion_generation(stack_metadata, STACK_NAME)
-    for unit_name, unit_uid, generation in _owned_units(desired, stack_uid):
-        _run_controller(
-            "finalize",
-            "unit",
-            "--environment",
-            "dev",
-            "--name",
-            unit_name,
-            "--uid",
-            unit_uid,
-            "--deletion-generation",
-            str(generation),
-        )
-    _run_controller(
-        "finalize",
-        "stack",
-        "--environment",
-        "dev",
-        "--name",
-        STACK_NAME,
-        "--uid",
-        stack_uid,
-        "--deletion-generation",
-        str(stack_generation),
-    )
+    # Apply records deletion intent. Converge owns child-first teardown and
+    # the controller-owned cleanup commits.
+    _run_controller("converge", "--environment", "dev", "--yes", capture=True)
     if run("docker", "container", "inspect", APP_NAME, check=False, capture=True).returncode == 0:
-        raise RuntimeError("Stack finalization left the Docker application running")
+        raise RuntimeError("automatic Stack deletion left the Docker application running")
+    desired = _desired_tree("deleted")
+    remaining = [
+        path for directory in ("stacks", "units") for path in (desired / directory).glob("*") if path.is_file()
+    ]
+    if remaining:
+        raise RuntimeError("automatic Stack deletion left desired resources: " + ", ".join(map(str, remaining)))
 
 
 def clean(registry: str) -> None:
@@ -272,8 +205,8 @@ def acceptance(registry_port: int, app_port: int) -> None:
         converge(registry_port, app_port, expect_clean=True)
         if deployment_heads() != first_heads:
             raise RuntimeError("clean Docker convergence moved desired or observed refs")
-        remove_and_finalize_partitioned_stack()
-        print("Acceptance passed: partitioned Docker Stack converged cleanly and finalized child-first.")
+        remove_and_converge_partitioned_stack()
+        print("Acceptance passed: partitioned Docker Stack converged cleanly and deleted child-first.")
     finally:
         clean(registry)
 

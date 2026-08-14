@@ -5,7 +5,9 @@ This demo documents one `StackTemplate` in explicit-input workflows:
 - Normal mode applies the `dev` Stack as the authoritative `application` partition, then promotes its exact image
   artifact into the explicitly selected `staging` Stack.
 - `--preview` applies an unpartitioned Stack in the `preview` environment. Acceptance also reapplies it at a newer
-  source revision and requests UID-fenced deletion.
+  source revision, records UID-fenced deletion intent, and runs convergence to progress teardown. Direct delivery
+  remains visibly waiting because it has no controller-owned teardown capability; Argo CD delivery can converge once
+  the observed Application is gone.
 
 The deferred promotion workflow combines three pinned inputs rather than copying dev's entire desired tree:
 

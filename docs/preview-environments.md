@@ -1,8 +1,8 @@
 # Preview environments
 
 A preview is an ordinary Environment whose resources are constructed from explicit apply input. A Stack is a useful
-root because it expands one parameterized StackTemplate into owned Units that can be reconciled and finalized as a
-group.
+root because it expands one parameterized StackTemplate into owned Units that can be reconciled and automatically
+progressed through teardown as a group.
 
 ## Apply a preview
 
@@ -87,16 +87,27 @@ gitopsctr delete stack \
   --uid "$STACK_UID"
 ```
 
-Deletion is recorded on the retained desired resource. Reconcile and finalize owned Units in reverse dependency order,
-then finalize the Stack with its UID and deletion-generation fences. Partitioned previews can instead be omitted from
-the next authoritative application of their partition.
+Deletion is recorded on the retained desired resource; `delete` does not touch the external system. Run convergence
+without authored files to perform idempotent teardown and automatic cleanup in child/dependent-first order:
+
+```console
+gitopsctr converge --environment preview --yes
+```
+
+The UID and deletion-generation fences are checked by the controller as it removes each safely completed resource.
+If a driver cannot prove teardown, the resource remains present and the Unit table shows `RECONCILIATION: WAIT`; no
+desired state is removed. Partitioned previews can instead be omitted from the next authoritative application of their
+partition, which records the same deletion intent before convergence.
+
+For an Environment with a change gate, a deletion candidate is inert until it reaches the live desired ref. Do not
+expect teardown or cleanup effects from an unmerged candidate.
 
 ## CI and forge boundary
 
 Forge identity is provenance only. Trusted CI decides whether a pull request is eligible and supplies explicit input
 to `apply` or `converge`; gitopsctr does not inspect forge state or persist authored input for later reconstruction. A
 scheduled deployment job may enumerate previews, consult the forge for missed events, and invoke the same apply or
-UID-fenced deletion operations.
+UID-fenced deletion operations, followed by convergence. Cleanup is part of that controller progression.
 
 For Argo CD, use a trusted ApplicationSet or Application that watches the preview Environment's desired ref and the
 Stack-owned Unit's materialized path. The Kubernetes demo exercises this boundary with:

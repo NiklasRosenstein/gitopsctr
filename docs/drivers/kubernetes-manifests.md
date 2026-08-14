@@ -144,8 +144,9 @@ GITOPSCTR_K8S_PROVIDER=minikube mise run demo-k8s run
 
 `mise run demo-k8s acceptance` starts from empty state, applies and reconciles the partitioned dev Stack, promotes its exact
 image artifact into staging, verifies both workloads, proves clean convergence, and always removes the cluster.
-`mise run demo-k8s acceptance --preview` instead applies, updates, and requests deletion of an unpartitioned preview
-Stack built from the same template.
+`mise run demo-k8s acceptance --preview` instead applies, updates, records deletion intent for, and runs convergence
+against an unpartitioned preview Stack built from the same template. Direct delivery has no controller-owned teardown,
+so its deleting Unit remains visibly `WAIT`; external delivery can progress once its observed Application disappears.
 
 Add `--delivery argocd` to any Kubernetes demo command to exercise external delivery. It installs an isolated Argo CD
 Core instance, creates automated Applications before their materialized payloads exist, and observes Argo CD syncing

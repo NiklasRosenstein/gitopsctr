@@ -1,6 +1,7 @@
 """Generic metadata-based Unit finalization and cleanup safety tests."""
 
 import shutil
+import tempfile
 from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
@@ -9,7 +10,7 @@ import pytest
 
 from gitopsctr import controller
 from gitopsctr.contracts import DesiredOwnerReference
-from gitopsctr.driver import TeardownResult
+from gitopsctr.driver import DriverError, TeardownResult
 from gitopsctr.errors import OperationError
 from tests.conftest import write_test_document
 
@@ -47,18 +48,17 @@ def _terraform_unit(
     }
 
 
-def _finalize_args(name: str = "application", **overrides: object) -> Namespace:
+def _reconcile_args(name: str = "application", **overrides: object) -> Namespace:
     values = {
-        "kind": "Unit",
-        "name": name,
+        "unit": name,
         "environment": "dev",
         "desired_ref": "deploy/dev",
         "observed_ref": "observed/dev",
-        "candidate_ref": None,
-        "uid": "d1-application",
-        "deletion_generation": 1,
+        "desired_revision": "c" * 40,
+        "plan": False,
         "report": None,
-        "dry": False,
+        "reapply": False,
+        "verbose": False,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -143,7 +143,15 @@ def _prepare_finalization(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docum
     monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
     monkeypatch.setattr(controller, "observed_tree", observed_tree)
     monkeypatch.setattr(controller, "fetch_ref", lambda _ref: desired_revision)
-    monkeypatch.setattr(controller, "materialize_revision", lambda _revision, output: output.mkdir(parents=True))
+    monkeypatch.setattr(controller, "resolve_ref", lambda _ref, _revision=None: desired_revision)
+
+    def materialize(revision: str, output: Path) -> None:
+        if revision == desired_revision:
+            shutil.copytree(desired, output)
+        else:
+            output.mkdir(parents=True)
+
+    monkeypatch.setattr(controller, "materialize_revision", materialize)
     monkeypatch.setattr(controller, "change_gate", lambda *_args: "none")
     monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
     monkeypatch.setattr(controller, "publish_tree", publish_tree)
@@ -154,16 +162,15 @@ def _prepare_finalization(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docum
 
 
 def _mark(document: dict[str, object], name: str = "application") -> dict[str, object]:
-    path = Path("/tmp") / f"gitopsctr-test-{name}.json"
-    _write(path, document)
-    resource = controller.load_desired_unit(path, name)
-    marked = controller.mark_resource_for_deletion(resource)
-    result = controller.serialize_unit_document(marked, profile="desired")
-    path.unlink()
-    return result
+    with tempfile.TemporaryDirectory(prefix="gitopsctr-mark-") as directory:
+        path = Path(directory) / f"{name}.json"
+        _write(path, document)
+        resource = controller.load_desired_unit(path, name)
+        marked = controller.mark_resource_for_deletion(resource)
+        return controller.serialize_unit_document(marked, profile="desired")
 
 
-def test_finalize_runs_teardown_records_observed_evidence_and_removes_unit(tmp_path, monkeypatch):
+def test_reconcile_deleting_unit_runs_teardown_records_observed_evidence_and_removes_unit(tmp_path, monkeypatch):
     document = _mark(_terraform_unit("application", "d1-application"))
     desired, observed, publications, teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
     teardown_calls = []
@@ -174,7 +181,7 @@ def test_finalize_runs_teardown_records_observed_evidence_and_removes_unit(tmp_p
 
     monkeypatch.setattr(type(controller.UNIT_DRIVERS["terraform"]), "teardown", teardown)
 
-    assert controller.command_finalize(_finalize_args()) is True
+    assert controller.command_reconcile(_reconcile_args()) is True
     assert len(teardown_calls) == 1
     assert len(publications) == 1
     assert teardown_publications
@@ -184,7 +191,78 @@ def test_finalize_runs_teardown_records_observed_evidence_and_removes_unit(tmp_p
     assert evidence.details == {"destroyed": True}
 
 
-def test_finalize_without_effect_leases_runs_teardown_without_lease_mutations(tmp_path, monkeypatch):
+def test_reconcile_plan_never_runs_deletion_teardown_or_publication(tmp_path, monkeypatch):
+    document = _mark(_terraform_unit("application", "d1-application"))
+    desired, _observed, publications, teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
+    monkeypatch.setattr(
+        type(controller.UNIT_DRIVERS["terraform"]),
+        "teardown",
+        lambda *_args, **_kwargs: pytest.fail("plan must not run teardown"),
+    )
+
+    assert controller.command_reconcile(_reconcile_args(plan=True)) is False
+
+    assert (desired / "units/application.yaml").exists()
+    assert publications == []
+    assert teardown_publications == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        DriverError("temporary teardown failure"),
+        controller.subprocess.CalledProcessError(1, ["terraform", "destroy"]),
+    ],
+    ids=["driver-error", "subprocess-error"],
+)
+def test_reconcile_driver_failure_releases_lease_for_automatic_retry(tmp_path, monkeypatch, failure):
+    document = _mark(_terraform_unit("application", "d1-application"))
+    desired, _observed, _publications, _teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
+    releases: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "release_effect_lease",
+        lambda _ref, _name, token, *_args, **_kwargs: releases.append(token),
+    )
+    attempts = 0
+
+    def teardown(_driver, _context):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise failure
+        return TeardownResult()
+
+    monkeypatch.setattr(type(controller.UNIT_DRIVERS["terraform"]), "teardown", teardown)
+
+    with pytest.raises(type(failure)):
+        controller.command_reconcile(_reconcile_args())
+    assert releases == ["lease-test"]
+    assert (desired / "units/application.yaml").exists()
+
+    assert controller.command_reconcile(_reconcile_args()) is True
+    assert attempts == 2
+
+
+def test_reconcile_invalid_teardown_result_releases_lease(tmp_path, monkeypatch):
+    document = _mark(_terraform_unit("application", "d1-application"))
+    desired, _observed, _publications, _teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
+    releases: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "release_effect_lease",
+        lambda _ref, _name, token, *_args, **_kwargs: releases.append(token),
+    )
+    monkeypatch.setattr(type(controller.UNIT_DRIVERS["terraform"]), "teardown", lambda *_args: object())
+
+    with pytest.raises(DriverError, match="invalid result"):
+        controller.command_reconcile(_reconcile_args())
+
+    assert releases == ["lease-test"]
+    assert (desired / "units/application.yaml").exists()
+
+
+def test_reconcile_deleting_unit_without_effect_leases_runs_teardown(tmp_path, monkeypatch):
     document = _mark(_terraform_unit("application", "d1-application"))
     desired, observed, _publications, _teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
     monkeypatch.setattr(controller, "effect_lease_ref", lambda *_args, **_kwargs: None)
@@ -199,18 +277,18 @@ def test_finalize_without_effect_leases_runs_teardown_without_lease_mutations(tm
         lambda _driver, _context: TeardownResult(details={"destroyed": True}),
     )
 
-    assert controller.command_finalize(_finalize_args()) is True
+    assert controller.command_reconcile(_reconcile_args()) is True
     assert not (desired / "units/application.yaml").exists()
     assert controller.load_teardown_evidence(observed, "application", "d1-application", 1) is not None
 
 
-def test_finalize_retry_releases_separate_store_lease_after_desired_removal(tmp_path, monkeypatch):
-    current = tmp_path / "current"
-    current.mkdir()
+def test_reconcile_retry_releases_separate_store_lease_after_desired_removal(tmp_path, monkeypatch):
+    desired = tmp_path / "desired"
+    desired.mkdir()
     lease_root = tmp_path / "leases"
     lease_root.mkdir()
     controller.write_resource_incarnation_tombstone(
-        current,
+        desired,
         controller.ResourceIncarnationTombstone(
             api_version=controller.UNIT_API_VERSION,
             kind="Terraform",
@@ -219,12 +297,22 @@ def test_finalize_retry_releases_separate_store_lease_after_desired_removal(tmp_
             deletion_generation=1,
         ),
     )
+    controller.write_resource_incarnation_tombstone(
+        desired,
+        controller.ResourceIncarnationTombstone(
+            api_version=controller.UNIT_API_VERSION,
+            kind="Terraform",
+            name="application",
+            uid="d1-older-application",
+            deletion_generation=1,
+        ),
+    )
     controller.write_effect_lease(
         lease_root,
         controller.EffectLease(
             unit_name="application",
             uid="d1-application",
-            token="lease-finalize",
+            token="lease-deletion",
             owner="test",
             desired_revision="c" * 40,
             expires_at=None,
@@ -233,16 +321,15 @@ def test_finalize_retry_releases_separate_store_lease_after_desired_removal(tmp_
     released: list[tuple[str, str, str | None]] = []
     monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
     monkeypatch.setattr(controller, "effect_lease_ref", lambda *_args, **_kwargs: "gitopsctr/leases")
+    monkeypatch.setattr(controller, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(controller, "resolve_ref", lambda *_args, **_kwargs: "c" * 40)
+    monkeypatch.setattr(controller, "materialize_revision", lambda _revision, output: shutil.copytree(desired, output))
     monkeypatch.setattr(
         controller,
         "observed_tree",
-        lambda _ref, output: (shutil.copytree(current, output), "c" * 40)[1],
+        lambda _ref, output: (shutil.copytree(desired, output), "c" * 40)[1],
     )
-    monkeypatch.setattr(
-        controller,
-        "_effect_lease_store_root",
-        lambda *_args, **_kwargs: (lease_root, "e" * 40),
-    )
+    monkeypatch.setattr(controller, "_effect_lease_store_root", lambda *_args, **_kwargs: (lease_root, "e" * 40))
     monkeypatch.setattr(
         controller,
         "release_effect_lease",
@@ -251,11 +338,11 @@ def test_finalize_retry_releases_separate_store_lease_after_desired_removal(tmp_
         ),
     )
 
-    assert controller.command_finalize(_finalize_args()) is True
+    assert controller.command_reconcile(_reconcile_args()) is True
     assert released == [("deploy/dev", "application", "gitopsctr/leases")]
 
 
-def test_finalize_retries_from_observed_evidence_without_repeating_teardown(tmp_path, monkeypatch):
+def test_reconcile_retries_from_observed_evidence_without_repeating_teardown(tmp_path, monkeypatch):
     document = _mark(_terraform_unit("application", "d1-application"))
     desired, observed, _publications, _teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
     teardown_calls = []
@@ -272,14 +359,26 @@ def test_finalize_retries_from_observed_evidence_without_repeating_teardown(tmp_
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("crash after evidence")),
     )
     with pytest.raises(RuntimeError, match="crash after evidence"):
-        controller.command_finalize(_finalize_args())
+        controller.command_reconcile(_reconcile_args())
     assert len(teardown_calls) == 1
     assert controller.load_teardown_evidence(observed, "application", "d1-application", 1) is not None
 
     monkeypatch.setattr(controller, "publish_desired_change", original_publish)
-    assert controller.command_finalize(_finalize_args()) is True
+    assert controller.command_reconcile(_reconcile_args()) is True
     assert len(teardown_calls) == 1
-    assert not (desired / "units/application.json").exists()
+    assert not (desired / "units/application.yaml").exists()
+
+
+def test_reconcile_rejects_changed_retained_resource_digest(tmp_path, monkeypatch):
+    document = _mark(_terraform_unit("application", "d1-application"))
+    desired, _observed, _publications, _teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
+    changed = controller.load_desired_unit(desired / "units/application.yaml", "application")
+    changed_document = controller.serialize_unit_document(changed, profile="desired")
+    changed_document["spec"]["terraform"]["variables"] = {"changed": True}  # type: ignore[index]
+    _write(desired / "units/application.yaml", changed_document)
+
+    with pytest.raises(OperationError, match="changed after deletion started"):
+        controller.command_reconcile(_reconcile_args())
 
 
 def test_teardown_evidence_requires_uid_and_generation_in_filename(tmp_path):
@@ -296,25 +395,7 @@ def test_teardown_evidence_requires_uid_and_generation_in_filename(tmp_path):
         controller.load_teardown_evidence(tmp_path, "application", "d1-application", 1)
 
 
-def test_finalize_rejects_stale_uid_generation_and_digest_fences(tmp_path, monkeypatch):
-    document = _mark(_terraform_unit("application", "d1-application"))
-    desired, _observed, _publications, _teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
-    for overrides, message in (
-        ({"uid": "d1-other"}, "stale Unit UID fence"),
-        ({"deletion_generation": 2}, "stale Unit deletion generation fence"),
-    ):
-        with pytest.raises(OperationError, match=message):
-            controller.command_finalize(_finalize_args(**overrides))
-
-    changed = controller.load_desired_unit(desired / "units/application.yaml", "application")
-    changed_document = controller.serialize_unit_document(changed, profile="desired")
-    changed_document["spec"]["terraform"]["variables"] = {"changed": True}  # type: ignore[index]
-    _write(desired / "units/application.yaml", changed_document)
-    with pytest.raises(OperationError, match="changed after deletion started"):
-        controller.command_finalize(_finalize_args())
-
-
-def test_finalize_blocks_owned_children_and_dependency_dependents(tmp_path, monkeypatch):
+def test_reconcile_blocks_owned_children_and_dependency_dependents(tmp_path, monkeypatch):
     parent = _terraform_unit("parent", "d1-parent")
     child = _terraform_unit(
         "child",
@@ -327,47 +408,35 @@ def test_finalize_blocks_owned_children_and_dependency_dependents(tmp_path, monk
         tmp_path, monkeypatch, _mark(parent, "parent")
     )
     _write(desired / "units/child.yaml", _mark(child, "child"))
-    with pytest.raises(OperationError, match="owned resources must be finalized first"):
-        controller.command_finalize(_finalize_args(name="parent", uid="d1-parent"))
+    assert controller.command_reconcile(_reconcile_args(name="parent")) is False
+    assert (desired / "units/parent.yaml").exists()
 
 
-def test_finalize_requires_runtime_fences(tmp_path, monkeypatch):
-    _prepare_finalization(tmp_path, monkeypatch, _mark(_terraform_unit("application", "d1-application")))
-    with pytest.raises(OperationError, match="requires --uid"):
-        controller.command_finalize(_finalize_args(uid=None))
-    with pytest.raises(OperationError, match="deletion-generation"):
-        controller.command_finalize(_finalize_args(deletion_generation=None))
+def test_public_finalize_command_is_absent():
+    with pytest.raises(SystemExit):
+        controller.build_parser().parse_args(["finalize"])
 
 
-def test_generic_finalize_parser_uses_kind_and_name_fences():
-    args = controller.build_parser().parse_args(
-        [
-            "finalize",
-            "unit",
-            "--environment",
-            "dev",
-            "--name",
-            "application",
-            "--uid",
-            "d1-application",
-            "--deletion-generation",
-            "1",
-        ]
-    )
-    assert args.kind == "unit"
-    assert args.name == "application"
-    assert args.uid == "d1-application"
-    assert args.deletion_generation == 1
-
-
-def test_finalize_blocks_observation_dependents_before_teardown(tmp_path, monkeypatch):
+def test_reconcile_blocks_observation_dependents_before_teardown(tmp_path, monkeypatch):
     parent = _mark(_terraform_unit("parent", "d1-parent"), "parent")
     child = _terraform_unit("child", "d1-child")
     child["spec"]["resolvedInputs"] = {"receipts": {"parent": "receipt-parent"}}  # type: ignore[index]
     desired, _observed, _publications, _teardown_publications = _prepare_finalization(tmp_path, monkeypatch, parent)
     _write(desired / "units/child.yaml", child)
-    with pytest.raises(OperationError, match="active owned/dependent Units"):
-        controller.command_finalize(_finalize_args(name="parent", uid="d1-parent"))
+    assert controller.command_reconcile(_reconcile_args(name="parent")) is False
+    assert (desired / "units/parent.yaml").exists()
+
+
+def test_reconcile_unsupported_teardown_remains_wait_with_desired_intact(tmp_path, monkeypatch):
+    document = _mark(_terraform_unit("application", "d1-application"))
+    desired, _observed, _publications, _teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
+
+    class NoTeardownCapability:
+        pass
+
+    monkeypatch.setattr(controller, "TeardownCapability", NoTeardownCapability)
+    assert controller.command_reconcile(_reconcile_args()) is False
+    assert (desired / "units/application.yaml").exists()
 
 
 def test_opaque_cleanup_resolution_remains_supported(tmp_path, monkeypatch):

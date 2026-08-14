@@ -94,8 +94,10 @@ gitopsctr apply --environment dev \
 ```
 
 Applying without `--partition` updates only explicitly supplied roots. Existing resources keep their partition; new
-resources remain unpartitioned. See [Preview environments](preview-environments.md) for the unpartitioned preview
-workflow and deletion/finalization.
+resources remain unpartitioned. Run `converge --environment dev --yes` after recording deletion intent to let the
+controller tear down generated Units child-first and remove the Stack when safe. See
+[Preview environments](preview-environments.md) for the unpartitioned preview workflow and automatic deletion
+progression.
 
 ## Prove clean convergence
 

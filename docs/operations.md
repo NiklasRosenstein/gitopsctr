@@ -114,6 +114,16 @@ roots are its complete membership: members omitted from that application begin d
 unpartitioned roots are untouched. Without `--partition`, apply updates only the named inputs; an existing root keeps
 its partition, while a new root is unpartitioned. Owned resources inherit selection through `ownerReferences`.
 
+Deletion is a two-phase lifecycle. `delete` and partition omission publish UID-/digest-fenced deletion intent only;
+they do not run external teardown. Reconcile a deleting Unit or run `converge` to let the controller process deleting
+resources child/dependent-first, perform idempotent teardown, record observed evidence, and publish the cleanup
+commit automatically. A resource whose driver cannot prove teardown remains in the desired tree and is shown as
+`RECONCILIATION: WAIT` rather than being removed.
+
+Persisted desired state supplies teardown inputs and Stack projection context. The controller's live Project and
+Environment configuration remains the trust anchor that identifies the accepted desired ref; desired or candidate
+documents never authorize their own cleanup effects.
+
 `--dry` previews the controller-owned Git changes. A no-op application creates no commit. An Environment change gate
 decides whether a changed candidate is published to the desired ref or offered for review. A reconciliation plan lets
 the driver inspect its work without applying changes or publishing a receipt; normal reconciliation publishes a
@@ -149,7 +159,9 @@ gitopsctr converge --environment dev \
 
 Without `--file`, converge reconciles current desired state and can re-project persisted StackTemplate/Stack
 inputs when new observation evidence unlocks a dynamic reference. No re-application of the original source files is
-required; provide `--file` only when intentionally changing authored input.
+required; provide `--file` only when intentionally changing authored input. It also progresses deleting resources until
+the environment is clean, waiting, or failed. A change-gated candidate is not live desired state: it cannot start
+reconciliation, teardown, or cleanup until it is approved and reaches the environment's desired ref.
 
 ## Promote and verify
 
@@ -205,12 +217,13 @@ Forge identity is provenance only. `gitopsctr` does not decide whether a pull
 request or merge request is eligible, and normal desired-state operations do not
 call GitHub or GitLab.
 
-Trusted PR CI may create, update, delete, and finalize a preview Stack with the
-normal CLI primitives. A scheduled CI job may enumerate preview refs or
-resources by lineage, consult the forge for missed events, and request cleanup.
-Cleanup still uses UID-/revision-fenced Stack finalization. The deployment-owned
-scheduled job is responsible for lineage enumeration and forge API calls; this
-repository does not provide a forge-aware recovery command or watcher.
+Trusted PR CI may create, update, and delete a preview Stack with the normal CLI
+primitives, then run `converge` against the live desired ref. Convergence performs
+UID-/revision-fenced teardown and automatic child/dependent-first cleanup. A
+scheduled CI job may enumerate preview refs or resources by lineage, consult the
+forge for missed events, and request deletion intent; the deployment-owned job
+remains responsible for lineage enumeration and forge API calls. This repository
+does not provide a forge-aware recovery command or watcher.
 
 ## Verify GitHub merge policy
 

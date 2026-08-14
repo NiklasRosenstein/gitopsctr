@@ -96,7 +96,7 @@ def test_fresh_stack_demo_command_selects_template_with_stack(tmp_path, monkeypa
     assert published is not None
 
 
-def test_docker_acceptance_proves_clean_convergence_then_finalizes(monkeypatch):
+def test_docker_acceptance_uses_automatic_deletion_convergence(monkeypatch):
     events: list[object] = []
     heads = iter((RefHeads("desired", "observed"), RefHeads("desired", "observed")))
     monkeypatch.setattr(docker_demo, "clean", lambda registry: events.append(("clean", registry)))
@@ -108,8 +108,8 @@ def test_docker_acceptance_proves_clean_convergence_then_finalizes(monkeypatch):
     monkeypatch.setattr(docker_demo, "deployment_heads", lambda: next(heads))
     monkeypatch.setattr(
         docker_demo,
-        "remove_and_finalize_partitioned_stack",
-        lambda: events.append(("finalize",)),
+        "remove_and_converge_partitioned_stack",
+        lambda: events.append(("deletion-converge",)),
     )
 
     docker_demo.acceptance(5001, 18081)
@@ -118,7 +118,7 @@ def test_docker_acceptance_proves_clean_convergence_then_finalizes(monkeypatch):
         ("clean", "localhost:5001"),
         ("converge", 5001, 18081, {}),
         ("converge", 5001, 18081, {"expect_clean": True}),
-        ("finalize",),
+        ("deletion-converge",),
         ("clean", "localhost:5001"),
     ]
 
@@ -129,8 +129,6 @@ def test_docker_acceptance_always_cleans_after_failed_invariant(monkeypatch):
     monkeypatch.setattr(docker_demo, "clean", cleaned.append)
     monkeypatch.setattr(docker_demo, "converge", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(docker_demo, "deployment_heads", lambda: next(heads))
-    monkeypatch.setattr(docker_demo, "remove_and_finalize_partitioned_stack", lambda: None)
-
     with pytest.raises(RuntimeError, match="moved desired or observed refs"):
         docker_demo.acceptance(5001, 18081)
 

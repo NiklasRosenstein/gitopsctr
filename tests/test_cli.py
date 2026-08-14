@@ -81,9 +81,10 @@ def test_root_help_groups_commands_and_describes_each_command():
     assert "Git data:\n" in help_text
     assert "    promote             promote reviewed desired state" in help_text
     assert "    reconcile           reconcile one deployment unit" in help_text
+    assert "finalize" not in help_text
 
 
-def test_delete_and_finalize_use_generic_resource_commands():
+def test_delete_is_public_but_finalize_is_not():
     parser = deploy_release.build_parser()
 
     delete = parser.parse_args(
@@ -103,25 +104,8 @@ def test_delete_and_finalize_use_generic_resource_commands():
     assert delete.name == "application"
     assert delete.uid == "d1-application"
 
-    finalize = parser.parse_args(
-        [
-            "finalize",
-            "unit",
-            "--environment",
-            "preview",
-            "--name",
-            "application",
-            "--uid",
-            "d1-application",
-            "--deletion-generation",
-            "1",
-        ]
-    )
-    assert finalize.handler is deploy_release.command_finalize
-    assert finalize.kind == "unit"
-    assert finalize.name == "application"
-    assert finalize.uid == "d1-application"
-    assert finalize.deletion_generation == 1
+    with pytest.raises(SystemExit):
+        parser.parse_args(["finalize"])
 
 
 def test_candidate_publication_delegates_change_request_to_ci(tmp_path, monkeypatch):

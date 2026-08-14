@@ -291,6 +291,7 @@ def converge(
     source_revision: str | None = None,
     expect_clean: bool = False,
     allow_stall: bool = False,
+    verbose: bool = False,
     files: tuple[str, ...] = (),
     partition: str | None = None,
 ) -> None:
@@ -299,6 +300,8 @@ def converge(
         arguments.extend(("--source-revision", source_revision))
     if partition is not None:
         arguments.extend(("--partition", partition))
+    if verbose:
+        arguments.append("--verbose")
     for path in files:
         arguments.extend(("--file", path))
     for attempt in range(4):
@@ -704,6 +707,24 @@ def request_preview_deletion(
     )
 
 
+def progress_preview_deletion(
+    provider: Provider,
+    delivery: Delivery,
+    *,
+    remote: str | None = None,
+) -> None:
+    """Let convergence progress preview teardown after deletion intent is live."""
+    converge(
+        provider,
+        "preview",
+        delivery,
+        preview=True,
+        remote=remote,
+        allow_stall=delivery == "direct",
+        verbose=delivery == "direct",
+    )
+
+
 def execute_story(
     provider: Provider,
     delivery: Delivery,
@@ -752,7 +773,14 @@ def execute_story(
             if second_image == first_image:
                 raise RuntimeError("preview application did not publish a new image")
             request_preview_deletion(provider, delivery, remote=remote)
-            print("Acceptance passed: unpartitioned preview applied, converged, updated, and entered deletion.")
+            progress_preview_deletion(provider, delivery, remote=remote)
+            if delivery == "direct":
+                print(
+                    "Acceptance passed: unpartitioned preview applied, converged, updated, and "
+                    "left unsupported teardown visibly waiting."
+                )
+            else:
+                print("Acceptance passed: unpartitioned preview applied, converged, updated, and deleted child-first.")
         return
 
     first_heads = run_promotion_story(provider, delivery, remote=remote)
