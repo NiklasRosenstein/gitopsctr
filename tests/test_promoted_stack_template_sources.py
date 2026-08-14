@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -184,6 +185,160 @@ def test_from_resource_uses_target_specification_revision_during_promotion(
 
     assert _marker(projection) == ("B", "staging")
     assert _desired_stack(output).spec.resolvedSource.fromGit.commit == fixture.revision_b
+
+
+def test_promotion_input_loads_exact_specification_snapshot(
+    promotion_fixture: PromotionFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = promotion_fixture
+    input_path = fixture.source / "promotion-input.yaml"
+    input_path.write_text(
+        "apiVersion: unit.gitopsctr.io/v1\nkind: FrontendS3Cloudfront\nmetadata:\n  name: reviewed\nspec: {}\n"
+    )
+    specification_revision = commit(fixture.source, "add reviewed promotion input")
+    input_path.write_text(input_path.read_text().replace("reviewed", "dirty"))
+    snapshot = tmp_path / "specification"
+    controller.materialize_revision(specification_revision, snapshot)
+    monkeypatch.chdir(fixture.source)
+
+    documents = controller._load_apply_documents(
+        ["promotion-input.yaml"],
+        source_revision=specification_revision,
+        source_root=snapshot,
+        operation="promotion",
+        revision_option="--specification-revision",
+    )
+
+    assert documents[0][1]["metadata"] == {"name": "reviewed"}
+
+
+@pytest.mark.parametrize("value", ["-", "outside.yaml"])
+def test_promotion_revision_rejects_stdin_and_outside_input_before_materialization(
+    promotion_fixture: PromotionFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    fixture = promotion_fixture
+    outside = tmp_path / value
+    if value != "-":
+        outside.write_text("apiVersion: unit.gitopsctr.io/v1\nkind: Terraform\nmetadata:\n  name: outside\n")
+        value = str(outside)
+    materialized = False
+
+    def fail_materialization(_revision: str, _target: Path) -> None:
+        nonlocal materialized
+        materialized = True
+
+    monkeypatch.setattr(controller, "materialize_revision", fail_materialization)
+    args = controller.build_parser().parse_args(
+        [
+            "promote",
+            "--from-environment",
+            "dev",
+            "--to-environment",
+            "staging",
+            "--specification-revision",
+            fixture.revision_b,
+            "-f",
+            value,
+        ]
+    )
+
+    with pytest.raises(OperationError, match="standard input|outside the project repository"):
+        controller.command_promote(args)
+    assert not materialized
+
+
+def test_promotion_rejects_zero_documents_without_partition(
+    promotion_fixture: PromotionFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = promotion_fixture
+    monkeypatch.chdir(fixture.source)
+    empty_input = fixture.source / "empty-promotion-input"
+    empty_input.mkdir()
+    (empty_input / "README").write_text("not a resource")
+    specification_revision = commit(fixture.source, "add empty promotion input")
+    args = controller.build_parser().parse_args(
+        [
+            "promote",
+            "--from-environment",
+            "dev",
+            "--to-environment",
+            "staging",
+            "--specification-revision",
+            specification_revision,
+            "-f",
+            "empty-promotion-input",
+        ]
+    )
+
+    with pytest.raises(OperationError, match="promotion produced zero documents"):
+        controller.command_promote(args)
+
+
+def test_empty_first_promotion_partition_is_a_noop(
+    promotion_fixture: PromotionFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = promotion_fixture
+    monkeypatch.chdir(fixture.source)
+    empty_input = fixture.source / "empty-promotion-input"
+    empty_input.mkdir()
+    (empty_input / "README").write_text("not a resource")
+    specification_revision = commit(fixture.source, "add empty promotion partition input")
+    args = controller.build_parser().parse_args(
+        [
+            "promote",
+            "--from-environment",
+            "dev",
+            "--to-environment",
+            "staging",
+            "--specification-revision",
+            specification_revision,
+            "--partition",
+            "application",
+            "-f",
+            "empty-promotion-input",
+        ]
+    )
+    actual_materialize = controller.materialize_revision
+
+    def materialize(revision: str, target: Path) -> None:
+        if revision == specification_revision:
+            actual_materialize(revision, target)
+        else:
+            shutil.copytree(fixture.dev_desired, target)
+
+    monkeypatch.setattr(controller, "materialize_revision", materialize)
+    monkeypatch.setattr(controller, "allowed_promotion_sources", lambda *_args: {"dev"})
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args: ("deploy/source", "observed/source"))
+    monkeypatch.setattr(controller, "resolve_ref", lambda *_args: "d" * 40)
+    monkeypatch.setattr(controller, "fetch_ref", lambda _ref: None)
+    monkeypatch.setattr(controller, "require_clean_source", lambda *_args: None)
+    monkeypatch.setattr(controller, "observed_tree", lambda _ref, target: (target.mkdir(), None)[1])
+    monkeypatch.setattr(controller, "change_gate", lambda *_args: "none")
+    monkeypatch.setattr(controller, "_copy_apply_source_base", lambda _source, destination, _environment: None)
+    monkeypatch.setattr(controller, "_write_apply_authored_documents", lambda *_args: ([], []))
+
+    def build_empty_candidate(*build_args: object, **_kwargs: object) -> None:
+        candidate = build_args[6]
+        assert isinstance(candidate, Path)
+        for directory in (candidate / "units", candidate / "stacks", candidate / "stack-templates"):
+            directory.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(controller, "build_desired_candidate", build_empty_candidate)
+    monkeypatch.setattr(controller, "_applied_root_closure", lambda *_args: frozenset())
+    monkeypatch.setattr(controller, "_copy_unrelated_desired_resources", lambda *_args: None)
+    monkeypatch.setattr(controller, "_prune_omitted_partition_resources", lambda *_args: None)
+    monkeypatch.setattr(controller, "effect_lease_ref", lambda *_args: None)
+    monkeypatch.setattr(controller, "validate_effect_leases_preserved", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        controller,
+        "publish_tree",
+        lambda *_args: pytest.fail("empty first promotion partition must not publish"),
+    )
+
+    assert controller.command_promote(args) is None
 
 
 @pytest.mark.parametrize(

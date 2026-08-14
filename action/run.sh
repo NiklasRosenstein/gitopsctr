@@ -44,6 +44,7 @@ if [[ -n "${PARTITION}" && "${OPERATION}" != "apply" && "${OPERATION}" != "conve
 fi
 
 working_directory="$(cd "${WORKING_DIRECTORY}" && pwd)"
+cd "${working_directory}"
 args=(--repository "${working_directory}")
 
 write_prepare_outputs() {

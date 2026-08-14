@@ -129,6 +129,7 @@ def _desired(store: GitStateStore, root: Path) -> dict[str, Any]:
 def test_apply_resolves_authored_unit_and_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     source, store, revision = _repository(tmp_path, monkeypatch)
     authored = _authored_unit(source / "application.yaml", "application")
+    revision = commit(source, "add application")
 
     first = _apply(source, revision, authored, partition="application")
     assert first is not None
@@ -153,6 +154,182 @@ def test_apply_without_source_revision_uses_worktree_for_source_less_input(
     store.materialize(published, desired)
     unit = controller.load_desired_unit(controller.unit_document_path(desired, "frontend"), "frontend")
     assert getattr(unit.spec, "source", None) is None
+
+
+def test_apply_without_source_revision_resolves_relative_input_from_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source, store, _revision = _repository(tmp_path, monkeypatch)
+    caller = tmp_path / "caller"
+    authored = _authored_source_less_unit(caller / "inputs/frontend.yaml", "frontend")
+    monkeypatch.chdir(caller)
+
+    published = _apply_worktree(Path("inputs/frontend.yaml"))
+
+    assert published is not None
+    desired = tmp_path / "cwd-relative"
+    store.materialize(published, desired)
+    unit = controller.load_desired_unit(controller.unit_document_path(desired, "frontend"), "frontend")
+    assert getattr(unit.spec, "source", None) is None
+    assert authored.is_file()
+
+
+def test_apply_without_source_revision_accepts_live_input_outside_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source, store, _revision = _repository(tmp_path, monkeypatch)
+    authored = _authored_source_less_unit(tmp_path / "outside/frontend.yaml", "frontend")
+
+    published = _apply_worktree(authored)
+
+    assert published is not None
+    desired = tmp_path / "outside-desired"
+    store.materialize(published, desired)
+    assert controller.unit_document_path(desired, "frontend").is_file()
+
+
+def test_apply_with_source_revision_reads_snapshot_instead_of_dirty_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source, store, _revision = _repository(tmp_path, monkeypatch)
+    authored = _authored_unit(source / "application.yaml", "application")
+    revision = commit(source, "add application")
+    authored.write_text(authored.read_text().replace("name: application", "name: dirty"))
+
+    published = _apply(source, revision, authored)
+
+    assert published is not None
+    desired = _desired(store, tmp_path / "revision-snapshot")
+    assert desired["metadata"]["name"] == "application"  # type: ignore[index]
+
+
+def test_apply_with_source_revision_uses_snapshot_for_a_dirty_symlink_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source, store, _revision = _repository(tmp_path, monkeypatch)
+    input_path = source / "inputs/application.yaml"
+    authored = _authored_unit(input_path, "application")
+    revision = commit(source, "add application input")
+    dirty = _authored_unit(tmp_path / "dirty.yaml", "dirty")
+    input_path.unlink()
+    input_path.symlink_to(dirty)
+    monkeypatch.chdir(source)
+
+    published = _apply(source, revision, Path("inputs/application.yaml"))
+
+    assert published is not None
+    desired = _desired(store, tmp_path / "symlink-snapshot")
+    assert desired["metadata"]["name"] == "application"  # type: ignore[index]
+    assert authored.is_symlink()
+
+
+def test_apply_symlink_loop_is_reported_as_operation_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source, _store, _revision = _repository(tmp_path, monkeypatch)
+    loop = source / "loop.yaml"
+    loop.symlink_to(loop.name)
+
+    with pytest.raises(OperationError, match="invalid or looping symbolic link"):
+        _apply_worktree(loop)
+
+
+def test_apply_snapshot_symlink_loop_is_reported_as_operation_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source, _store, _revision = _repository(tmp_path, monkeypatch)
+    loop = source / "loop.yaml"
+    loop.symlink_to(loop.name)
+    revision = commit(source, "add looping input")
+
+    with pytest.raises(OperationError, match="invalid or looping symbolic link"):
+        _apply(source, revision, loop)
+
+
+def test_revision_apply_rejects_stdin_and_outside_input_before_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source, _store, revision = _repository(tmp_path, monkeypatch)
+    outside = _authored_source_less_unit(tmp_path / "outside/frontend.yaml", "frontend")
+    materialized = False
+
+    def fail_materialization(_revision: str, _target: Path) -> None:
+        nonlocal materialized
+        materialized = True
+
+    monkeypatch.setattr(controller, "materialize_revision", fail_materialization)
+    with pytest.raises(OperationError, match="standard input"):
+        _apply(source, revision, Path("-"))
+    with pytest.raises(OperationError, match="outside the project repository"):
+        _apply(source, revision, outside)
+    assert not materialized
+
+
+@pytest.mark.parametrize("input_kind", ["missing", "malformed", "empty"])
+def test_live_apply_validates_input_before_materializing_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, input_kind: str
+):
+    source, _store, _revision = _repository(tmp_path, monkeypatch)
+    if input_kind == "missing":
+        input_path = source / "missing.yaml"
+    elif input_kind == "malformed":
+        input_path = source / "malformed.yaml"
+        input_path.write_text("metadata: [")
+    else:
+        input_path = source / "empty"
+        input_path.mkdir()
+    materialized = False
+
+    def fail_materialization(_target: Path) -> None:
+        nonlocal materialized
+        materialized = True
+
+    monkeypatch.setattr(controller, "_materialize_apply_worktree", fail_materialization)
+    expected = (
+        "does not exist" if input_kind == "missing" else "zero documents" if input_kind == "empty" else "malformed"
+    )
+    with pytest.raises(OperationError, match=expected):
+        _apply_worktree(input_path)
+    assert not materialized
+
+
+def test_apply_with_source_revision_rejects_stdin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source, _store, revision = _repository(tmp_path, monkeypatch)
+
+    with pytest.raises(OperationError, match=r"--source-revision.*standard input"):
+        _apply(source, revision, Path("-"))
+
+
+def test_apply_with_source_revision_rejects_outside_repository_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source, _store, revision = _repository(tmp_path, monkeypatch)
+    outside = _authored_source_less_unit(tmp_path / "outside/frontend.yaml", "frontend")
+
+    with pytest.raises(OperationError, match=r"outside the project repository.*--source-revision"):
+        _apply(source, revision, outside)
+
+
+def test_apply_rejects_zero_document_input_without_partition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _source, _store, _revision = _repository(tmp_path, monkeypatch)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    with pytest.raises(OperationError, match="zero documents"):
+        _apply_worktree(empty)
+
+
+def test_partitioned_empty_directory_marks_omitted_members_for_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source, store, _revision = _repository(tmp_path, monkeypatch)
+    authored = _authored_source_less_unit(tmp_path / "application.yaml", "application")
+    _apply_worktree(authored, partition="application")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    published = _apply_worktree(empty, partition="application")
+
+    assert published is not None
+    desired = tmp_path / "empty-partition"
+    store.materialize(published, desired)
+    omitted = controller.load_desired_unit(controller.unit_document_path(desired, "application"), "application")
+    assert omitted.metadata.partition == "application"
+    assert controller.resource_deletion(omitted) is not None
 
 
 def test_apply_without_source_revision_rejects_repository_backed_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -204,6 +381,7 @@ def test_first_apply_initializes_an_unpublished_desired_ref(tmp_path: Path, monk
     source, store, revision = _repository(tmp_path, monkeypatch)
     git(source, "push", "origin", ":refs/heads/deploy/dev")
     authored = _authored_unit(source / "application.yaml", "application")
+    revision = commit(source, "add application")
 
     published = _apply(source, revision, authored, partition="application")
 
@@ -211,9 +389,22 @@ def test_first_apply_initializes_an_unpublished_desired_ref(tmp_path: Path, monk
     assert store.fetch("deploy/dev").revision == published
 
 
+def test_empty_first_partition_is_a_noop_without_creating_desired_ref(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source, store, _revision = _repository(tmp_path, monkeypatch)
+    git(source, "push", "origin", ":refs/heads/deploy/dev")
+    empty = source / "empty"
+    empty.mkdir()
+
+    published = _apply_worktree(empty, partition="application")
+
+    assert published is None
+    assert store.fetch("deploy/dev").revision is None
+
+
 def test_unpartitioned_apply_preserves_existing_partition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     source, store, revision = _repository(tmp_path, monkeypatch)
     authored = _authored_unit(source / "application.yaml", "application")
+    revision = commit(source, "add application")
     _apply(source, revision, authored, partition="application")
 
     _apply(source, revision, authored)
@@ -225,6 +416,9 @@ def test_unpartitioned_apply_preserves_existing_partition(tmp_path: Path, monkey
 def test_apply_rejects_cross_partition_transfer_and_duplicate_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     source, _store, revision = _repository(tmp_path, monkeypatch)
     authored = _authored_unit(source / "application.yaml", "application")
+    same_physical_unit = source / "same-name-other-kind.yaml"
+    same_physical_unit.write_text(authored.read_text().replace("kind: Terraform", "kind: OciImages"))
+    revision = commit(source, "add duplicate inputs")
     _apply(source, revision, authored, partition="application")
 
     with pytest.raises(OperationError, match="belongs to partition 'application'"):
@@ -232,8 +426,6 @@ def test_apply_rejects_cross_partition_transfer_and_duplicate_input(tmp_path: Pa
     with pytest.raises(OperationError, match="duplicate apply resource"):
         _apply(source, revision, authored, authored)
 
-    same_physical_unit = source / "same-name-other-kind.yaml"
-    same_physical_unit.write_text(authored.read_text().replace("kind: Terraform", "kind: OciImages"))
     with pytest.raises(OperationError, match="duplicate apply resource"):
         _apply(source, revision, authored, same_physical_unit)
 
@@ -338,6 +530,7 @@ def test_partition_apply_prunes_omitted_roots_and_retains_partition(tmp_path: Pa
     source, store, revision = _repository(tmp_path, monkeypatch)
     first = _authored_unit(source / "first.yaml", "first")
     second = _authored_unit(source / "second.yaml", "second")
+    revision = commit(source, "add partition inputs")
     _apply(source, revision, first, second, partition="application")
 
     _apply(source, revision, second, partition="application")
@@ -359,6 +552,7 @@ def test_shared_partition_pruning_marks_omitted_promotion_roots_for_deletion(
     source, store, revision = _repository(tmp_path, monkeypatch)
     first = _authored_unit(source / "first.yaml", "first")
     second = _authored_unit(source / "second.yaml", "second")
+    revision = commit(source, "add partition inputs")
     _apply(source, revision, first, second, partition="application")
     desired_revision = store.fetch("deploy/dev").revision
     assert desired_revision is not None
@@ -381,12 +575,14 @@ def test_canonical_desired_input_is_preserved_but_controller_owns_identity(
 ):
     source, store, revision = _repository(tmp_path, monkeypatch)
     authored = _authored_unit(source / "application.yaml", "application")
+    revision = commit(source, "add application")
     _apply(source, revision, authored)
     initial = _desired(store, tmp_path / "canonical-initial")
     initial_uid = initial["metadata"]["uid"]  # type: ignore[index]
     initial["metadata"]["uid"] = "caller-controlled"  # type: ignore[index]
     canonical = source / "canonical.yaml"
     canonical.write_text(yaml.safe_dump(initial, sort_keys=False))
+    revision = commit(source, "add canonical input")
 
     _apply(source, revision, canonical)
 

@@ -5653,12 +5653,29 @@ def _initialize_gated_desired_ref(
 
 def command_promote(args: argparse.Namespace) -> None:
     specification_revision = git("rev-parse", f"{args.specification_revision or 'HEAD'}^{{commit}}").stdout.strip()
+    _validate_apply_input_selection(
+        args.files,
+        specification_revision,
+        operation="promotion",
+        revision_option="--specification-revision",
+    )
     log_heading(f"Promote {style_environment(args.from_environment)} to {style_environment(args.to_environment)}")
     log_status("SPEC", f"reviewed source {describe_revision(specification_revision)}")
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
         source_root = temporary / "source"
         materialize_revision(specification_revision, source_root)
+        explicit_documents = _load_apply_documents(
+            args.files,
+            source_revision=specification_revision,
+            source_root=source_root,
+            operation="promotion",
+            revision_option="--specification-revision",
+        )
+        if not explicit_documents and args.partition is None:
+            raise OperationError(
+                "promotion produced zero documents; specify --partition for authoritative empty membership"
+            )
         allowed_sources = allowed_promotion_sources(source_root, args.to_environment)
         if args.from_environment not in allowed_sources:
             raise OperationError(
@@ -5691,13 +5708,6 @@ def command_promote(args: argparse.Namespace) -> None:
         target_revision = observed_tree(target_desired_ref, current_target)
         target_observed_revision = observed_tree(target_observed_ref, target_observed)
         gate = change_gate(source_root, args.to_environment)
-        if target_revision is None and gate == "pullRequest":
-            target_revision = _initialize_gated_desired_ref(
-                source_root,
-                args.to_environment,
-                target_desired_ref,
-                current_target,
-            )
         promotion = PromotionContext(
             source_environment=args.from_environment,
             desired_ref=source_desired_ref,
@@ -5708,7 +5718,6 @@ def command_promote(args: argparse.Namespace) -> None:
             desired_root=source_desired,
             observed_root=source_observed,
         )
-        explicit_documents = _load_apply_documents(args.files)
         explicit_source = temporary / "explicit-target"
         _copy_apply_source_base(source_root, explicit_source, args.to_environment)
         authored_units, authored_stacks = _write_apply_authored_documents(
@@ -5730,7 +5739,17 @@ def command_promote(args: argparse.Namespace) -> None:
         applied = _applied_root_closure(candidate, [*authored_units, *authored_stacks])
         _copy_unrelated_desired_resources(current_target, candidate, applied, args.partition)
         _prune_omitted_partition_resources(current_target, candidate, applied, args.partition)
-        load_desired_resource_graph(candidate)
+        candidate_resources = load_desired_resource_graph(candidate)
+        if target_revision is None and not candidate_resources:
+            log_status("KEEP", f"{style_branch(target_desired_ref)} remains empty")
+            return
+        if target_revision is None and gate == "pullRequest":
+            target_revision = _initialize_gated_desired_ref(
+                source_root,
+                args.to_environment,
+                target_desired_ref,
+                current_target,
+            )
         target_lease_ref = effect_lease_ref(args.to_environment, target_desired_ref)
         if target_lease_ref == target_desired_ref:
             copy_active_effect_leases(current_target, candidate)
@@ -7894,13 +7913,112 @@ def _parse_optional_units(value: str | None) -> list[str] | None:
     return units
 
 
-def _load_apply_documents(files: Sequence[str]) -> list[tuple[str, JsonObject]]:
-    """Load a deterministic resource stream from files, directories, or stdin."""
+def _lexical_apply_input_path(value: str) -> Path:
+    """Normalize a caller-spelled path without following any symlink."""
+
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return Path(os.path.normpath(str(path)))
+
+
+def _revision_apply_input_relative_path(
+    value: str,
+    *,
+    operation: str,
+    revision_option: str,
+) -> Path:
+    """Map a caller-spelled path lexically into the repository namespace."""
+
+    lexical = _lexical_apply_input_path(value)
+    try:
+        return lexical.relative_to(REPOSITORY_ROOT)
+    except ValueError as exc:
+        raise OperationError(
+            f"{operation} input {value!r} is outside the project repository and cannot be used with {revision_option}"
+        ) from exc
+
+
+def _resolve_checked_apply_path(path: Path, *, source_root: Path | None, value: str) -> Path:
+    """Resolve an input path and, for snapshots, prove it remains inside the snapshot."""
+
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise OperationError(f"{value!r} contains an invalid or looping symbolic link: {exc}") from exc
+    if source_root is not None:
+        try:
+            resolved.relative_to(source_root.resolve())
+        except ValueError as exc:
+            raise OperationError(
+                f"apply input {value!r} resolves outside the selected source revision snapshot"
+            ) from exc
+    return resolved
+
+
+def _validate_apply_input_selection(
+    files: Sequence[str],
+    source_revision: str | None,
+    *,
+    operation: str,
+    revision_option: str,
+) -> None:
+    """Validate input selection before materializing a revision-backed source."""
 
     if not files:
-        raise OperationError("apply requires at least one --file")
+        raise OperationError(f"{operation} requires at least one --file")
     if files.count("-") > 1:
         raise OperationError("standard input may be specified only once")
+    if source_revision is None:
+        return
+    if "-" in files:
+        raise OperationError(f"{operation} with {revision_option} does not accept standard input ('-')")
+    for value in files:
+        _revision_apply_input_relative_path(
+            value,
+            operation=operation,
+            revision_option=revision_option,
+        )
+
+
+def _resolve_apply_input_path(
+    value: str,
+    source_revision: str | None,
+    source_root: Path | None,
+    *,
+    operation: str = "apply",
+    revision_option: str = "--source-revision",
+) -> Path:
+    """Resolve a user-spelled apply or promotion path from the caller's CWD."""
+
+    if source_revision is None:
+        return _resolve_checked_apply_path(_lexical_apply_input_path(value), source_root=None, value=value)
+    if source_root is None:
+        raise OperationError(f"revision-backed {operation} inputs require a materialized source snapshot")
+    relative = _revision_apply_input_relative_path(
+        value,
+        operation=operation,
+        revision_option=revision_option,
+    )
+    return _resolve_checked_apply_path(source_root / relative, source_root=source_root, value=value)
+
+
+def _load_apply_documents(
+    files: Sequence[str],
+    *,
+    source_revision: str | None = None,
+    source_root: Path | None = None,
+    operation: str = "apply",
+    revision_option: str = "--source-revision",
+) -> list[tuple[str, JsonObject]]:
+    """Load a deterministic resource stream from live or revision-backed paths."""
+
+    _validate_apply_input_selection(
+        files,
+        source_revision,
+        operation=operation,
+        revision_option=revision_option,
+    )
     loaded: list[tuple[str, JsonObject]] = []
     paths: list[Path] = []
     for value in files:
@@ -7920,17 +8038,24 @@ def _load_apply_documents(files: Sequence[str]) -> list[tuple[str, JsonObject]]:
                     raise OperationError(f"standard input document {index} must be a resource mapping")
                 loaded.append((f"stdin#{index}", document))
             continue
-        path = Path(value)
-        if not path.is_absolute():
-            path = REPOSITORY_ROOT / path
+        path = _resolve_apply_input_path(
+            value,
+            source_revision,
+            source_root,
+            operation=operation,
+            revision_option=revision_option,
+        )
         if not path.exists():
             raise OperationError(f"apply input does not exist: {value}")
         if path.is_dir():
-            paths.extend(
-                child
-                for child in sorted(path.rglob("*"))
-                if child.is_file() and child.suffix.lower() in {".json", ".yaml", ".yml"}
-            )
+            try:
+                children = sorted(path.rglob("*"))
+            except (OSError, RuntimeError) as exc:
+                raise OperationError(f"{value!r} contains an invalid or looping symbolic link: {exc}") from exc
+            for child in children:
+                checked_child = _resolve_checked_apply_path(child, source_root=source_root, value=value)
+                if checked_child.is_file() and checked_child.suffix.lower() in {".json", ".yaml", ".yml"}:
+                    paths.append(checked_child)
         elif path.suffix.lower() in {".json", ".yaml", ".yml"}:
             paths.append(path)
         else:
@@ -7938,7 +8063,7 @@ def _load_apply_documents(files: Sequence[str]) -> list[tuple[str, JsonObject]]:
     for path in paths:
         try:
             loaded.append((str(path), RESOURCE_CATALOG.load_document(path)))
-        except (DocumentFormatError, OperationError) as exc:
+        except (DocumentFormatError, OperationError, OSError, RuntimeError) as exc:
             raise OperationError(f"{path}: {exc}") from exc
     identities: dict[tuple[str, str], str] = {}
     for origin, document in loaded:
@@ -8141,7 +8266,6 @@ def command_apply(args: argparse.Namespace) -> str | None:
 
     _resource_name(args.environment, "environment name")
     partition = _resource_name(args.partition, "partition name") if args.partition is not None else None
-    documents = _load_apply_documents(args.files)
     source_revision = (
         git("rev-parse", f"{args.source_revision}^{{commit}}").stdout.strip()
         if args.source_revision is not None
@@ -8158,9 +8282,29 @@ def command_apply(args: argparse.Namespace) -> str | None:
         observed = temporary / "observed"
         candidate = temporary / "candidate"
         if source_revision is None:
+            documents = _load_apply_documents(args.files)
+            if not documents and partition is None:
+                raise OperationError(
+                    "apply produced zero documents; specify --partition for authoritative empty membership"
+                )
             _materialize_apply_worktree(source)
         else:
+            _validate_apply_input_selection(
+                args.files,
+                source_revision,
+                operation="apply",
+                revision_option="--source-revision",
+            )
             materialize_revision(source_revision, source)
+            documents = _load_apply_documents(
+                args.files,
+                source_revision=source_revision,
+                source_root=source,
+            )
+        if source_revision is not None and not documents and partition is None:
+            raise OperationError(
+                "apply produced zero documents; specify --partition for authoritative empty membership"
+            )
         _copy_apply_source_base(source, apply_source, args.environment)
         authored_units, authored_stacks = _write_apply_authored_documents(apply_source, args.environment, documents)
         _validate_apply_source_revision(source_revision, authored_units, authored_stacks)
@@ -8228,6 +8372,9 @@ def command_apply(args: argparse.Namespace) -> str | None:
         _copy_unrelated_desired_resources(current, candidate, frozenset(applied), partition)
         _prune_omitted_partition_resources(current, candidate, frozenset(applied), partition)
         load_desired_resource_graph(candidate)
+        if current_revision is None and not directory_files(candidate):
+            log_status("KEEP", f"{style_branch(desired_ref)} remains empty")
+            return None
         if current_revision is None and change_gate(source, args.environment) == "pullRequest" and not args.dry:
             current_revision = _initialize_gated_desired_ref(source, args.environment, desired_ref, current)
         if current_revision is not None and directory_files(current) == directory_files(candidate):

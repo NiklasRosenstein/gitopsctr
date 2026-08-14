@@ -51,6 +51,7 @@ def _action_environment(tmp_path: Path, **overrides: str) -> dict[str, str]:
         "PLAN": "false",
         "PARTITION": "",
         "PATH": f"{binary_directory}:{os.environ['PATH']}",
+        "PWD_LOG": str(tmp_path / "pwd.log"),
         "REAPPLY": "false",
         "REPORT": "",
         "REQUIRE_SOURCE_REF": "",
@@ -176,6 +177,22 @@ def test_apply_action_maps_explicit_files_partition_and_refs(tmp_path: Path) -> 
         "changes/dev/application",
         "--dry",
     ]
+
+
+def test_action_runs_gitopsctr_from_the_configured_working_directory(tmp_path: Path) -> None:
+    working_directory = tmp_path / "repository"
+    working_directory.mkdir()
+    result = _run_action(
+        tmp_path,
+        command_body='printf "%s\\0" "$@" > "${ACTION_LOG}"\nprintf "%s" "$PWD" > "${PWD_LOG}"',
+        OPERATION="apply",
+        ENVIRONMENT="dev",
+        FILES="input.yaml",
+        WORKING_DIRECTORY=str(working_directory),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "pwd.log").read_text() == str(working_directory)
 
 
 @pytest.mark.parametrize("files", ["", "deployment/application.yaml"])
