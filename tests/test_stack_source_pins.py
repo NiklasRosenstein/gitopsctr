@@ -396,7 +396,6 @@ def test_finalized_template_releases_all_incarnation_pins(tmp_path: Path, monkey
         name="preview",
         uid=template_uid,
         deletion_generation=1,
-        source_revision=source_revision,
     )
     controller.write_resource_incarnation_tombstone(candidate, tombstone)
     older = "b" * 40
@@ -440,7 +439,6 @@ def test_finalization_releases_source_pins_for_source_less_tombstone_with_new_ui
             name="preview",
             uid=old_uid,
             deletion_generation=1,
-            source_revision=None,
         ),
     )
     pin = _pin(f"stack-templates/dev/preview/{old_uid}/{old_revision}", old_revision)
@@ -476,7 +474,6 @@ def test_finalization_refuses_old_uid_references_after_same_name_recreation(
             name="preview",
             uid=old_uid,
             deletion_generation=1,
-            source_revision=old_revision,
         ),
     )
     pin = _pin(f"stack-templates/dev/preview/{old_uid}/{old_revision}", old_revision)
@@ -507,7 +504,6 @@ def test_old_incarnation_cleanup_evidence_survives_new_uid_finalization(
             name="preview",
             uid=old_uid,
             deletion_generation=1,
-            source_revision=old_revision,
         ),
     )
     old_pin = _pin(f"stack-templates/dev/preview/{old_uid}/{old_revision}", old_revision)
@@ -542,7 +538,6 @@ def test_old_incarnation_cleanup_evidence_survives_new_uid_finalization(
             name="preview",
             uid=new_uid,
             deletion_generation=1,
-            source_revision=new_revision,
         ),
     )
     assert controller._release_finalized_stack_template_pins("dev", "preview", old_uid, 1, desired) is True

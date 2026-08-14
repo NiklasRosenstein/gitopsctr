@@ -25,7 +25,6 @@ def _local_effect_lease(monkeypatch):
             token="lease-test",
             owner="test-runner",
             desired_revision=revision,
-            expires_at=2_000_000_000,
         )
         return deploy_release.EffectLeaseAcquisition(lease=lease, revision=revision)
 

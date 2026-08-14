@@ -252,17 +252,12 @@ def test_generated_desired_schema_rejects_explicit_null_metadata(field):
         Draft202012Validator(schema).validate(document)
 
 
-def test_generated_desired_schema_rejects_lifecycle_and_invalid_partition_metadata():
+def test_generated_desired_schema_rejects_invalid_partition_metadata():
     authored = authored_examples()[0]
     desired = desired_example(authored)
     document = controller.serialize_unit_document(desired, profile="desired")
     schema = next(schema for schema in schemas.schema_documents().values() if schema.get("$id") == document["$schema"])
 
-    document["metadata"]["lifecycle"] = {"management": {"mode": "sourceTracked"}}
-    with pytest.raises(ValidationError):
-        Draft202012Validator(schema).validate(document)
-
-    document["metadata"].pop("lifecycle")
     document["metadata"]["labels"] = {"gitopsctr.io/partition": "Not Valid"}
     with pytest.raises(ValidationError):
         Draft202012Validator(schema).validate(document)
@@ -287,6 +282,48 @@ def test_authored_stack_template_schema_exposes_only_canonical_unit_templates():
 
     assert "unitTemplates" in spec["properties"]
     assert "resources" not in spec["properties"]
+
+
+@pytest.mark.parametrize(
+    ("schema_kind", "profile", "mutation"),
+    [
+        ("StackTemplate", "desired", lambda spec: spec.update(requestedSource={"fromGit": {"path": "."}})),
+        ("Stack", "authored", lambda spec: spec.update(template={"fromResource": {"name": "application"}})),
+        ("Stack", "authored", lambda spec: spec.update(template={"fromGit": {"path": "."}})),
+        ("StackTemplate", "authored", lambda spec: spec.update(fromPromotion={"name": "application"})),
+    ],
+)
+def test_stack_schemas_reject_unsupported_acquisition_shapes(schema_kind, profile, mutation):
+    if schema_kind == "StackTemplate":
+        spec = {
+            "parameters": [],
+            "unitTemplates": {
+                "app": {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "spec": {},
+                }
+            },
+        }
+        if profile == "desired":
+            spec.update(contentDigest=DIGEST, acquisition={"documentDigest": DIGEST, "fromInput": {}})
+        document = {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "StackTemplate",
+            "metadata": {"name": "application", **({"uid": "template-uid"} if profile == "desired" else {})},
+            "spec": spec,
+        }
+    else:
+        document = {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Stack",
+            "metadata": {"name": "application"},
+            "spec": {"template": "application"},
+        }
+    mutation(document["spec"])
+    schema = schemas.core_resource_schema(schema_kind, profile)
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
 
 
 def test_schema_catalog_is_deterministic_checkable_and_prunes_obsolete_schemas(tmp_path):

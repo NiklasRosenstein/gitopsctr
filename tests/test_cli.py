@@ -248,11 +248,14 @@ def test_finalized_same_name_recreation_gets_new_uid_from_tombstone(tmp_path):
     deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate, verbose=False)
     recreated = deploy_release.load_desired_unit(candidate / "units/application.json", "application")
     assert recreated.metadata.uid != old_uid
-    assert (
-        deploy_release.load_resource_incarnation_tombstones(candidate)[
-            ("unit.gitopsctr.io/v1", "Terraform", "application")
-        ].uid
-        == old_uid
+    assert deploy_release.load_resource_incarnation_evidence(candidate) == (
+        deploy_release.ResourceIncarnationTombstone(
+            api_version="unit.gitopsctr.io/v1",
+            kind="Terraform",
+            name="application",
+            uid=old_uid,
+            deletion_generation=1,
+        ),
     )
 
     deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, repeated, verbose=False)
@@ -285,7 +288,6 @@ def test_effect_lease_is_cas_published_and_blocks_a_second_runner(tmp_path, monk
     assert acquired.revision == "b" * 40
     persisted = deploy_release.load_desired_effect_leases(desired)["application"]
     assert persisted.token == "lease-runner-a"
-    assert persisted.expires_at is None
 
     with pytest.raises(deploy_release.EffectLeaseUnavailable, match="explicit UID/token recovery"):
         deploy_release.acquire_effect_lease("deploy/dev", "b" * 40, "application", "d1-application")
@@ -343,14 +345,13 @@ def test_effect_lease_precondition_rechecks_after_publish_race(tmp_path, monkeyp
     assert deploy_release.load_desired_effect_leases(desired) == {}
 
 
-def test_effect_lease_heartbeat_renews_before_expiry_during_long_effect(monkeypatch):
+def test_effect_lease_heartbeat_renews_during_long_effect(monkeypatch):
     lease = deploy_release.EffectLease(
         unit_name="application",
         uid="d1-application",
         token="lease-runner-a",
         owner="runner-a",
         desired_revision="a" * 40,
-        expires_at=None,
     )
     acquisition = deploy_release.EffectLeaseAcquisition(lease=lease, revision="a" * 40)
     renewals = []
@@ -358,7 +359,7 @@ def test_effect_lease_heartbeat_renews_before_expiry_during_long_effect(monkeypa
     def renew(_ref, current):
         renewals.append(current)
         return deploy_release.EffectLeaseAcquisition(
-            lease=replace(current.lease, expires_at=None),
+            lease=current.lease,
             revision="a" * 40,
         )
 
@@ -369,7 +370,6 @@ def test_effect_lease_heartbeat_renews_before_expiry_during_long_effect(monkeypa
 
     assert renewals
     assert renewed.lease.token == lease.token
-    assert renewed.lease.expires_at is None
 
 
 def test_different_unit_heartbeats_rebase_and_preserve_each_other(monkeypatch, tmp_path):
@@ -452,7 +452,6 @@ def test_completion_rebases_after_unrelated_unit_renewal(tmp_path, monkeypatch):
             token="lease-a",
             owner="runner-a",
             desired_revision="a" * 40,
-            expires_at=None,
         ),
     )
     deploy_release.write_effect_lease(
@@ -463,7 +462,6 @@ def test_completion_rebases_after_unrelated_unit_renewal(tmp_path, monkeypatch):
             token="lease-b",
             owner="runner-b",
             desired_revision="a" * 40,
-            expires_at=None,
         ),
     )
     shutil.copytree(desired, local)
@@ -506,7 +504,6 @@ def test_observation_publication_rebases_after_unrelated_lease_renewal(tmp_path,
             token="lease-a",
             owner="runner-a",
             desired_revision="a" * 40,
-            expires_at=None,
         ),
     )
     deploy_release.write_effect_lease(
@@ -517,7 +514,6 @@ def test_observation_publication_rebases_after_unrelated_lease_renewal(tmp_path,
             token="lease-b",
             owner="runner-b",
             desired_revision="a" * 40,
-            expires_at=None,
         ),
     )
     application_lease = deploy_release.load_desired_effect_leases(desired)["application"]
@@ -600,11 +596,9 @@ def test_desired_mutation_cannot_drop_active_effect_lease(tmp_path, monkeypatch)
         token="lease-runner-a",
         owner="runner-a",
         desired_revision="a" * 40,
-        expires_at=100,
     )
     deploy_release.write_effect_lease(current, lease)
     candidate.mkdir()
-    monkeypatch.setattr(deploy_release, "effect_lease_now", lambda: 1)
     monkeypatch.setattr(
         deploy_release, "materialize_revision", lambda _revision, output: shutil.copytree(current, output)
     )

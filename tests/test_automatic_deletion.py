@@ -28,6 +28,7 @@ class _DeletionHarness:
         self.observed_revision: str | None = None
         self.desired_publications: list[Path] = []
         self.observed_publications: list[Path] = []
+        self.reconcile_outputs: list[bool] = []
 
     def install(self, monkeypatch: pytest.MonkeyPatch, *, change_gate: str = "none") -> None:
         class EmptyPinStore:
@@ -76,6 +77,7 @@ class _DeletionHarness:
         monkeypatch.setattr(controller, "publish_tree", publish_observed)
         monkeypatch.setattr(controller, "publish_desired_change", publish_desired)
         monkeypatch.setattr(controller, "write_change_outputs", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(controller, "write_reconcile_outputs", self.reconcile_outputs.append)
         monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
         monkeypatch.setattr(controller, "change_gate", lambda *_args, **_kwargs: change_gate)
         monkeypatch.setattr(controller, "effect_lease_ref", lambda *_args, **_kwargs: None)
@@ -111,6 +113,17 @@ def _unit_tree(tmp_path: Path, *documents: dict[str, object]) -> Path:
         assert isinstance(name, str)
         write_test_document(root / "units" / f"{name}.yaml", document)
     return root
+
+
+def test_converge_writes_one_true_output_when_projection_progress_is_followed_by_clean_state(tmp_path, monkeypatch):
+    harness = _DeletionHarness(tmp_path, _unit_tree(tmp_path))
+    harness.install(monkeypatch)
+    projections = iter(["d" * 40, None])
+    monkeypatch.setattr(controller, "progress_durable_stack_projection", lambda *_args: next(projections))
+
+    controller.command_converge(harness.converge_args())
+
+    assert harness.reconcile_outputs == [True]
 
 
 def test_converge_tears_down_deleting_dependency_closure_consumer_before_producer(tmp_path, monkeypatch):
@@ -206,6 +219,7 @@ def test_converge_finalization_removes_a_completed_unit_materialization(tmp_path
 
     assert not (harness.desired / "units/application.yaml").exists()
     assert not (harness.desired / "materialized/application").exists()
+    assert harness.reconcile_outputs == [True]
 
 
 def test_converge_stack_deletion_is_child_first_and_writes_one_progressive_cleanup_candidate(tmp_path, monkeypatch):
@@ -250,10 +264,14 @@ def test_converge_stack_deletion_is_child_first_and_writes_one_progressive_clean
     assert not (harness.desired / "units" / f"{child_name}.json").exists()
     assert not (harness.desired / "stacks/preview.json").exists()
     assert not (harness.desired / "stack-templates/preview.json").exists()
-    tombstones = controller.load_resource_incarnation_tombstones(harness.desired)
-    assert (controller.CORE_API_VERSION, "Stack", "preview") in tombstones
-    assert (controller.CORE_API_VERSION, "StackTemplate", "preview") in tombstones
+    tombstones = controller.load_resource_incarnation_evidence(harness.desired)
+    assert {(tombstone.api_version, tombstone.kind, tombstone.name, tombstone.uid) for tombstone in tombstones} == {
+        (controller.CORE_API_VERSION, "Stack", "preview", "d1-stack-preview"),
+        (controller.CORE_API_VERSION, "StackTemplate", "preview", "d1-template"),
+        (controller.UNIT_API_VERSION, "Terraform", child_name, "d1-preview-app"),
+    }
     assert len(harness.desired_publications) == 1
+    assert harness.reconcile_outputs == [True]
     cleanup = harness.desired_publications[0]
     assert not (cleanup / "units" / f"{child_name}.json").exists()
     assert not (cleanup / "stacks/preview.json").exists()
@@ -326,6 +344,7 @@ def test_converge_retries_template_pin_cleanup_after_desired_removal(tmp_path, m
     assert attempts == 2
     assert pins == []
     assert teardown_calls == [child_name]
+    assert harness.reconcile_outputs == [True]
 
 
 def test_converge_finalizes_a_standalone_deleting_stacktemplate(tmp_path, monkeypatch):
@@ -360,8 +379,16 @@ def test_converge_finalizes_a_standalone_deleting_stacktemplate(tmp_path, monkey
 
     assert len(harness.desired_publications) == 1
     assert not (harness.desired / "stack-templates/preview.json").exists()
-    tombstones = controller.load_resource_incarnation_tombstones(harness.desired)
-    assert tombstones[(controller.CORE_API_VERSION, "StackTemplate", "preview")].uid == "d1-template"
+    assert controller.load_resource_incarnation_evidence(harness.desired) == (
+        controller.ResourceIncarnationTombstone(
+            api_version=controller.CORE_API_VERSION,
+            kind="StackTemplate",
+            name="preview",
+            uid="d1-template",
+            deletion_generation=1,
+            partition="preview",
+        ),
+    )
 
 
 def test_converge_missing_stack_child_without_tombstone_fails_closed(tmp_path, monkeypatch):
@@ -581,7 +608,6 @@ def test_finalized_cleanup_rejects_unaccepted_desired_ref(tmp_path, monkeypatch)
         uid="d1-application",
         deletion_generation=1,
         effect_lease_ref="gitopsctr/leases",
-        effect_lease_ref_recorded=True,
     )
     controller.write_resource_incarnation_tombstone(desired, tombstone)
     monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
@@ -599,7 +625,6 @@ def test_finalized_cleanup_rejects_unaccepted_desired_ref(tmp_path, monkeypatch)
             desired_ref="candidate/dev",
             current_revision="c" * 40,
             desired_root=desired,
-            fallback_lease_ref=None,
         )
 
 
@@ -613,7 +638,6 @@ def test_finalized_cleanup_rejects_historical_revision_of_live_ref(tmp_path, mon
         uid="d1-application",
         deletion_generation=1,
         effect_lease_ref=None,
-        effect_lease_ref_recorded=True,
     )
     controller.write_resource_incarnation_tombstone(desired, tombstone)
     monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
@@ -626,5 +650,113 @@ def test_finalized_cleanup_rejects_historical_revision_of_live_ref(tmp_path, mon
             desired_ref="deploy/dev",
             current_revision="c" * 40,
             desired_root=desired,
-            fallback_lease_ref=None,
         )
+
+
+def test_resource_incarnation_tombstone_requires_effect_lease_ref():
+    document = controller.ResourceIncarnationTombstone(
+        api_version=controller.UNIT_API_VERSION,
+        kind="Terraform",
+        name="application",
+        uid="d1-application",
+        deletion_generation=1,
+    ).document()
+    del document["resource"]["effectLeaseRef"]  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="invalid resource incarnation identity"):
+        controller.ResourceIncarnationTombstone.from_document(document)
+
+
+def test_same_name_recreation_cleanup_retries_against_tombstone_lease_store(tmp_path, monkeypatch):
+    desired = tmp_path / "desired"
+    desired.mkdir()
+    write_test_document(desired / "units/application.yaml", _terraform_unit("application", "d2-application"))
+    tombstone = controller.ResourceIncarnationTombstone(
+        api_version=controller.UNIT_API_VERSION,
+        kind="Terraform",
+        name="application",
+        uid="d1-application",
+        deletion_generation=1,
+        effect_lease_ref="gitopsctr/historical-leases",
+    )
+    controller.write_resource_incarnation_tombstone(desired, tombstone)
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(controller, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(
+        controller,
+        "effect_lease_ref",
+        lambda *_args, **_kwargs: pytest.fail("cleanup must not synthesize a current-config lease ref"),
+    )
+    lease_root = tmp_path / "historical-leases"
+    lease_root.mkdir()
+    controller.write_effect_lease(
+        lease_root,
+        controller.EffectLease(
+            unit_name="application",
+            uid="d1-application",
+            token="lease-old",
+            owner="test",
+            desired_revision="c" * 40,
+        ),
+    )
+    monkeypatch.setattr(controller, "_effect_lease_store_root", lambda *_args, **_kwargs: (lease_root, "e" * 40))
+    calls: list[str | None] = []
+    monkeypatch.setattr(
+        controller,
+        "release_effect_lease",
+        lambda _ref, _name, _token, _uid, **kwargs: calls.append(kwargs.get("lease_ref")),
+    )
+
+    assert (
+        controller._retry_finalized_cleanup(
+            tombstone,
+            environment="dev",
+            desired_ref="deploy/dev",
+            current_revision="c" * 40,
+            desired_root=desired,
+        )
+        is True
+    )
+    assert calls == ["gitopsctr/historical-leases"]
+
+
+def test_finalized_cleanup_fails_closed_on_ambiguous_driver_tombstones(tmp_path, monkeypatch):
+    desired = tmp_path / "desired"
+    desired.mkdir()
+    for kind, lease_ref in (("Terraform", "gitopsctr/terraform-leases"), ("OciImages", "gitopsctr/oci-leases")):
+        controller.write_resource_incarnation_tombstone(
+            desired,
+            controller.ResourceIncarnationTombstone(
+                api_version=controller.UNIT_API_VERSION,
+                kind=kind,
+                name="application",
+                uid="d1-application",
+                deletion_generation=1,
+                effect_lease_ref=lease_ref,
+            ),
+        )
+    monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(controller, "fetch_ref", lambda _ref: "c" * 40)
+    monkeypatch.setattr(
+        controller,
+        "release_effect_lease",
+        lambda *_args, **_kwargs: pytest.fail("ambiguous tombstones must not release a lease"),
+    )
+
+    assert (
+        controller._retry_finalized_cleanup(
+            controller.ResourceIncarnationTombstone(
+                api_version=controller.UNIT_API_VERSION,
+                kind="Terraform",
+                name="application",
+                uid="d1-application",
+                deletion_generation=1,
+                effect_lease_ref="gitopsctr/terraform-leases",
+            ),
+            environment="dev",
+            desired_ref="deploy/dev",
+            current_revision="c" * 40,
+            desired_root=desired,
+        )
+        is False
+    )

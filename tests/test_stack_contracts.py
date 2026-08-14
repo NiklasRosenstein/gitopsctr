@@ -24,7 +24,6 @@ from gitopsctr.contracts import (
     StackProjectionUnitBinding,
     StackSpec,
     StackTemplateAcquisition,
-    StackTemplateContent,
     StackTemplateFromInput,
     StackTemplateReference,
     StackTemplateSourceContext,
@@ -37,6 +36,8 @@ from gitopsctr.templates import (
     dump_template_value,
     parse_projection_value,
 )
+
+TEST_PROJECTION_CONTEXT_DIGEST = "sha256:" + "c" * 64
 
 
 def template_document(resources: list[dict[str, object]], parameters: list[dict[str, str]]) -> dict[str, object]:
@@ -115,6 +116,7 @@ def test_direct_inline_template_and_stack_contracts_are_typed_and_round_trip():
                 stack_uid="stack-uid",
                 template_uid="template-uid",
                 template_content_digest=desired.spec.contentDigest,
+                context_digest=TEST_PROJECTION_CONTEXT_DIGEST,
                 units={},
             ),
         ),
@@ -144,33 +146,43 @@ def test_direct_inline_template_and_stack_contracts_are_typed_and_round_trip():
         )
 
 
-def test_old_stack_template_acquisition_and_source_shapes_are_rejected():
+@pytest.mark.parametrize("shape", ["requestedSource", "fromResource", "fromGit", "templateFromPromotion"])
+def test_unsupported_stack_template_acquisition_and_source_shapes_are_rejected(shape: str):
     authored = template_document([unit_resource("app", {})], [])
-    old_template = desired_template_document(authored)
-    old_template["spec"] = {**old_template["spec"], "requestedSource": {"fromGit": {"path": "."}}}
-    with pytest.raises(ContractError):
-        CORE_CONTRACTS["stack-template-desired"].parse(old_template)
+    if shape == "requestedSource":
+        document = desired_template_document(authored)
+        document["spec"] = {**document["spec"], "requestedSource": {"fromGit": {"path": "."}}}
+        contract = CORE_CONTRACTS["stack-template-desired"]
+    elif shape in {"fromResource", "fromGit"}:
+        source = {"name": "preview"} if shape == "fromResource" else {"path": "."}
+        document = {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Stack",
+            "metadata": {"name": "web"},
+            "spec": {"template": {shape: source}},
+        }
+        contract = CORE_CONTRACTS["stack-authored"]
+    else:
+        document = {**authored, "spec": {**authored["spec"], "fromPromotion": {"name": "preview"}}}
+        contract = CORE_CONTRACTS["stack-template-authored"]
 
-    old_stack = {
-        "apiVersion": "gitopsctr.io/v1",
-        "kind": "Stack",
-        "metadata": {"name": "web", "uid": "stack-uid"},
-        "spec": {
-            "template": {"fromResource": {"name": "preview"}},
-            "resolvedProjection": {"units": {}},
-        },
-    }
     with pytest.raises(ContractError):
-        CORE_CONTRACTS["stack-desired"].parse(old_stack)
+        contract.parse(document)
 
-    old_authored_stack = {
-        "apiVersion": "gitopsctr.io/v1",
-        "kind": "Stack",
-        "metadata": {"name": "web"},
-        "spec": {"template": {"fromGit": {"path": "."}}},
-    }
-    with pytest.raises(ContractError):
-        CORE_CONTRACTS["stack-authored"].parse(old_authored_stack)
+
+def test_stack_only_input_references_an_existing_target_template_by_name():
+    authored = template_document([unit_resource("app", {})], [])
+    template = CORE_CONTRACTS["stack-template-authored"].parse(authored)
+    stack = CORE_CONTRACTS["stack-authored"].parse(
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Stack",
+            "metadata": {"name": "web"},
+            "spec": {"template": template.metadata.name},
+        }
+    )
+
+    assert stack.spec.template == template.metadata.name
 
 
 def test_template_semantic_identity_and_source_context_are_fenced():
@@ -191,7 +203,7 @@ def test_template_semantic_identity_and_source_context_are_fenced():
         ),
         sourceContext=StackTemplateSourceContext(revision="a" * 40),
     )
-    assert StackTemplateContent.from_spec(desired).semantic_content_digest() == digest
+    assert desired.semantic_content_digest() == digest
     assert (
         CORE_CONTRACTS["stack-template-desired"]
         .parse(
@@ -226,6 +238,7 @@ def test_structural_projection_is_required_identity_fenced_and_round_trips():
         stack_uid="stack-uid",
         template_uid="template-uid",
         template_content_digest="sha256:" + "a" * 64,
+        context_digest=TEST_PROJECTION_CONTEXT_DIGEST,
         units={"app": projection_unit()},
     )
     assert projection.identity.projectionDigest.startswith("sha256:")
@@ -238,11 +251,22 @@ def test_structural_projection_is_required_identity_fenced_and_round_trips():
         )
 
 
+def test_structural_projection_build_requires_context_digest():
+    with pytest.raises(TypeError, match="context_digest"):
+        StackProjection.build(
+            stack_uid="stack-uid",
+            template_uid="template-uid",
+            template_content_digest="sha256:" + "a" * 64,
+            units={},
+        )
+
+
 def test_structural_projection_schema_and_runtime_reject_from_parameter():
     projection = StackProjection.build(
         stack_uid="stack-uid",
         template_uid="template-uid",
         template_content_digest="sha256:" + "a" * 64,
+        context_digest=TEST_PROJECTION_CONTEXT_DIGEST,
         units={"app": projection_unit()},
     )
     document = CORE_CONTRACTS["stack-desired"].dump(
@@ -290,6 +314,7 @@ def test_structural_projection_rejects_missing_self_and_cyclic_dependencies(unit
             stack_uid="stack-uid",
             template_uid="template-uid",
             template_content_digest="sha256:" + "a" * 64,
+            context_digest=TEST_PROJECTION_CONTEXT_DIGEST,
             units=units,
         )
 
@@ -328,6 +353,7 @@ def test_desired_stack_requires_exact_active_dependencies_for_current_structure(
         stack_uid="stack-uid",
         template_uid="template-uid",
         template_content_digest="sha256:" + "a" * 64,
+        context_digest=TEST_PROJECTION_CONTEXT_DIGEST,
         units={"db": projection_unit(), "app": projection_unit(["db"])},
     )
     active = StackActiveProjection.build(

@@ -66,7 +66,7 @@ def _validate_options(args: argparse.Namespace, family: ResourceFamilyDefinition
     plane = family.inspection.default_plane if family.inspection is not None else None
     if desired_override and plane is not ResourcePlane.DESIRED:
         raise OperationError(f"get {family.plural} does not accept desired-ref overrides")
-    if observed_override and plane is not ResourcePlane.OBSERVED:
+    if observed_override and plane is not ResourcePlane.OBSERVED and family.name not in {"unit", "stack"}:
         raise OperationError(f"get {family.plural} does not accept observed-ref overrides")
     if args.artifact is not None or args.artifacts:
         view = family.inspection
@@ -118,6 +118,14 @@ def _records_for_environment(
             names=frozenset((args.name,)) if args.name is not None else None,
         )
 
+    if evaluate and family.name in {"stack", "stacktemplate"}:
+        allow_missing_observed_ref = args.observed_ref is None and args.observed_revision is None
+        inventory.prepare_stack_inspection(
+            records,
+            observed_ref=args.observed_ref or observed_ref,
+            observed_revision=args.observed_revision,
+            allow_missing_observed_ref=allow_missing_observed_ref,
+        )
     relationship_by_path = _relationship_states(inventory, family, records, environment, args) if evaluate else {}
     return tuple(InspectionResult(record, relationship_by_path.get(record.path)) for record in records)
 
@@ -369,7 +377,9 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
     with InventorySession(repository_root, RESOURCE_REGISTRY) as inventory:
         wants_artifacts = args.artifact is not None or args.artifacts
         table = args.output == "table" and not wants_artifacts
-        evaluate = bool(family.inspection.observation) and (table or wants_artifacts)
+        evaluate = (table or wants_artifacts) and (
+            bool(family.inspection.observation) or family.name in {"stack", "stacktemplate"}
+        )
         results = _select(inventory, family, args, evaluate=evaluate)
         if wants_artifacts:
             results = _artifact_results(inventory, results, args)

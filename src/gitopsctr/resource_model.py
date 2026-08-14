@@ -48,13 +48,37 @@ class InspectionRecord(Protocol):
     def blob_id(self) -> str | None: ...
 
 
+@dataclass(frozen=True)
+class EnvironmentInspectionSummary:
+    """Named registry-presenter inputs for one environment namespace."""
+
+    desired_ref: str
+    desired_revision: str | None
+    observed_ref: str
+    observed_revision: str | None
+    reconciliation: str
+
+
+@dataclass(frozen=True)
+class StackInspectionSummary:
+    """Relationship-derived facts for one Stack or StackTemplate table row."""
+
+    template_name: str | None = None
+    template_uid: str | None = None
+    template_digest: str | None = None
+    references: tuple[str, ...] = ()
+    child_observations: tuple[str, ...] = ()
+
+
 @runtime_checkable
 class InspectionRuntime(Protocol):
     """Inventory services available to registry-owned presenters."""
 
-    def environment_summary(self, environment: str) -> tuple[str, str | None, str, str | None, str]: ...
+    def environment_summary(self, environment: str) -> EnvironmentInspectionSummary: ...
 
     def resource_partition(self, record: InspectionRecord) -> str | None: ...
+
+    def stack_inspection_summary(self, record: InspectionRecord) -> StackInspectionSummary: ...
 
 
 @runtime_checkable
@@ -329,6 +353,78 @@ def _short_revision(value: object) -> str:
     return value[:12] if isinstance(value, str) and value else "-"
 
 
+def _short_digest(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return "-"
+    return value if len(value) <= 19 else f"{value[:19]}..."
+
+
+def _digest(value: object) -> str:
+    return value if isinstance(value, str) and value else "-"
+
+
+def _deletion_state(metadata: Mapping[str, JsonValue]) -> str:
+    deletion = _mapping_field(metadata, "deletion")
+    if not deletion:
+        return "ACTIVE"
+    generation = deletion.get("generation")
+    return f"DELETING(generation={generation})" if generation is not None else "DELETING"
+
+
+def _acquisition(specification: Mapping[str, JsonValue]) -> str:
+    acquisition = _mapping_field(specification, "acquisition")
+    modes = [
+        {"fromInput": "input", "fromGit": "git", "fromPromotion": "promotion"}.get(key, key)
+        for key in acquisition
+        if key != "documentDigest"
+    ]
+    mode = "+".join(modes) or "-"
+    document_digest = acquisition.get("documentDigest")
+    if document_digest is None:
+        return mode
+    return f"{mode}(document={_short_digest(document_digest)})"
+
+
+def _projection_topology(projection: Mapping[str, JsonValue]) -> str:
+    units = projection.get("units")
+    if not isinstance(units, dict):
+        return "-"
+    topology: list[str] = []
+    for logical_name, value in sorted(units.items()):
+        unit = value if isinstance(value, dict) else {}
+        dependencies = unit.get("dependsOn")
+        dependency_names = (
+            ",".join(str(item) for item in dependencies) if isinstance(dependencies, list) and dependencies else "-"
+        )
+        topology.append(f"{logical_name}<-{dependency_names}")
+    return ";".join(topology) or "-"
+
+
+def _projection_summary(projection: object, *, active: bool) -> str:
+    value = projection if isinstance(projection, dict) else {}
+    if not value:
+        return "-"
+    identity = value if active else _mapping_field(value, "identity")
+    digest = identity.get("projectionDigest")
+    context_digest = identity.get("projectionContextDigest")
+    if active:
+        prefix = f"projection={_short_digest(digest)} source={_short_digest(identity.get('sourceProjectionDigest'))}"
+    else:
+        prefix = f"projection={_short_digest(digest)}"
+    units = value.get("units")
+    rendered_units: list[str] = []
+    if isinstance(units, dict):
+        for logical_name, item in sorted(units.items()):
+            unit = item if isinstance(item, dict) else {}
+            if active:
+                rendered_units.append(
+                    f"{logical_name}:{unit.get('name', '-')}@{_short_digest(unit.get('desiredDigest'))}"
+                )
+            else:
+                rendered_units.append(f"{logical_name}:{unit.get('kind', '-')}")
+    return f"{prefix} context={_short_digest(context_digest)} units={','.join(rendered_units) or '-'}"
+
+
 def _enum_value(value: object, description: str) -> str:
     candidate = getattr(value, "value", None)
     if not isinstance(candidate, str):
@@ -346,9 +442,12 @@ class EnvironmentInspectionPresenter:
         relationship: object | None,
         runtime: InspectionRuntime,
     ) -> tuple[str, ...]:
-        desired_ref, desired_revision, observed_ref, observed_revision, reconciliation = runtime.environment_summary(
-            record.name
-        )
+        summary = runtime.environment_summary(record.name)
+        desired_ref = summary.desired_ref
+        desired_revision = summary.desired_revision
+        observed_ref = summary.observed_ref
+        observed_revision = summary.observed_revision
+        reconciliation = summary.reconciliation
         desired = f"{desired_ref}@{_short_revision(desired_revision)}" if desired_revision else f"{desired_ref}@missing"
         observed = (
             f"{observed_ref}@{_short_revision(observed_revision)}" if observed_revision else f"{observed_ref}@missing"
@@ -378,7 +477,7 @@ class UnitInspectionPresenter:
 
 @dataclass(frozen=True)
 class StackInspectionPresenter:
-    """Present desired Stack selection, partition, and projection size."""
+    """Present desired Stack identity fences, projections, and child observation."""
 
     def row(
         self,
@@ -388,26 +487,28 @@ class StackInspectionPresenter:
     ) -> tuple[str, ...]:
         metadata = _mapping_field(record.document, "metadata")
         specification = _mapping_field(record.document, "spec")
-        template = specification.get("templateRef")
-        if isinstance(template, dict) and isinstance(template.get("name"), str):
-            template_name = cast(str, template["name"])
-        else:
-            template_name = "-"
-        projection = specification.get("structuralProjection")
-        units = projection.get("units") if isinstance(projection, dict) else None
-        unit_count = len(units) if isinstance(units, (dict, list)) else 0
+        structural_projection = specification.get("structuralProjection")
+        if not isinstance(structural_projection, dict):
+            structural_projection = {}
+        summary = runtime.stack_inspection_summary(record)
         return (
             record.name,
-            template_name,
+            str(metadata.get("uid", "-")),
+            summary.template_name or "-",
+            summary.template_uid or "-",
+            _digest(summary.template_digest),
             runtime.resource_partition(record) or "-",
-            str(unit_count),
-            "DELETING" if metadata.get("deletion") is not None else "ACTIVE",
+            _projection_summary(structural_projection, active=False),
+            _projection_summary(specification.get("activeProjection"), active=True),
+            _projection_topology(structural_projection),
+            ",".join(summary.child_observations) or "N/A",
+            _deletion_state(metadata),
         )
 
 
 @dataclass(frozen=True)
 class StackTemplateInspectionPresenter:
-    """Present desired StackTemplate parameter and Unit counts."""
+    """Present desired StackTemplate provenance, partition, and references."""
 
     def row(
         self,
@@ -415,15 +516,24 @@ class StackTemplateInspectionPresenter:
         relationship: object | None,
         runtime: InspectionRuntime,
     ) -> tuple[str, ...]:
+        metadata = _mapping_field(record.document, "metadata")
         specification = _mapping_field(record.document, "spec")
         parameters = specification.get("parameters")
         units = specification.get("unitTemplates")
-        digest = specification.get("contentDigest")
+        summary = runtime.stack_inspection_summary(record)
         return (
             record.name,
-            digest if isinstance(digest, str) else "-",
+            str(metadata.get("uid", "-")),
+            _digest(specification.get("contentDigest")),
+            _acquisition(specification),
+            f"context@{_short_revision(_mapping_field(specification, 'sourceContext').get('revision'))}"
+            if _mapping_field(specification, "sourceContext")
+            else "-",
             str(len(parameters)) if isinstance(parameters, list) else "0",
             str(len(units)) if isinstance(units, (list, dict)) else "0",
+            runtime.resource_partition(record) or "-",
+            ",".join(summary.references) or "-",
+            _deletion_state(metadata),
         )
 
 
@@ -1697,7 +1807,19 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             core("Stack"),
             inspection=InspectionViewDefinition(
                 desired,
-                ("NAME", "TEMPLATE", "PARTITION", "UNITS", "STATE"),
+                (
+                    "NAME",
+                    "UID",
+                    "TEMPLATE",
+                    "TEMPLATE-UID",
+                    "TEMPLATE-DIGEST",
+                    "PARTITION",
+                    "STRUCTURAL",
+                    "ACTIVE",
+                    "TOPOLOGY",
+                    "OBSERVATION",
+                    "STATE",
+                ),
                 StackInspectionPresenter(),
             ),
         ),
@@ -1712,7 +1834,18 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             core("StackTemplate"),
             inspection=InspectionViewDefinition(
                 desired,
-                ("NAME", "CONTENT-DIGEST", "PARAMETERS", "UNITS"),
+                (
+                    "NAME",
+                    "UID",
+                    "CONTENT-DIGEST",
+                    "ACQUISITION",
+                    "SOURCE",
+                    "PARAMETERS",
+                    "UNITS",
+                    "PARTITION",
+                    "REFERENCES",
+                    "STATE",
+                ),
                 StackTemplateInspectionPresenter(),
             ),
         ),

@@ -1,8 +1,8 @@
 # Stacks and StackTemplates
 
-`gitopsctr.io/v1` `StackTemplate` is an inline, parameterized collection of Unit templates. A directly applied
-StackTemplate is an independent desired root. A `Stack` selects a StackTemplate in the same environment and is
-projected into UID-fenced generated Units.
+`gitopsctr.io/v1` `StackTemplate` is an inline, parameterized collection of Unit templates. An explicitly applied
+StackTemplate is an independent desired root. A `Stack` selects a desired StackTemplate in the same environment and
+is projected into UID-fenced generated Units.
 
 ## Authoring and applying
 
@@ -58,13 +58,17 @@ Inline Unit templates may contain repository-backed Unit paths. Such a template 
 project from the stored revision without another source revision. Source-less inline projections do not need a source
 context.
 
-External Git, promotion, and Stack-owned template source modes are not part of this contract. Documents using
-`fromResource`, `fromGit`, or a template `fromPromotion` source are rejected until a later acquisition slice exists.
+Authored StackTemplates do not have a source-request union. `fromGit`, `fromResource`, and template-level
+`fromPromotion` documents are rejected by the current schema/runtime; StackTemplate acquisition is direct-inline only.
+A promotion may reuse a retained target StackTemplate only when its target input is Stack-only and no authoritative
+partition selects it. When an authoritative partition selects that template, supply it inline with `--file`. It is
+never implicitly acquired from the source promotion state or from Git.
 
 ## Desired-state records
 
-Desired StackTemplates retain their full inline `parameters` and `unitTemplates`, a semantic `contentDigest`, one
-canonical direct-input `acquisition` record, and optional exact `sourceContext`.
+Desired StackTemplates retain their full parameterized `parameters` and `unitTemplates`, a semantic `contentDigest`,
+a direct-input `acquisition` record (`documentDigest` plus `fromInput`), and the optional exact `sourceContext` required
+by repository-backed Unit paths.
 
 Desired Stacks contain a mandatory:
 
@@ -92,6 +96,13 @@ artifact/receipt/promotion evidence fail before desired publication.
 
 Artifact imports with `artifactImports[].fromPromotion` are a separate Unit artifact-lineage feature; they do not select
 or acquire a StackTemplate.
+
+### Projection source propagation
+
+Repository-backed Unit paths inherit the desired StackTemplate's exact source context. Applying that StackTemplate
+requires `--source-revision <commit>`; a later Stack-only apply reads the retained context and does not need the source
+checkout. The current authored Unit source contract has no independent per-Stack revision selector. Updating the
+inline template's source context advances its referring Stacks together.
 
 Inspect desired representations with:
 

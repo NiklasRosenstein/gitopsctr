@@ -24,6 +24,11 @@ def test_action_metadata_exposes_the_supported_operations_and_install_modes() ->
     } <= set(metadata["outputs"])
     assert "advance" not in metadata["inputs"]
     assert metadata["inputs"]["files"]["required"] is False
+    assert "finalize" not in metadata["inputs"]["operation"]["description"].lower()
+    assert "automatic deletion" in metadata["outputs"]["reconciled"]["description"].lower()
+    assert "preview controller" not in metadata["inputs"]["dry"]["description"].lower()
+    candidate_description = metadata["inputs"]["candidate-ref"]["description"].lower()
+    assert all(operation in candidate_description for operation in ("apply", "converge", "promote", "rollback"))
 
 
 def _fake_command(tmp_path: Path, name: str, body: str) -> Path:
@@ -214,7 +219,7 @@ def test_converge_action_maps_optional_input_and_selection(tmp_path: Path, files
     assert _action_arguments(tmp_path) == expected
 
 
-def test_reconcile_action_maps_typed_inputs_to_cli_arguments(tmp_path: Path) -> None:
+def test_reconcile_action_maps_only_supported_cli_arguments(tmp_path: Path) -> None:
     result = _run_action(
         tmp_path,
         OPERATION="reconcile",
@@ -239,10 +244,6 @@ def test_reconcile_action_maps_typed_inputs_to_cli_arguments(tmp_path: Path) -> 
         "application",
         "--desired-revision",
         "d" * 40,
-        "--source-revision",
-        "s" * 40,
-        "--require-source-ref",
-        "main",
         "--report",
         "reports/application",
         "--plan",
@@ -326,6 +327,20 @@ def test_promote_action_defaults_to_the_workflow_revision(tmp_path: Path) -> Non
         "--source-desired-revision",
         "d" * 40,
     ]
+
+
+def test_promote_action_accepts_dry_and_passes_it_to_cli(tmp_path: Path) -> None:
+    result = _run_action(
+        tmp_path,
+        OPERATION="promote",
+        FROM_ENVIRONMENT="dev",
+        TO_ENVIRONMENT="staging",
+        FILES="target-stack.yaml",
+        DRY="true",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _action_arguments(tmp_path)[-1] == "--dry"
 
 
 @pytest.mark.parametrize(

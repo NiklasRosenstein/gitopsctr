@@ -90,7 +90,6 @@ def test_effect_lease_blocks_opaque_recovery(tmp_path: Path, monkeypatch: pytest
             token="lease-token",
             owner="test",
             desired_revision="c" * 40,
-            expires_at=None,
         ),
     )
     monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))

@@ -9,13 +9,16 @@ from typing import cast
 
 import pytest
 
+from gitopsctr.api import GVK
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
     DesiredResourceMetadata,
     DesiredStackDocument,
     DesiredStackSpec,
+    StackActiveProjection,
     StackProjection,
     StackProjectionUnit,
+    StackProjectionUnitBinding,
     StackTemplateReference,
 )
 from gitopsctr.document import JsonObjectValue
@@ -31,6 +34,7 @@ from gitopsctr.operational import materialization_tree_digest
 from gitopsctr.plane_repositories import PlaneRepositorySession
 from gitopsctr.registry import RESOURCE_REGISTRY
 from gitopsctr.resource_model import ObservationDefinition, ResourcePlane, ResourceRegistry
+from gitopsctr.resources import desired_unit_binding_digest
 from gitopsctr.state import GitRefSnapshot, GitStateStore
 
 
@@ -150,6 +154,7 @@ def stack(
             stack_uid=cast(str, metadata["uid"]),
             template_uid=template_uid,
             template_content_digest=content_digest,
+            context_digest="sha256:" + "c" * 64,
             units={
                 "application": StackProjectionUnit(
                     apiVersion="unit.gitopsctr.io/v1",
@@ -329,6 +334,80 @@ def test_inventory_discovers_every_registered_initial_placement(repository: Path
     assert [item.name for item in promotions] == ["dev"]
     assert [item.name for item in receipts] == ["application"]
     assert artifacts == ()
+
+
+def test_stack_summary_uses_exact_active_bindings_and_surfaces_mismatch(repository: Path):
+    git(repository, "checkout", "desired")
+    stack_document = json.loads((repository / "stacks/web.yaml").read_text())
+    application = desired_terraform("application")
+    application["metadata"]["ownerReferences"] = [  # type: ignore[index]
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Stack",
+            "name": "web",
+            "uid": "uid-web",
+        }
+    ]
+    application["metadata"].pop("labels")  # type: ignore[union-attr]
+    unrelated = desired_terraform("unrelated")
+    unrelated["metadata"]["ownerReferences"] = application["metadata"]["ownerReferences"]  # type: ignore[index]
+    unrelated["metadata"].pop("labels")  # type: ignore[union-attr]
+    application_resource = RESOURCE_REGISTRY.contract(GVK("unit.gitopsctr.io/v1", "Terraform"), "desired").parse(
+        application
+    )
+    application_digest = desired_unit_binding_digest(application_resource)
+    parsed_stack = CORE_CONTRACTS["stack-desired"].parse(stack_document)
+    active = StackActiveProjection.build(
+        source_projection_digest=parsed_stack.spec.structuralProjection.identity.projectionDigest,
+        projection_context_digest=parsed_stack.spec.structuralProjection.identity.projectionContextDigest,
+        units={
+            "application": StackProjectionUnitBinding(
+                apiVersion="unit.gitopsctr.io/v1",
+                kind="Terraform",
+                name="application",
+                uid="uid-application",
+                desiredDigest=application_digest,
+            )
+        },
+    )
+    active_stack = replace(parsed_stack, spec=replace(parsed_stack.spec, activeProjection=active))
+    write_json(repository / "units/application.yaml", application)
+    write_json(repository / "units/unrelated.yaml", unrelated)
+    write_json(repository / "stacks/web.yaml", CORE_CONTRACTS["stack-desired"].dump(active_stack))
+    exact_revision = commit(repository, "active Stack child bindings")
+    git(repository, "push", "origin", f"{exact_revision}:refs/heads/gitopsctr/desired/active-bindings")
+    git(repository, "checkout", "main")
+
+    with InventorySession(repository, RESOURCE_REGISTRY) as inventory:
+        stack_record = inventory.resources(
+            "stack",
+            environment="dev",
+            ref="gitopsctr/desired/active-bindings",
+        )[0]
+        summary = inventory.stack_inspection_summary(stack_record)
+    assert summary.child_observations == ("STALE",)
+
+    git(repository, "checkout", "desired")
+    broken_binding = replace(active.units["application"], desiredDigest="sha256:" + "d" * 64)
+    broken_active = StackActiveProjection.build(
+        source_projection_digest=active.sourceProjectionDigest,
+        projection_context_digest=active.projectionContextDigest,
+        units={"application": broken_binding},
+    )
+    broken_stack = replace(parsed_stack, spec=replace(parsed_stack.spec, activeProjection=broken_active))
+    write_json(repository / "stacks/web.yaml", CORE_CONTRACTS["stack-desired"].dump(broken_stack))
+    broken_revision = commit(repository, "broken active Stack child binding")
+    git(repository, "push", "origin", f"{broken_revision}:refs/heads/gitopsctr/desired/broken-bindings")
+    git(repository, "checkout", "main")
+
+    with InventorySession(repository, RESOURCE_REGISTRY) as inventory:
+        stack_record = inventory.resources(
+            "stack",
+            environment="dev",
+            ref="gitopsctr/desired/broken-bindings",
+        )[0]
+        summary = inventory.stack_inspection_summary(stack_record)
+    assert summary.child_observations == ("BROKEN(application:mismatch)",)
 
 
 def test_environment_local_stacktemplate_is_not_a_registered_source_representation(repository: Path):

@@ -163,6 +163,16 @@ def test_full_stack_rollback_rejects_resurrection_of_finalized_root(tmp_path: Pa
             deletion_generation=1,
         ),
     )
+    deploy_release.write_resource_incarnation_tombstone(
+        current,
+        deploy_release.ResourceIncarnationTombstone(
+            api_version=deploy_release.CORE_API_VERSION,
+            kind="StackTemplate",
+            name="preview",
+            uid="d1-template-newer",
+            deletion_generation=1,
+        ),
+    )
 
     with pytest.raises(deploy_release.OperationError, match="resurrect finalized StackTemplate"):
         deploy_release.validate_full_rollback_stack_aggregate(current, target)
@@ -686,9 +696,28 @@ def test_rollback_restores_historical_payload_with_new_uid_after_finalization(tm
     assert restored.metadata.uid != finalized.uid
     assert restored.metadata.uid != second_finalized.uid
     assert restored.metadata.partition == "application"
-    assert deploy_release.load_resource_incarnation_tombstones(candidate)[
-        ("unit.gitopsctr.io/v1", "Test", "application")
-    ] in {finalized, second_finalized}
+    assert set(deploy_release.load_resource_incarnation_evidence(candidate)) == {finalized, second_finalized}
+
+
+def test_resource_incarnation_evidence_rejects_legacy_name_path(tmp_path: Path):
+    tombstone = deploy_release.ResourceIncarnationTombstone(
+        api_version="unit.gitopsctr.io/v1",
+        kind="Test",
+        name="application",
+        uid="d1-finalized-application",
+        deletion_generation=1,
+    )
+    legacy_path = (
+        tmp_path
+        / deploy_release.DESIRED_RESOURCE_INCARNATIONS_PATH
+        / "unit.gitopsctr.io/v1"
+        / "Test"
+        / "application.json"
+    )
+    _write_json(legacy_path, tombstone.document())
+
+    with pytest.raises(OperationError, match="invalid resource incarnation tombstone path"):
+        deploy_release.load_resource_incarnation_evidence(tmp_path)
 
 
 def test_desired_graph_rejects_reuse_of_finalized_uid(tmp_path):

@@ -150,6 +150,7 @@ def test_registered_stack_template_selection_binding_checks_uid_and_content_dige
                 stack_uid="stack-uid",
                 template_uid="template-uid",
                 template_content_digest=template_spec.contentDigest,
+                context_digest="sha256:" + "c" * 64,
                 units={
                     "app": StackProjectionUnit(
                         apiVersion="unit.gitopsctr.io/v1",

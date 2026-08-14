@@ -763,6 +763,7 @@ def test_canonical_stacktemplate_update_recomputes_fanout_and_ignores_caller_ide
         stack_uid="caller-stack",
         template_uid="caller-template",
         template_content_digest=updated_spec.contentDigest,
+        context_digest=first_web.spec.structuralProjection.identity.projectionContextDigest,
         units={
             "app": StackProjectionUnit(
                 apiVersion="unit.gitopsctr.io/v1",

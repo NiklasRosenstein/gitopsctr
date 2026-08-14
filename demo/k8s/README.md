@@ -9,21 +9,21 @@ This demo documents one `StackTemplate` in explicit-input workflows:
   remains visibly waiting because it has no controller-owned teardown capability; Argo CD delivery can converge once
   the observed Application is gone.
 
-The deferred promotion workflow combines three pinned inputs rather than copying dev's entire desired tree:
+The promotion workflow combines three pinned inputs rather than copying dev's entire desired tree. This demo supplies
+the target StackTemplate and Stack explicitly; a Stack-only promotion may instead reuse a target StackTemplate already
+present in target desired state. Only the image artifact is selected from dev's pinned desired and observed state:
 
 ```mermaid
 flowchart LR
-  specification["Specification revision<br/>staging Stack and parameters"] --> staging["Staging desired state"]
-  desired["Dev desired revision<br/>source Stack and template pin"] --> template["Load exact parameterized template"]
-  template --> staging
-  desired --> import["Promoted image import"]
+  specification["Specification revision<br/>staging StackTemplate and Stack"] --> staging["Staging desired state"]
+  desired["Dev desired revision<br/>source Stack"] --> import["Promoted image import"]
   observed["Dev observed revision<br/>receipt and image artifact"] --> import
   import --> staging
 ```
 
-The current direct-inline slice supports the `preview` workflow and direct StackTemplate application. Template
-promotion is deferred; the staging example retains its artifact-lineage documentation for the follow-up promotion
-slice. See [Promotion](../../docs/apis/promotion.md#how-target-desired-state-is-built) and
+The target specification revision authenticates the Project/Environment configuration and the exact bytes of explicit
+target input files. The source desired and observed revisions provide artifact lineage; they do not acquire or reload a
+StackTemplate from external Git or from source desired state. See [Promotion](../../docs/apis/promotion.md#how-target-desired-state-is-built) and
 [Stacks and StackTemplates](../../docs/apis/stacks.md#desired-state-records).
 
 The provider comes from `GITOPSCTR_K8S_PROVIDER` and defaults to `kind`:

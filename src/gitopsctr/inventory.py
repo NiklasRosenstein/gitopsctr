@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
+from typing import cast
 
 from gitopsctr.api import GVK
+from gitopsctr.contracts import StackProjectionUnitBinding
 from gitopsctr.document import JsonObject
 from gitopsctr.errors import OperationError
-from gitopsctr.formats import DocumentFormatError, load_project_config
+from gitopsctr.formats import DocumentFormatError, load_document, load_project_config
 from gitopsctr.operational import (
     ObservationEvidence,
     ReconciliationState,
@@ -23,6 +25,8 @@ from gitopsctr.resource_model import (
     ArtifactResolutionContext,
     CollectionReadContext,
     DiscoveredResource,
+    EnvironmentInspectionSummary,
+    InspectionRecord,
     ObservationState,
     RelationshipResource,
     ResourceFamilyDefinition,
@@ -31,8 +35,9 @@ from gitopsctr.resource_model import (
     ResourcePlacement,
     ResourcePlane,
     ResourceRegistry,
+    StackInspectionSummary,
 )
-from gitopsctr.resources import UnitResource
+from gitopsctr.resources import ResourceMetadata, StackResource, UnitResource, desired_unit_binding_digest
 
 
 class InventoryError(OperationError):
@@ -89,6 +94,41 @@ class InventoryRecord:
         )
 
 
+def _metadata_value(record: InventoryRecord, field: str) -> str | None:
+    metadata = record.document.get("metadata")
+    value = metadata.get(field) if isinstance(metadata, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def _specification_value(record: InventoryRecord, field: str) -> str | None:
+    specification = record.document.get("spec")
+    value = specification.get(field) if isinstance(specification, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def _graph_parsed(record: InventoryRecord) -> object:
+    """Adapt core contract models to the typed graph resource surface."""
+
+    if record.family.name not in {"stack", "stacktemplate"}:
+        return record.parsed
+    parsed = record.parsed
+    metadata = getattr(parsed, "metadata", None)
+    specification = getattr(parsed, "spec", None)
+    if metadata is None or specification is None:
+        raise InventoryError(f"desired {record.family.singular} {record.name!r} has no typed graph representation")
+    return StackResource(
+        record.gvk,
+        ResourceMetadata(
+            name=metadata.name,
+            uid=getattr(metadata, "uid", None),
+            labels=getattr(metadata, "labels", None),
+            ownerReferences=getattr(metadata, "ownerReferences", None),
+            deletion=getattr(metadata, "deletion", None),
+        ),
+        specification,
+    )
+
+
 @dataclass(frozen=True)
 class UnitOperationalState:
     unit: InventoryRecord
@@ -131,6 +171,11 @@ class InventorySession:
             self.project = load_project_config(self.repository_root)
         except DocumentFormatError as exc:
             raise InventoryError(str(exc)) from exc
+        self._stack_inspection_cache: dict[
+            tuple[str, str, str | None, str, str | None, bool],
+            dict[PurePosixPath, StackInspectionSummary],
+        ] = {}
+        self._stack_inspection_observed_keys: dict[tuple[str, str, str | None], tuple[str, str | None, bool]] = {}
 
     def __enter__(self) -> InventorySession:
         return self
@@ -353,7 +398,7 @@ class InventorySession:
         counts[ReconciliationState.WAIT] += len(cleanup_by_name)
         return counts
 
-    def environment_summary(self, environment: str) -> tuple[str, str | None, str, str | None, str]:
+    def environment_summary(self, environment: str) -> EnvironmentInspectionSummary:
         """Return registry-presenter inputs for one environment namespace."""
 
         desired_ref, observed_ref = self.deployment_refs(environment)
@@ -363,7 +408,341 @@ class InventorySession:
         reconciliation = (
             " ".join(f"{state.value.lower()}={count}" for state, count in counts.items() if count) or "none"
         )
-        return desired_ref, desired.revision, observed_ref, observed.revision, reconciliation
+        return EnvironmentInspectionSummary(
+            desired_ref,
+            desired.revision,
+            observed_ref,
+            observed.revision,
+            reconciliation,
+        )
+
+    def stack_inspection_summary(self, record: InspectionRecord) -> StackInspectionSummary:
+        """Return one lazy Stack relationship summary for the record's snapshots."""
+
+        if not isinstance(record, InventoryRecord):
+            raise InventoryError("inspection presenter received a non-inventory record")
+        if record.family.name not in {"stack", "stacktemplate"}:
+            raise InventoryError(f"resource {record.name!r} has no Stack inspection summary")
+        if record.environment is None or record.ref is None:
+            raise InventoryError(f"resource {record.name!r} has no desired environment provenance")
+
+        desired_key = (record.environment, record.ref, record.revision)
+        observed_key = self._stack_inspection_observed_keys.get(desired_key)
+        if observed_key is None:
+            _configured_desired, observed_ref = self.deployment_refs(record.environment)
+            observed = self.planes.snapshot(ResourcePlane.OBSERVED, observed_ref, allow_missing=True)
+            observed_key = (observed_ref, observed.revision, True)
+        observed_ref, observed_revision, allow_missing_observed_ref = observed_key
+        self.prepare_stack_inspection(
+            (record,),
+            observed_ref=observed_ref,
+            observed_revision=observed_revision,
+            allow_missing_observed_ref=allow_missing_observed_ref,
+        )
+        cache_key = self._stack_inspection_key(record, observed_ref, observed_revision, allow_missing_observed_ref)
+        summaries = self._stack_inspection_cache[cache_key]
+        try:
+            return summaries[record.path]
+        except KeyError as exc:
+            raise InventoryError(
+                f"resource {record.name!r} is not present in its cached Stack inspection snapshot"
+            ) from exc
+
+    @staticmethod
+    def _stack_inspection_key(
+        record: InventoryRecord,
+        observed_ref: str,
+        observed_revision: str | None,
+        allow_missing_observed_ref: bool,
+    ) -> tuple[str, str, str | None, str, str | None, bool]:
+        if record.environment is None or record.ref is None:
+            raise InventoryError(f"resource {record.name!r} has no desired environment provenance")
+        return (
+            record.environment,
+            record.ref,
+            record.revision,
+            observed_ref,
+            observed_revision,
+            allow_missing_observed_ref,
+        )
+
+    def prepare_stack_inspection(
+        self,
+        records: tuple[InventoryRecord, ...],
+        *,
+        observed_ref: str,
+        observed_revision: str | None,
+        allow_missing_observed_ref: bool = True,
+    ) -> None:
+        """Prepare indexed summaries only for the desired records being rendered."""
+
+        if not records:
+            return
+        first = records[0]
+        if first.family.name not in {"stack", "stacktemplate"}:
+            return
+        if any(
+            record.environment != first.environment or record.ref != first.ref or record.revision != first.revision
+            for record in records
+        ):
+            raise InventoryError("Stack inspection records must share one desired snapshot")
+        cache_key = self._stack_inspection_key(first, observed_ref, observed_revision, allow_missing_observed_ref)
+        desired_key = (cast(str, first.environment), cast(str, first.ref), first.revision)
+        self._stack_inspection_observed_keys[desired_key] = (
+            observed_ref,
+            observed_revision,
+            allow_missing_observed_ref,
+        )
+        summaries = self._stack_inspection_cache.setdefault(cache_key, {})
+        missing = tuple(record for record in records if record.path not in summaries)
+        if missing:
+            summaries.update(
+                self._build_stack_inspection_summaries(
+                    missing,
+                    observed_ref=observed_ref,
+                    observed_revision=observed_revision,
+                    allow_missing_observed_ref=allow_missing_observed_ref,
+                )
+            )
+
+    @staticmethod
+    def _active_projection_bindings(record: InventoryRecord) -> tuple[StackProjectionUnitBinding, ...]:
+        specification = getattr(record.parsed, "spec", None)
+        active = getattr(specification, "activeProjection", None)
+        units = getattr(active, "units", None)
+        return (
+            tuple(value for value in units.values() if isinstance(value, StackProjectionUnitBinding))
+            if isinstance(units, dict)
+            else ()
+        )
+
+    @staticmethod
+    def _template_reference(record: InventoryRecord) -> tuple[str, str, str] | None:
+        specification = getattr(record.parsed, "spec", None)
+        reference = getattr(specification, "templateRef", None)
+        name = getattr(reference, "name", None)
+        uid = getattr(reference, "uid", None)
+        digest = getattr(reference, "contentDigest", None)
+        if not all(isinstance(value, str) for value in (name, uid, digest)):
+            return None
+        return cast(str, name), cast(str, uid), cast(str, digest)
+
+    @staticmethod
+    def _raw_stack_names_for_templates(root: Path, templates: tuple[InventoryRecord, ...]) -> frozenset[str]:
+        fences = {
+            (template.name, _metadata_value(template, "uid"), _specification_value(template, "contentDigest"))
+            for template in templates
+        }
+        if not fences:
+            return frozenset()
+        stack_directory = root / "stacks"
+        if not stack_directory.is_dir():
+            return frozenset()
+        names: set[str] = set()
+        for path in sorted(stack_directory.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in {".yaml", ".yml", ".json"}:
+                continue
+            try:
+                document = load_document(path)
+            except Exception:
+                continue
+            if not isinstance(document, dict):
+                continue
+            metadata = document.get("metadata")
+            specification = document.get("spec")
+            reference = specification.get("templateRef") if isinstance(specification, dict) else None
+            fence = (
+                (
+                    reference.get("name"),
+                    reference.get("uid"),
+                    reference.get("contentDigest"),
+                )
+                if isinstance(reference, dict)
+                else None
+            )
+            name = metadata.get("name") if isinstance(metadata, dict) else None
+            if isinstance(name, str) and fence in fences:
+                names.add(name)
+        return frozenset(names)
+
+    def _build_stack_inspection_summaries(
+        self,
+        records: tuple[InventoryRecord, ...],
+        *,
+        observed_ref: str,
+        observed_revision: str | None,
+        allow_missing_observed_ref: bool,
+    ) -> dict[PurePosixPath, StackInspectionSummary]:
+        stack_template_relation = self.registry.graph_relationship("stack-selects-stacktemplate")
+        stack_unit_relation = self.registry.graph_relationship("stack-owns-unit")
+        first = records[0]
+        if first.environment is None or first.ref is None:
+            raise InventoryError(f"resource {first.name!r} has no desired environment provenance")
+        desired_ref, desired_revision = first.ref, first.revision
+        if first.family.name == "stack":
+            stacks = records
+            template_names = frozenset(
+                reference[0] for stack in stacks if (reference := self._template_reference(stack)) is not None
+            )
+            templates = self.resources(
+                stack_template_relation.target_family,
+                environment=first.environment,
+                plane=stack_template_relation.target_plane,
+                ref=desired_ref,
+                revision=desired_revision,
+                names=template_names,
+            )
+            unit_names = frozenset(
+                binding.name for stack in stacks for binding in self._active_projection_bindings(stack)
+            )
+            units = self.resources(
+                stack_unit_relation.target_family,
+                environment=first.environment,
+                plane=stack_unit_relation.target_plane,
+                ref=desired_ref,
+                revision=desired_revision,
+                names=unit_names,
+            )
+            templates_for_references = templates
+        else:
+            templates = records
+            stack_names = self._raw_stack_names_for_templates(first.snapshot_root or Path(), templates)
+            stacks = self.resources(
+                stack_template_relation.source_family,
+                environment=first.environment,
+                plane=stack_template_relation.source_plane,
+                ref=desired_ref,
+                revision=desired_revision,
+                names=stack_names,
+            )
+            units = ()
+            templates_for_references = templates
+
+        template_by_fence = {
+            (template.name, _metadata_value(template, "uid"), _specification_value(template, "contentDigest")): template
+            for template in templates
+        }
+        units_by_identity: dict[tuple[str, str, str], list[InventoryRecord]] = {}
+        units_by_binding: dict[tuple[str, str, str, str, str], InventoryRecord] = {}
+        units_by_owner: dict[tuple[str, str, str, str], list[InventoryRecord]] = {}
+        for unit in units:
+            identity_key = (unit.gvk.api_version, unit.gvk.kind, unit.name)
+            units_by_identity.setdefault(identity_key, []).append(unit)
+            parsed = unit.parsed
+            if isinstance(parsed, UnitResource) and parsed.metadata.uid is not None:
+                digest = desired_unit_binding_digest(parsed)
+                units_by_binding[(*identity_key, parsed.metadata.uid, digest)] = unit
+                owners = parsed.metadata.ownerReferences or []
+                if len(owners) == 1:
+                    owner = owners[0]
+                    units_by_owner.setdefault((owner.apiVersion, owner.kind, owner.name, owner.uid), []).append(unit)
+
+        valid_units: list[InventoryRecord] = []
+        child_observations: dict[PurePosixPath, list[str]] = {}
+        unit_states: dict[PurePosixPath, UnitOperationalState] = {}
+        unit_view = self.registry.family(stack_unit_relation.target_family).inspection
+        if unit_view is None or unit_view.observation is None:
+            raise InventoryError(
+                f"resource family {stack_unit_relation.target_family!r} has no registered observation relationship"
+            )
+        observation = self.registry.observation(unit_view.observation)
+        active_names = {binding.name for stack in stacks for binding in self._active_projection_bindings(stack)}
+        receipts = self.resources(
+            observation.observer_family,
+            environment=first.environment,
+            ref=observed_ref,
+            revision=observed_revision,
+            allow_missing_ref=allow_missing_observed_ref,
+            names=frozenset(active_names),
+        )
+
+        def record_child_state(stack: InventoryRecord, binding: StackProjectionUnitBinding) -> InventoryRecord | None:
+            name = binding.name
+            key = (binding.apiVersion, binding.kind, name)
+            exact = units_by_binding.get((*key, binding.uid, binding.desiredDigest))
+            if exact is None:
+                candidates = units_by_identity.get(key, [])
+                reason = "missing" if not candidates else "mismatch"
+                child_observations.setdefault(stack.path, []).append(f"BROKEN({name}:{reason})")
+                return None
+            owner_key = (
+                stack.gvk.api_version,
+                stack.gvk.kind,
+                stack.name,
+                _metadata_value(stack, "uid") or "",
+            )
+            if exact not in units_by_owner.get(owner_key, ()):
+                child_observations.setdefault(stack.path, []).append(f"BROKEN({name}:owner)")
+                return None
+            try:
+                stack_unit_relation.binding.validate(_graph_parsed(stack), exact.parsed)
+            except ResourceModelError:
+                child_observations.setdefault(stack.path, []).append(f"BROKEN({name}:owner)")
+                return None
+            valid_units.append(exact)
+            return exact
+
+        by_path: dict[PurePosixPath, StackInspectionSummary] = {}
+        template_references: dict[PurePosixPath, list[str]] = {
+            template.path: [] for template in templates_for_references
+        }
+        for stack in stacks:
+            reference = self._template_reference(stack)
+            template = template_by_fence.get(reference) if reference is not None else None
+            if template is None:
+                if first.family.name == "stacktemplate":
+                    continue
+                raise InventoryError(
+                    f"environment {first.environment!r}, desired Stack {stack.name!r} has no uniquely fenced "
+                    "StackTemplate relationship"
+                )
+            try:
+                stack_template_relation.binding.validate(_graph_parsed(stack), _graph_parsed(template))
+            except ResourceModelError as exc:
+                if first.family.name == "stacktemplate":
+                    continue
+                raise InventoryError(
+                    f"environment {first.environment!r}, desired Stack {stack.name!r} has a broken "
+                    "StackTemplate relationship"
+                ) from exc
+            template_references.setdefault(template.path, []).append(stack.name)
+            if first.family.name != "stack":
+                continue
+            for binding in self._active_projection_bindings(stack):
+                record_child_state(stack, binding)
+            by_path[stack.path] = StackInspectionSummary(
+                template_name=template.name,
+                template_uid=_metadata_value(template, "uid"),
+                template_digest=_specification_value(template, "contentDigest"),
+                child_observations=tuple(sorted(set(child_observations.get(stack.path, ())))) or ("N/A",),
+            )
+        if valid_units:
+            evaluation = evaluate_relationships(
+                self.registry,
+                tuple({unit.path: unit for unit in valid_units}.values()),
+                receipts,
+                (),
+                resolve_artifacts=False,
+            )
+            unit_states = {value.unit.path: value for value in evaluation.units}
+        for stack in stacks:
+            if stack.path not in by_path:
+                continue
+            statuses = child_observations.setdefault(stack.path, [])
+            for binding in self._active_projection_bindings(stack):
+                key = (binding.apiVersion, binding.kind, binding.name)
+                exact = units_by_binding.get((*key, binding.uid, binding.desiredDigest))
+                if exact is not None and exact.path in unit_states:
+                    statuses.append(unit_states[exact.path].observation.value)
+            by_path[stack.path] = replace(
+                by_path[stack.path],
+                child_observations=tuple(sorted(set(statuses))) or ("N/A",),
+            )
+        for template in templates_for_references:
+            by_path[template.path] = StackInspectionSummary(
+                references=tuple(sorted(template_references[template.path]))
+            )
+        return by_path
 
     def resource_partition(self, record: object) -> str | None:
         """Resolve a desired resource's partition, following UID-fenced owner references."""
@@ -441,11 +820,36 @@ def evaluate_relationships(
 ) -> RelationshipEvaluation:
     """Evaluate registered observations and artifact descriptions without joining documents."""
 
-    view = registry.family("unit").inspection
-    if view is None or view.observation is None or view.artifact_description is None:
-        raise InventoryError("Unit inspection has no registered observation and artifact-description relationships")
-    observation = registry.observation(view.observation)
-    description = registry.artifact_description(view.artifact_description)
+    unit_families = {item.family.name for item in units}
+    if len(unit_families) == 1:
+        unit_family = registry.family(next(iter(unit_families)))
+        view = unit_family.inspection
+        if view is None or view.observation is None or view.artifact_description is None:
+            raise InventoryError(
+                f"resource family {unit_family.name!r} has no registered observation and artifact-description relationships"
+            )
+        observation = registry.observation(view.observation)
+        description = registry.artifact_description(view.artifact_description)
+    else:
+        observer_families = {item.family.name for item in receipts}
+        observations = tuple(
+            definition
+            for definition in registry.observations
+            if (not unit_families or definition.subject_family in unit_families)
+            and (not observer_families or definition.observer_family in observer_families)
+        )
+        if len(observations) != 1:
+            raise InventoryError("registered Unit observation relationship is not unambiguous")
+        observation = observations[0]
+        descriptions = tuple(
+            definition
+            for definition in registry.artifact_descriptions
+            if definition.producer_family == observation.subject_family
+            and definition.describer_family == observation.observer_family
+        )
+        if len(descriptions) != 1:
+            raise InventoryError("registered Unit artifact-description relationship is not unambiguous")
+        description = descriptions[0]
     units_by_identity = {item.identity: item for item in units}
     artifacts_by_path = {item.path: item.relationship_resource() for item in artifacts}
     receipt_by_subject: dict[ResourceIdentity, InventoryRecord] = {}

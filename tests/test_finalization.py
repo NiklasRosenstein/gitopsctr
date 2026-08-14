@@ -10,7 +10,8 @@ import pytest
 
 from gitopsctr import controller
 from gitopsctr.contracts import DesiredOwnerReference
-from gitopsctr.driver import DriverError, TeardownResult
+from gitopsctr.contrib.drivers.terraform import AppliedTerraformModel, TerraformResultModel
+from gitopsctr.driver import DriverError, ReconciliationOutput, TeardownResult
 from gitopsctr.errors import OperationError
 from tests.conftest import write_test_document
 
@@ -72,23 +73,15 @@ def _stub_effect_lease(monkeypatch: pytest.MonkeyPatch) -> None:
             token="lease-test",
             owner="test-runner",
             desired_revision=revision,
-            expires_at=2_000_000_000,
         )
         return controller.EffectLeaseAcquisition(lease=lease, revision=revision)
-
-    class NoopHeartbeat:
-        def __init__(self, acquisition):
-            self.acquisition = acquisition
-
-        def stop(self):
-            return self.acquisition
 
     monkeypatch.setattr(controller, "acquire_effect_lease", acquire)
     monkeypatch.setattr(controller, "release_effect_lease", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         controller,
         "start_effect_lease_heartbeat",
-        lambda _ref, acquisition, **_kwargs: NoopHeartbeat(acquisition),
+        lambda *_args, **_kwargs: pytest.fail("non-expiring leases must not start periodic renewal"),
     )
     monkeypatch.setattr(controller, "validate_effect_lease_head", lambda _ref, *_args, **_kwargs: "c" * 40)
     monkeypatch.setattr(
@@ -188,7 +181,36 @@ def test_reconcile_deleting_unit_runs_teardown_records_observed_evidence_and_rem
     assert not (desired / "units/application.yaml").exists()
     evidence = controller.load_teardown_evidence(observed, "application", "d1-application", 1)
     assert evidence is not None
+    assert evidence.effect_lease_ref == "deploy/dev"
     assert evidence.details == {"destroyed": True}
+
+
+def test_reconcile_reports_explicit_recovery_when_non_expiring_lease_release_is_deferred(tmp_path, monkeypatch, capsys):
+    desired, _observed, _publications, _teardown_publications = _prepare_finalization(
+        tmp_path, monkeypatch, _terraform_unit("application", "d1-application")
+    )
+    monkeypatch.setattr(
+        type(controller.UNIT_DRIVERS["terraform"]),
+        "reconcile",
+        lambda *_args, **_kwargs: ReconciliationOutput(
+            result=TerraformResultModel(
+                applied=AppliedTerraformModel(sourceRevision="a" * 40),
+                outputs={},
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "release_effect_lease",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OperationError("lease store unavailable")),
+    )
+
+    assert controller.command_reconcile(_reconcile_args()) is True
+
+    stderr = capsys.readouterr().err
+    assert "explicit recovery remains available" in stderr
+    assert "pending expiry" not in stderr
+    assert (desired / "units/application.yaml").exists()
 
 
 def test_reconcile_plan_never_runs_deletion_teardown_or_publication(tmp_path, monkeypatch):
@@ -279,7 +301,9 @@ def test_reconcile_deleting_unit_without_effect_leases_runs_teardown(tmp_path, m
 
     assert controller.command_reconcile(_reconcile_args()) is True
     assert not (desired / "units/application.yaml").exists()
-    assert controller.load_teardown_evidence(observed, "application", "d1-application", 1) is not None
+    evidence = controller.load_teardown_evidence(observed, "application", "d1-application", 1)
+    assert evidence is not None
+    assert evidence.effect_lease_ref is None
 
 
 def test_reconcile_retry_releases_separate_store_lease_after_desired_removal(tmp_path, monkeypatch):
@@ -295,6 +319,7 @@ def test_reconcile_retry_releases_separate_store_lease_after_desired_removal(tmp
             name="application",
             uid="d1-application",
             deletion_generation=1,
+            effect_lease_ref="gitopsctr/leases",
         ),
     )
     controller.write_resource_incarnation_tombstone(
@@ -315,7 +340,6 @@ def test_reconcile_retry_releases_separate_store_lease_after_desired_removal(tmp
             token="lease-deletion",
             owner="test",
             desired_revision="c" * 40,
-            expires_at=None,
         ),
     )
     released: list[tuple[str, str, str | None]] = []
@@ -346,6 +370,16 @@ def test_reconcile_retries_from_observed_evidence_without_repeating_teardown(tmp
     document = _mark(_terraform_unit("application", "d1-application"))
     desired, observed, _publications, _teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
     teardown_calls = []
+    lease_configuration = {"value": "gitopsctr/old-leases"}
+    lease_refs: list[str | None] = []
+    monkeypatch.setattr(controller, "effect_lease_ref", lambda *_args, **_kwargs: lease_configuration["value"])
+    acquire = controller.acquire_effect_lease
+
+    def record_acquire(*args, **kwargs):
+        lease_refs.append(kwargs.get("lease_ref"))
+        return acquire(*args, **kwargs)
+
+    monkeypatch.setattr(controller, "acquire_effect_lease", record_acquire)
 
     def teardown(_driver, context):
         teardown_calls.append(context)
@@ -361,11 +395,17 @@ def test_reconcile_retries_from_observed_evidence_without_repeating_teardown(tmp
     with pytest.raises(RuntimeError, match="crash after evidence"):
         controller.command_reconcile(_reconcile_args())
     assert len(teardown_calls) == 1
-    assert controller.load_teardown_evidence(observed, "application", "d1-application", 1) is not None
+    evidence = controller.load_teardown_evidence(observed, "application", "d1-application", 1)
+    assert evidence is not None
+    assert evidence.effect_lease_ref == "gitopsctr/old-leases"
 
+    lease_configuration["value"] = "gitopsctr/new-leases"
     monkeypatch.setattr(controller, "publish_desired_change", original_publish)
     assert controller.command_reconcile(_reconcile_args()) is True
     assert len(teardown_calls) == 1
+    assert lease_refs == ["gitopsctr/old-leases", "gitopsctr/old-leases"]
+    tombstone = controller.load_resource_incarnation_evidence(desired)[0]
+    assert tombstone.effect_lease_ref == "gitopsctr/old-leases"
     assert not (desired / "units/application.yaml").exists()
 
 
@@ -387,12 +427,26 @@ def test_teardown_evidence_requires_uid_and_generation_in_filename(tmp_path):
         uid="d1-application",
         deletion_generation=1,
         desired_revision="a" * 40,
+        effect_lease_ref=None,
         details={},
     )
     _write(tmp_path / ".gitopsctr/teardowns/units/application.json", evidence.document())
 
     with pytest.raises(OperationError, match="filename does not match its fence"):
         controller.load_teardown_evidence(tmp_path, "application", "d1-application", 1)
+
+
+def test_teardown_evidence_requires_explicit_nullable_effect_lease_ref():
+    evidence = controller.TeardownEvidence(
+        unit_name="application",
+        uid="d1-application",
+        deletion_generation=1,
+        desired_revision="a" * 40,
+    ).document()
+    del evidence["effectLeaseRef"]
+
+    with pytest.raises(ValueError, match="invalid teardown evidence envelope"):
+        controller.TeardownEvidence.from_document(evidence, "application")
 
 
 def test_reconcile_blocks_owned_children_and_dependency_dependents(tmp_path, monkeypatch):

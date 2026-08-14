@@ -45,7 +45,8 @@ Converge with the same explicit input for the duration of the Action step:
 ```
 
 Omit `files` to reconcile current desired state. Omit both `unit` and `partition` to converge every desired Unit;
-`partition` selects all Units in that apply partition, while `unit` selects one explicit Unit.
+`partition` selects all Units in that apply partition, while `unit` selects one explicit Unit. Converge also processes
+deleting resources child/dependent-first and publishes the fenced cleanup commit automatically.
 
 ## Prepare and reconcile
 
@@ -69,7 +70,8 @@ Omit `files` to reconcile current desired state. Omit both `unit` and `partition
 ```
 
 The prepare outputs are `active` and `desired-revision`. `active=false` means the selected desired state does not
-exist. Reconcile publishes a Receipt only after its driver succeeds.
+exist. Reconcile publishes a Receipt only after its driver succeeds; `reconciled` reports progress, including
+automatic deletion progression.
 
 ## Promote
 
@@ -90,6 +92,11 @@ Promotion requires explicit target input in addition to its pinned source contex
 
 The same change outputs describe direct publication or a gated candidate. Gated changes require `contents: write` and
 `pull-requests: write`; Receipt publication requires `contents: write`.
+
+Promotion reuses a retained target StackTemplate only when the explicit input is Stack-only and no authoritative
+partition selects it. When an authoritative partition selects that template, include it explicitly in `files`. It is
+not acquired implicitly from source promotion state or Git. `specification-revision` authenticates the target
+Project/Environment configuration and the exact bytes of explicit target input files.
 
 ## Roll back
 

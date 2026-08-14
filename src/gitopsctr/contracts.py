@@ -652,24 +652,6 @@ class StackTemplateSpec(StrictModel):
 
 
 @dataclass(frozen=True, kw_only=True)
-class StackTemplateContent(StrictModel):
-    """Normalized desired StackTemplate content used for semantic identity."""
-
-    parameters: list[ParameterDeclaration]
-    unitTemplates: dict[Annotated[str, Pattern(DESIRED_UID_PATTERN)], StackTemplateUnitTemplate]
-
-    @classmethod
-    def from_spec(cls, spec: StackTemplateSpec) -> StackTemplateContent:
-        return cls(parameters=list(spec.parameters), unitTemplates=dict(spec.unitTemplates))
-
-    def as_spec(self) -> StackTemplateSpec:
-        return StackTemplateSpec(parameters=list(self.parameters), unitTemplates=dict(self.unitTemplates))
-
-    def semantic_content_digest(self) -> str:
-        return self.as_spec().semantic_content_digest()
-
-
-@dataclass(frozen=True, kw_only=True)
 class StackTemplateFromInput(StrictModel):
     """Empty marker for the only supported StackTemplate acquisition mode."""
 
@@ -946,13 +928,8 @@ class StackProjection(StrictModel):
         template_uid: str,
         template_content_digest: str,
         units: Mapping[str, StackProjectionUnit],
-        context_digest: str | None = None,
+        context_digest: str,
     ) -> StackProjection:
-        if context_digest is None:
-            # Keep the Python construction helper usable by old in-memory
-            # callers while every persisted desired document carries the
-            # explicit context fence.
-            context_digest = f"sha256:{hashlib.sha256(template_content_digest.encode()).hexdigest()}"
         projection_digest = cls.compute_projection_digest(
             stack_uid,
             template_uid,
@@ -1007,10 +984,6 @@ class StackTemplateReference(StrictModel):
             raise ValueError("StackTemplate reference UID must be supplied")
         if not re.fullmatch(CONTENT_DIGEST_PATTERN, self.contentDigest):
             raise ValueError("StackTemplate reference contentDigest must be a SHA-256 digest")
-
-    @property
-    def is_fenced(self) -> bool:
-        return True
 
 
 @dataclass(frozen=True, kw_only=True)

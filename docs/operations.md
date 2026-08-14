@@ -58,10 +58,21 @@ The built-in views use these columns, with `ENVIRONMENT` added for `-A`:
 | --- | --- |
 | Environments | `NAME`, `DESIRED`, `OBSERVED`, reconciliation counts |
 | Units | `NAME`, `KIND`, `DESIRED`, `OBSERVATION`, `RECONCILIATION`, `REASON` |
-| Stacks | `NAME`, `TEMPLATE`, `PARTITION`, `UNITS`, `STATE` |
-| StackTemplates | `NAME`, `CONTENT-DIGEST`, `PARAMETERS`, `UNITS` |
+| Stacks | `NAME`, `UID`, `TEMPLATE`, `TEMPLATE-UID`, `TEMPLATE-DIGEST`, `PARTITION`, `STRUCTURAL`, `ACTIVE`, `TOPOLOGY`, `OBSERVATION`, `STATE` |
+| StackTemplates | `NAME`, `UID`, `CONTENT-DIGEST`, `ACQUISITION`, `SOURCE`, `PARAMETERS`, `UNITS`, `PARTITION`, `REFERENCES`, `STATE` |
 | Promotions | `NAME`, `SOURCE`, pinned desired, observed, and specification revisions |
 | Receipts | `NAME`, subject `KIND`, `OBSERVATION`, `ARTIFACTS` |
+
+Stack `TEMPLATE`, `TEMPLATE-UID`, and `TEMPLATE-DIGEST` are the name/UID/content fences for its selected desired
+StackTemplate. `STRUCTURAL` shows the intended projection identity, context, generated Unit kinds, and topology;
+`ACTIVE` shows the concrete activated projection and its source projection. `TOPOLOGY` shows each logical Unit and its
+dependencies. `OBSERVATION` is derived from UID-fenced child Units and their separate receipts, so it reports child
+observation states rather than embedded Stack status. `STATE` reports the Stack's deletion state.
+
+StackTemplate `ACQUISITION` reports the direct-input mode and document digest, `SOURCE` reports retained repository
+context, and `REFERENCES` lists Stacks whose name/UID/content-digest binding selects that template. `PARTITION` follows
+the resource's authoritative apply membership; `PARAMETERS` and `UNITS` are counts. These relationship and child
+observation facts are evaluated against the selected desired and observed snapshots at read time.
 
 For Units, `DESIRED` is the short Git blob identity of that exact persisted Unit document—the same identity used by a
 Receipt's freshness binding. It is intentionally per-resource rather than repeating the desired snapshot commit on
@@ -135,8 +146,11 @@ Unit uses repository-backed `spec.source`, apply fails and asks for `--source-re
 revision is persisted as the desired template's `sourceContext`.
 
 `--source-revision` selects the exact committed snapshot used for repository-backed paths and pins. In that mode,
-working-tree changes are excluded and apply reports that exclusion. Commit the intended content and select that
-commit explicitly.
+working-tree changes are excluded and apply reports that exclusion. Every `-f/--file` spelling is first resolved
+relative to the caller's current working directory; revision-backed apply then maps that path into the selected
+repository snapshot and rejects stdin or paths outside the repository. Without a source revision, live filesystem
+input is read as spelled and no hidden `HEAD` commit is created. Commit the intended content and select that commit
+explicitly when reproducibility is required.
 
 For local orchestration, converge a unit and its dependencies until clean:
 
@@ -180,16 +194,26 @@ gitopsctr verify --environment staging
 ```
 
 Promotion applies the explicit target resources passed with `--file`; `--partition` gives that target apply set the
-same omission-based pruning semantics as ordinary apply. The Promotion resource pins three independently selected
-revisions: the source desired revision, its matching source observed revision, and `--specification-revision`, which
-contains the target Environment, project configuration, and template sources.
+same omission-based pruning semantics as ordinary apply. A Stack-only promotion may reuse a retained target
+StackTemplate only when no authoritative partition selects it. When an authoritative partition selects that template,
+the target StackTemplate must be supplied inline. The Promotion resource pins three independently selected revisions:
+the source desired revision, its matching source observed
+revision, and `--specification-revision`, which authenticates the target Project/Environment configuration and the
+exact bytes of the explicit target input files.
 `--source-desired-revision` defaults to the source desired-ref head; `--specification-revision` defaults to `HEAD`.
 Pass the latter explicitly when `HEAD` might have advanced beyond the source revision reviewed in the source
 environment.
 
-Within the target specification, StackTemplate acquisition is direct-inline only for this slice. A promotion input must
-carry the target StackTemplate and Stack together; external Git and template-promotion acquisition modes are rejected.
-Promoted field values and artifact imports remain separate features for their respective later slices.
+Promotion is a resolution context, not a source-tree copy. A target StackTemplate is reused only from target desired
+state when no authoritative partition selects the retained template, or supplied as direct-inline content by the
+explicit `--file` input; it is never implicitly acquired from source promotion state or Git. External/historical Git and
+promotion-backed StackTemplate acquisition are not supported by the
+current contract. Field-level `fromPromotion` values and `artifactImports[].fromPromotion` are resolved against the
+pinned source desired and observed revisions, with receipt, producer, artifact, and digest validation before publication.
+
+Repository-backed Unit paths inherit the exact source context retained by the desired StackTemplate. The current
+authored Unit source contract has no independent per-Stack revision selector. Updating the inline template's source
+context reprojects its referring Stacks.
 
 The target Environment decides whether promotion is published directly or through a pull-request candidate. After a
 gated candidate is merged, reconcile or converge the target without a source revision because its specification and
