@@ -131,6 +131,8 @@ def converge(registry_port: int, app_port: int, *, expect_clean: bool = False) -
         "--partition",
         "application",
         "--file",
+        "deployment/stack-templates/application.yaml",
+        "--file",
         "deployment/environments/dev/stacks",
         "--source-revision",
         "HEAD",
@@ -211,7 +213,7 @@ def remove_and_finalize_partitioned_stack() -> None:
         "--partition",
         "application",
         "--file",
-        "deployment/environments/dev/stacks",
+        "deployment/stack-templates/application.yaml",
         "--source-revision",
         "HEAD",
     )

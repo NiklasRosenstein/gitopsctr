@@ -157,6 +157,22 @@ class GitStateStore:
         names = ", ".join(repr(name) for name, _pin_ref, _revision in remaining)
         raise OperationError(pushed.stderr.strip() or f"could not atomically create controller pins: {names}")
 
+    def create_controller_pin_claims(
+        self,
+        revisions: Mapping[str, str],
+        claim: str,
+    ) -> tuple[ControllerPin, ...]:
+        """Create attempt-scoped retention refs under the controller pin namespace.
+
+        Claims are separate refs from the canonical desired-state pins.  An
+        abandoned attempt can therefore release only its own refs without
+        deleting a concurrently published incarnation's retention.
+        """
+
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", claim):
+            raise OperationError(f"invalid controller pin claim: {claim!r}")
+        return self.create_controller_pins({f"claims/{claim}/{name}": revision for name, revision in revisions.items()})
+
     def release_controller_pin(self, name: str, expected_revision: str) -> bool:
         """Release a pin only when its remote revision matches.
 

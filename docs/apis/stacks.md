@@ -1,14 +1,18 @@
 # Stacks and StackTemplates
 
-`gitopsctr.io/v1` `StackTemplate` defines a parameterized collection of Unit templates. A `Stack` selects one
-StackTemplate, supplies its parameters, optionally selects a subset of its Units, and may import artifacts from a
-promoted source Stack. Projection gives each generated Unit a Stack-scoped name and records the resolved template in
-immutable desired state.
+`gitopsctr.io/v1` `StackTemplate` is an inline, parameterized collection of Unit templates. A directly applied
+StackTemplate is an independent desired root. A `Stack` selects a StackTemplate in the same environment and is
+projected into UID-fenced generated Units.
 
-## Basic authoring
+## Authoring and applying
 
-Project-level StackTemplates live below `Project.spec.stackTemplatesPath`, which defaults to
-`deployment/stack-templates`:
+Apply the template and any Stacks that use it explicitly:
+
+```console
+gitopsctr apply --environment dev -f template.yaml -f stack.yaml
+```
+
+The authored documents are:
 
 ```yaml
 apiVersion: gitopsctr.io/v1
@@ -19,37 +23,15 @@ spec:
   parameters:
     - name: workload-name
       type: string
-    - name: message
-      type: string
   unitTemplates:
-    image:
-      apiVersion: unit.gitopsctr.io/v1
-      kind: OciImages
-      spec:
-        source: {path: .}
     deploy:
       apiVersion: unit.gitopsctr.io/v1
       kind: KubernetesManifests
       spec:
         source: {path: charts/application, inputs: ["**/*"]}
         materialize:
-          type: helm
-          releaseName:
-            fromParameter: {name: workload-name}
-          namespace: default
-          values:
-            message:
-              fromParameter: {name: message}
-            image:
-              fromArtifact:
-                unit: image
-                name: containers
-                apiVersion: artifact.gitopsctr.io/v1
-                kind: ContainerImages
-                pointer: /images/application/uri
+          type: plain
 ```
-
-Source-authored Stacks live below `<environmentsPath>/<environment>/stacks`:
 
 ```yaml
 apiVersion: gitopsctr.io/v1
@@ -60,152 +42,67 @@ spec:
   template: application
   parameters:
     workload-name: application-dev
-    message: rendered in dev
-  units: [image, deploy]
 ```
 
-This generates `application--image` and `application--deploy`. References and `dependsOn` edges that use logical names
-inside the template are scoped to those generated names.
-
-`spec.units` is optional. When present, it selects logical Unit templates and must include the dependencies of every
+`spec.units` is optional. When present, it selects logical Unit templates and must include every dependency of each
 selected Unit. `spec.parameters` must supply exactly the declared parameters.
 
-## Template sources
+Applying a StackTemplate without a Stack keeps the template as an unreferenced desired root. Applying changed content
+preserves that root's UID, changes its semantic `contentDigest`, and atomically reprojects every referring Stack in the
+complete desired candidate.
 
-The short form `template: application` selects the project-level StackTemplate available in the operation's pinned
-specification tree. It is equivalent to selecting the named desired `StackTemplate` resource:
+## Repository-backed Unit sources
 
-```yaml
-template:
-  name: application
-  source:
-    fromResource: {}
-```
+Inline Unit templates may contain repository-backed Unit paths. Such a template must be applied with an exact
+`--source-revision <commit>`. Desired state records that revision in `spec.sourceContext`; a later Stack apply can
+project from the stored revision without another source revision. Source-less inline projections do not need a source
+context.
 
-A Stack may instead request a StackTemplate from an explicitly pinned Git source:
-
-```yaml
-template:
-  name: application
-  source:
-    fromGit:
-      remote: https://github.com/example/deployment-templates.git
-      commit: 0123456789abcdef0123456789abcdef01234567
-```
-
-Desired Stack resources record both the requested source and the resolved commit, resource path, and content digest.
-They also store the expanded projection, so reconciliation does not rebuild a Stack from a mutable source branch.
-
-## Promotion and template selection
-
-Environment promotion and Stack template selection are separate decisions. A target Environment permits sources
-through `Environment.spec.promotion.allowedSources`; promotion then pins the source desired revision, source observed
-revision, and target specification revision in a
-[`Promotion`](promotion.md) resource.
-
-The target Stack chooses its template source explicitly:
-
-| Template source | Selection during promotion |
-| --- | --- |
-| `template: application` or `fromResource` | Load `application` from the Promotion's pinned target `specificationRevision`. |
-| `fromGit` | Resolve the target-authored Git request independently and record the selected commit and digest. |
-| `fromPromotion` | Read the selected source Stack from the pinned source desired revision and load its exact recorded template commit, path, and digest. |
-
-A moving `fromGit.ref` is pinned when target desired state is resolved. Use an explicit commit when repeated attempts
-must select the same source even if a ref moves. `fromPromotion` never resolves the source Stack's recorded ref again
-and never substitutes `HEAD`; if its recorded repository, commit, path, or digest is unavailable, promotion fails.
-
-The common pattern is to expand the target's parameterized template from the pinned specification revision and import
-an exact artifact produced by the source Stack:
-
-```yaml
-apiVersion: gitopsctr.io/v1
-kind: Stack
-metadata:
-  name: application
-spec:
-  template: application
-  parameters:
-    workload-name: application-staging
-    message: promoted from dev to staging
-  units: [deploy]
-  artifactImports:
-    - unit: image
-      name: containers
-      apiVersion: artifact.gitopsctr.io/v1
-      kind: ContainerImages
-      fromPromotion:
-        stack: application
-```
-
-This has two independent effects:
-
-1. `template: application` loads and expands the target StackTemplate from `Promotion.spec.specificationRevision`.
-2. `artifactImports[].fromPromotion` finds the source Stack's `image` Unit in the pinned source desired revision,
-   validates `containers` against its receipt in the pinned source observed revision, and makes that immutable artifact
-   available to the selected `deploy` Unit.
-
-The target can therefore use staging-specific parameters without rebuilding the image.
-
-### Reusing a source Stack's template pin
-
-The following is a different operation:
-
-```yaml
-spec:
-  template:
-    name: application
-    source:
-      fromPromotion:
-        stack: application
-  parameters:
-    workload-name: application-staging
-    message: promoted from dev to staging
-  units: [deploy]
-```
-
-The controller loads `application` from the exact source pin recorded in the promoted source Stack's
-`resolvedSource`, verifies the raw document digest and template identity, and expands the original parameterized
-StackTemplate with the target parameters. In this example, the template code is exactly what dev pinned, while the
-expanded workload name and message are staging-specific.
-
-This source choice is independent of promoted artifacts. A Stack can combine `template.source.fromPromotion` with
-`artifactImports[].fromPromotion`, selecting template lineage and artifact lineage separately. It may instead use a
-target-owned `fromResource` or `fromGit` template and consume promoted fields or artifacts. A target-only companion
-Stack may participate in the same promotion transaction without consuming any source value at all.
-
-!!! note "Similar names, different scopes"
-
-    - A field-level [`fromPromotion`](../references.md#promotion-selectors) expression reads public `spec` data from a
-      source desired Unit.
-    - `artifactImports[].fromPromotion` imports and validates an artifact using source desired and observed evidence.
-    - `template.source.fromPromotion` reuses a source Stack's exact StackTemplate source pin, then applies target
-      parameters and Unit selection.
+External Git, promotion, and Stack-owned template source modes are not part of this contract. Documents using
+`fromResource`, `fromGit`, or a template `fromPromotion` source are rejected until a later acquisition slice exists.
 
 ## Desired-state records
 
-Desired StackTemplate and Stack documents are controller-owned projections. Their metadata records stable identity;
-a root may also carry `gitopsctr.io/partition` when it belongs to an authoritative apply set. A desired Stack
-additionally records its requested and resolved template source,
-expanded Unit projection, and resolved promoted-artifact lineage. Generated Units carry a UID-fenced owner reference
-to the Stack so updates and child-first deletion cannot cross Stack incarnations.
+Desired StackTemplates retain their full inline `parameters` and `unitTemplates`, a semantic `contentDigest`, one
+canonical direct-input `acquisition` record, and optional exact `sourceContext`.
 
-`resolvedProjection` is the immutable expanded record used for reconciliation, dependency and graph validation, and
-teardown. Template selection never reconstructs a parameterized StackTemplate from another Stack's projection.
+Desired Stacks contain a mandatory:
 
-Inspect these desired representations independently of their authored source forms:
-
-```console
-gitopsctr get stacks --environment staging
-gitopsctr get stack application --environment staging -o yaml
-gitopsctr get stacktemplates --environment staging
-gitopsctr get stacktemplate application --environment staging -o yaml
+```yaml
+templateRef:
+  name: application
+  uid: <StackTemplate UID>
+  contentDigest: sha256:<semantic-template-digest>
 ```
 
-Use `-A/--all-environments` instead of `--environment` to inspect the desired representations across every
-Environment. Raw YAML or JSON is the exact persisted desired document; the default table is an inspection view.
+They also contain one mandatory `structuralProjection`. Its identity is fenced by the Stack UID, selected
+StackTemplate UID and content digest, and its projection digest is derived from the canonical Unit GVKs, resolved specs,
+and required `dependsOn` lists. The persisted topology is authoritative and is checked against the selected
+StackTemplate before publication.
 
-Do not author or edit desired Stack resources manually. The complete structural contracts are the StackTemplate
+When Units are active, `activeProjection` records both the structural projection digest it was activated from and the
+`projectionContextDigest` used to resolve those Units. A blocked structural transition retains the prior active Unit
+set and context as one immutable lineage. Reconciliation of a retained active Unit therefore uses its active context;
+the structural context is used only after the active projection catches up. Both referenced context records must remain
+available in the desired snapshot.
+
+Generated Units use names such as `application--deploy` and carry an owner reference fenced by the exact Stack
+`apiVersion`, kind, name, and UID. Missing, stale, cyclic, or unknown dependencies and unsupported unresolved dynamic
+artifact/receipt/promotion evidence fail before desired publication.
+
+Artifact imports with `artifactImports[].fromPromotion` are a separate Unit artifact-lineage feature; they do not select
+or acquire a StackTemplate.
+
+Inspect desired representations with:
+
+```console
+gitopsctr get stacks --environment dev
+gitopsctr get stack application --environment dev -o yaml
+gitopsctr get stacktemplates --environment dev
+gitopsctr get stacktemplate application --environment dev -o yaml
+```
+
+The complete public contracts are the StackTemplate
 [authored](../schemas/apis/gitopsctr.io/v1/StackTemplate/authored.schema.json) and
 [desired](../schemas/apis/gitopsctr.io/v1/StackTemplate/desired.schema.json) schemas, and the Stack
 [authored](../schemas/apis/gitopsctr.io/v1/Stack/authored.schema.json) and

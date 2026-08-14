@@ -94,10 +94,6 @@
             "fromEnvironment": {
               "additionalProperties": false,
               "properties": {
-                "dryFallback": {
-                  "$ref": "#/$defs/TemplateValue",
-                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                },
                 "pointer": {
                   "description": "JSON Pointer relative to the target Environment resource.",
                   "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -399,10 +395,6 @@
                             "fromEnvironment": {
                               "additionalProperties": false,
                               "properties": {
-                                "dryFallback": {
-                                  "$ref": "#/$defs/TemplateValue",
-                                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                                },
                                 "pointer": {
                                   "description": "JSON Pointer relative to the target Environment resource.",
                                   "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -555,10 +547,6 @@
                             "fromEnvironment": {
                               "additionalProperties": false,
                               "properties": {
-                                "dryFallback": {
-                                  "$ref": "#/$defs/TemplateValue",
-                                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                                },
                                 "pointer": {
                                   "description": "JSON Pointer relative to the target Environment resource.",
                                   "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -711,10 +699,6 @@
                             "fromEnvironment": {
                               "additionalProperties": false,
                               "properties": {
-                                "dryFallback": {
-                                  "$ref": "#/$defs/TemplateValue",
-                                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                                },
                                 "pointer": {
                                   "description": "JSON Pointer relative to the target Environment resource.",
                                   "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -872,10 +856,6 @@
                                     "fromEnvironment": {
                                       "additionalProperties": false,
                                       "properties": {
-                                        "dryFallback": {
-                                          "$ref": "#/$defs/TemplateValue",
-                                          "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                                        },
                                         "pointer": {
                                           "description": "JSON Pointer relative to the target Environment resource.",
                                           "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -1029,10 +1009,6 @@
                                             "fromEnvironment": {
                                               "additionalProperties": false,
                                               "properties": {
-                                                "dryFallback": {
-                                                  "$ref": "#/$defs/TemplateValue",
-                                                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                                                },
                                                 "pointer": {
                                                   "description": "JSON Pointer relative to the target Environment resource.",
                                                   "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -1181,10 +1157,6 @@
                                             "fromEnvironment": {
                                               "additionalProperties": false,
                                               "properties": {
-                                                "dryFallback": {
-                                                  "$ref": "#/$defs/TemplateValue",
-                                                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                                                },
                                                 "pointer": {
                                                   "description": "JSON Pointer relative to the target Environment resource.",
                                                   "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -1333,10 +1305,6 @@
                                             "fromEnvironment": {
                                               "additionalProperties": false,
                                               "properties": {
-                                                "dryFallback": {
-                                                  "$ref": "#/$defs/TemplateValue",
-                                                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                                                },
                                                 "pointer": {
                                                   "description": "JSON Pointer relative to the target Environment resource.",
                                                   "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -1489,10 +1457,6 @@
                                     "fromEnvironment": {
                                       "additionalProperties": false,
                                       "properties": {
-                                        "dryFallback": {
-                                          "$ref": "#/$defs/TemplateValue",
-                                          "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                                        },
                                         "pointer": {
                                           "description": "JSON Pointer relative to the target Environment resource.",
                                           "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -1641,10 +1605,6 @@
                                     "fromEnvironment": {
                                       "additionalProperties": false,
                                       "properties": {
-                                        "dryFallback": {
-                                          "$ref": "#/$defs/TemplateValue",
-                                          "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                                        },
                                         "pointer": {
                                           "description": "JSON Pointer relative to the target Environment resource.",
                                           "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -1797,10 +1757,6 @@
                             "fromEnvironment": {
                               "additionalProperties": false,
                               "properties": {
-                                "dryFallback": {
-                                  "$ref": "#/$defs/TemplateValue",
-                                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                                },
                                 "pointer": {
                                   "description": "JSON Pointer relative to the target Environment resource.",
                                   "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -1953,10 +1909,6 @@
                             "fromEnvironment": {
                               "additionalProperties": false,
                               "properties": {
-                                "dryFallback": {
-                                  "$ref": "#/$defs/TemplateValue",
-                                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                                },
                                 "pointer": {
                                   "description": "JSON Pointer relative to the target Environment resource.",
                                   "pattern": "^(?:$|/(?:[^~]|~[01])*)$",

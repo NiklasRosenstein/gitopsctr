@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 from pathlib import Path
 from typing import Any
@@ -10,7 +12,7 @@ import yaml
 from gitopsctr import controller
 from gitopsctr.errors import OperationError
 from gitopsctr.state import GitStateStore
-from tests.stack_support import commit, git, project_repository, write_stack_source
+from tests.stack_support import commit, git, project_repository
 
 
 def _repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, GitStateStore, str]:
@@ -124,6 +126,34 @@ def _desired(store: GitStateStore, root: Path) -> dict[str, Any]:
     assert revision is not None
     store.materialize(revision, root)
     return controller.load_json(next((root / "units").glob("application.*")))
+
+
+def test_single_stdin_document_hashes_the_exact_supplied_bytes(monkeypatch: pytest.MonkeyPatch):
+    raw = "# preserved comment\n---\napiVersion: unit.gitopsctr.io/v1\nkind: Terraform\nmetadata:\n  name: app\nspec:\n  source:\n    path: .\n  \n"
+    monkeypatch.setattr(controller.sys, "stdin", io.StringIO(raw))
+
+    documents = controller._load_apply_documents(["-"])
+
+    assert len(documents) == 1
+    assert documents[0].origin == "stdin#1"
+    assert documents[0].document_digest == f"sha256:{hashlib.sha256(raw.encode()).hexdigest()}"
+
+
+def test_multi_document_stdin_uses_contiguous_parser_segments(monkeypatch: pytest.MonkeyPatch):
+    raw = (
+        "# first\n---\napiVersion: unit.gitopsctr.io/v1\nkind: Terraform\nmetadata:\n  name: first\n"
+        "---\n# second\napiVersion: unit.gitopsctr.io/v1\nkind: Terraform\nmetadata:\n  name: second\n"
+    )
+    monkeypatch.setattr(controller.sys, "stdin", io.StringIO(raw))
+
+    documents = controller._load_apply_documents(["-"])
+    nodes = list(yaml.compose_all(raw))
+    first_segment = raw[: nodes[1].start_mark.index].encode()
+    second_segment = raw[nodes[1].start_mark.index :].encode()
+
+    assert [item.origin for item in documents] == ["stdin#1", "stdin#2"]
+    assert documents[0].document_digest == f"sha256:{hashlib.sha256(first_segment).hexdigest()}"
+    assert documents[1].document_digest == f"sha256:{hashlib.sha256(second_segment).hexdigest()}"
 
 
 def test_apply_resolves_authored_unit_and_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -340,26 +370,6 @@ def test_apply_without_source_revision_rejects_repository_backed_input(tmp_path:
         _apply_worktree(authored)
 
 
-def test_apply_without_source_revision_rejects_repository_stacktemplate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    source, _store, _revision = _repository(tmp_path, monkeypatch)
-    environment = source / "deployment/environments/dev"
-    write_stack_source(
-        environment,
-        unit_templates={
-            "preview-app": {
-                "apiVersion": "unit.gitopsctr.io/v1",
-                "kind": "Terraform",
-                "spec": {"source": {"path": "."}},
-            }
-        },
-    )
-
-    with pytest.raises(OperationError, match=r"Stack 'web'.*StackTemplate 'preview'.*--source-revision <commit>"):
-        _apply_worktree(environment / "stacks/web.json")
-
-
 def test_missing_required_source_revision_does_not_initialize_gated_desired_ref(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -455,57 +465,6 @@ def test_apply_source_snapshot_keeps_workload_payload_without_discovering_other_
     assert implicit.is_file()
 
 
-def test_apply_stack_persists_only_selected_template_and_deletes_removed_owned_unit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    source, store, _revision = _repository(tmp_path, monkeypatch)
-    environment = source / "deployment/environments/dev"
-    write_stack_source(
-        environment,
-        unit_templates={
-            "preview-app": {
-                "apiVersion": "unit.gitopsctr.io/v1",
-                "kind": "Terraform",
-                "spec": {"source": {"path": "."}},
-            },
-            "preview-db": {
-                "apiVersion": "unit.gitopsctr.io/v1",
-                "kind": "Terraform",
-                "spec": {"source": {"path": "."}},
-            },
-        },
-    )
-    selected_template = source / "deployment/stack-templates/preview.json"
-    unused_template = source / "deployment/stack-templates/unused.json"
-    unused = yaml.safe_load(selected_template.read_text())
-    unused["metadata"]["name"] = "unused"
-    unused_template.write_text(json.dumps(unused))
-    stack = environment / "stacks/web.json"
-    revision = commit(source, "add stack catalog")
-
-    _apply(source, revision, stack, partition="application")
-    first_revision = store.fetch("deploy/dev").revision
-    assert first_revision is not None
-    first = tmp_path / "stack-first"
-    store.materialize(first_revision, first)
-    assert controller.document_candidates(first / "stack-templates", "preview")
-    assert not controller.document_candidates(first / "stack-templates", "unused")
-
-    authored_stack = yaml.safe_load(stack.read_text())
-    authored_stack["spec"]["units"] = ["preview-app"]
-    stack.write_text(json.dumps(authored_stack))
-    next_revision = commit(source, "shrink stack projection")
-    _apply(source, next_revision, stack)
-
-    desired_revision = store.fetch("deploy/dev").revision
-    assert desired_revision is not None
-    desired = tmp_path / "stack-shrunk"
-    store.materialize(desired_revision, desired)
-    removed = controller.load_desired_unit(controller.unit_document_path(desired, "web--preview-db"), "web--preview-db")
-    assert controller.resource_owner_reference(removed) is not None
-    assert controller.resource_deletion(removed) is not None
-
-
 def test_first_gated_apply_initializes_target_and_publishes_child_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -542,6 +501,46 @@ def test_partition_apply_prunes_omitted_roots_and_retains_partition(tmp_path: Pa
     omitted = controller.load_desired_unit(controller.unit_document_path(desired, "first"), "first")
     assert omitted.metadata.partition == "application"
     assert controller.resource_deletion(omitted) is not None
+
+
+def test_apply_carries_promotion_lineage_through_unrelated_and_noop_updates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source, store, revision = _repository(tmp_path, monkeypatch)
+    promotion = {
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "Promotion",
+        "metadata": {"name": "dev"},
+        "spec": {
+            "source": {
+                "environment": "staging",
+                "desiredRef": "deploy/staging",
+                "desiredRevision": revision,
+                "observedRef": "observed/staging",
+                "observedRevision": revision,
+            },
+            "specificationRevision": revision,
+        },
+    }
+    desired_revision = store.fetch("deploy/dev").revision
+    assert desired_revision is not None
+    baseline = tmp_path / "promotion-baseline"
+    store.materialize(desired_revision, baseline)
+    promotion_path = baseline / "promotion.yaml"
+    promotion_path.write_text(yaml.safe_dump(promotion, sort_keys=False))
+    promotion_bytes = promotion_path.read_bytes()
+    store.publish("deploy/dev", baseline, desired_revision, "seed promotion lineage")
+
+    unrelated = _authored_source_less_unit(source / "unrelated.yaml", "unrelated")
+    revision = commit(source, "add unrelated root")
+    published = _apply(source, revision, unrelated)
+    assert published is not None
+    desired = tmp_path / "promotion-desired"
+    store.materialize(published, desired)
+    assert controller.document_candidates(desired, "promotion")[0].read_bytes() == promotion_bytes
+
+    assert _apply(source, revision, unrelated) == published
 
 
 def test_shared_partition_pruning_marks_omitted_promotion_roots_for_deletion(
@@ -693,6 +692,25 @@ def test_converge_defaults_to_all_units_and_partition_is_unit_selection(
 
     controller.command_converge(all_args)
     controller.command_converge(partition_args)
+
+    monkeypatch.setattr(
+        controller,
+        "deployment_refs",
+        lambda *_args, **_kwargs: pytest.fail("explicit converge refs must not load live configuration"),
+    )
+    explicit_args = controller.build_parser().parse_args(
+        [
+            "converge",
+            "--environment",
+            "dev",
+            "--desired-ref",
+            "deploy/dev",
+            "--observed-ref",
+            "observed/dev",
+            "--yes",
+        ]
+    )
+    controller.command_converge(explicit_args)
 
     parser = controller.build_parser()
     with pytest.raises(SystemExit):

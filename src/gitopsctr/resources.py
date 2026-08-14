@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import re
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -14,7 +14,6 @@ from gitopsctr.api import GVK
 from gitopsctr.artifacts import ArtifactApi
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
-    DESIRED_UID_PATTERN,
     PARTITION_LABEL,
     ArtifactDescriptor,
     AuthoredResourceMetadata,
@@ -30,7 +29,6 @@ from gitopsctr.contracts import (
     StackDocument,
     StackSpec,
     StackTemplateDocument,
-    StackTemplateFromResource,
     StackTemplateSpec,
     StrictModel,
     stack_generated_unit_name,
@@ -47,6 +45,7 @@ from gitopsctr.formats import (
     write_document,
 )
 from gitopsctr.schemas import receipt_resource_schema, resource_schema_url
+from gitopsctr.templates import TemplateValue, dump_template_value
 
 CORE_API_VERSION = "gitopsctr.io/v1"
 UNIT_API_VERSION = "unit.gitopsctr.io/v1"
@@ -188,17 +187,20 @@ DesiredGraphResource = UnitResource[Any] | StackResource
 
 
 def _stack_template_name(spec: StackSpec | DesiredStackSpec) -> str:
-    """Return the logical template name from shorthand or explicit Stack syntax."""
+    """Return the logical template name from authored or desired Stack syntax."""
 
-    template = spec.template
-    return template if isinstance(template, str) else template.name
+    return spec.template if isinstance(spec, StackSpec) else spec.templateRef.name
 
 
-def _stack_uses_resource_template(spec: StackSpec | DesiredStackSpec) -> bool:
-    """Return whether the Stack must resolve a sibling desired StackTemplate."""
+def _validate_stack_template_reference(stack: StackResource, template: StackResource) -> None:
+    """Validate the optional desired StackTemplate identity fence."""
 
-    template = spec.template
-    return isinstance(template, str) or isinstance(template.source, StackTemplateFromResource)
+    from gitopsctr.registry import RESOURCE_REGISTRY
+
+    try:
+        RESOURCE_REGISTRY.graph_relationship("stack-selects-stacktemplate").binding.validate(stack, template)
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -209,53 +211,31 @@ class _ProjectedStackUnit:
     api_version: str
     kind: str
     name: str
+    spec: object
     dependencies: tuple[str, ...]
 
 
 def _resolved_stack_projection(stack: StackResource) -> tuple[_ProjectedStackUnit, ...]:
-    """Parse the immutable Unit topology recorded by a desired Stack."""
+    """Parse the required structural Unit topology recorded by a desired Stack."""
 
-    if not isinstance(stack.spec, DesiredStackSpec) or stack.spec.resolvedProjection is None:
-        raise ValueError(f"Stack {stack.name!r} with a non-resource template source requires resolvedProjection")
-    projection = stack.spec.resolvedProjection
-    if set(projection) != {"units"} or not isinstance(projection.get("units"), dict):
-        raise ValueError(f"Stack {stack.name!r} has an invalid resolvedProjection")
-    units = cast(dict[object, object], projection["units"])
+    if not isinstance(stack.spec, DesiredStackSpec):
+        raise ValueError(f"Stack {stack.name!r} must use a desired Stack specification")
+    projection = stack.spec.structuralProjection
+    units = projection.units
     projected: list[_ProjectedStackUnit] = []
     for logical_name, value in units.items():
-        if not isinstance(logical_name, str) or not re.fullmatch(DESIRED_UID_PATTERN, logical_name):
-            raise ValueError(f"Stack {stack.name!r} resolvedProjection has an invalid Unit name")
-        if not isinstance(value, dict) or set(value) != {"apiVersion", "kind", "spec", "dependsOn"}:
-            raise ValueError(
-                f"Stack {stack.name!r} resolvedProjection Unit {logical_name!r} has an invalid declaration"
-            )
-        api_version = value.get("apiVersion")
-        kind = value.get("kind")
-        specification = value.get("spec")
-        dependencies = value.get("dependsOn")
-        if not isinstance(api_version, str) or re.fullmatch(r"[^/]+/[^/]+", api_version) is None:
-            raise ValueError(f"Stack {stack.name!r} resolvedProjection Unit {logical_name!r} has an invalid apiVersion")
-        if not isinstance(kind, str) or re.fullmatch(r"[A-Z][A-Za-z0-9]*", kind) is None:
-            raise ValueError(f"Stack {stack.name!r} resolvedProjection Unit {logical_name!r} has an invalid kind")
-        if not isinstance(specification, dict):
-            raise ValueError(f"Stack {stack.name!r} resolvedProjection Unit {logical_name!r} has an invalid spec")
-        if (
-            not isinstance(dependencies, list)
-            or not all(
-                isinstance(dependency, str) and re.fullmatch(DESIRED_UID_PATTERN, dependency)
-                for dependency in dependencies
-            )
-            or len(set(dependencies)) != len(dependencies)
-        ):
-            raise ValueError(f"Stack {stack.name!r} resolvedProjection Unit {logical_name!r} has invalid dependencies")
+        api_version = value.apiVersion
+        kind = value.kind
+        dependencies = value.dependsOn
         if logical_name in dependencies:
-            raise ValueError(f"Stack {stack.name!r} resolvedProjection Unit {logical_name!r} cannot depend on itself")
+            raise ValueError(f"Stack {stack.name!r} structuralProjection Unit {logical_name!r} cannot depend on itself")
         projected.append(
             _ProjectedStackUnit(
                 logical_name=logical_name,
                 api_version=api_version,
                 kind=kind,
                 name=stack_generated_unit_name(stack.name, logical_name),
+                spec=dump_template_value(cast(TemplateValue, value.spec)),
                 dependencies=tuple(stack_generated_unit_name(stack.name, dependency) for dependency in dependencies),
             )
         )
@@ -268,15 +248,14 @@ def _resource_template_projection(
 ) -> tuple[_ProjectedStackUnit, ...]:
     """Expand a sibling StackTemplate and validate any persisted projection against it."""
 
-    assert isinstance(stack.spec, (StackSpec, DesiredStackSpec))
-    assert isinstance(template.spec, StackTemplateSpec)
+    if not isinstance(stack.spec, DesiredStackSpec) or not isinstance(template.spec, DesiredStackTemplateSpec):
+        raise ValueError(f"Stack {stack.name!r} and StackTemplate {template.name!r} must both be desired resources")
     expanded = template.spec.expand(stack.spec.parameters)
-    projected: tuple[_ProjectedStackUnit, ...] | None = None
-    if isinstance(stack.spec, DesiredStackSpec) and stack.spec.resolvedProjection is not None:
-        projected = _resolved_stack_projection(stack)
-        selected_names = {resource.logical_name for resource in projected}
-    else:
-        selected_names = set(stack.spec.units or (resource.name for resource in expanded))
+    projected = _resolved_stack_projection(stack)
+    selected_names = {resource.logical_name for resource in projected}
+    expected_names = set(stack.spec.units or (resource.name for resource in expanded))
+    if selected_names != expected_names:
+        raise ValueError(f"Stack {stack.name!r} structuralProjection does not match selected Unit templates")
     expanded = tuple(resource for resource in expanded if resource.name in selected_names)
     expected = tuple(
         _ProjectedStackUnit(
@@ -284,14 +263,15 @@ def _resource_template_projection(
             api_version=resource.apiVersion,
             kind=resource.kind,
             name=stack_generated_unit_name(stack.name, resource.name),
+            spec=dump_template_value(cast(TemplateValue, resource.spec)),
             dependencies=tuple(stack_generated_unit_name(stack.name, dependency) for dependency in resource.dependsOn),
         )
         for resource in expanded
     )
-    if projected is not None and {resource.logical_name: resource for resource in projected} != {
+    if {resource.logical_name: resource for resource in projected} != {
         resource.logical_name: resource for resource in expected
     }:
-        raise ValueError(f"Stack {stack.name!r} resolvedProjection does not match StackTemplate expansion")
+        raise ValueError(f"Stack {stack.name!r} structuralProjection does not match StackTemplate expansion")
     return expected
 
 
@@ -304,14 +284,14 @@ def _validate_stack_projection(
 
     by_name = {resource.name: resource for resource in projected}
     if len(by_name) != len(projected):
-        raise ValueError(f"Stack {stack.name!r} resolvedProjection has duplicate generated Unit names")
+        raise ValueError(f"Stack {stack.name!r} structuralProjection has duplicate generated Unit names")
 
     visiting: set[str] = set()
     visited: set[str] = set()
 
     def visit(name: str) -> None:
         if name in visiting:
-            raise ValueError(f"Stack {stack.name!r} resolvedProjection dependencies must be acyclic")
+            raise ValueError(f"Stack {stack.name!r} structuralProjection dependencies must be acyclic")
         if name in visited:
             return
         visiting.add(name)
@@ -334,7 +314,104 @@ def _validate_stack_projection(
         if (owner.apiVersion, owner.kind, owner.name, owner.uid) == expected_owner:
             actual_owned[key] = resource
 
+    if not isinstance(stack.spec, DesiredStackSpec):
+        raise ValueError(f"Stack {stack.name!r} must use a desired Stack specification")
+    active = stack.spec.activeProjection
+    active_units = active.units if active is not None else {}
+    if active is not None:
+        if (
+            active.sourceProjectionDigest == stack.spec.structuralProjection.identity.projectionDigest
+            and active.projectionContextDigest != stack.spec.structuralProjection.identity.projectionContextDigest
+        ):
+            raise ValueError(
+                f"Stack {stack.name!r} active projection context does not match structural projection context"
+            )
+        concrete_names = [binding.name for binding in active_units.values()]
+        if len(set(concrete_names)) != len(concrete_names):
+            raise ValueError(f"Stack {stack.name!r} active projection has duplicate concrete Unit names")
+        active_names = set(concrete_names)
+        active_by_name = {binding.name: binding for binding in active_units.values()}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit_active(name: str) -> None:
+            if name in visiting:
+                raise ValueError(f"Stack {stack.name!r} active projection dependencies must be acyclic")
+            if name in visited:
+                return
+            visiting.add(name)
+            for dependency in active_by_name[name].dependsOn:
+                if dependency not in active_names:
+                    raise ValueError(
+                        f"Stack {stack.name!r} active projection Unit {name!r} depends on non-active Unit "
+                        f"{dependency!r}"
+                    )
+                visit_active(dependency)
+            visiting.remove(name)
+            visited.add(name)
+
+        for name in active_names:
+            visit_active(name)
+    if active is None and any(resource.metadata.deletion is None for resource in actual_owned.values()):
+        raise ValueError(f"Stack {stack.name!r} has concrete Units but no active projection binding")
+    if (
+        active is not None
+        and active.sourceProjectionDigest != stack.spec.structuralProjection.identity.projectionDigest
+    ):
+        # A blocked structural transition keeps the previous active Unit set
+        # atomically.  Those bindings can legitimately refer to a logical Unit
+        # that is absent from the new structural projection until the complete
+        # transition resolves.
+        for binding in active_units.values():
+            generated_resource = identities.get((binding.apiVersion, binding.kind, binding.name))
+            if not isinstance(generated_resource, UnitResource):
+                raise ValueError(f"Stack {stack.name!r} stale active projection is missing Unit {binding.name!r}")
+            owner_references = generated_resource.metadata.ownerReferences
+            owner = owner_references[0] if owner_references is not None else None
+            if (
+                generated_resource.metadata.deletion is not None
+                or generated_resource.metadata.uid != binding.uid
+                or owner is None
+                or (owner.apiVersion, owner.kind, owner.name, owner.uid)
+                != (stack.gvk.api_version, stack.gvk.kind, stack.name, stack.metadata.uid)
+                or desired_unit_binding_digest(generated_resource) != binding.desiredDigest
+            ):
+                raise ValueError(
+                    f"Stack {stack.name!r} stale active projection does not authenticate Unit {binding.name!r}"
+                )
+            missing_dependencies = sorted(set(binding.dependsOn) - {item.name for item in active_units.values()})
+            if missing_dependencies:
+                raise ValueError(
+                    f"Stack {stack.name!r} stale active projection Unit {binding.name!r} depends on "
+                    f"non-active Unit(s): {', '.join(missing_dependencies)}"
+                )
+        active_keys = {(binding.apiVersion, binding.kind, binding.name) for binding in active_units.values()}
+        unexpected = [
+            resource
+            for key, resource in actual_owned.items()
+            if key not in active_keys and resource.metadata.deletion is None
+        ]
+        if unexpected:
+            names = ", ".join(sorted(resource.name for resource in unexpected))
+            raise ValueError(f"Stack {stack.name!r} stale active projection has unexpected generated Units: {names}")
+        return
+    unknown_active = sorted(set(active_units) - {resource.logical_name for resource in projected})
+    if unknown_active:
+        raise ValueError(
+            f"Stack {stack.name!r} active projection has unknown Unit templates: {', '.join(unknown_active)}"
+        )
+
     for generated in projected:
+        binding = active_units.get(generated.logical_name)
+        if binding is None:
+            # A structurally valid Unit may be absent while its dynamic inputs
+            # wait, or may still be represented by a deleting old child.
+            stale = actual_owned.get((generated.api_version, generated.kind, generated.name))
+            if stale is not None and stale.metadata.deletion is None:
+                raise ValueError(
+                    f"Stack {stack.name!r} generated Unit {generated.name!r} is concrete but absent from active projection"
+                )
+            continue
         generated_key = (generated.api_version, generated.kind, generated.name)
         generated_resource = identities.get(generated_key)
         if generated_resource is None:
@@ -361,6 +438,24 @@ def _validate_stack_projection(
         )
         if actual_owner != expected_owner:
             raise ValueError(f"Stack {stack.name!r} generated Unit {generated.name!r} has an invalid owner reference")
+        if (
+            binding.apiVersion != generated_resource.gvk.api_version
+            or binding.kind != generated_resource.gvk.kind
+            or binding.name != generated_resource.name
+            or binding.uid != generated_resource.metadata.uid
+        ):
+            raise ValueError(f"Stack {stack.name!r} active projection binding does not match Unit {generated.name!r}")
+        actual_digest = desired_unit_binding_digest(generated_resource)
+        if binding.desiredDigest != actual_digest:
+            raise ValueError(
+                f"Stack {stack.name!r} active projection binding does not authenticate Unit {generated.name!r}"
+            )
+        from gitopsctr.registry import RESOURCE_REGISTRY
+
+        try:
+            RESOURCE_REGISTRY.graph_relationship("stack-owns-unit").binding.validate(stack, generated_resource)
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
         for dependency in generated.dependencies:
             dependency_resource = by_name[dependency]
             dependency_key = (
@@ -370,8 +465,22 @@ def _validate_stack_projection(
             )
             if dependency_key not in identities:
                 raise ValueError(f"Stack {stack.name!r} dependency {dependency!r} is absent from this ref")
+        expected_dependencies = tuple(generated.dependencies)
+        if tuple(sorted(binding.dependsOn)) != tuple(sorted(expected_dependencies)):
+            if (
+                active is not None
+                and active.sourceProjectionDigest == stack.spec.structuralProjection.identity.projectionDigest
+            ):
+                raise ValueError(
+                    f"Stack {stack.name!r} active projection dependencies do not match structural topology for "
+                    f"{generated.logical_name!r}"
+                )
 
-    expected_keys = {(resource.api_version, resource.kind, resource.name) for resource in projected}
+    expected_keys = {
+        (resource.api_version, resource.kind, resource.name)
+        for resource in projected
+        if resource.logical_name in active_units
+    }
     unexpected = [
         resource
         for key, resource in actual_owned.items()
@@ -380,6 +489,19 @@ def _validate_stack_projection(
     if unexpected:
         names = ", ".join(sorted(resource.name for resource in unexpected))
         raise ValueError(f"Stack {stack.name!r} has unexpected generated Units: {names}")
+
+
+def desired_unit_binding_digest(unit: UnitResource[Any]) -> str:
+    """Hash the effect-bearing desired Unit identity and typed specification."""
+
+    payload = {
+        "apiVersion": unit.gvk.api_version,
+        "kind": unit.gvk.kind,
+        "name": unit.name,
+        "spec": unit.driver.desired_unit_contract.dump(unit.spec),
+    }
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], DesiredGraphResource]) -> None:
@@ -433,32 +555,33 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
     for key in identities:
         visit(key)
 
-    # Resolve each Stack's authoritative Unit topology, then validate every
-    # source mode through the same concrete desired-graph checks. Repository
-    # and promotion sources deliberately never consult a same-named sibling
-    # StackTemplate: their immutable resolvedProjection is the graph record.
+    # Resolve each Stack's authoritative Unit topology from the same-environment
+    # desired StackTemplate and validate the identity fences before children.
     templates = {
         resource.name: resource
         for resource in identities.values()
         if isinstance(resource, StackResource) and resource.gvk.kind == "StackTemplate"
     }
+    for template in templates.values():
+        if not isinstance(template.spec, DesiredStackTemplateSpec):
+            raise ValueError(f"StackTemplate {template.name!r} has an invalid desired specification")
+        if not template.metadata.is_root:
+            raise ValueError(f"StackTemplate {template.name!r} must be a root resource")
     for stack in (
         resource
         for resource in identities.values()
         if isinstance(resource, StackResource) and resource.gvk.kind == "Stack"
     ):
-        if not isinstance(stack.spec, (StackSpec, DesiredStackSpec)):
-            raise ValueError(f"Stack {stack.name!r} has an invalid Stack spec")
+        if not isinstance(stack.spec, DesiredStackSpec):
+            raise ValueError(f"Stack {stack.name!r} has an invalid desired Stack spec")
         if not stack.metadata.is_root:
             raise ValueError(f"Stack {stack.name!r} must be a root resource")
-        if _stack_uses_resource_template(stack.spec):
-            template_name = _stack_template_name(stack.spec)
-            template = templates.get(template_name)
-            if template is None:
-                raise ValueError(f"Stack {stack.name!r} references missing StackTemplate {template_name!r} in this ref")
-            projected = _resource_template_projection(stack, template)
-        else:
-            projected = _resolved_stack_projection(stack)
+        template_name = _stack_template_name(stack.spec)
+        template = templates.get(template_name)
+        if template is None:
+            raise ValueError(f"Stack {stack.name!r} references missing StackTemplate {template_name!r} in this ref")
+        _validate_stack_template_reference(stack, template)
+        projected = _resource_template_projection(stack, template)
         _validate_stack_projection(stack, projected, identities)
 
 
@@ -662,14 +785,11 @@ class ResourceCatalog:
                     spec=resource.spec,
                 )
             else:
-                desired_template_spec = (
-                    resource.spec
-                    if isinstance(resource.spec, DesiredStackTemplateSpec)
-                    else DesiredStackTemplateSpec(
-                        parameters=resource.spec.parameters,
-                        unitTemplates=resource.spec.unitTemplates,
+                if not isinstance(resource.spec, DesiredStackTemplateSpec):
+                    raise OperationError(
+                        "cannot serialize an authored StackTemplate as desired without acquisition and content digest"
                     )
-                )
+                desired_template_spec = resource.spec
                 document = DesiredStackTemplateDocument(
                     apiVersion=CORE_API_VERSION,
                     kind="StackTemplate",
@@ -690,11 +810,9 @@ class ResourceCatalog:
                     spec=resource.spec,
                 )
             else:
-                desired_spec = (
-                    resource.spec
-                    if isinstance(resource.spec, DesiredStackSpec)
-                    else DesiredStackSpec(template=resource.spec.template, parameters=resource.spec.parameters)
-                )
+                if not isinstance(resource.spec, DesiredStackSpec):
+                    raise OperationError("cannot serialize an authored Stack as a desired Stack without projection")
+                desired_spec = resource.spec
                 document = DesiredStackDocument(
                     apiVersion=CORE_API_VERSION,
                     kind="Stack",

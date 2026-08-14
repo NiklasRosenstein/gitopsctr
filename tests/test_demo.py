@@ -1,16 +1,17 @@
 import shutil
 import subprocess
 from collections.abc import Mapping
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import yaml
 
 from demo.docker import run as docker_demo
 from demo.k8s import run as k8s_demo
 from demo.utils import RefHeads
 from gitopsctr import controller
-from tests.stack_support import commit, git
+from tests.stack_support import commit, write_stack_source
+from tests.test_apply import _repository
 
 
 def test_k8s_controller_preserves_terminal_color_when_capturing(monkeypatch, tmp_path):
@@ -31,37 +32,6 @@ def test_k8s_controller_preserves_terminal_color_when_capturing(monkeypatch, tmp
     environment = captured["env"]
     assert isinstance(environment, Mapping)
     assert environment["FORCE_COLOR"] == "1"
-
-
-def test_docker_demo_projects_only_stack_owned_units(tmp_path, monkeypatch):
-    worktree = tmp_path / "repository"
-    state = tmp_path / "terraform.tfstate"
-    shutil.copytree(docker_demo.TEMPLATE, worktree)
-    monkeypatch.setattr(docker_demo, "WORKTREE", worktree)
-    monkeypatch.setattr(docker_demo, "TERRAFORM_STATE", state)
-    monkeypatch.setattr(docker_demo, "docker_platform", lambda: "linux/arm64")
-
-    docker_demo.configure_template("localhost:5001", 18081)
-    assert controller.load_environment_specifications(worktree, "dev") == {}
-
-    projection = controller.project_stack_resources(
-        worktree,
-        "dev",
-        "a" * 40,
-        tmp_path / "candidate",
-        worktree,
-    )
-
-    assert set(projection.generated_units) == {"application--image", "application--deploy"}
-    image = projection.generated_units["application--image"]
-    deploy = projection.generated_units["application--deploy"]
-    assert image.spec.build.platform == "linux/arm64"
-    assert image.spec.publish.targets["application"].repository == "localhost:5001/gitopsctr-demo/app"
-    deploy_spec = deploy.driver.unit_contract.dump(deploy.spec)
-    assert deploy_spec["terraform"]["backend"]["path"] == str(state)
-    assert deploy_spec["terraform"]["variables"]["container_name"] == "gitopsctr-demo-app"
-    assert deploy_spec["terraform"]["variables"]["host_port"] == 18081
-    assert deploy_spec["terraform"]["variables"]["image"]["fromArtifact"]["unit"] == "application--image"
 
 
 def test_docker_converge_reapplies_the_authoritative_partition(monkeypatch):
@@ -86,12 +56,44 @@ def test_docker_converge_reapplies_the_authoritative_partition(monkeypatch):
             "--partition",
             "application",
             "--file",
+            "deployment/stack-templates/application.yaml",
+            "--file",
             "deployment/environments/dev/stacks",
             "--source-revision",
             "HEAD",
             "--yes",
         )
     ]
+
+
+def test_fresh_stack_demo_command_selects_template_with_stack(tmp_path, monkeypatch):
+    source, _store, _initial_revision = _repository(tmp_path, monkeypatch)
+    environment = source / "deployment/environments/dev"
+    write_stack_source(environment, stack_name="application")
+    revision = commit(source, "add demo StackTemplate and Stack")
+    stack_path = environment / "stacks/application.json"
+    template_path = source / "deployment/stack-templates/preview.json"
+
+    def parse(*files: Path):
+        arguments = [
+            "apply",
+            "--environment",
+            "dev",
+            "--source-revision",
+            revision,
+            "--desired-ref",
+            "deploy/dev",
+            "--observed-ref",
+            "observed/dev",
+        ]
+        for path in files:
+            arguments.extend(("--file", str(path)))
+        return controller.build_parser().parse_args(arguments)
+
+    with pytest.raises(controller.OperationError, match="missing desired StackTemplate"):
+        controller.command_apply(parse(stack_path))
+    published = controller.command_apply(parse(template_path, stack_path))
+    assert published is not None
 
 
 def test_docker_acceptance_proves_clean_convergence_then_finalizes(monkeypatch):
@@ -135,96 +137,6 @@ def test_docker_acceptance_always_cleans_after_failed_invariant(monkeypatch):
     assert cleaned == ["localhost:5001", "localhost:5001"]
 
 
-@pytest.mark.parametrize("provider", ("kind", "minikube"))
-def test_k8s_demo_projects_partitioned_stack_for_provider(tmp_path, monkeypatch, provider):
-    worktree = tmp_path / provider / "repository"
-    shutil.copytree(k8s_demo.TEMPLATE, worktree)
-    monkeypatch.setattr(k8s_demo, "docker_platform", lambda: "linux/amd64")
-
-    k8s_demo.configure_template(provider, worktree)
-    assert controller.load_environment_specifications(worktree, "dev") == {}
-    projection = controller.project_stack_resources(
-        worktree,
-        "dev",
-        "a" * 40,
-        tmp_path / provider / "candidate",
-        worktree,
-    )
-
-    assert set(projection.generated_units) == {"application--image", "application--deploy"}
-    image = projection.generated_units["application--image"]
-    deploy = projection.generated_units["application--deploy"]
-    target = image.spec.publish.targets["application"]
-    assert target.type == provider
-    assert getattr(target, "cluster" if provider == "kind" else "profile") == k8s_demo.cluster_name("direct")
-    assert deploy.spec.materialize.values._serialize()["image"]["fromArtifact"]["unit"] == "application--image"
-    assert deploy.driver.unit_contract.dump(deploy.spec)["delivery"] == {
-        "mode": "direct",
-        "kubeContext": k8s_demo.kube_context(provider),
-        "prune": False,
-        "wait": [
-            {
-                "resource": "deployment/gitopsctr-k8s-dev",
-                "namespace": "default",
-                "condition": "Available",
-                "timeoutSeconds": 120,
-            }
-        ],
-    }
-
-
-def test_k8s_staging_stack_uses_promoted_template_pin_with_target_parameters(tmp_path, monkeypatch):
-    worktree = tmp_path / "repository"
-    shutil.copytree(k8s_demo.TEMPLATE, worktree)
-    monkeypatch.setattr(k8s_demo, "docker_platform", lambda: "linux/amd64")
-    k8s_demo.configure_template("kind", worktree)
-
-    stack = yaml.safe_load((worktree / "deployment/environments/staging/stacks/application.yaml").read_text())
-
-    assert stack["spec"]["template"] == {
-        "name": "application",
-        "source": {"fromPromotion": {"stack": "application"}},
-    }
-    assert stack["spec"]["units"] == ["deploy"]
-    assert stack["spec"]["artifactImports"] == [
-        {
-            "unit": "image",
-            "name": "containers",
-            "apiVersion": "artifact.gitopsctr.io/v1",
-            "kind": "ContainerImages",
-            "fromPromotion": {"stack": "application"},
-        }
-    ]
-
-    git(worktree, "init", "-b", "main")
-    source_revision = commit(worktree, "configured demo")
-    monkeypatch.setattr(controller, "REPOSITORY_ROOT", worktree)
-    controller._state_store.cache_clear()
-    dev_desired = tmp_path / "dev-desired"
-    controller.project_stack_resources(worktree, "dev", source_revision, dev_desired, worktree)
-    staging = controller.project_stack_resources(
-        worktree,
-        "staging",
-        source_revision,
-        tmp_path / "staging-desired",
-        worktree,
-        promotion=controller.PromotionContext(
-            source_environment="dev",
-            desired_ref="gitopsctr/desired/dev",
-            desired_revision="b" * 40,
-            observed_ref="gitopsctr/observed/dev",
-            observed_revision="c" * 40,
-            specification_revision=source_revision,
-            desired_root=dev_desired,
-        ),
-    )
-
-    assert set(staging.generated_units) == {"application--deploy"}
-    deploy = staging.generated_units["application--deploy"]
-    assert deploy.spec.materialize.releaseName == "gitopsctr-k8s-staging"
-    assert deploy.spec.materialize.values._serialize()["message"] == "promoted from dev to staging"
-
-
 def test_k8s_promotion_passes_explicit_target_input(monkeypatch):
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(k8s_demo, "converge", lambda *_args, **_kwargs: None)
@@ -247,45 +159,12 @@ def test_k8s_promotion_passes_explicit_target_input(monkeypatch):
             "staging",
             "--file",
             "deployment/environments/staging/stacks/application.yaml",
+            "--file",
+            "deployment/stack-templates/application.yaml",
             "--partition",
             "application",
         )
     ]
-
-
-@pytest.mark.parametrize("provider", ("kind", "minikube"))
-def test_argocd_delivery_uses_parameterized_stack_observer(tmp_path, monkeypatch, provider):
-    worktree = tmp_path / provider / "repository"
-    shutil.copytree(k8s_demo.TEMPLATE, worktree)
-    monkeypatch.setattr(k8s_demo, "docker_platform", lambda: "linux/amd64")
-
-    k8s_demo.configure_template(provider, worktree, "argocd")
-    projection = controller.project_stack_resources(
-        worktree,
-        "dev",
-        "a" * 40,
-        tmp_path / provider / "candidate",
-        worktree,
-    )
-    deploy = projection.generated_units["application--deploy"]
-
-    assert deploy.driver.unit_contract.dump(deploy.spec)["delivery"] == {
-        "mode": "external",
-        "observer": {
-            "type": "argocd",
-            "access": "kubernetes",
-            "application": "gitopsctr-k8s-dev",
-            "applicationNamespace": k8s_demo.ARGO_NAMESPACE,
-            "kubeContext": k8s_demo.kube_context(provider, "argocd"),
-            "timeoutSeconds": 600,
-        },
-    }
-    application = k8s_demo.argo_application_document("dev")
-    assert application["spec"]["source"] == {
-        "repoURL": f"git://{k8s_demo.ARGO_GIT_SERVICE}.{k8s_demo.ARGO_NAMESPACE}.svc.cluster.local:9418/origin.git",
-        "targetRevision": "gitopsctr/desired/dev",
-        "path": "materialized/application--deploy",
-    }
 
 
 def test_preview_application_targets_unpartitioned_stack_projection():
@@ -316,7 +195,10 @@ def test_existing_preview_at_current_source_only_converges(monkeypatch, tmp_path
     assert image == "application--image:r1"
     assert len(events) == 1
     assert events[0][0] == "converge"
-    assert events[0][2]["files"] == ("deployment/environments/preview/stacks/preview.yaml",)
+    assert events[0][2]["files"] == (
+        "deployment/stack-templates/application.yaml",
+        "deployment/environments/preview/stacks/preview.yaml",
+    )
 
 
 def test_provider_defaults_to_kind_and_accepts_minikube(monkeypatch):
@@ -353,3 +235,63 @@ def test_refresh_argo_application_requests_environment_application_refresh(monke
         "gitopsctr-k8s-staging",
     )
     assert calls[0][1] == {"check": False}
+
+
+@pytest.mark.parametrize(
+    ("demo_root", "replacements", "expected_kind"),
+    [
+        (
+            docker_demo.TEMPLATE,
+            {
+                "__APP_PORT__": "18081",
+                "__DOCKER_PLATFORM__": "linux/arm64",
+                "__REGISTRY__": "localhost:5001",
+                "__TERRAFORM_STATE__": "/tmp/gitopsctr-demo.tfstate",
+            },
+            "Terraform",
+        ),
+        (
+            k8s_demo.TEMPLATE,
+            {"__CLUSTER_NAME__": "gitopsctr-k8s-dev", "__KUBE_CONTEXT__": "kind-gitopsctr-k8s-dev"},
+            "KubernetesManifests",
+        ),
+    ],
+)
+def test_demo_stack_templates_project_real_driver_contracts(
+    tmp_path: Path,
+    demo_root: Path,
+    replacements: dict[str, str],
+    expected_kind: str,
+):
+    source = tmp_path / demo_root.name
+    shutil.copytree(demo_root, source)
+    for path in source.rglob("*"):
+        if not path.is_file() or path.suffix in {".pyc", ".pyo"}:
+            continue
+        content = path.read_text()
+        for old, new in replacements.items():
+            content = content.replace(old, new)
+        path.write_text(content)
+
+    current = tmp_path / "current"
+    observed = tmp_path / "observed"
+    candidate = tmp_path / "candidate"
+    current.mkdir()
+    observed.mkdir()
+    result = controller.build_desired_candidate(
+        "dev",
+        source,
+        "a" * 40,
+        current,
+        observed,
+        None,
+        candidate,
+        verbose=False,
+    )
+    resources = controller.load_desired_resource_graph(candidate)
+    stack = resources[("gitopsctr.io/v1", "Stack", "application")]
+    assert stack.spec.structuralProjection.units["deploy"].kind == expected_kind  # type: ignore[union-attr]
+    assert stack.spec.structuralProjection.units["image"].kind == "OciImages"  # type: ignore[union-attr]
+    assert result.blocked == {"application--deploy": "receipt does not exist: application--image"}
+    assert stack.spec.activeProjection is not None  # type: ignore[union-attr]
+    assert set(stack.spec.activeProjection.units) == {"image"}  # type: ignore[union-attr]

@@ -1,13 +1,16 @@
 """A rollback is a forward commit containing the complete desired-state input."""
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from gitopsctr import controller as deploy_release
 from tests.conftest import receipt_document, write_test_document
+from tests.stack_deletion_support import stack_tree
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
@@ -123,6 +126,91 @@ def _promotion_document(revision: str) -> dict:
             "specificationRevision": revision,
         },
     }
+
+
+def _template_only(root: Path) -> None:
+    stack_tree(root)
+    (root / "stacks/preview.json").unlink()
+    (root / "units/preview--preview-app.json").unlink()
+
+
+def test_full_stack_rollback_rejects_recreated_root_identity(tmp_path: Path):
+    current = tmp_path / "current"
+    target = tmp_path / "target"
+    _template_only(current)
+    _template_only(target)
+    target_document = json.loads((target / "stack-templates/preview.json").read_text())
+    target_document["metadata"]["uid"] = "d1-template-new"
+    (target / "stack-templates/preview.json").write_text(json.dumps(target_document))
+
+    with pytest.raises(deploy_release.OperationError, match="cross the current StackTemplate"):
+        deploy_release.validate_full_rollback_stack_aggregate(current, target)
+
+
+def test_full_stack_rollback_rejects_resurrection_of_finalized_root(tmp_path: Path):
+    current = tmp_path / "current"
+    target = tmp_path / "target"
+    current.mkdir()
+    _template_only(target)
+    deploy_release.write_resource_incarnation_tombstone(
+        current,
+        deploy_release.ResourceIncarnationTombstone(
+            api_version=deploy_release.CORE_API_VERSION,
+            kind="StackTemplate",
+            name="preview",
+            uid="d1-template",
+            deletion_generation=1,
+        ),
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="resurrect finalized StackTemplate"):
+        deploy_release.validate_full_rollback_stack_aggregate(current, target)
+
+
+def test_targeted_rollback_rejects_stack_owned_unit_before_publication(tmp_path: Path, monkeypatch):
+    current = tmp_path / "current"
+    stack_tree(current)
+    unit_name = "preview--preview-app"
+    owned = deploy_release.load_desired_unit(current / "units/preview--preview-app.json", unit_name)
+    inventory = deploy_release.RollbackDesiredInventory({unit_name: owned}, {unit_name: ()})
+    published = False
+
+    def observed_tree(_ref: str, output: Path) -> str:
+        shutil.copytree(current, output)
+        return "c" * 40
+
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
+    monkeypatch.setattr(deploy_release, "resolve_ref", lambda *_args: "a" * 40)
+    monkeypatch.setattr(deploy_release, "effect_lease_ref", lambda *_args: None)
+    monkeypatch.setattr(deploy_release, "git", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=""))
+    monkeypatch.setattr(deploy_release, "materialize_revision", lambda _revision, output: output.mkdir())
+    monkeypatch.setattr(deploy_release, "validate_rollback_desired_inventory", lambda *_args: inventory)
+
+    def fail_publish(*_args, **_kwargs):
+        nonlocal published
+        published = True
+        raise AssertionError("targeted Stack-owned rollback must stop before publication")
+
+    monkeypatch.setattr(deploy_release, "publish_desired_change", fail_publish)
+    args = deploy_release.build_parser().parse_args(
+        [
+            "rollback",
+            "--environment",
+            "dev",
+            "--to-desired-revision",
+            "a" * 40,
+            "--unit",
+            unit_name,
+            "--reason",
+            "avoid historical Stack child",
+        ]
+    )
+
+    with pytest.raises(deploy_release.OperationError, match=r"targeted rollback of Stack-owned Unit\(s\)"):
+        deploy_release.command_rollback(args)
+    assert not published
 
 
 def test_downstream_unit_closure_is_transitive_and_excludes_selected_units():
@@ -658,6 +746,42 @@ def test_full_rollback_preserves_current_parseable_blocked_unit_and_materializat
         "blocks": {"base": "current parseable transition is blocked"},
         "schema": 1,
     }
+
+
+@pytest.mark.parametrize("different_payload", [False, True])
+def test_full_rollback_stack_owned_block_overlay_keeps_target_payload_and_blocks(
+    tmp_path: Path,
+    different_payload: bool,
+):
+    current = tmp_path / "current"
+    target = tmp_path / "target"
+    stack_tree(current)
+    stack_tree(target)
+    current_unit_path = current / "units/preview--preview-app.json"
+    if different_payload:
+        current_document = json.loads(current_unit_path.read_text())
+        current_document["spec"]["terraform"] = {"backend": {}, "variables": {"value": "current"}}
+        current_unit_path.write_text(json.dumps(current_document))
+    deploy_release.write_desired_transition_blocks(
+        current,
+        {"preview--preview-app": "current Stack-owned transition is blocked"},
+    )
+    candidate = tmp_path / "candidate"
+    shutil.copytree(target, candidate)
+
+    deploy_release.merge_current_cleanup_state(
+        current,
+        candidate,
+        preserve_target_stack_semantics=True,
+    )
+
+    target_unit = deploy_release.load_desired_unit(target / "units/preview--preview-app.json", "preview--preview-app")
+    candidate_unit = deploy_release.load_desired_unit(
+        candidate / "units/preview--preview-app.json",
+        "preview--preview-app",
+    )
+    assert candidate_unit.spec == target_unit.spec
+    assert deploy_release.load_desired_transition_blocks(candidate) == {}
 
 
 @pytest.mark.parametrize(

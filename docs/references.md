@@ -3,13 +3,12 @@
 Reference expressions let one authored value read immutable state produced elsewhere. They are self-contained objects
 and can appear in template-bearing fields supported by a unit kind.
 
-!!! note "Three uses of promotion"
+!!! note "Two uses of promotion"
 
     This page describes the field-level `fromPromotion` reference expression, which reads a source Unit's public
     `spec`. A Stack's `artifactImports[].fromPromotion` instead imports a validated artifact from source desired and
-    observed state. `template.source.fromPromotion` instead reuses a source Stack's exact parameterized-template
-    source pin and expands it with target parameters. See [Stacks and
-    StackTemplates](apis/stacks.md#promotion-and-template-selection).
+    observed state. StackTemplate acquisition is direct-inline only in the current contract; it has no promotion
+    source mode. See [Stacks and StackTemplates](apis/stacks.md#desired-state-records).
 
 | Expression | Reads | Pointer scope | Required selectors |
 | --- | --- | --- | --- |
@@ -86,6 +85,9 @@ endpoint:
     dryFallback:
       fromReceipt: {unit: preview-infrastructure, pointer: /outputs/endpoint}
 ```
+
+`fromParameter` is not allowed anywhere inside a projection-time fallback, including nested fallback objects. Stack
+parameters must be expanded before a structural projection is persisted.
 
 When a fallback supplies the value, the unavailable reference contributes no fingerprint. A nested fallback reference
 that resolves successfully contributes its own normal fingerprint.

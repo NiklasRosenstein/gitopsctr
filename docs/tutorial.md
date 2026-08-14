@@ -89,7 +89,7 @@ partition, gitopsctr begins deletion of the Stack and its generated Units:
 ```console
 gitopsctr apply --environment dev \
   --partition application \
-  --file deployment/environments/dev/stacks \
+  --file deployment/stack-templates/application.yaml \
   --source-revision HEAD
 ```
 

@@ -100,7 +100,7 @@ def test_create_project_writes_a_valid_canonical_resource(tmp_path: Path, capsys
     assert capsys.readouterr().out == "gitopsctr.yaml\n"
 
 
-def test_create_stack_and_stacktemplate_write_source_resources(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+def test_create_stack_and_stacktemplate_write_authored_resources(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     create_project(tmp_path)
     create_environment(tmp_path)
     template_path = tmp_path / "template.json"
@@ -111,13 +111,14 @@ def test_create_stack_and_stacktemplate_write_source_resources(tmp_path: Path, c
                 "kind": "StackTemplate",
                 "metadata": {"name": "application"},
                 "spec": {
+                    "parameters": [],
                     "unitTemplates": {
                         "deploy": {
                             "apiVersion": "unit.gitopsctr.io/v1",
                             "kind": "Terraform",
                             "spec": {"source": {"path": "."}},
                         }
-                    }
+                    },
                 },
             }
         )
@@ -154,7 +155,7 @@ def test_create_stack_and_stacktemplate_write_source_resources(tmp_path: Path, c
 
     assert (tmp_path / "deployment/stack-templates/application.yaml").is_file()
     stack = yaml.safe_load((tmp_path / "deployment/environments/dev/stacks/application.yaml").read_text())
-    assert stack["spec"]["template"]["name"] == "application"
+    assert stack["spec"]["template"] == "application"
     assert stack["spec"]["parameters"] == {}
     assert stack["spec"]["units"] == ["deploy"]
     assert capsys.readouterr().out.splitlines()[-1].endswith("application.yaml")

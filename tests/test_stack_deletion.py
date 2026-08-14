@@ -9,7 +9,6 @@ import pytest
 
 from gitopsctr import controller
 from gitopsctr.errors import OperationError
-from gitopsctr.state import ControllerPin
 from tests.stack_deletion_support import deletion_args as _args
 from tests.stack_deletion_support import fake_git as _fake_git
 from tests.stack_deletion_support import stack_tree as _stack_tree
@@ -50,63 +49,6 @@ def _configure_state(monkeypatch, tmp_path: Path, current: Path, store=None) -> 
         monkeypatch.setattr(controller, "state_store", lambda: store)
 
 
-def test_stack_pin_release_releases_every_source_commit_for_exact_incarnation(tmp_path: Path, monkeypatch):
-    current = tmp_path / "current"
-    _stack_tree(current)
-    stack = _stack(current)
-    first = ControllerPin(
-        f"stacks/dev/preview/{stack.metadata.uid}/{'a' * 40}",
-        f"refs/heads/gitopsctr/pins/stacks/dev/preview/{stack.metadata.uid}/{'a' * 40}",
-        "a" * 40,
-    )
-    second = ControllerPin(
-        f"stacks/dev/preview/{stack.metadata.uid}/{'b' * 40}",
-        f"refs/heads/gitopsctr/pins/stacks/dev/preview/{stack.metadata.uid}/{'b' * 40}",
-        "b" * 40,
-    )
-    unrelated = ControllerPin(
-        f"stacks/dev/preview/d1-other/{'c' * 40}",
-        f"refs/heads/gitopsctr/pins/stacks/dev/preview/d1-other/{'c' * 40}",
-        "c" * 40,
-    )
-    released: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        controller,
-        "state_store",
-        lambda: SimpleNamespace(
-            list_controller_pins=lambda: (first, second, unrelated),
-            release_controller_pin=lambda name, revision: released.append((name, revision)),
-        ),
-    )
-
-    controller._release_stack_pin("dev", stack)
-    assert released == [(first.name, first.revision), (second.name, second.revision)]
-
-
-def test_stack_pin_release_validates_all_pin_identities_before_mutation(tmp_path: Path, monkeypatch):
-    current = tmp_path / "current"
-    _stack_tree(current)
-    stack = _stack(current)
-    malformed = ControllerPin(
-        f"stacks/dev/preview/{stack.metadata.uid}/not-a-commit",
-        f"refs/heads/gitopsctr/pins/stacks/dev/preview/{stack.metadata.uid}/not-a-commit",
-        "a" * 40,
-    )
-    released: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        controller,
-        "state_store",
-        lambda: SimpleNamespace(
-            list_controller_pins=lambda: (malformed,),
-            release_controller_pin=lambda name, revision: released.append((name, revision)),
-        ),
-    )
-
-    with pytest.raises(OperationError, match="invalid identity"):
-        controller._release_stack_pin("dev", stack)
-    assert released == []
-
-
 def test_delete_stack_marks_stack_and_owned_units_with_metadata(tmp_path: Path, monkeypatch):
     current = tmp_path / "current"
     _stack_tree(current)
@@ -134,7 +76,12 @@ def test_delete_and_finalize_standalone_stacktemplate(tmp_path: Path, monkeypatc
     (current / "stacks/preview.json").unlink()
     (current / "units/preview--preview-app.json").unlink()
     published, publish = _publish_snapshots(tmp_path)
-    _configure_state(monkeypatch, tmp_path, current)
+    _configure_state(
+        monkeypatch,
+        tmp_path,
+        current,
+        SimpleNamespace(list_controller_pins=lambda: (), release_controller_pin=lambda *_args: True),
+    )
     monkeypatch.setattr(controller, "publish_desired_change", publish)
     args = _args(kind="StackTemplate", name="preview", uid="d1-template")
 
@@ -159,64 +106,11 @@ def test_delete_and_finalize_standalone_stacktemplate(tmp_path: Path, monkeypatc
     )
 
 
-def test_finalize_stack_requires_child_first_then_releases_pin(tmp_path: Path, monkeypatch):
+def test_finalize_stack_after_child_finalization(tmp_path: Path, monkeypatch):
     current = tmp_path / "current"
     _stack_tree(current)
     published, publish = _publish_snapshots(tmp_path)
-    released: list[tuple[str, str]] = []
-    pin = ControllerPin(
-        f"stacks/dev/preview/d1-stack-preview/{'a' * 40}",
-        f"refs/heads/gitopsctr/pins/stacks/dev/preview/d1-stack-preview/{'a' * 40}",
-        "a" * 40,
-    )
-    store = SimpleNamespace(
-        list_controller_pins=lambda: (pin,),
-        release_controller_pin=lambda name, revision: released.append((name, revision)),
-    )
-    _configure_state(monkeypatch, tmp_path, current, store)
-    monkeypatch.setattr(controller, "publish_desired_change", publish)
-    assert controller.command_delete_resource(_args()) is None
-    marked = published[0]
-    monkeypatch.setattr(controller, "materialize_revision", lambda _revision, output: shutil.copytree(marked, output))
-
-    with pytest.raises(OperationError, match="owned resources must be finalized first"):
-        controller.command_finalize(_args())
-
-    unsafe = tmp_path / "unsafe"
-    shutil.copytree(published[0], unsafe)
-    (unsafe / "units/preview--preview-app.json").unlink()
-    with pytest.raises(OperationError, match="missing generated Unit"):
-        controller.load_desired_resource_graph(unsafe)
-
-    retryable = tmp_path / "retryable"
-    shutil.copytree(published[0], retryable)
-    (retryable / "units/preview--preview-app.json").unlink()
-    controller.write_resource_incarnation_tombstone(
-        retryable,
-        controller.ResourceIncarnationTombstone(
-            api_version=controller.UNIT_API_VERSION,
-            kind="Terraform",
-            name="preview--preview-app",
-            uid="d1-preview-app",
-            deletion_generation=1,
-        ),
-    )
-    monkeypatch.setattr(
-        controller, "materialize_revision", lambda _revision, output: shutil.copytree(retryable, output)
-    )
-    assert controller.command_finalize(_args()) is True
-
-    finalized = published[1]
-    assert not list(finalized.glob("stacks/preview.*"))
-    assert released == [(pin.name, "a" * 40)]
-
-
-def test_finalize_stack_without_local_source_pin_after_child_finalization(tmp_path: Path, monkeypatch):
-    current = tmp_path / "current"
-    _stack_tree(current)
-    published, publish = _publish_snapshots(tmp_path)
-    store = SimpleNamespace(list_controller_pins=lambda: ())
-    _configure_state(monkeypatch, tmp_path, current, store)
+    _configure_state(monkeypatch, tmp_path, current)
     monkeypatch.setattr(controller, "publish_desired_change", publish)
 
     assert controller.command_delete_resource(_args()) is None
@@ -236,6 +130,71 @@ def test_finalize_stack_without_local_source_pin_after_child_finalization(tmp_pa
 
     assert controller.command_finalize(_args()) is True
     assert not list((published[1] / "stacks").glob("preview.*"))
+
+
+def test_finalize_stack_refuses_a_present_child(tmp_path: Path, monkeypatch):
+    current = tmp_path / "current"
+    _stack_tree(current)
+    published, publish = _publish_snapshots(tmp_path)
+    _configure_state(monkeypatch, tmp_path, current)
+    monkeypatch.setattr(controller, "publish_desired_change", publish)
+    assert controller.command_delete_resource(_args()) is None
+    marked = published[0]
+    monkeypatch.setattr(controller, "materialize_revision", lambda _revision, output: shutil.copytree(marked, output))
+
+    with pytest.raises(OperationError, match="owned resources must be finalized first"):
+        controller.command_finalize(_args())
+
+
+def test_finalize_stack_rejects_missing_child_without_tombstone(tmp_path: Path, monkeypatch):
+    current = tmp_path / "current"
+    _stack_tree(current)
+    published, publish = _publish_snapshots(tmp_path)
+    _configure_state(monkeypatch, tmp_path, current)
+    monkeypatch.setattr(controller, "publish_desired_change", publish)
+    assert controller.command_delete_resource(_args()) is None
+    marked = published[0]
+    (marked / "units/preview--preview-app.json").unlink()
+    monkeypatch.setattr(controller, "materialize_revision", lambda _revision, output: shutil.copytree(marked, output))
+
+    with pytest.raises(OperationError, match="missing without a matching incarnation tombstone"):
+        controller.command_finalize(_args())
+
+
+def test_finalize_stack_publication_failure_is_retryable(tmp_path: Path, monkeypatch):
+    current = tmp_path / "current"
+    _stack_tree(current)
+    published, publish = _publish_snapshots(tmp_path)
+    _configure_state(monkeypatch, tmp_path, current)
+    monkeypatch.setattr(controller, "publish_desired_change", publish)
+    assert controller.command_delete_resource(_args()) is None
+    marked = published[0]
+    (marked / "units/preview--preview-app.json").unlink()
+    controller.write_resource_incarnation_tombstone(
+        marked,
+        controller.ResourceIncarnationTombstone(
+            api_version=controller.UNIT_API_VERSION,
+            kind="Terraform",
+            name="preview--preview-app",
+            uid="d1-preview-app",
+            deletion_generation=1,
+        ),
+    )
+    monkeypatch.setattr(controller, "materialize_revision", lambda _revision, output: shutil.copytree(marked, output))
+    attempts = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("publication unavailable")
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(controller, "publish_desired_change", fail_once)
+    with pytest.raises(RuntimeError, match="publication unavailable"):
+        controller.command_finalize(_args())
+    assert controller.command_finalize(_args()) is True
+    assert attempts == 2
 
 
 @pytest.mark.parametrize(

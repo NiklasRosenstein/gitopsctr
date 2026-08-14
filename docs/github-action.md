@@ -18,6 +18,7 @@ Apply one authoritative partition from checked-out files:
     environment: dev
     partition: application
     files: |
+      deployment/stack-templates/application.yaml
       deployment/environments/dev/stacks/application.yaml
     source-revision: ${{ github.sha }}
 ```
@@ -37,7 +38,9 @@ Converge with the same explicit input for the duration of the Action step:
     package-source: action
     environment: dev
     partition: application
-    files: deployment/environments/dev/stacks/application.yaml
+    files: |
+      deployment/stack-templates/application.yaml
+      deployment/environments/dev/stacks/application.yaml
     source-revision: ${{ github.sha }}
 ```
 
@@ -78,7 +81,9 @@ Promotion requires explicit target input in addition to its pinned source contex
     operation: promote
     from-environment: dev
     to-environment: staging
-    files: deployment/environments/staging/stacks/application.yaml
+    files: |
+      deployment/stack-templates/application.yaml
+      deployment/environments/staging/stacks/application.yaml
     partition: application
     specification-revision: ${{ github.sha }}
 ```

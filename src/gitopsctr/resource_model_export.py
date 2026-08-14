@@ -140,6 +140,24 @@ def render_resource_model(registry: ResourceRegistry) -> str:
             "Receipt artifact descriptors identify separately stored Artifact resources and bind their producer, media",
             "type, and serialized-byte digest. Artifact resources are not Receipt fields and are not Unit status.",
             "",
+            "## Desired graph relationships",
+            "",
+            "| Relationship | Source | Target | Identity fence |",
+            "| --- | --- | --- | --- |",
+        ]
+    )
+    for relationship in sorted(registry.graph_relationships, key=lambda item: item.name):
+        identity = ", ".join(f"`{field}`" for field in relationship.binding.documentation())
+        lines.append(
+            f"| {relationship.name} | {relationship.source_plane}/{relationship.source_family} | "
+            f"{relationship.target_plane}/{relationship.target_family} | {identity} |"
+        )
+    lines.extend(
+        [
+            "",
+            "Desired Stack relationships are registry contracts: a StackTemplate selection may be fenced by the",
+            "template name, UID, and semantic content digest, while generated Units are fenced by the Stack owner UID.",
+            "",
         ]
     )
     return "\n".join(lines)

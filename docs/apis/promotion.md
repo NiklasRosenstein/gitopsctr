@@ -39,6 +39,7 @@ specific reviewed commit.
 gitopsctr promote \
   --from-environment dev \
   --to-environment staging \
+  --file deployment/stack-templates/application.yaml \
   --file deployment/environments/staging/stacks/application.yaml \
   --partition application \
   --specification-revision REVIEWED_SHA
@@ -93,15 +94,10 @@ spec:
         stack: application
 ```
 
-Here, `template: application` resolves the template from the pinned specification tree. The artifact import resolves
-`image/containers` from the source Stack using the pinned source desired and observed trees, validates its receipt and
-digest, and records immutable import lineage in the target desired Stack.
-
-`template.source.fromPromotion` makes a different, independent selection: it follows the source Stack's recorded
-StackTemplate commit, path, and digest, verifies that exact parameterized document, and expands it with the target
-Stack's parameters and Unit selection. It does not reuse the source Stack's expanded projection. A target Stack is not
-required to choose this mode merely because its Environment permits promotion. See [Promotion and template
-selection](stacks.md#promotion-and-template-selection).
+Here, `template: application` is a direct-inline selection. The artifact import resolves `image/containers` from the
+source Stack using the pinned source desired and observed trees, validates its receipt and digest, and records
+immutable import lineage in the target desired Stack. External Git and template-promotion acquisition modes are not
+part of the current StackTemplate contract and are rejected.
 
 During desired-state resolution, [`fromPromotion`](../references.md#promotion-selectors) reads public unit `spec`
 values from the pinned source desired revision. Broken selectors in an active Promotion are errors. They do not make

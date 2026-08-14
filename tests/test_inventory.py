@@ -5,9 +5,20 @@ import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from gitopsctr.contracts import (
+    CORE_CONTRACTS,
+    DesiredResourceMetadata,
+    DesiredStackDocument,
+    DesiredStackSpec,
+    StackProjection,
+    StackProjectionUnit,
+    StackTemplateReference,
+)
+from gitopsctr.document import JsonObjectValue
 from gitopsctr.errors import OperationError
 from gitopsctr.inventory import (
     InventoryError,
@@ -86,40 +97,86 @@ def desired_terraform(name: str) -> dict[str, object]:
 
 def stack_template(name: str, *, desired: bool) -> dict[str, object]:
     metadata: dict[str, object] = {"name": name}
-    if desired:
-        metadata.update({"uid": f"uid-{name}", "labels": {"gitopsctr.io/partition": "application"}})
-    return {
+    authored = {
         "apiVersion": "gitopsctr.io/v1",
         "kind": "StackTemplate",
         "metadata": metadata,
         "spec": {
+            "parameters": [],
             "unitTemplates": {
                 "application": {
                     "apiVersion": "unit.gitopsctr.io/v1",
                     "kind": "Terraform",
                     "spec": {"source": {"path": "."}},
                 }
-            }
+            },
         },
     }
+    if not desired:
+        return authored
+    parsed = CORE_CONTRACTS["stack-template-authored"].parse(authored)
+    metadata.update({"uid": f"uid-{name}", "labels": {"gitopsctr.io/partition": "application"}})
+    specification = cast(dict[str, object], authored["spec"])
+    specification.update(
+        {
+            "contentDigest": parsed.spec.semantic_content_digest(),
+            "acquisition": {
+                "documentDigest": "sha256:" + "b" * 64,
+                "fromInput": {},
+            },
+        }
+    )
+    return authored
 
 
-def stack(name: str, template: str, *, desired: bool) -> dict[str, object]:
+def stack(
+    name: str,
+    template: str,
+    *,
+    desired: bool,
+    template_document: dict[str, object] | None = None,
+) -> dict[str, object]:
     metadata: dict[str, object] = {"name": name}
     if desired:
         metadata.update({"uid": f"uid-{name}", "labels": {"gitopsctr.io/partition": "application"}})
     specification: dict[str, object] = {"template": template, "parameters": {}}
     if desired:
-        specification["resolvedProjection"] = {
-            "units": {
-                "application": {
-                    "apiVersion": "unit.gitopsctr.io/v1",
-                    "kind": "Terraform",
-                    "spec": {"source": {"path": "."}},
-                    "dependsOn": [],
-                }
-            }
-        }
+        assert template_document is not None
+        template_metadata = cast(dict[str, object], template_document["metadata"])
+        template_spec = cast(dict[str, object], template_document["spec"])
+        template_uid = cast(str, template_metadata["uid"])
+        content_digest = cast(str, template_spec["contentDigest"])
+        projection = StackProjection.build(
+            stack_uid=cast(str, metadata["uid"]),
+            template_uid=template_uid,
+            template_content_digest=content_digest,
+            units={
+                "application": StackProjectionUnit(
+                    apiVersion="unit.gitopsctr.io/v1",
+                    kind="Terraform",
+                    spec=JsonObjectValue({"source": {"path": "."}}),
+                    dependsOn=[],
+                )
+            },
+        )
+        desired = DesiredStackDocument(
+            apiVersion="gitopsctr.io/v1",
+            kind="Stack",
+            metadata=DesiredResourceMetadata(
+                name=name,
+                uid=cast(str, metadata["uid"]),
+                labels={"gitopsctr.io/partition": "application"},
+            ),
+            spec=DesiredStackSpec(
+                templateRef=StackTemplateReference(
+                    name=template,
+                    uid=template_uid,
+                    contentDigest=content_digest,
+                ),
+                structuralProjection=projection,
+            ),
+        )
+        return CORE_CONTRACTS["stack-desired"].dump(desired)
     return {
         "apiVersion": "gitopsctr.io/v1",
         "kind": "Stack",
@@ -199,8 +256,9 @@ def repository(tmp_path: Path) -> Path:
             },
         },
     )
-    write_json(working / "stack-templates/web.yaml", stack_template("web", desired=True))
-    write_json(working / "stacks/web.yaml", stack("web", "web", desired=True))
+    desired_template = stack_template("web", desired=True)
+    write_json(working / "stack-templates/web.yaml", desired_template)
+    write_json(working / "stacks/web.yaml", stack("web", "web", desired=True, template_document=desired_template))
     write_json(
         working / "promotion.yaml",
         {

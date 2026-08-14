@@ -7,6 +7,7 @@ controller API used by local callers and the command-line adapter.
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import glob as globlib
 import hashlib
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -44,24 +46,25 @@ from gitopsctr.contracts import (
     DesiredSource,
     DesiredStackSpec,
     DesiredStackTemplateSpec,
-    GitSourceRequest,
     MaterializationDocument,
     ReceiptDesired,
     ResolvedArtifactImport,
-    ResolvedGitSource,
-    ResolvedStackTemplateSource,
+    StackActiveProjection,
+    StackProjectionUnit,
+    StackProjectionUnitBinding,
     StackSpec,
-    StackTemplateFromGit,
-    StackTemplateFromPromotion,
-    StackTemplateFromResource,
+    StackTemplateAcquisition,
+    StackTemplateFromInput,
     StackTemplateReference,
     StackTemplateResource,
+    StackTemplateSourceContext,
     StackTemplateSpec,
     StrictModel,
     scope_stack_template_resources,
     stack_generated_unit_name,
     with_schema,
 )
+from gitopsctr.contracts import StackProjection as StructuralStackProjection
 from gitopsctr.dependencies import (
     convergence_order,
     convergence_scope,
@@ -106,6 +109,7 @@ from gitopsctr.formats import (
     document_candidates,
     load_document,
     load_project_config,
+    project_config_path,
     project_environment_root,
     validate_project_document,
     write_document,
@@ -144,6 +148,7 @@ from gitopsctr.resources import (
     ResourceMetadata,
     StackResource,
     UnitResource,
+    desired_unit_binding_digest,
     validate_desired_resource_graph,
 )
 from gitopsctr.schemas import encoded_schema, export_schemas, resource_schema_url, show_schema
@@ -153,6 +158,7 @@ from gitopsctr.templates import (
 )
 from gitopsctr.templates import (
     ArtifactReferenceTarget,
+    ProjectionObject,
     PromotionReference,
     ReceiptReference,
     TemplateError,
@@ -177,6 +183,7 @@ DESIRED_TRANSITION_BLOCKS_PATH = PurePosixPath(".gitopsctr/transition-blocks.jso
 DESIRED_CLEANUP_UNITS_PATH = PurePosixPath(".gitopsctr/cleanup/units")
 DESIRED_EFFECT_LEASES_PATH = PurePosixPath(".gitopsctr/effect-leases/units")
 DESIRED_RESOURCE_INCARNATIONS_PATH = PurePosixPath(".gitopsctr/incarnations/resources")
+DESIRED_PROJECTION_CONTEXTS_PATH = PurePosixPath(".gitopsctr/projection-contexts")
 OBSERVED_TEARDOWN_EVIDENCE_PATH = PurePosixPath(".gitopsctr/teardowns/units")
 EFFECT_LEASE_TTL_SECONDS = 300
 
@@ -206,6 +213,15 @@ class PromotionContext:
             },
             str(CORE_CONTRACTS["promotion"].json_schema()["$id"]),
         )
+
+
+@dataclass(frozen=True)
+class ApplyInputDocument:
+    """One explicitly supplied document and the bytes used to acquire it."""
+
+    origin: str
+    document: JsonObject
+    document_digest: str
 
 
 @dataclass(frozen=True)
@@ -658,6 +674,24 @@ def write_desired_candidate_unit(path: Path, unit: UnitResource[Any], project_ro
     return write_document(path, serialize_unit_document(unit, profile="desired"), format=selected)
 
 
+def _validate_desired_projection_context_records(
+    root: Path,
+    resources: Mapping[tuple[str, str, str], UnitResource[Any] | StackResource],
+) -> None:
+    """Require every structural and active Stack context digest to be durable."""
+
+    for resource in resources.values():
+        if not isinstance(resource, StackResource) or resource.gvk.kind != "Stack":
+            continue
+        if not isinstance(resource.spec, DesiredStackSpec):
+            continue
+        digests = {resource.spec.structuralProjection.identity.projectionContextDigest}
+        if resource.spec.activeProjection is not None:
+            digests.add(resource.spec.activeProjection.projectionContextDigest)
+        for digest in sorted(digests):
+            load_projection_context(root, digest)
+
+
 def load_desired_resource_graph(
     root: Path, *, validate: bool = True
 ) -> dict[tuple[str, str, str], UnitResource[Any] | StackResource]:
@@ -700,21 +734,8 @@ def load_desired_resource_graph(
             stack_key = (CORE_API_VERSION, "Stack", stack_name)
             stack_resource = resources.get(stack_key)
             template_resource = (
-                resources.get(
-                    (
-                        CORE_API_VERSION,
-                        "StackTemplate",
-                        stack_resource.spec.template
-                        if isinstance(stack_resource.spec.template, str)
-                        else stack_resource.spec.template.name,
-                    )
-                )
-                if isinstance(stack_resource, StackResource)
-                and isinstance(stack_resource.spec, (StackSpec, DesiredStackSpec))
-                and (
-                    isinstance(stack_resource.spec.template, str)
-                    or isinstance(stack_resource.spec.template.source, StackTemplateFromResource)
-                )
+                resources.get((CORE_API_VERSION, "StackTemplate", stack_resource.spec.templateRef.name))
+                if isinstance(stack_resource, StackResource) and isinstance(stack_resource.spec, DesiredStackSpec)
                 else None
             )
             if (
@@ -738,38 +759,10 @@ def load_desired_resource_graph(
                     and any(name == unit_name for _api_version, _kind, name in missing_resources)
                     and all(key in tombstones for key in missing_resources)
                 ):
-                    return resources
-            transition_blocks = load_desired_transition_blocks(root)
-            if (
-                transition_blocks.get(unit_name)
-                and isinstance(stack_resource, StackResource)
-                and isinstance(stack_resource.spec, DesiredStackSpec)
-                and stack_resource.spec.resolvedProjection is not None
-                and stack_resource.metadata.is_root
-                and resource_owner_reference(stack_resource) is None
-                and unit_name not in _current_desired_unit_paths(root)
-            ):
-                projected_units = stack_resource.spec.resolvedProjection.get("units")
-                if isinstance(projected_units, dict) and unit_name.removeprefix(f"{stack_name}--") in projected_units:
-                    validation_projection = dict(projected_units)
-                    for blocked_name in transition_blocks:
-                        logical_name = blocked_name.removeprefix(f"{stack_name}--")
-                        if (
-                            blocked_name.startswith(f"{stack_name}--")
-                            and not unit_document_path(root, blocked_name).is_file()
-                        ):
-                            validation_projection.pop(logical_name, None)
-                    validation_resources = dict(resources)
-                    validation_resources[stack_key] = replace(
-                        stack_resource,
-                        spec=replace(
-                            stack_resource.spec,
-                            resolvedProjection=JsonObjectValue({"units": validation_projection}),
-                        ),
-                    )
-                    validate_desired_resource_graph(validation_resources)
+                    _validate_desired_projection_context_records(root, resources)
                     return resources
         raise OperationError(f"invalid desired resource graph: {exc}") from exc
+    _validate_desired_projection_context_records(root, resources)
     return resources
 
 
@@ -786,75 +779,41 @@ def stack_dependency_edges(
     validated by ``load_desired_resource_graph``.
     """
 
-    templates = {
-        resource.name: resource
-        for resource in resources.values()
-        if isinstance(resource, StackResource) and resource.gvk.kind == "StackTemplate"
-    }
     edges: dict[str, set[str]] = {}
     for stack in (
         resource
         for resource in resources.values()
         if isinstance(resource, StackResource) and resource.gvk.kind == "Stack"
     ):
-        if not isinstance(stack.spec, (StackSpec, DesiredStackSpec)):
+        if not isinstance(stack.spec, DesiredStackSpec):
             continue
-        template_name = stack.spec.template if isinstance(stack.spec.template, str) else stack.spec.template.name
-        uses_resource_template = isinstance(stack.spec.template, str) or isinstance(
-            stack.spec.template.source, StackTemplateFromResource
+        active = stack.spec.activeProjection
+        use_active = active is not None and (
+            active.sourceProjectionDigest != stack.spec.structuralProjection.identity.projectionDigest
         )
-        template = templates.get(template_name) if uses_resource_template else None
-        if template is None or not isinstance(template.spec, StackTemplateSpec):
-            projection = stack.spec.resolvedProjection if isinstance(stack.spec, DesiredStackSpec) else None
-            units = projection.get("units") if isinstance(projection, dict) else None
-            if not isinstance(units, dict):
-                continue
-            for logical_name, value in units.items():
-                if not isinstance(logical_name, str) or not isinstance(value, dict):
-                    continue
-                dependencies = value.get("dependsOn", [])
-                if not isinstance(dependencies, list):
-                    continue
-                generated_name = stack_generated_unit_name(stack.name, logical_name)
-                if include_missing or any(
-                    isinstance(item, UnitResource) and item.name == generated_name for item in resources.values()
+        if use_active:
+            for binding in active.units.values():
+                if not include_missing and not any(
+                    isinstance(item, UnitResource) and item.name == binding.name for item in resources.values()
                 ):
-                    edges.setdefault(generated_name, set()).update(
-                        stack_generated_unit_name(stack.name, dependency)
-                        for dependency in dependencies
-                        if isinstance(dependency, str)
-                        and (
-                            include_missing
-                            or any(
-                                isinstance(item, UnitResource)
-                                and item.name == stack_generated_unit_name(stack.name, dependency)
-                                for item in resources.values()
-                            )
-                        )
-                    )
+                    continue
+                edges.setdefault(binding.name, set()).update(binding.dependsOn)
             continue
-        expanded_by_name = {
-            resource.name: resource
-            for resource in scope_stack_template_resources(
-                stack.name,
-                template.spec.expand(stack.spec.parameters),
-            )
-        }
-        for generated in expanded_by_name.values():
-            generated_key = (generated.apiVersion, generated.kind, generated.name)
-            if not include_missing and generated_key not in resources:
+        for logical_name, projected in stack.spec.structuralProjection.units.items():
+            generated_name = stack_generated_unit_name(stack.name, logical_name)
+            if not include_missing and not any(
+                isinstance(item, UnitResource) and item.name == generated_name for item in resources.values()
+            ):
                 # A deleting Stack may intentionally omit a finalized child.
                 continue
-            edges.setdefault(generated.name, set()).update(
-                dependency
-                for dependency in generated.dependsOn
+            edges.setdefault(generated_name, set()).update(
+                stack_generated_unit_name(stack.name, dependency)
+                for dependency in projected.dependsOn
                 if include_missing
-                or (
-                    expanded_by_name[dependency].apiVersion,
-                    expanded_by_name[dependency].kind,
-                    dependency,
+                or any(
+                    isinstance(item, UnitResource) and item.name == stack_generated_unit_name(stack.name, dependency)
+                    for item in resources.values()
                 )
-                in resources
             )
     return {name: tuple(sorted(dependencies)) for name, dependencies in sorted(edges.items())}
 
@@ -1069,6 +1028,16 @@ def resource_owner_reference(resource: UnitResource[Any] | StackResource) -> Des
     if len(references) > 1:
         raise OperationError(f"desired resource {resource.name!r} has more than one ownerReference")
     return references[0] if references else None
+
+
+def _unit_is_stack_owned(unit: UnitResource[Any]) -> bool:
+    owner = resource_owner_reference(unit)
+    return owner is not None and owner.kind == "Stack"
+
+
+def _unit_owned_by_stack(unit: UnitResource[Any], name: str, uid: str | None) -> bool:
+    owner = resource_owner_reference(unit)
+    return owner is not None and owner.kind == "Stack" and owner.name == name and owner.uid == uid
 
 
 def resource_deletion(resource: UnitResource[Any] | StackResource) -> DeletionMetadata | None:
@@ -1835,6 +1804,179 @@ def load_environment(source_root: Path, environment_name: str) -> dict[str, Any]
     return environment
 
 
+_CONTEXT_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _projection_context_digest(context: Mapping[str, Any]) -> str:
+    payload = {key: value for key, value in context.items() if key != "digest"}
+    return f"sha256:{hashlib.sha256(canonical_json(payload)).hexdigest()}"
+
+
+def _safe_context_basename(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value or value in {".", ".."}:
+        raise OperationError(f"projection context has an invalid {field_name}")
+    if Path(value).is_absolute() or "/" in value or "\\" in value or ".." in PurePosixPath(value).parts:
+        raise OperationError(f"projection context {field_name} must be a safe basename")
+    if Path(value).name != value:
+        raise OperationError(f"projection context {field_name} must be a safe basename")
+    return value
+
+
+def _projection_context_path(root: Path, digest: str) -> Path:
+    if not _CONTEXT_DIGEST_RE.fullmatch(digest):
+        raise OperationError("projection context digest is invalid")
+    return root / DESIRED_PROJECTION_CONTEXTS_PATH / f"{digest.removeprefix('sha256:')}.json"
+
+
+def capture_projection_context(
+    source_root: Path,
+    environment_name: str,
+    promotion: PromotionContext | None = None,
+) -> JsonObject:
+    """Capture an immutable Project/Environment resolution context."""
+
+    project_path = project_config_path(source_root)
+    environment_root = project_environment_root(source_root, environment_name)
+    environment_paths = document_candidates(environment_root, "environment")
+    if len(environment_paths) != 1:
+        raise OperationError(f"expected exactly one environment document for {environment_name}")
+    project_document = load_document(project_path)
+    validate_project_document(project_document, project_path)
+    environment_document = load_document(environment_paths[0])
+    normalize_environment_document(environment_document, environment_name)
+    context: JsonObject = {
+        "schema": 1,
+        "kind": "ProjectionContext",
+        "environment": environment_name,
+        "projectFile": project_path.name,
+        "environmentFile": environment_paths[0].name,
+        "projectDocument": project_document,
+        "environmentDocument": environment_document,
+        "projectBytes": base64.b64encode(project_path.read_bytes()).decode("ascii"),
+        "environmentBytes": base64.b64encode(environment_paths[0].read_bytes()).decode("ascii"),
+    }
+    if promotion is not None:
+        context["promotionDocument"] = RESOURCE_CATALOG.serialize_promotion(promotion.document())
+    context["digest"] = _projection_context_digest(context)
+    return context
+
+
+def _validate_projection_context(
+    context: object,
+    *,
+    expected_digest: str | None = None,
+    environment_name: str | None = None,
+) -> JsonObject:
+    if not isinstance(context, dict):
+        raise OperationError("invalid durable projection context")
+    required = {
+        "schema",
+        "kind",
+        "digest",
+        "environment",
+        "projectFile",
+        "environmentFile",
+        "projectDocument",
+        "environmentDocument",
+        "projectBytes",
+        "environmentBytes",
+    }
+    allowed = required | {"promotionDocument"}
+    if (
+        set(context) not in (required, allowed)
+        or context.get("schema") != 1
+        or context.get("kind") != "ProjectionContext"
+    ):
+        raise OperationError("invalid durable projection context")
+    digest = context.get("digest")
+    if not isinstance(digest, str) or not _CONTEXT_DIGEST_RE.fullmatch(digest):
+        raise OperationError("projection context has an invalid digest")
+    if expected_digest is not None and digest != expected_digest:
+        raise OperationError("projection context digest binding does not match its record")
+    if _projection_context_digest(cast(Mapping[str, Any], context)) != digest:
+        raise OperationError("projection context content does not match its digest")
+    environment = context.get("environment")
+    if not isinstance(environment, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", environment):
+        raise OperationError("projection context has an invalid environment")
+    if environment_name is not None and environment != environment_name:
+        raise OperationError("projection context targets a different environment")
+    project_file = _safe_context_basename(context.get("projectFile"), "projectFile")
+    environment_file = _safe_context_basename(context.get("environmentFile"), "environmentFile")
+    if project_file not in PROJECT_CONFIG_NAMES:
+        raise OperationError("projection context projectFile is not an allowed project basename")
+    if environment_file not in {"environment.yaml", "environment.yml", "environment.json"}:
+        raise OperationError("projection context environmentFile is not an allowed environment basename")
+    for field_name in ("projectDocument", "environmentDocument"):
+        if not isinstance(context.get(field_name), dict):
+            raise OperationError(f"projection context has an invalid {field_name}")
+    decoded: dict[str, bytes] = {}
+    for field_name in ("projectBytes", "environmentBytes"):
+        value = context.get(field_name)
+        if not isinstance(value, str):
+            raise OperationError(f"projection context has an invalid {field_name}")
+        try:
+            decoded[field_name] = base64.b64decode(value, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise OperationError(f"projection context has invalid {field_name}") from exc
+    # Parse and validate the bytes in a private fixed layout before any caller
+    # can use a persisted filename to write into a source tree.
+    with tempfile.TemporaryDirectory(prefix="gitopsctr-context-verify-") as directory:
+        verify_root = Path(directory)
+        project_path = verify_root / project_file
+        environment_path = verify_root / environment_file
+        project_path.write_bytes(decoded["projectBytes"])
+        environment_path.write_bytes(decoded["environmentBytes"])
+        try:
+            project_document = load_document(project_path)
+            validate_project_document(project_document, project_path)
+            parsed_environment = load_document(environment_path)
+            normalize_environment_document(parsed_environment, environment)
+        except (DocumentFormatError, OperationError, OSError) as exc:
+            raise OperationError("projection context document bytes are invalid") from exc
+    if project_document != context["projectDocument"] or parsed_environment != context["environmentDocument"]:
+        raise OperationError("projection context bytes do not match stored documents")
+    if "promotionDocument" in context:
+        promotion_document = context["promotionDocument"]
+        if not isinstance(promotion_document, dict):
+            raise OperationError("projection context has an invalid promotionDocument")
+        validate_document(
+            CORE_CONTRACTS["promotion"],
+            normalize_promotion_document(promotion_document),
+            "projection context promotion",
+        )
+    return cast(JsonObject, dict(context))
+
+
+def load_projection_context(
+    root: Path,
+    digest: str,
+    environment_name: str | None = None,
+) -> JsonObject:
+    path = _projection_context_path(root, digest)
+    if not path.is_file():
+        raise OperationError(f"projection context record {digest!r} is missing")
+    try:
+        document = load_document(path)
+    except (DocumentFormatError, OSError) as exc:
+        raise OperationError(f"invalid durable projection context: {exc}") from exc
+    return _validate_projection_context(document, expected_digest=digest, environment_name=environment_name)
+
+
+def write_projection_context(root: Path, context: JsonObject) -> Path:
+    validated = _validate_projection_context(context)
+    digest = cast(str, validated["digest"])
+    path = _projection_context_path(root, digest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return write_document(path, validated, format=DocumentFormat.JSON)
+
+
+def copy_projection_context(current: Path, candidate: Path) -> None:
+    source = current / DESIRED_PROJECTION_CONTEXTS_PATH
+    if source.is_dir():
+        target = candidate / DESIRED_PROJECTION_CONTEXTS_PATH
+        shutil.copytree(source, target, dirs_exist_ok=True)
+
+
 def change_gate(source_root: Path, environment_name: str) -> str:
     return str(load_environment(source_root, environment_name).get("changeGate", "none"))
 
@@ -1876,7 +2018,11 @@ def deployment_refs(
     return desired_ref, observed_ref
 
 
-def effect_lease_ref(environment: str, desired_ref: str) -> str | None:
+def effect_lease_ref(
+    environment: str,
+    desired_ref: str,
+    configuration_root: Path | None = None,
+) -> str | None:
     """Resolve the configured lease store for one environment.
 
     ``None`` disables leases. Low-level lease helpers keep their historical
@@ -1884,7 +2030,7 @@ def effect_lease_ref(environment: str, desired_ref: str) -> str | None:
     """
 
     try:
-        store = load_project_config(REPOSITORY_ROOT).effect_lease_store
+        store = load_project_config(configuration_root or REPOSITORY_ROOT).effect_lease_store
     except DocumentFormatError:
         # Unit-level callers can exercise the lease primitives without a full
         # repository. Real controller entry points validate Project first.
@@ -2078,7 +2224,9 @@ class StackProjection:
     owners: dict[str, DesiredOwnerReference]
     dependencies: dict[str, tuple[str, ...]]
     artifact_imports: dict[str, tuple[ArtifactImport, ...]] = field(default_factory=dict)
+    source_contexts: dict[str, tuple[Path, str | None]] = field(default_factory=dict)
     applied_stacks: frozenset[str] = frozenset()
+    structural_projections: dict[str, StructuralStackProjection] = field(default_factory=dict)
 
 
 def _write_desired_stack_resource(path: Path, resource: StackResource, project_root: Path) -> Path:
@@ -2091,255 +2239,111 @@ def _write_desired_stack_resource(path: Path, resource: StackResource, project_r
     return write_document(path, document, format=selected)
 
 
-def _stack_template_reference(spec: StackSpec) -> StackTemplateReference:
-    template = spec.template
-    return template if isinstance(template, StackTemplateReference) else StackTemplateReference(name=template)
+def _template_has_repository_sources(spec: StackTemplateSpec) -> bool:
+    """Return whether any inline Unit template needs repository-backed inputs."""
+
+    def visit_source(value: object) -> bool:
+        if getattr(value, "fromParameter", None) is not None:
+            return True
+        if isinstance(value, dict):
+            if "path" in value or "fromParameter" in value:
+                return True
+            return any(visit_source(item) for item in value.values())
+        if isinstance(value, list):
+            return any(visit_source(item) for item in value)
+        return False
+
+    def visit(value: object) -> bool:
+        if isinstance(value, dict):
+            source = value.get("source")
+            if source is not None and visit_source(source):
+                return True
+            return any(visit(item) for name, item in value.items() if name != "source")
+        if isinstance(value, list):
+            return any(visit(item) for item in value)
+        return False
+
+    return any(visit(template.spec) for template in spec.unitTemplates.values())
 
 
-def _clone_stack_template_repository(remote: str, checkout: Path) -> None:
-    clone = subprocess.run(
-        ("git", "clone", "--no-checkout", "--quiet", remote, str(checkout)),
-        text=True,
-        capture_output=True,
-    )
-    if clone.returncode != 0:
-        raise OperationError(f"could not fetch StackTemplate source {remote!r}: {clone.stderr.strip()}")
+def _stack_template_document_digest(path: Path) -> str:
+    return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
 
 
-def _checkout_stack_template_commit(checkout: Path, commit: str, location: str) -> None:
-    checkout_result = subprocess.run(
-        ("git", "-C", str(checkout), "checkout", "--quiet", "--detach", commit),
-        text=True,
-        capture_output=True,
-    )
-    if checkout_result.returncode != 0:
-        raise OperationError(f"Git commit {commit!r} is not available in {location!r}")
-
-
-def _load_exact_stack_template_document(
-    root: Path,
-    resource_path: str,
-    template_name: str,
-    *,
-    expected_digest: str | None = None,
-) -> StackResource:
-    """Load and validate one exact, repository-relative StackTemplate document."""
-
-    path = root.joinpath(*PurePosixPath(resource_path).parts)
-    if not path.is_file():
-        raise OperationError(f"pinned StackTemplate document {resource_path!r} is not available")
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    if expected_digest is not None and digest != expected_digest:
-        raise OperationError(
-            f"pinned StackTemplate document {resource_path!r} has digest {digest}, expected {expected_digest}"
-        )
-    try:
-        document = RESOURCE_CATALOG.load_document(path)
-        return RESOURCE_CATALOG.parse_stack_template(document, profile="authored", expected_name=template_name)
-    except (ContractError, OperationError, ValueError) as error:
-        raise OperationError(f"pinned StackTemplate document {resource_path!r} is invalid: {error}") from error
-
-
-def _load_pinned_stack_template(source: ResolvedStackTemplateSource, template_name: str) -> StackResource:
-    """Load a StackTemplate from its authoritative immutable source pin."""
-
-    pin = source.fromGit
-    with tempfile.TemporaryDirectory(prefix="gitopsctr-pinned-stack-template-") as temporary_directory:
-        checkout = Path(temporary_directory) / "repo"
-        if pin.remote is not None:
-            _clone_stack_template_repository(pin.remote, checkout)
-            _checkout_stack_template_commit(checkout, pin.commit, pin.remote)
-            template_root = checkout
-        else:
-            try:
-                materialize_revision(pin.commit, checkout)
-            except (OperationError, subprocess.CalledProcessError) as error:
-                raise OperationError(
-                    f"Git commit {pin.commit!r} is not available for pinned StackTemplate source"
-                ) from error
-            assert pin.path is not None
-            template_root = checkout.joinpath(*PurePosixPath(pin.path).parts)
-        return _load_exact_stack_template_document(
-            template_root,
-            pin.resourcePath,
-            template_name,
-            expected_digest=pin.digest,
-        )
-
-
-def _fetch_repository_local_stack_template_pin(
-    promotion: PromotionContext,
-    source_stack: StackResource,
-    source: ResolvedStackTemplateSource,
-) -> None:
-    """Fetch and verify the controller pin retaining a repository-local source."""
-
-    pin = source.fromGit
-    if pin.path is None:
-        return
-    if source_stack.metadata.uid is None:
-        raise OperationError(f"promoted source Stack {source_stack.name!r} has no UID")
-    name = _stack_source_pin_name(
-        promotion.source_environment,
-        source_stack.name,
-        source_stack.metadata.uid,
-        pin.commit,
-    )
-    try:
-        matching = [candidate for candidate in state_store().list_controller_pins() if candidate.name == name]
-    except OperationError as exc:
-        raise OperationError(f"Git commit {pin.commit!r} is not available for pinned StackTemplate source") from exc
-    if len(matching) != 1 or matching[0].revision != pin.commit:
-        raise OperationError(
-            f"promoted source Stack {source_stack.name!r} controller pin is unavailable or does not match {pin.commit}"
-        )
-    fetched = state_store().git("fetch", "--no-tags", "origin", matching[0].ref, check=False)
-    if fetched.returncode != 0 or not commit_is_available(pin.commit):
-        raise OperationError(f"Git commit {pin.commit!r} is not available from controller pin {matching[0].ref!r}")
-
-
-def _resolve_stack_template(
+def _materialize_template_source_context(
+    template: StackResource,
     source_root: Path,
-    template_ref: StackTemplateReference,
-    templates: Mapping[str, StackResource],
     source_revision: str | None,
-    promotion: PromotionContext | None = None,
-) -> tuple[StackResource, ResolvedStackTemplateSource]:
-    """Resolve one StackTemplate source for desired-state projection."""
+    candidate: Path,
+    environment_name: str,
+) -> tuple[Path, str | None]:
+    """Select the exact source tree used by generated repository-backed Units."""
 
-    source = template_ref.source
-    if isinstance(source, StackTemplateFromPromotion):
-        if promotion is None:
-            raise OperationError("fromPromotion StackTemplate source requires an active Promotion")
-        source_path = document_candidates(promotion.desired_root / "stacks", source.fromPromotion.stack)
-        if len(source_path) != 1:
-            raise OperationError(f"promoted source Stack {source.fromPromotion.stack!r} is not available")
-        source_stack = RESOURCE_CATALOG.parse_stack(
-            RESOURCE_CATALOG.load_document(source_path[0]),
-            profile="desired",
-            expected_name=source.fromPromotion.stack,
-        )
-        if not isinstance(source_stack.spec, DesiredStackSpec):
-            raise OperationError("promoted source Stack is not a desired Stack")
-        source_template = cast(StackTemplateReference, source_stack.spec.template)
-        if source_template.name != template_ref.name:
-            raise OperationError(
-                f"promoted source Stack uses StackTemplate {source_template.name!r}, "
-                f"but target Stack references {template_ref.name!r}"
-            )
-        if source_stack.spec.resolvedSource is None:
-            raise OperationError("promoted source Stack has no resolved source")
-        if source_stack.spec.resolvedSource.fromGit.path is not None and not commit_is_available(
-            source_stack.spec.resolvedSource.fromGit.commit
-        ):
-            _fetch_repository_local_stack_template_pin(promotion, source_stack, source_stack.spec.resolvedSource)
-        return (
-            _load_pinned_stack_template(source_stack.spec.resolvedSource, template_ref.name),
-            source_stack.spec.resolvedSource,
-        )
-    if isinstance(source, StackTemplateFromGit):
-        request = source.fromGit
-        if request.remote is not None:
-            with tempfile.TemporaryDirectory(prefix="gitopsctr-stack-template-") as temporary_directory:
-                checkout = Path(temporary_directory) / "repo"
-                _clone_stack_template_repository(request.remote, checkout)
-                selected = request.commit
-                if selected is None:
-                    assert request.ref is not None
-                    revision = subprocess.run(
-                        ("git", "-C", str(checkout), "rev-parse", f"{request.ref}^{{commit}}"),
-                        text=True,
-                        capture_output=True,
-                    )
-                    if revision.returncode != 0:
-                        raise OperationError(f"Git ref {request.ref!r} does not exist in {request.remote!r}")
-                    selected = revision.stdout.strip()
-                _checkout_stack_template_commit(checkout, selected, request.remote)
-                project = load_project_config(checkout)
-                catalog_root = checkout.joinpath(*project.stack_templates_path.parts)
-                paths = document_candidates(catalog_root, template_ref.name)
-                if len(paths) != 1:
-                    raise OperationError(f"expected exactly one StackTemplate document for {template_ref.name!r}")
-                template_path = paths[0]
-                resource_path = template_path.relative_to(checkout).as_posix()
-                template = _load_exact_stack_template_document(
-                    checkout,
-                    resource_path,
-                    template_ref.name,
-                )
-                return template, ResolvedStackTemplateSource(
-                    fromGit=ResolvedGitSource(
-                        remote=request.remote,
-                        commit=selected,
-                        resourcePath=resource_path,
-                        digest=hashlib.sha256(template_path.read_bytes()).hexdigest(),
-                        ref=request.ref,
-                    )
-                )
-        selected = request.commit
-        if selected is None and request.ref is not None:
-            revision = git("rev-parse", "--verify", f"{request.ref}^{{commit}}", check=False)
-            if revision.returncode != 0:
-                raise OperationError(f"Git ref {request.ref!r} does not exist in the source repository")
-            selected = revision.stdout.strip()
-        if selected is None:
-            if source_revision is None:
+    assert isinstance(template.spec, DesiredStackTemplateSpec)
+    context = template.spec.sourceContext
+    if context is None:
+        return source_root, source_revision
+    if context.revision == source_revision:
+        return source_root, context.revision
+    checkout = candidate.parent / f".stack-template-source-{context.revision}"
+    if not checkout.exists():
+        try:
+            materialize_revision(context.revision, checkout)
+        except (OperationError, subprocess.CalledProcessError) as original:
+            # A later Stack-only apply may run in a clone that has pruned the
+            # original source object. Fetch the exact remote controller pin,
+            # or an exact matching attempt claim left by a successful
+            # publication whose canonical promotion failed, then retry by
+            # immutable revision.
+            if template.metadata.uid is None:
                 raise OperationError(
-                    f"Stack {template_ref.name!r} uses a repository-local StackTemplate source; "
-                    "apply it with --source-revision <commit>"
-                )
-            selected = source_revision
-        with tempfile.TemporaryDirectory(prefix="gitopsctr-stack-template-") as temporary_directory:
-            if selected == source_revision:
-                checkout = source_root
-            else:
-                checkout = Path(temporary_directory) / "repo"
-                try:
-                    materialize_revision(selected, checkout)
-                except (OperationError, subprocess.CalledProcessError) as error:
-                    raise OperationError(
-                        f"Git commit {selected!r} is not available in the source repository"
-                    ) from error
-            assert request.path is not None
-            template_root = checkout.joinpath(*PurePosixPath(request.path).parts)
-            project = load_project_config(template_root)
-            catalog_root = template_root.joinpath(*project.stack_templates_path.parts)
-            paths = document_candidates(catalog_root, template_ref.name)
-            if len(paths) != 1:
-                raise OperationError(f"expected exactly one StackTemplate document for {template_ref.name!r}")
-            resource_path = paths[0].relative_to(template_root).as_posix()
-            template = _load_exact_stack_template_document(template_root, resource_path, template_ref.name)
-            return template, ResolvedStackTemplateSource(
-                fromGit=ResolvedGitSource(
-                    path=request.path,
-                    commit=selected,
-                    resourcePath=resource_path,
-                    digest=hashlib.sha256(paths[0].read_bytes()).hexdigest(),
-                    ref=request.ref,
-                )
+                    f"StackTemplate {template.name!r} has no UID for source pin recovery"
+                ) from original
+            pin_name = _stack_template_source_pin_name(
+                environment_name,
+                template.name,
+                template.metadata.uid,
+                context.revision,
             )
-    template = templates.get(template_ref.name)
-    if template is None:
-        raise OperationError(f"Stack {template_ref.name!r} references missing StackTemplate")
-    if source_revision is None:
-        raise OperationError(
-            f"Stack {template_ref.name!r} uses StackTemplate {template_ref.name!r} from the source repository; "
-            "apply it with --source-revision <commit>"
-        )
-    path_candidates = document_candidates(
-        source_root.joinpath(*load_project_config(source_root).stack_templates_path.parts), template_ref.name
-    )
-    resource_path = (
-        path_candidates[0].relative_to(source_root).as_posix() if len(path_candidates) == 1 else template_ref.name
-    )
-    return template, ResolvedStackTemplateSource(
-        fromGit=ResolvedGitSource(
-            path=".",
-            commit=source_revision,
-            resourcePath=resource_path,
-            digest=hashlib.sha256(path_candidates[0].read_bytes() if len(path_candidates) == 1 else b"").hexdigest(),
-        )
-    )
+            store = state_store()
+            pin_ref = f"refs/heads/gitopsctr/pins/{pin_name}"
+            canonical = store.git(
+                "ls-remote",
+                "--exit-code",
+                "--refs",
+                "origin",
+                pin_ref,
+                check=False,
+            )
+            if canonical.returncode == 2:
+                list_pins = getattr(store, "list_controller_pins", None)
+                matching_claim = None
+                if callable(list_pins):
+                    for pin in cast(tuple[ControllerPin, ...], list_pins()):
+                        parts = pin.name.split("/")
+                        if (
+                            len(parts) >= 3
+                            and parts[0] == "claims"
+                            and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", parts[1]) is not None
+                            and "/".join(parts[2:]) == pin_name
+                            and pin.revision == context.revision
+                        ):
+                            matching_claim = pin
+                            break
+                if matching_claim is not None:
+                    pin_ref = matching_claim.ref
+            fetched = state_store().git(
+                "fetch",
+                "origin",
+                f"{pin_ref}:refs/remotes/origin/gitopsctr/pins/{pin_name}",
+                check=False,
+            )
+            if fetched.returncode != 0:
+                raise OperationError(
+                    f"StackTemplate {template.name!r} source context {context.revision!r} is not materializable"
+                ) from original
+            materialize_revision(context.revision, checkout)
+    return checkout, context.revision
 
 
 def _stack_root_metadata(
@@ -2376,11 +2380,17 @@ def _stack_root_metadata(
     )
     metadata = ResourceMetadata.root_from_provenance(name, provenance, partition=partition)
     if current_desired is not None:
-        previous_tombstone = load_resource_incarnation_tombstones(current_desired).get((CORE_API_VERSION, kind, name))
-        if previous_tombstone is not None and metadata.uid == previous_tombstone.uid:
+        finalized_uids = tuple(
+            sorted(
+                tombstone.uid
+                for tombstone in load_resource_incarnation_evidence(current_desired)
+                if tombstone.api_version == CORE_API_VERSION and tombstone.kind == kind and tombstone.name == name
+            )
+        )
+        if finalized_uids:
             metadata = ResourceMetadata.root_from_provenance(
                 name,
-                provenance + "\0reincarnation:" + previous_tombstone.uid,
+                provenance + "\0reincarnations:" + "\0".join(finalized_uids),
                 partition=partition,
             )
     return metadata
@@ -2415,6 +2425,373 @@ def _stack_owned_metadata(name: str, owner: DesiredOwnerReference) -> ResourceMe
     )
 
 
+def _bind_active_stack_projections(
+    candidate: Path,
+    current_desired: Path,
+    blocked_transitions: Mapping[str, str],
+    project_root: Path,
+) -> set[str]:
+    """Authenticate every concrete selected Stack Unit before graph validation."""
+
+    current_resources = (
+        load_desired_resource_graph(current_desired, validate=False) if any(current_desired.iterdir()) else {}
+    )
+    candidate_resources = load_desired_resource_graph(candidate, validate=False)
+    atomically_retained_units: set[str] = set()
+    for stack in tuple(candidate_resources.values()):
+        if not isinstance(stack, StackResource) or stack.gvk.kind != "Stack":
+            continue
+        if not isinstance(stack.spec, DesiredStackSpec):
+            continue
+        structural = stack.spec.structuralProjection
+        previous = current_resources.get((CORE_API_VERSION, "Stack", stack.name))
+        previous_active = (
+            previous.spec.activeProjection
+            if isinstance(previous, StackResource) and isinstance(previous.spec, DesiredStackSpec)
+            else None
+        )
+        generated_names = {stack_generated_unit_name(stack.name, logical_name) for logical_name in structural.units}
+        waiting = bool(generated_names.intersection(blocked_transitions))
+        if waiting and previous_active is not None:
+            # A structural projection is an all-or-nothing transition.  The
+            # candidate may already contain newly resolved siblings, but none
+            # of them are active until every selected child resolves.
+            source_projection_digest = previous_active.sourceProjectionDigest
+            active_names = {binding.name for binding in previous_active.units.values()}
+            stack_owner = (stack.gvk.api_version, stack.gvk.kind, stack.name, stack.metadata.uid)
+            for resource in tuple(candidate_resources.values()):
+                if not isinstance(resource, UnitResource) or resource.name in active_names:
+                    continue
+                owner = resource_owner_reference(resource)
+                if owner is None or (owner.apiVersion, owner.kind, owner.name, owner.uid) != stack_owner:
+                    continue
+                for extra_path in document_candidates(candidate / "units", resource.name):
+                    extra_path.unlink()
+                materialization = getattr(resource.spec, "materialization", None)
+                if materialization is not None:
+                    materialized_path = candidate / materialization.path
+                    if materialized_path.is_dir():
+                        shutil.rmtree(materialized_path)
+            for binding in previous_active.units.values():
+                previous_name = binding.name
+                previous_path = unit_document_path(current_desired, previous_name)
+                if not previous_path.is_file():
+                    raise OperationError(
+                        f"Stack {stack.name!r} active projection references missing Unit {previous_name!r}"
+                    )
+                for candidate_path in document_candidates(candidate / "units", previous_name):
+                    candidate_path.unlink()
+                target_path = candidate / "units" / previous_path.name
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(previous_path, target_path)
+                previous_unit = load_desired_unit(previous_path, previous_name)
+                if getattr(previous_unit.spec, "materialization", None) is not None:
+                    copy_unit_materialization(current_desired, candidate, previous_name, previous_unit)
+                atomically_retained_units.add(previous_name)
+        elif waiting:
+            source_projection_digest = structural.identity.projectionDigest
+            # There is no previous active set to retain on a first projection.
+            # Concrete siblings may bootstrap the graph; each first-time
+            # blocked child remains absent/WAIT below.
+        else:
+            source_projection_digest = structural.identity.projectionDigest
+        if waiting and previous_active is not None:
+            # Keep the previous binding map as well as its source digest.  A
+            # blocked structural transition may add, remove, or rename
+            # logical children; the old active set remains authoritative until
+            # the complete new projection is ready.
+            active = previous_active
+        else:
+            bindings: dict[str, StackProjectionUnitBinding] = {}
+            for logical_name, projected in structural.units.items():
+                unit_name = stack_generated_unit_name(stack.name, logical_name)
+                unit_path = unit_document_path(candidate, unit_name)
+                if not unit_path.is_file():
+                    continue
+                unit = load_desired_unit(unit_path, unit_name)
+                owner = resource_owner_reference(unit)
+                if (
+                    resource_deletion(unit) is not None
+                    or unit.gvk.api_version != projected.apiVersion
+                    or unit.gvk.kind != projected.kind
+                    or owner is None
+                    or owner.apiVersion != stack.gvk.api_version
+                    or owner.kind != stack.gvk.kind
+                    or owner.name != stack.name
+                    or owner.uid != stack.metadata.uid
+                    or unit.metadata.uid is None
+                ):
+                    continue
+                bindings[logical_name] = StackProjectionUnitBinding(
+                    apiVersion=unit.gvk.api_version,
+                    kind=unit.gvk.kind,
+                    name=unit.name,
+                    uid=unit.metadata.uid,
+                    desiredDigest=desired_unit_binding_digest(unit),
+                    dependsOn=[stack_generated_unit_name(stack.name, dependency) for dependency in projected.dependsOn],
+                )
+            # A first projection publishes only the dependency-closed active
+            # subset.  A concrete descendant of an unavailable Unit is not
+            # executable merely because its own dynamic fields resolved.
+            changed = True
+            while changed:
+                changed = False
+                active_names = {binding.name for binding in bindings.values()}
+                for logical_name, binding in tuple(bindings.items()):
+                    if any(dependency not in active_names for dependency in binding.dependsOn):
+                        bindings.pop(logical_name)
+                        changed = True
+            if waiting and previous_active is None:
+                # A first projection has no prior active lineage to retain.
+                # Remove concrete descendants that were resolved locally but
+                # are not in the dependency-closed active subset; otherwise
+                # the persisted graph would contain executable Units without
+                # an authenticated active binding.
+                active_names = set(bindings)
+                for logical_name in set(structural.units) - active_names:
+                    unit_name = stack_generated_unit_name(stack.name, logical_name)
+                    for unit_path in document_candidates(candidate / "units", unit_name):
+                        unit_path.unlink()
+                    unit = candidate_resources.get((UNIT_API_VERSION, structural.units[logical_name].kind, unit_name))
+                    materialization = getattr(getattr(unit, "spec", None), "materialization", None)
+                    if materialization is not None:
+                        materialized_path = candidate / materialization.path
+                        if materialized_path.is_dir():
+                            shutil.rmtree(materialized_path)
+            active = StackActiveProjection.build(
+                source_projection_digest=source_projection_digest,
+                projection_context_digest=(
+                    previous_active.projectionContextDigest
+                    if waiting and previous_active is not None
+                    else structural.identity.projectionContextDigest
+                ),
+                units=bindings,
+            )
+        updated = replace(stack, spec=replace(stack.spec, activeProjection=active))
+        _write_desired_stack_resource(candidate / "stacks" / f"{stack.name}.json", updated, project_root)
+    return atomically_retained_units
+
+
+def _stack_template_source_pin_prefix(environment: str, template_name: str, uid: str) -> str:
+    """Return the controller-pin namespace for one StackTemplate incarnation."""
+
+    return f"stack-templates/{environment}/{template_name}/{uid}/"
+
+
+def _stack_template_source_pin_name(environment: str, template_name: str, uid: str, revision: str) -> str:
+    return f"{_stack_template_source_pin_prefix(environment, template_name, uid)}{revision}"
+
+
+def _required_stack_template_source_pins(environment: str, desired_root: Path) -> tuple[tuple[str, str], ...]:
+    """Collect exact source contexts needed by desired StackTemplate incarnations."""
+
+    required: set[tuple[str, str]] = set()
+    resources = load_desired_resource_graph(desired_root, validate=False)
+    for resource in resources.values():
+        if not isinstance(resource, StackResource) or resource.gvk.kind != "StackTemplate":
+            continue
+        if not isinstance(resource.spec, DesiredStackTemplateSpec) or resource.spec.sourceContext is None:
+            continue
+        if resource.metadata.uid is None:
+            raise OperationError(f"StackTemplate {resource.name!r} has no UID")
+        revision = resource.spec.sourceContext.revision
+        required.add(
+            (_stack_template_source_pin_name(environment, resource.name, resource.metadata.uid, revision), revision)
+        )
+    return tuple(sorted(required))
+
+
+def _ensure_stack_template_source_pins(environment: str, desired_root: Path) -> tuple[ControllerPin, ...]:
+    """Retain every source context before desired publication or a no-op result."""
+
+    required = _required_stack_template_source_pins(environment, desired_root)
+    if not required:
+        return ()
+    store = state_store()
+    if hasattr(store, "materialize"):
+        resources = load_desired_resource_graph(desired_root, validate=False)
+        revisions = {revision for _name, revision in required}
+        for revision in sorted(revisions):
+            with tempfile.TemporaryDirectory(prefix="gitopsctr-template-source-check-") as directory:
+                materialized = Path(directory) / "source"
+                try:
+                    store.materialize(revision, materialized)
+                except (OperationError, OSError, subprocess.CalledProcessError) as exc:
+                    raise OperationError(f"StackTemplate source context {revision!r} is not materializable") from exc
+                for resource in resources.values():
+                    if not isinstance(resource, StackResource) or resource.gvk.kind != "StackTemplate":
+                        continue
+                    if not isinstance(resource.spec, DesiredStackTemplateSpec) or resource.spec.sourceContext is None:
+                        continue
+                    if resource.spec.sourceContext.revision != revision:
+                        continue
+                    for unit_template in resource.spec.unitTemplates.values():
+                        raw_spec = dump_template_value(cast(TemplateValue, unit_template.spec))
+                        source = raw_spec.get("source") if isinstance(raw_spec, dict) else None
+                        if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+                            continue
+                        source_path = cast(str, source["path"])
+                        safe_source_path(source_path, f"{resource.name} source path")
+                        source_directory = materialized / source_path
+                        if not source_directory.exists():
+                            raise OperationError(
+                                f"StackTemplate {resource.name!r} source path {source_path!r} "
+                                f"is not available at {revision}"
+                            )
+                        inputs = source.get("inputs")
+                        if isinstance(inputs, list) and all(isinstance(value, str) for value in inputs):
+                            hash_source_inputs(materialized, source_path, cast(list[str], inputs), {})
+    return store.create_controller_pins(dict(required))
+
+
+@dataclass(frozen=True)
+class ControllerPinAcquisition:
+    """Pins acquired by one publication attempt and safe to roll back."""
+
+    pins: tuple[ControllerPin, ...]
+    newly_created: tuple[ControllerPin, ...]
+    claims: tuple[ControllerPin, ...] = ()
+
+
+def _acquire_stack_template_source_pins(environment: str, desired_root: Path) -> ControllerPinAcquisition:
+    if not _required_stack_template_source_pins(environment, desired_root):
+        return ControllerPinAcquisition(pins=(), newly_created=())
+    store = state_store()
+    claim_creator = getattr(store, "create_controller_pin_claims", None)
+    if callable(claim_creator):
+        token = uuid.uuid4().hex[:16]
+        required = dict(_required_stack_template_source_pins(environment, desired_root))
+        claims = cast(
+            tuple[ControllerPin, ...],
+            claim_creator(required, token),
+        )
+        return ControllerPinAcquisition(pins=claims, newly_created=claims, claims=claims)
+    existing_names: set[str] | None = None
+    list_pins = getattr(store, "list_controller_pins", None)
+    if callable(list_pins):
+        existing_names = {pin.name for pin in cast(tuple[ControllerPin, ...], list_pins())}
+    pins = _ensure_stack_template_source_pins(environment, desired_root)
+    newly_created = tuple(pin for pin in pins if existing_names is None or pin.name not in existing_names)
+    return ControllerPinAcquisition(pins=pins, newly_created=newly_created)
+
+
+def _release_new_stack_template_source_pins(acquisition: ControllerPinAcquisition | None) -> None:
+    if acquisition is not None and acquisition.claims:
+        store = state_store()
+        for claim in acquisition.claims:
+            store.release_controller_pin(claim.name, claim.revision)
+        return
+    # Compatibility fallback for lightweight stores that do not expose
+    # attempt claims: deterministic pins remain monotonic and are released
+    # only by exact UID finalization.
+    if acquisition is not None and acquisition.newly_created:
+        log_status(
+            "KEEP",
+            "retained StackTemplate source pins after failed publication without attempt-claim support",
+        )
+
+
+def _promote_stack_template_source_pins(
+    environment: str,
+    desired_root: Path,
+    acquisition: ControllerPinAcquisition | None,
+) -> None:
+    """Install canonical retention pins after a desired/candidate publication."""
+
+    if acquisition is None or not acquisition.claims:
+        return
+    store = state_store()
+    required = dict(_required_stack_template_source_pins(environment, desired_root))
+    store.create_controller_pins(required)
+    list_pins = getattr(store, "list_controller_pins", None)
+    if callable(list_pins):
+        claims = tuple(
+            pin
+            for pin in cast(tuple[ControllerPin, ...], list_pins())
+            if pin.name.startswith("claims/")
+            and any(
+                "/".join(pin.name.split("/")[2:]) == name and pin.revision == revision
+                for name, revision in required.items()
+            )
+        )
+    else:
+        claims = acquisition.claims
+    for claim in claims:
+        store.release_controller_pin(claim.name, claim.revision)
+
+
+def _release_finalized_stack_template_pins(
+    environment: str,
+    name: str,
+    uid: str,
+    deletion_generation: int,
+    desired_root: Path,
+) -> bool:
+    """Release pins only after the exact StackTemplate tombstone is durable."""
+
+    tombstone = finalized_incarnation_evidence(
+        desired_root,
+        CORE_API_VERSION,
+        "StackTemplate",
+        name,
+        uid,
+        deletion_generation,
+    )
+    if tombstone is None:
+        return False
+    resources = load_desired_resource_graph(desired_root, validate=False)
+    if any(
+        isinstance(item, StackResource)
+        and item.gvk.kind == "StackTemplate"
+        and item.name == name
+        and item.metadata.uid == uid
+        for item in resources.values()
+    ):
+        raise OperationError(f"StackTemplate {name!r} is still present after finalization")
+    references = [
+        item.name
+        for item in resources.values()
+        if isinstance(item, StackResource)
+        and item.gvk.kind == "Stack"
+        and isinstance(item.spec, DesiredStackSpec)
+        and item.spec.templateRef.name == name
+        and item.spec.templateRef.uid == uid
+    ]
+    if references:
+        raise OperationError("Stacks reference this StackTemplate: " + ", ".join(sorted(references)))
+    prefix = _stack_template_source_pin_prefix(environment, name, uid)
+    store = state_store()
+    pins = tuple(
+        pin
+        for pin in store.list_controller_pins()
+        if pin.name.startswith(prefix)
+        or (
+            pin.name.startswith("claims/")
+            and len(pin.name.split("/")) >= 3
+            and "/".join(pin.name.split("/")[2:]).startswith(prefix)
+        )
+    )
+    for pin in pins:
+        if pin.name.startswith("claims/"):
+            claim_parts = pin.name.split("/")
+            original_name = "/".join(claim_parts[2:])
+            valid = (
+                len(claim_parts) >= 4
+                and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", claim_parts[1]) is not None
+                and original_name.startswith(prefix)
+                and original_name.removeprefix(prefix) == pin.revision
+                and re.fullmatch(r"[0-9a-f]{40}", pin.revision) is not None
+            )
+        else:
+            suffix = pin.name.removeprefix(prefix)
+            valid = re.fullmatch(r"[0-9a-f]{40}", suffix) is not None and suffix == pin.revision
+        if not valid:
+            raise OperationError(f"StackTemplate {name!r}: controller source pin has an invalid identity")
+    for pin in pins:
+        store.release_controller_pin(pin.name, pin.revision)
+    return bool(pins)
+
+
 def project_stack_resources(
     source_root: Path,
     environment_name: str,
@@ -2424,116 +2801,245 @@ def project_stack_resources(
     current_desired: Path | None = None,
     promotion: PromotionContext | None = None,
     partition: str | None = None,
+    source_context_root: Path | None = None,
+    stack_template_document_digests: Mapping[str, str] | None = None,
+    projection_context: JsonObject | None = None,
+    stack_names: frozenset[str] | None = None,
 ) -> StackProjection:
-    """Persist Stack roots and expand concrete Stacks into authored Unit inputs."""
+    """Build desired inline StackTemplate roots and project every Stack."""
 
     (candidate / "stack-templates").mkdir(parents=True, exist_ok=True)
     (candidate / "stacks").mkdir(parents=True, exist_ok=True)
-    templates, stacks = _load_authored_stack_resources(source_root, environment_name)
+    authored_templates, authored_stacks = _load_authored_stack_resources(source_root, environment_name)
+    if projection_context is None and current_desired is None and (authored_templates or authored_stacks):
+        projection_context = capture_projection_context(source_root, environment_name, promotion)
+        write_projection_context(candidate, projection_context)
+    if source_revision is None and projection_context is None and current_desired is not None:
+        # Durable progression materializes authored-shaped files only to
+        # satisfy path/configuration helpers.  The desired Stack and
+        # StackTemplate documents remain the authoritative projection inputs.
+        authored_templates = {}
+        authored_stacks = {}
+    project = load_project_config(source_root)
+    template_root = source_root.joinpath(*project.stack_templates_path.parts)
+    authored_template_paths = _document_paths(template_root)
+
+    current_resources: dict[tuple[str, str, str], UnitResource[Any] | StackResource] = {}
+    if current_desired is not None and current_desired.exists() and any(current_desired.iterdir()):
+        current_resources = load_desired_resource_graph(current_desired)
+    current_templates = {
+        resource.name: resource
+        for resource in current_resources.values()
+        if isinstance(resource, StackResource) and resource.gvk.kind == "StackTemplate"
+    }
+    current_stacks = {
+        resource.name: resource
+        for resource in current_resources.values()
+        if isinstance(resource, StackResource) and resource.gvk.kind == "Stack"
+    }
+
+    desired_templates: dict[str, StackResource] = dict(current_templates)
+    explicit_template_names = set(authored_templates)
+    for name, authored in authored_templates.items():
+        if not isinstance(authored.spec, StackTemplateSpec):
+            raise OperationError(f"StackTemplate {name!r} has an invalid authored specification")
+        has_repository_sources = _template_has_repository_sources(authored.spec)
+        authored_path = authored_template_paths.get(name)
+        if authored_path is None:
+            raise OperationError(f"direct StackTemplate input {name!r} was not materialized")
+        source_context = None
+        if has_repository_sources:
+            if source_revision is not None:
+                source_context = StackTemplateSourceContext(revision=source_revision)
+            else:
+                previous = current_templates.get(name)
+                if (
+                    previous is not None
+                    and isinstance(previous.spec, DesiredStackTemplateSpec)
+                    and previous.spec.contentDigest == authored.spec.semantic_content_digest()
+                    and previous.spec.sourceContext is not None
+                ):
+                    source_context = previous.spec.sourceContext
+                else:
+                    raise OperationError(
+                        f"StackTemplate {name!r} contains repository-backed Unit sources; "
+                        "apply it with --source-revision <commit>"
+                    )
+        desired_templates[name] = StackResource(
+            authored.gvk,
+            _stack_root_metadata("StackTemplate", name, source_revision, current_desired, partition),
+            DesiredStackTemplateSpec(
+                parameters=list(authored.spec.parameters),
+                unitTemplates=dict(authored.spec.unitTemplates),
+                contentDigest=authored.spec.semantic_content_digest(),
+                acquisition=StackTemplateAcquisition(
+                    documentDigest=(
+                        stack_template_document_digests.get(name, _stack_template_document_digest(authored_path))
+                        if stack_template_document_digests is not None
+                        else _stack_template_document_digest(authored_path)
+                    ),
+                    fromInput=StackTemplateFromInput(),
+                ),
+                sourceContext=source_context,
+            ),
+        )
+
+    for name in explicit_template_names:
+        template = desired_templates[name]
+        _write_desired_stack_resource(
+            candidate / "stack-templates" / f"{template.name}.json",
+            template,
+            project_root,
+        )
+
+    desired_stacks: dict[str, StackResource] = dict(current_stacks)
+    explicit_stack_names = set(authored_stacks)
+    for name, authored in authored_stacks.items():
+        if not isinstance(authored.spec, StackSpec):
+            raise OperationError(f"Stack {name!r} has an invalid authored specification")
+        desired_stacks[name] = StackResource(
+            authored.gvk,
+            _stack_root_metadata("Stack", name, source_revision, current_desired, partition),
+            authored.spec,
+        )
+
+    # Only explicitly supplied Stacks and current Stacks referring to an
+    # explicitly updated template are reprojected. All other roots and owned
+    # Units are copied later without parsing or rewriting them.
+    reprojected_stack_names = set(explicit_stack_names)
+    if stack_names is not None:
+        reprojected_stack_names.update(stack_names)
+    for name, stack in current_stacks.items():
+        if name in reprojected_stack_names or resource_deletion(stack) is not None:
+            continue
+        if not isinstance(stack.spec, DesiredStackSpec):
+            continue
+        if stack.spec.templateRef.name in explicit_template_names:
+            reprojected_stack_names.add(name)
+    if stack_names is not None:
+        reprojected_stack_names.intersection_update(stack_names)
+
     generated: dict[str, UnitResource[Any]] = {}
     owners: dict[str, DesiredOwnerReference] = {}
     dependencies: dict[str, tuple[str, ...]] = {}
     artifact_imports: dict[str, tuple[ArtifactImport, ...]] = {}
-    selected_resource_templates: set[str] = set()
-    for name, authored_stack in stacks.items():
-        assert isinstance(authored_stack.spec, StackSpec)
-        template_ref = _stack_template_reference(authored_stack.spec)
-        template, resolved_source = _resolve_stack_template(
-            source_root, template_ref, templates, source_revision, promotion
-        )
-        if isinstance(template_ref.source, StackTemplateFromResource):
-            selected_resource_templates.add(template_ref.name)
-            authored_template_spec = cast(StackTemplateSpec, template.spec)
-            desired_template = StackResource(
-                template.gvk,
-                _stack_root_metadata(
-                    "StackTemplate",
-                    template_ref.name,
-                    source_revision,
-                    current_desired,
-                    partition,
-                ),
-                DesiredStackTemplateSpec(
-                    parameters=authored_template_spec.parameters,
-                    unitTemplates=authored_template_spec.unitTemplates,
-                    requestedSource=StackTemplateFromGit(fromGit=GitSourceRequest(path=".")),
-                    resolvedSource=resolved_source,
-                ),
+    source_contexts: dict[str, tuple[Path, str | None]] = {}
+    structural_projections: dict[str, StructuralStackProjection] = {}
+
+    for name in sorted(reprojected_stack_names):
+        stack = desired_stacks[name]
+        if resource_deletion(stack) is not None:
+            # An explicitly applied deleting Stack is rejected by
+            # _stack_root_metadata; a carried deleting Stack is not rebuilt.
+            continue
+        if not isinstance(stack.spec, (StackSpec, DesiredStackSpec)):
+            raise OperationError(f"Stack {name!r} has an invalid specification")
+        template_name = stack.spec.template if isinstance(stack.spec, StackSpec) else stack.spec.templateRef.name
+        template = desired_templates.get(template_name)
+        if template is None:
+            raise OperationError(
+                f"Stack {name!r} references missing desired StackTemplate {template_name!r} in environment "
+                f"{environment_name!r}"
             )
-            _write_desired_stack_resource(
-                candidate / "stack-templates" / f"{template_ref.name}.json",
-                desired_template,
-                project_root,
-            )
-        stack = StackResource(
-            authored_stack.gvk,
-            _stack_root_metadata("Stack", name, source_revision, current_desired, partition),
-            DesiredStackSpec(
-                template=template_ref,
-                parameters=authored_stack.spec.parameters,
-                units=authored_stack.spec.units,
-                artifactImports=authored_stack.spec.artifactImports,
-                requestedSource=template_ref.source,
-                resolvedSource=resolved_source,
-                resolvedProjection=None,
-            ),
-        )
-        template_spec = cast(StackTemplateSpec, template.spec)
-        expanded_template = template_spec.expand(authored_stack.spec.parameters)
-        selected_names = set(authored_stack.spec.units or (resource.name for resource in expanded_template))
-        known_names = {resource.name for resource in expanded_template}
+        if resource_deletion(template) is not None:
+            if name in explicit_stack_names:
+                raise OperationError(f"Stack {name!r} references deleting StackTemplate {template_name!r}")
+            continue
+        if not isinstance(template.spec, DesiredStackTemplateSpec):
+            raise OperationError(f"StackTemplate {template_name!r} is not a desired StackTemplate")
+        if stack.metadata.uid is None or template.metadata.uid is None:
+            raise OperationError(f"Stack {name!r} and StackTemplate {template_name!r} must have UIDs")
+
+        expanded = template.spec.expand(stack.spec.parameters)
+        selected_names = set(stack.spec.units or (resource.name for resource in expanded))
+        known_names = {resource.name for resource in expanded}
         unknown = sorted(selected_names - known_names)
         if unknown:
             raise OperationError(f"Stack {name!r} selects unknown Unit templates: {', '.join(unknown)}")
-        promoted_imports: Mapping[str, ResolvedArtifactImport] = {}
-        if isinstance(template_ref.source, StackTemplateFromPromotion) and promotion is not None:
-            source_paths = document_candidates(
-                promotion.desired_root / "stacks", template_ref.source.fromPromotion.stack
-            )
-            if len(source_paths) == 1:
-                promoted_source_stack = RESOURCE_CATALOG.parse_stack(
-                    RESOURCE_CATALOG.load_document(source_paths[0]),
-                    profile="desired",
-                    expected_name=template_ref.source.fromPromotion.stack,
-                )
-                if isinstance(promoted_source_stack.spec, DesiredStackSpec):
-                    promoted_imports = promoted_source_stack.spec.resolvedArtifactImports or {}
-        for imported in authored_stack.spec.artifactImports:
-            has_promoted_evidence = any(
-                key == f"{imported.unit}/{imported.name}" or key.endswith(f"--{imported.unit}/{imported.name}")
-                for key in promoted_imports
-            )
-            if imported.unit not in known_names and not has_promoted_evidence:
-                raise OperationError(f"Stack {name!r} imports an artifact from unknown Unit template {imported.unit!r}")
-            if imported.unit in selected_names:
+        for resource in expanded:
+            if resource.name not in selected_names:
+                continue
+            omitted = sorted(set(resource.dependsOn) - selected_names)
+            if omitted:
                 raise OperationError(
-                    f"Stack {name!r} imports an artifact from selected Unit template {imported.unit!r}"
+                    f"Stack {name!r} selects {resource.name!r} but omits dependencies: {', '.join(omitted)}"
                 )
-        for resource in expanded_template:
-            if resource.name in selected_names:
-                omitted = sorted(set(resource.dependsOn) - selected_names)
-                if omitted:
-                    raise OperationError(
-                        f"Stack {name!r} selects {resource.name!r} but omits dependencies: {', '.join(omitted)}"
-                    )
-        expanded_template = tuple(resource for resource in expanded_template if resource.name in selected_names)
-        projection_document: JsonObjectValue = JsonObjectValue(
-            {
-                "units": {
-                    resource.name: {
-                        "apiVersion": resource.apiVersion,
-                        "kind": resource.kind,
-                        "spec": cast(JsonObjectValue, dump_template_value(cast(TemplateValue, resource.spec))),
-                        "dependsOn": list(resource.dependsOn),
-                    }
-                    for resource in expanded_template
-                }
-            }
+        expanded = tuple(resource for resource in expanded if resource.name in selected_names)
+        projection_units = {
+            resource.name: StackProjectionUnit(
+                apiVersion=resource.apiVersion,
+                kind=resource.kind,
+                spec=ProjectionObject(cast(dict[str, Any], dump_template_value(cast(TemplateValue, resource.spec)))),
+                dependsOn=list(resource.dependsOn),
+            )
+            for resource in expanded
+        }
+        bound_context_digest: str
+        if (
+            projection_context is not None
+            and promotion is None
+            and isinstance(stack.spec, DesiredStackSpec)
+            and current_desired is not None
+        ):
+            # An explicitly supplied Stack is a new operation root and must
+            # bind to this operation's immutable Project/Environment record.
+            # A Stack reached only through template fan-out is carried state;
+            # preserve its independent context and promotion lineage.
+            if name in explicit_stack_names:
+                bound_context_digest = cast(str, projection_context["digest"])
+                context_root = candidate
+            else:
+                bound_context_digest = stack.spec.structuralProjection.identity.projectionContextDigest
+                context_root = current_desired
+            load_projection_context(context_root, bound_context_digest, environment_name)
+        elif projection_context is not None:
+            bound_context_digest = cast(str, projection_context["digest"])
+        elif isinstance(stack.spec, DesiredStackSpec):
+            bound_context_digest = stack.spec.structuralProjection.identity.projectionContextDigest
+            load_projection_context(
+                current_desired if current_desired is not None else project_root,
+                bound_context_digest,
+                environment_name,
+            )
+        else:
+            raise OperationError(
+                f"Stack {stack.name!r} has no persisted projection context binding; refusing to fabricate one"
+            )
+        projection = StructuralStackProjection.build(
+            stack_uid=stack.metadata.uid,
+            template_uid=template.metadata.uid,
+            template_content_digest=template.spec.contentDigest,
+            units=projection_units,
+            context_digest=bound_context_digest,
         )
-        stack = replace(stack, spec=replace(cast(DesiredStackSpec, stack.spec), resolvedProjection=projection_document))
-        _write_desired_stack_resource(candidate / "stacks" / f"{name}.json", stack, project_root)
-        assert isinstance(template.spec, StackTemplateSpec)
-        for resource in scope_stack_template_resources(
+        desired_stack = StackResource(
+            stack.gvk,
+            stack.metadata,
+            DesiredStackSpec(
+                templateRef=StackTemplateReference(
+                    name=template.name,
+                    uid=template.metadata.uid,
+                    contentDigest=template.spec.contentDigest,
+                ),
+                parameters=stack.spec.parameters,
+                units=stack.spec.units,
+                artifactImports=stack.spec.artifactImports,
+                structuralProjection=projection,
+                activeProjection=(stack.spec.activeProjection if isinstance(stack.spec, DesiredStackSpec) else None),
+            ),
+        )
+        structural_projections[name] = projection
+        desired_stacks[name] = desired_stack
+        _write_desired_stack_resource(candidate / "stacks" / f"{name}.json", desired_stack, project_root)
+
+        context_root, context_revision = _materialize_template_source_context(
+            template,
+            source_context_root or source_root,
+            source_revision,
+            candidate,
+            environment_name,
+        )
+        scoped_resources = scope_stack_template_resources(
             name,
             tuple(
                 StackTemplateResource(
@@ -2543,9 +3049,10 @@ def project_stack_resources(
                     spec=item.spec,
                     dependsOn=item.dependsOn,
                 )
-                for item in expanded_template
+                for item in expanded
             ),
-        ):
+        )
+        for resource in scoped_resources:
             document: JsonObject = {
                 "apiVersion": resource.apiVersion,
                 "kind": resource.kind,
@@ -2560,42 +3067,23 @@ def project_stack_resources(
                 )
             generated[resource.name] = unit
             dependencies[resource.name] = tuple(resource.dependsOn)
-            artifact_imports[resource.name] = tuple(authored_stack.spec.artifactImports)
-            assert stack.metadata.uid is not None
+            artifact_imports[resource.name] = tuple(stack.spec.artifactImports)
             owners[resource.name] = DesiredOwnerReference(
                 apiVersion=stack.gvk.api_version,
                 kind=stack.gvk.kind,
                 name=stack.name,
                 uid=stack.metadata.uid,
             )
-    # Keep desired Stack roots available while their owned Units are being
-    # finalized.  Deletion metadata keeps the UID-fenced graph intact until
-    # child-first finalization removes the resources.
-    if current_desired is not None:
-        for kind in ("StackTemplate", "Stack"):
-            source_names = selected_resource_templates if kind == "StackTemplate" else set(stacks)
-            for name, previous_path in _current_desired_stack_paths(current_desired, kind).items():
-                if name in source_names:
-                    continue
-                target = candidate / ("stack-templates" if kind == "StackTemplate" else "stacks") / previous_path.name
-                previous = (
-                    RESOURCE_CATALOG.parse_stack_template(
-                        RESOURCE_CATALOG.load_document(previous_path), profile="desired", expected_name=name
-                    )
-                    if kind == "StackTemplate"
-                    else RESOURCE_CATALOG.parse_stack(
-                        RESOURCE_CATALOG.load_document(previous_path), profile="desired", expected_name=name
-                    )
-                )
-                if partition is not None and previous.metadata.partition == partition:
-                    previous = cast(StackResource, mark_resource_for_deletion(previous))
-                _write_desired_stack_resource(target, previous, project_root)
+            source_contexts[resource.name] = (context_root, context_revision)
+
     return StackProjection(
         generated,
         owners,
         dependencies,
         artifact_imports,
-        applied_stacks=frozenset(stacks),
+        source_contexts,
+        applied_stacks=frozenset(reprojected_stack_names),
+        structural_projections=structural_projections,
     )
 
 
@@ -3213,6 +3701,7 @@ class BuildDesiredResult:
     cleanup_inputs: Mapping[str, DesiredCleanupInput] = field(default_factory=dict)
     blocked_transitions: Mapping[str, str] = field(default_factory=dict)
     refreshes: Mapping[str, str] = field(default_factory=dict)
+    reprojected_stacks: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -3244,9 +3733,10 @@ class ResourceIncarnationTombstone:
     name: str
     uid: str
     deletion_generation: int
+    source_revision: str | None = None
 
     def document(self) -> JsonObject:
-        return {
+        document: JsonObject = {
             "schema": 1,
             "kind": "ResourceIncarnationTombstone",
             "resource": {
@@ -3257,6 +3747,9 @@ class ResourceIncarnationTombstone:
                 "deletionGeneration": self.deletion_generation,
             },
         }
+        if self.source_revision is not None:
+            cast(dict[str, object], document["resource"])["sourceRevision"] = self.source_revision
+        return document
 
     @classmethod
     def from_document(cls, document: object) -> ResourceIncarnationTombstone:
@@ -3268,19 +3761,17 @@ class ResourceIncarnationTombstone:
         ):
             raise ValueError("invalid resource incarnation tombstone")
         resource = document.get("resource")
-        if not isinstance(resource, dict) or set(resource) != {
-            "apiVersion",
-            "kind",
-            "name",
-            "uid",
-            "deletionGeneration",
-        }:
+        if not isinstance(resource, dict) or set(resource) not in (
+            {"apiVersion", "kind", "name", "uid", "deletionGeneration"},
+            {"apiVersion", "kind", "name", "uid", "deletionGeneration", "sourceRevision"},
+        ):
             raise ValueError("invalid resource incarnation identity")
         api_version = resource.get("apiVersion")
         kind = resource.get("kind")
         name = resource.get("name")
         uid = resource.get("uid")
         deletion_generation = resource.get("deletionGeneration")
+        source_revision = resource.get("sourceRevision")
         if not all(isinstance(value, str) and value for value in (api_version, kind, name, uid)):
             raise ValueError("invalid resource incarnation identity")
         GVK(cast(str, api_version), cast(str, kind))
@@ -3290,12 +3781,17 @@ class ResourceIncarnationTombstone:
             raise ValueError("invalid resource incarnation UID")
         if type(deletion_generation) is not int or deletion_generation < 1:
             raise ValueError("invalid resource incarnation deletion generation")
+        if source_revision is not None and (
+            not isinstance(source_revision, str) or not re.fullmatch(r"[0-9a-f]{40}", source_revision)
+        ):
+            raise ValueError("invalid resource incarnation source revision")
         return cls(
             api_version=cast(str, api_version),
             kind=cast(str, kind),
             name=cast(str, name),
             uid=cast(str, uid),
             deletion_generation=deletion_generation,
+            source_revision=cast(str | None, source_revision),
         )
 
 
@@ -3707,27 +4203,45 @@ def resource_incarnation_path(root: Path, tombstone: ResourceIncarnationTombston
         / DESIRED_RESOURCE_INCARNATIONS_PATH
         / PurePosixPath(tombstone.api_version)
         / tombstone.kind
-        / f"{tombstone.name}.json"
+        / tombstone.name
+        / f"{tombstone.uid}.json"
     )
 
 
 def load_resource_incarnation_tombstones(
     root: Path,
 ) -> dict[tuple[str, str, str], ResourceIncarnationTombstone]:
-    directory = root / DESIRED_RESOURCE_INCARNATIONS_PATH
+    """Return the latest compatibility index; all evidence is UID-keyed on disk."""
+
     tombstones: dict[tuple[str, str, str], ResourceIncarnationTombstone] = {}
+    for tombstone in load_resource_incarnation_evidence(root):
+        tombstones[(tombstone.api_version, tombstone.kind, tombstone.name)] = tombstone
+    return tombstones
+
+
+def load_resource_incarnation_evidence(root: Path) -> tuple[ResourceIncarnationTombstone, ...]:
+    """Load every finalized UID evidence record, including older incarnations."""
+
+    directory = root / DESIRED_RESOURCE_INCARNATIONS_PATH
+    evidence: list[ResourceIncarnationTombstone] = []
     if not directory.is_dir():
-        return tombstones
+        return ()
     for path in sorted(directory.rglob("*.json")):
         try:
             tombstone = ResourceIncarnationTombstone.from_document(load_json(path))
         except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
             raise OperationError(f"invalid resource incarnation tombstone at {path.relative_to(root)}") from exc
-        key = (tombstone.api_version, tombstone.kind, tombstone.name)
-        if key in tombstones or path != resource_incarnation_path(root, tombstone):
-            raise OperationError(f"ambiguous resource incarnation tombstone for {key!r}")
-        tombstones[key] = tombstone
-    return tombstones
+        legacy_path = (
+            root
+            / DESIRED_RESOURCE_INCARNATIONS_PATH
+            / PurePosixPath(tombstone.api_version)
+            / tombstone.kind
+            / f"{tombstone.name}.json"
+        )
+        if path not in {resource_incarnation_path(root, tombstone), legacy_path}:
+            raise OperationError(f"invalid resource incarnation tombstone path for {tombstone.name!r}")
+        evidence.append(tombstone)
+    return tuple(evidence)
 
 
 def write_resource_incarnation_tombstone(root: Path, tombstone: ResourceIncarnationTombstone) -> Path:
@@ -3736,8 +4250,16 @@ def write_resource_incarnation_tombstone(root: Path, tombstone: ResourceIncarnat
 
 
 def copy_resource_incarnation_tombstones(current: Path, candidate: Path) -> None:
-    for tombstone in load_resource_incarnation_tombstones(current).values():
+    for tombstone in load_resource_incarnation_evidence(current):
         source = resource_incarnation_path(current, tombstone)
+        if not source.is_file():
+            source = (
+                current
+                / DESIRED_RESOURCE_INCARNATIONS_PATH
+                / PurePosixPath(tombstone.api_version)
+                / tombstone.kind
+                / f"{tombstone.name}.json"
+            )
         target = resource_incarnation_path(candidate, tombstone)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
@@ -3750,6 +4272,26 @@ def finalized_incarnation_for_resource(
     name: str,
 ) -> ResourceIncarnationTombstone | None:
     return tombstones.get((api_version, kind, name))
+
+
+def finalized_incarnation_evidence(
+    root: Path,
+    api_version: str,
+    kind: str,
+    name: str,
+    uid: str,
+    deletion_generation: int | None = None,
+) -> ResourceIncarnationTombstone | None:
+    for tombstone in load_resource_incarnation_evidence(root):
+        if (
+            tombstone.api_version == api_version
+            and tombstone.kind == kind
+            and tombstone.name == name
+            and tombstone.uid == uid
+            and (deletion_generation is None or tombstone.deletion_generation == deletion_generation)
+        ):
+            return tombstone
+    return None
 
 
 def load_desired_effect_leases(root: Path) -> dict[str, EffectLease]:
@@ -4303,7 +4845,11 @@ def desired_uid_provenance(
     source: DesiredSource | None,
     source_revision: str | None,
     previous_finalized_uid: str | None = None,
+    finalized_uids: Sequence[str] = (),
 ) -> str:
+    all_finalized_uids = set(finalized_uids)
+    if previous_finalized_uid is not None:
+        all_finalized_uids.add(previous_finalized_uid)
     return json.dumps(
         {
             "apiVersion": unit.gvk.api_version,
@@ -4311,7 +4857,7 @@ def desired_uid_provenance(
             "name": unit.name,
             "source": source.to_dict() if source is not None else None,
             "sourceRevision": source_revision,
-            "previousFinalizedUid": previous_finalized_uid,
+            "finalizedUids": sorted(all_finalized_uids),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -4323,13 +4869,20 @@ def root_metadata_for_resource(
     source: DesiredSource | None = None,
     source_revision: str | None = None,
     previous_finalized_uid: str | None = None,
+    finalized_uids: Sequence[str] = (),
 ) -> ResourceMetadata:
     retained_source = source if source is not None else getattr(unit.spec, "source", None)
     if retained_source is not None and not isinstance(retained_source, DesiredSource):
         retained_source = None
     return ResourceMetadata.root_from_provenance(
         unit.name,
-        desired_uid_provenance(unit, retained_source, source_revision, previous_finalized_uid),
+        desired_uid_provenance(
+            unit,
+            retained_source,
+            source_revision,
+            previous_finalized_uid,
+            finalized_uids,
+        ),
     )
 
 
@@ -4817,14 +5370,19 @@ def desired_metadata_for_candidate(
     source: DesiredSource | None = None,
     source_revision: str | None = None,
     previous_finalized_uid: str | None = None,
+    finalized_uids: Sequence[str] = (),
     partition: str | None = None,
 ) -> ResourceMetadata:
     """Select a durable desired identity without reusing a colliding incarnation."""
 
     if previous is None:
-        return root_metadata_for_resource(authored, source, source_revision, previous_finalized_uid).with_partition(
-            partition
-        )
+        return root_metadata_for_resource(
+            authored,
+            source,
+            source_revision,
+            previous_finalized_uid,
+            finalized_uids,
+        ).with_partition(partition)
     previous.metadata.validate_desired()
     if resource_owner_reference(previous) is not None:
         raise OperationError(
@@ -4869,6 +5427,10 @@ def build_desired_candidate(
     source_revision_operation: Literal["apply", "plan"] = "apply",
     preserve_stack_owned_metadata: bool = False,
     partition: str | None = None,
+    source_context_root: Path | None = None,
+    stack_template_document_digests: Mapping[str, str] | None = None,
+    projection_context: JsonObject | None = None,
+    projection_stack_names: frozenset[str] | None = None,
 ) -> BuildDesiredResult:
     if verbose:
         log_heading(f"Resolve desired state for {style_environment(environment_name)}")
@@ -4880,10 +5442,28 @@ def build_desired_candidate(
         )
     specifications = load_environment_specifications(source_root, environment_name)
     candidate_units = candidate / "units"
-    candidate_units.mkdir(parents=True)
-    (candidate / "stack-templates").mkdir(parents=True)
-    (candidate / "stacks").mkdir(parents=True)
+    candidate_units.mkdir(parents=True, exist_ok=True)
+    (candidate / "stack-templates").mkdir(parents=True, exist_ok=True)
+    (candidate / "stacks").mkdir(parents=True, exist_ok=True)
     copy_resource_incarnation_tombstones(current_desired, candidate)
+    copy_projection_context(current_desired, candidate)
+    project = load_project_config(source_root)
+    source_has_stack_graph = bool(
+        _document_paths(source_root.joinpath(*project.stack_templates_path.parts))
+        or _document_paths(project_environment_root(source_root, environment_name) / "stacks")
+    )
+    if (
+        projection_context is None
+        and not _current_desired_stack_paths(current_desired, "Stack")
+        and source_has_stack_graph
+    ):
+        # A new explicitly applied Stack graph has no prior binding to load;
+        # create its operation context before projection.  File-less
+        # progression with existing Stacks must take the fail-closed path in
+        # ``project_stack_resources`` instead of manufacturing a new context.
+        projection_context = capture_projection_context(source_root, environment_name)
+    if projection_context is not None:
+        write_projection_context(candidate, projection_context)
     stack_projection = project_stack_resources(
         source_root,
         environment_name,
@@ -4893,6 +5473,10 @@ def build_desired_candidate(
         current_desired,
         promotion,
         partition,
+        source_context_root,
+        stack_template_document_digests,
+        projection_context,
+        projection_stack_names,
     )
     imported_artifact_fingerprints: dict[str, dict[str, str]] = {}
     imported_artifact_evidence: dict[str, dict[str, ResolvedArtifactImport]] = {}
@@ -4900,6 +5484,54 @@ def build_desired_candidate(
         if unit_name in specifications:
             raise OperationError(f"generated Stack Unit {unit_name!r} collides with a source Unit")
         specifications[unit_name] = generated_unit
+    stack_promotions: dict[str, PromotionContext | None] = {}
+    stack_environment_documents: dict[str, Mapping[str, Any]] = {}
+    promotion_context_cache: dict[str, PromotionContext | None] = {}
+    if promotion is None:
+        for owner in stack_projection.owners.values():
+            if owner.name in stack_promotions:
+                continue
+            # The projection engine has already selected the binding that is
+            # authoritative for this operation.  Read the resulting Stack,
+            # rather than the old desired Stack, so an explicitly reapplied
+            # root resolves from its new operation context while a carried
+            # fan-out root keeps its retained context.
+            stack_path = _current_desired_stack_paths(candidate, "Stack").get(owner.name)
+            if stack_path is None:
+                stack_path = _current_desired_stack_paths(current_desired, "Stack").get(owner.name)
+            if stack_path is None:
+                if projection_context is not None:
+                    stack_environment_documents[owner.name] = normalize_environment_document(
+                        cast(dict[str, Any], projection_context["environmentDocument"]),
+                        environment_name,
+                    )
+                else:
+                    stack_environment_documents[owner.name] = load_environment(source_root, environment_name)
+                continue
+            stack_resource = RESOURCE_CATALOG.parse_stack(
+                RESOURCE_CATALOG.load_document(stack_path), profile="desired", expected_name=owner.name
+            )
+            if not isinstance(stack_resource.spec, DesiredStackSpec):
+                stack_environment_documents[owner.name] = load_environment(source_root, environment_name)
+                continue
+            context_digest = stack_resource.spec.structuralProjection.identity.projectionContextDigest
+            context = load_projection_context(candidate, context_digest, environment_name)
+            stack_environment_documents[owner.name] = normalize_environment_document(
+                cast(dict[str, Any], context["environmentDocument"]),
+                environment_name,
+            )
+            if context_digest not in promotion_context_cache:
+                promotion_context_cache[context_digest] = load_promotion_context(
+                    candidate,
+                    candidate.parent,
+                    context_digest,
+                )
+            stack_promotions[owner.name] = promotion_context_cache[context_digest]
+    else:
+        operation_environment = load_environment(source_root, environment_name)
+        for owner in stack_projection.owners.values():
+            stack_environment_documents[owner.name] = operation_environment
+    operation_environment = load_environment(source_root, environment_name)
     if source_revision_policy is None:
         source_revision_policy = (
             load_project_config(source_root).source_revision_policy
@@ -4908,6 +5540,20 @@ def build_desired_candidate(
         )
     if promotion is not None:
         write_preferred_document(candidate / "promotion.json", promotion.document(), source_root)
+    else:
+        promotion_paths = document_candidates(current_desired, "promotion")
+        if len(promotion_paths) > 1:
+            raise OperationError("multiple promotion document formats exist")
+        if promotion_paths:
+            promotion_document = load_json(promotion_paths[0])
+            validate_document(
+                CORE_CONTRACTS["promotion"],
+                normalize_promotion_document(promotion_document),
+                "promotion document",
+            )
+            target = candidate / promotion_paths[0].name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(promotion_paths[0], target)
 
     prepared: dict[str, tuple[UnitResource[Any], ResolvedUnitSourceResult]] = {}
     retained_transitions: dict[str, UnitResource[Any]] = {}
@@ -4921,7 +5567,6 @@ def build_desired_candidate(
         for name, opaque in opaque_transitions.items()
     }
     blocked_transitions = load_desired_transition_blocks(current_desired)
-    incarnation_tombstones = load_resource_incarnation_tombstones(current_desired)
     blocked: dict[str, str] = {}
     cleanup_inputs: dict[str, DesiredCleanupInput] = {}
     refreshes: dict[str, str] = {}
@@ -4970,10 +5615,13 @@ def build_desired_candidate(
                     f"{style_unit(unit_name)}: GVK/driver changed; retain previous desired cleanup root",
                 )
             continue
+        unit_source_root, unit_source_revision = stack_projection.source_contexts.get(
+            unit_name, (source_root, source_revision)
+        )
         source_resolution = resolved_unit_source(
             specification,
-            source_root,
-            source_revision,
+            unit_source_root,
+            unit_source_revision,
             current_desired,
             source_revision_policy,
             source_revision_operation,
@@ -5005,23 +5653,31 @@ def build_desired_candidate(
             unit_artifact_imports = stack_projection.artifact_imports.get(authored.name, ())
             unit_owner = stack_projection.owners.get(authored.name)
             target_stack_uid = unit_owner.uid if unit_owner is not None else None
+            unit_environment_document = (
+                stack_environment_documents.get(unit_owner.name, operation_environment)
+                if unit_owner is not None
+                else operation_environment
+            )
             try:
+                unit_promotion = promotion
+                if unit_owner is not None and promotion is None:
+                    unit_promotion = stack_promotions.get(unit_owner.name)
                 resolution = authored.driver.resolve_unit(
                     authored.spec,
                     UnitResolutionContext(
                         source=resolved_source,
-                        resolve_template=lambda value, pointer, target_unit=authored.name, target_gvk=authored.gvk, artifact_imports=unit_artifact_imports, target_stack_uid=target_stack_uid: (
+                        resolve_template=lambda value, pointer, target_unit=authored.name, target_gvk=authored.gvk, artifact_imports=unit_artifact_imports, target_stack_uid=target_stack_uid, unit_promotion=unit_promotion, unit_environment_document=unit_environment_document: (
                             resolve_template(
                                 value,
                                 candidate,
                                 observed,
                                 observed_revision,
-                                promotion=promotion,
+                                promotion=unit_promotion,
                                 target_unit=target_unit,
                                 target_gvk=target_gvk,
                                 pointer=pointer,
                                 dry=dry,
-                                environment_document=load_environment(source_root, environment_name),
+                                environment_document=unit_environment_document,
                                 artifact_imports=artifact_imports,
                                 target_stack_uid=target_stack_uid,
                             )
@@ -5035,22 +5691,25 @@ def build_desired_candidate(
             resolved = materialize_resolved_unit(
                 environment_name,
                 resolved,
-                source_root,
-                source_revision,
+                unit_source_root,
+                unit_source_revision,
                 current_desired,
                 candidate,
             )
             previous_unit = unit_document_path(current_desired, unit_name)
             previous = load_desired_unit(previous_unit, unit_name) if previous_unit.is_file() else None
-            previous_incarnation = (
-                finalized_incarnation_for_resource(
-                    incarnation_tombstones,
-                    resolved.gvk.api_version,
-                    resolved.gvk.kind,
-                    unit_name,
+            previous_finalized_uids = (
+                tuple(
+                    sorted(
+                        tombstone.uid
+                        for tombstone in load_resource_incarnation_evidence(current_desired)
+                        if tombstone.api_version == resolved.gvk.api_version
+                        and tombstone.kind == resolved.gvk.kind
+                        and tombstone.name == unit_name
+                    )
                 )
                 if previous is None
-                else None
+                else ()
             )
             owner = stack_projection.owners.get(unit_name)
             if owner is not None and preserve_stack_owned_metadata and previous is not None:
@@ -5068,8 +5727,8 @@ def build_desired_candidate(
                         previous,
                         resolved_source,
                         source_revision,
-                        previous_incarnation.uid if previous_incarnation is not None else None,
-                        partition,
+                        finalized_uids=previous_finalized_uids,
+                        partition=partition,
                     )
                 )
             candidate_unit = write_desired_candidate_unit(candidate_units / f"{unit_name}.json", resolved, source_root)
@@ -5187,6 +5846,13 @@ def build_desired_candidate(
         )
         _write_desired_stack_resource(stack_path, stack_resource, source_root)
 
+    atomically_retained_units = _bind_active_stack_projections(
+        candidate,
+        current_desired,
+        blocked_transitions,
+        source_root,
+    )
+
     for unit_name, retained in retained_transitions.items():
         previous_path = unit_document_path(current_desired, unit_name)
         write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
@@ -5207,6 +5873,8 @@ def build_desired_candidate(
     for unit_name, previous_path in _current_desired_unit_paths(current_desired).items():
         if unit_name in specifications:
             continue
+        if unit_name in atomically_retained_units:
+            continue
         try:
             previous = load_desired_unit(previous_path, unit_name)
         except Exception:
@@ -5219,6 +5887,13 @@ def build_desired_candidate(
             )
             blocked_transitions[unit_name] = "opaque desired root retained"
             continue
+        previous_owner = resource_owner_reference(previous)
+        if previous_owner is not None and previous_owner.kind == "Stack":
+            if previous_owner.name not in stack_projection.applied_stacks:
+                # The apply contract does not select this Stack. Leave its
+                # root and complete owned closure byte-for-byte for the
+                # candidate copy step below.
+                continue
         retained = previous
         write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
         if getattr(retained.spec, "materialization", None) is not None:
@@ -5264,6 +5939,7 @@ def build_desired_candidate(
         cleanup_inputs=cleanup_inputs,
         blocked_transitions=blocked_transitions,
         refreshes=refreshes,
+        reprojected_stacks=stack_projection.applied_stacks,
     )
 
 
@@ -5278,14 +5954,12 @@ def require_revision(value: Any, description: str) -> str:
     return value
 
 
-def load_promotion_context(current_desired: Path, temporary: Path) -> PromotionContext | None:
-    paths = document_candidates(current_desired, "promotion")
-    if not paths:
-        return None
-    if len(paths) > 1:
-        raise OperationError("multiple promotion document formats exist")
-    path = paths[0]
-    document = normalize_promotion_document(load_json(path))
+def _promotion_context_from_document(
+    document: dict[str, Any],
+    temporary: Path,
+    context_digest: str | None = None,
+) -> PromotionContext:
+    document = normalize_promotion_document(document)
     validate_document(CORE_CONTRACTS["promotion"], document, "promotion.json")
     source = document.get("source")
     if not isinstance(source, dict) or set(source) != {
@@ -5313,11 +5987,16 @@ def load_promotion_context(current_desired: Path, temporary: Path) -> PromotionC
         raise OperationError("promotion source desired revision changed unexpectedly")
     if observed_revision is not None and resolve_ref(observed_ref, observed_revision) != observed_revision:
         raise OperationError("promotion source observed revision changed unexpectedly")
-    desired_root = temporary / "promotion-source"
+    materialization_key = (
+        context_digest.removeprefix("sha256:")
+        if context_digest is not None
+        else hashlib.sha256(canonical_json(document)).hexdigest()
+    )
+    desired_root = temporary / f"promotion-{materialization_key}" / "source"
     materialize_revision(desired_revision, desired_root)
     observed_root = None
     if observed_revision is not None:
-        observed_root = temporary / "promotion-observed"
+        observed_root = desired_root.parent / "observed"
         materialize_revision(observed_revision, observed_root)
     return PromotionContext(
         source_environment=source_environment,
@@ -5329,6 +6008,27 @@ def load_promotion_context(current_desired: Path, temporary: Path) -> PromotionC
         desired_root=desired_root,
         observed_root=observed_root,
     )
+
+
+def load_promotion_context(
+    current_desired: Path,
+    temporary: Path,
+    context_digest: str | None = None,
+) -> PromotionContext | None:
+    if context_digest is not None:
+        context = load_projection_context(current_desired, context_digest)
+        promotion_document = context.get("promotionDocument")
+        if promotion_document is None:
+            return None
+        if not isinstance(promotion_document, dict):
+            raise OperationError("projection context has an invalid promotionDocument")
+        return _promotion_context_from_document(promotion_document, temporary, context_digest)
+    paths = document_candidates(current_desired, "promotion")
+    if not paths:
+        return None
+    if len(paths) > 1:
+        raise OperationError("multiple promotion document formats exist")
+    return _promotion_context_from_document(load_json(paths[0]), temporary)
 
 
 def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) -> bool:
@@ -5652,6 +6352,7 @@ def _initialize_gated_desired_ref(
 
 
 def command_promote(args: argparse.Namespace) -> None:
+    dry = bool(getattr(args, "dry", False))
     specification_revision = git("rev-parse", f"{args.specification_revision or 'HEAD'}^{{commit}}").stdout.strip()
     _validate_apply_input_selection(
         args.files,
@@ -5720,10 +6421,19 @@ def command_promote(args: argparse.Namespace) -> None:
         )
         explicit_source = temporary / "explicit-target"
         _copy_apply_source_base(source_root, explicit_source, args.to_environment)
+        stack_template_document_digests: dict[str, str] = {}
         authored_units, authored_stacks = _write_apply_authored_documents(
-            explicit_source, args.to_environment, explicit_documents
+            explicit_source,
+            args.to_environment,
+            explicit_documents,
+            stack_template_document_digests,
         )
-        if any(_document_is_canonical_desired(document) for _origin, document in explicit_documents):
+        projection_context = (
+            capture_projection_context(explicit_source, args.to_environment, promotion)
+            if any(item.document.get("kind") in {"Stack", "StackTemplate"} for item in explicit_documents)
+            else None
+        )
+        if any(_document_is_canonical_desired(item.document) for item in explicit_documents):
             raise OperationError("promote accepts authored target input only")
         build_desired_candidate(
             args.to_environment,
@@ -5734,16 +6444,21 @@ def command_promote(args: argparse.Namespace) -> None:
             target_observed_revision,
             candidate,
             promotion=promotion,
+            dry=dry,
             partition=args.partition,
+            source_context_root=source_root,
+            stack_template_document_digests=stack_template_document_digests,
+            projection_context=projection_context,
         )
-        applied = _applied_root_closure(candidate, [*authored_units, *authored_stacks])
-        _copy_unrelated_desired_resources(current_target, candidate, applied, args.partition)
-        _prune_omitted_partition_resources(current_target, candidate, applied, args.partition)
+        applied = set(_explicit_applied_root_identities(explicit_documents, [*authored_units, *authored_stacks]))
+        _copy_unrelated_desired_resources(current_target, candidate, frozenset(applied), args.partition)
+        _prune_omitted_partition_resources(current_target, candidate, frozenset(applied), args.partition)
+        _reject_applied_stacks_against_deleting_templates(candidate, frozenset(applied))
         candidate_resources = load_desired_resource_graph(candidate)
         if target_revision is None and not candidate_resources:
             log_status("KEEP", f"{style_branch(target_desired_ref)} remains empty")
             return
-        if target_revision is None and gate == "pullRequest":
+        if target_revision is None and gate == "pullRequest" and not dry:
             target_revision = _initialize_gated_desired_ref(
                 source_root,
                 args.to_environment,
@@ -5761,6 +6476,18 @@ def command_promote(args: argparse.Namespace) -> None:
             lease_ref=target_lease_ref,
         )
 
+        if dry:
+            log_status("DRY", f"{style_branch(target_desired_ref)} would receive the promotion")
+            return
+
+        validate_desired_resource_transition(current_target, candidate)
+
+        if target_revision is not None and directory_files(current_target) == directory_files(candidate):
+            log_status("KEEP", f"{style_branch(target_desired_ref)} already contains this promotion")
+            print(target_revision)
+            write_change_outputs(target_revision, target_desired_ref)
+            return
+
         commit_message = f"Promote {args.from_environment} to {args.to_environment} from {source_desired_revision}"
         title = f"Promote {args.from_environment} to {args.to_environment}"
         body = (
@@ -5768,60 +6495,70 @@ def command_promote(args: argparse.Namespace) -> None:
             f"After merge, reconcile `{args.to_environment}`."
         )
         outcome: ChangeRequestResult | ManualChangeRequest | None = None
-        if gate == "pullRequest":
-            assert target_revision is not None
-            candidate_id = candidate_identifier(
-                "promotion",
-                args.to_environment,
-                candidate,
-                target_desired_ref,
-                target_revision,
-                promotion.document(),
-            )
-            candidate_ref = resolve_candidate_ref(
-                source_root,
-                args.to_environment,
-                "promotion",
-                candidate_id,
-                args.candidate_ref,
-            )
-            if candidate_ref in {
-                source_desired_ref,
-                source_observed_ref,
-                target_desired_ref,
-                target_observed_ref,
-            }:
-                raise OperationError("promotion candidate ref conflicts with deployment state")
-            change_revision, outcome = publish_change_candidate(
-                candidate,
-                candidate_ref,
-                target_desired_ref,
-                target_revision,
-                commit_message,
-                title,
-                body,
-                current_target,
-                lease_ref=target_lease_ref,
-            )
-            log_status(
-                "CANDIDATE",
-                f"{style_branch(candidate_ref)} at {describe_revision(change_revision)} targets "
-                f"{style_branch(target_desired_ref)}",
-            )
-        else:
-            if args.candidate_ref:
-                raise OperationError("--candidate-ref requires changeGate pullRequest")
-            candidate_ref = ""
-            change_revision = publish_tree(
-                target_desired_ref,
-                candidate,
-                target_revision,
-                commit_message,
-            )
-            log_status(
-                "UPDATE",
-                f"{style_branch(target_desired_ref)} advanced to {describe_revision(change_revision)}",
-            )
+        pin_acquisition = _acquire_stack_template_source_pins(args.to_environment, candidate)
+        published = False
+        try:
+            if gate == "pullRequest":
+                assert target_revision is not None
+                candidate_id = candidate_identifier(
+                    "promotion",
+                    args.to_environment,
+                    candidate,
+                    target_desired_ref,
+                    target_revision,
+                    promotion.document(),
+                )
+                candidate_ref = resolve_candidate_ref(
+                    source_root,
+                    args.to_environment,
+                    "promotion",
+                    candidate_id,
+                    args.candidate_ref,
+                )
+                if candidate_ref in {
+                    source_desired_ref,
+                    source_observed_ref,
+                    target_desired_ref,
+                    target_observed_ref,
+                }:
+                    raise OperationError("promotion candidate ref conflicts with deployment state")
+                change_revision, outcome = publish_change_candidate(
+                    candidate,
+                    candidate_ref,
+                    target_desired_ref,
+                    target_revision,
+                    commit_message,
+                    title,
+                    body,
+                    current_target,
+                    lease_ref=target_lease_ref,
+                )
+                published = True
+                log_status(
+                    "CANDIDATE",
+                    f"{style_branch(candidate_ref)} at {describe_revision(change_revision)} targets "
+                    f"{style_branch(target_desired_ref)}",
+                )
+            else:
+                if args.candidate_ref:
+                    raise OperationError("--candidate-ref requires changeGate pullRequest")
+                candidate_ref = ""
+                change_revision = publish_tree(
+                    target_desired_ref,
+                    candidate,
+                    target_revision,
+                    commit_message,
+                )
+                published = True
+                log_status(
+                    "UPDATE",
+                    f"{style_branch(target_desired_ref)} advanced to {describe_revision(change_revision)}",
+                )
+        except BaseException:
+            if not published:
+                _release_new_stack_template_source_pins(pin_acquisition)
+            raise
+        _promote_stack_template_source_pins(args.to_environment, candidate, pin_acquisition)
         print(change_revision)
         write_change_outputs(
             change_revision,
@@ -5877,11 +6614,13 @@ def publish_desired_change(
     allow_removed_units: frozenset[str] = frozenset(),
     request_change: bool = True,
     finalized_resources: frozenset[ResourceFinalizationFence] = frozenset(),
+    configuration_root: Path | None = None,
 ) -> tuple[str, ChangeRequestResult | ManualChangeRequest | None]:
     load_desired_resource_graph(candidate)
     if current_root is not None:
         validate_desired_resource_transition(current_root, candidate, finalized_resources)
-    lease_ref = effect_lease_ref(environment, target_ref)
+    configuration_root = configuration_root or REPOSITORY_ROOT
+    lease_ref = effect_lease_ref(environment, target_ref, configuration_root)
     validate_effect_leases_preserved(
         target_ref,
         target_revision,
@@ -5890,35 +6629,45 @@ def publish_desired_change(
         allow_removed_units,
         lease_ref=lease_ref,
     )
-    gate = change_gate(REPOSITORY_ROOT, environment)
+    gate = change_gate(configuration_root, environment)
     if dry:
         log_status("DRY", f"{style_branch(target_ref)} would receive {title.lower()}")
         return target_revision or "", None
-    _ensure_stack_source_pins(environment, candidate)
-    if gate == "pullRequest":
-        if target_revision is None:
-            raise OperationError("pull-request publication requires an initialized desired ref")
-        revision, outcome = publish_change_candidate(
-            candidate,
-            candidate_ref,
-            target_ref,
-            target_revision,
-            commit_message,
-            title,
-            body,
-            current_root,
-            allow_removed_units,
-            request_change,
-            lease_ref,
-        )
-        log_status(
-            "CANDIDATE",
-            f"{style_branch(candidate_ref)} at {describe_revision(revision)} targets {style_branch(target_ref)}",
-        )
-        return revision, outcome
-    revision = publish_tree(target_ref, candidate, target_revision, commit_message)
-    log_status("UPDATE", f"{style_branch(target_ref)} advanced to {describe_revision(revision)}")
-    return revision, None
+    if gate == "pullRequest" and target_revision is None:
+        raise OperationError("pull-request publication requires an initialized desired ref")
+    pin_acquisition = _acquire_stack_template_source_pins(environment, candidate)
+    published = False
+    try:
+        if gate == "pullRequest":
+            revision, outcome = publish_change_candidate(
+                candidate,
+                candidate_ref,
+                target_ref,
+                target_revision,
+                commit_message,
+                title,
+                body,
+                current_root,
+                allow_removed_units,
+                request_change,
+                lease_ref,
+            )
+            published = True
+            log_status(
+                "CANDIDATE",
+                f"{style_branch(candidate_ref)} at {describe_revision(revision)} targets {style_branch(target_ref)}",
+            )
+            _promote_stack_template_source_pins(environment, candidate, pin_acquisition)
+            return revision, outcome
+        revision = publish_tree(target_ref, candidate, target_revision, commit_message)
+        published = True
+        log_status("UPDATE", f"{style_branch(target_ref)} advanced to {describe_revision(revision)}")
+        _promote_stack_template_source_pins(environment, candidate, pin_acquisition)
+        return revision, None
+    except BaseException:
+        if not published:
+            _release_new_stack_template_source_pins(pin_acquisition)
+        raise
 
 
 @dataclass(frozen=True)
@@ -6030,8 +6779,18 @@ def copy_current_blocked_unit(current: Path, candidate: Path, unit_name: str) ->
     copy_unit_materialization(current, candidate, unit_name, current_unit)
 
 
-def merge_current_cleanup_state(current: Path, candidate: Path) -> None:
-    """Carry deletion metadata and opaque cleanup roots through a rollback."""
+def merge_current_cleanup_state(
+    current: Path,
+    candidate: Path,
+    *,
+    preserve_target_stack_semantics: bool = False,
+) -> None:
+    """Carry genuine cleanup state through a rollback.
+
+    Full Stack aggregate rollback keeps the target's parseable Stack-owned
+    payload and transition blocks authoritative.  Targeted rollback retains
+    the historical broader overlay behavior for unrelated cleanup.
+    """
 
     copy_resource_incarnation_tombstones(current, candidate)
     current_blocks = load_desired_transition_blocks(current)
@@ -6055,13 +6814,23 @@ def merge_current_cleanup_state(current: Path, candidate: Path) -> None:
         shutil.copy2(source_path, target_path)
         if isinstance(resource, UnitResource):
             copy_unit_materialization(current, candidate, resource.name, resource)
+    retained_blocks = dict(current_blocks)
     for name in current_blocks:
         if name in current_roots:
             continue
         current_path = unit_document_path(current, name)
         if current_path.is_file():
+            if preserve_target_stack_semantics:
+                try:
+                    current_unit = load_desired_unit(current_path, name)
+                except Exception:
+                    current_unit = None
+                owner = resource_owner_reference(current_unit) if current_unit is not None else None
+                if owner is not None and owner.kind == "Stack":
+                    retained_blocks.pop(name, None)
+                    continue
             copy_current_blocked_unit(current, candidate, name)
-    write_desired_transition_blocks(candidate, current_blocks)
+    write_desired_transition_blocks(candidate, retained_blocks)
 
 
 def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[str, ...]:
@@ -6095,6 +6864,84 @@ def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[s
                 dependents.add(child.name)
                 pending.append(child_identity)
     return tuple(sorted(dependents))
+
+
+def validate_full_rollback_stack_aggregate(current: Path, target: Path) -> None:
+    """Reject rollback targets that would mix historical and current Stack identities."""
+
+    current_resources = load_desired_resource_graph(current)
+    target_resources = load_desired_resource_graph(target)
+    root_kinds = {"Stack", "StackTemplate"}
+    current_roots = {
+        key: resource
+        for key, resource in current_resources.items()
+        if isinstance(resource, StackResource) and resource.gvk.kind in root_kinds
+    }
+    target_roots = {
+        key: resource
+        for key, resource in target_resources.items()
+        if isinstance(resource, StackResource) and resource.gvk.kind in root_kinds
+    }
+    current_tombstones = load_resource_incarnation_tombstones(current)
+    for key, target_root in target_roots.items():
+        tombstone = current_tombstones.get(key)
+        if key not in current_roots and tombstone is not None and tombstone.uid == target_root.metadata.uid:
+            raise OperationError(
+                f"full rollback would resurrect finalized {target_root.gvk.kind} {target_root.name!r} "
+                "without a new aggregate incarnation"
+            )
+    if set(current_roots) != set(target_roots):
+        raise OperationError(
+            "full rollback across Stack/StackTemplate aggregate shape is not supported; "
+            "the target must contain the same root identities"
+        )
+
+    for key, target_root in target_roots.items():
+        current_root = current_roots[key]
+        if resource_deletion(current_root) is not None:
+            raise OperationError(
+                f"full rollback is blocked while {target_root.gvk.kind} {target_root.name!r} is deleting"
+            )
+        if current_root.metadata.uid != target_root.metadata.uid:
+            raise OperationError(
+                f"full rollback would cross the current {target_root.gvk.kind} {target_root.name!r} incarnation"
+            )
+        tombstone = current_tombstones.get(key)
+        if tombstone is not None and target_root.metadata.uid == tombstone.uid:
+            raise OperationError(
+                f"full rollback would resurrect finalized {target_root.gvk.kind} {target_root.name!r} "
+                "without a new aggregate incarnation"
+            )
+
+    # A full aggregate rollback may change Unit specifications, but it must
+    # not splice historical owned identities into a current Stack projection.
+    for stack_key, current_stack in current_roots.items():
+        if not isinstance(current_stack, StackResource) or current_stack.gvk.kind != "Stack":
+            continue
+        target_stack = target_roots[stack_key]
+        current_owned = {
+            key: resource
+            for key, resource in current_resources.items()
+            if isinstance(resource, UnitResource)
+            and _unit_owned_by_stack(resource, current_stack.name, current_stack.metadata.uid)
+        }
+        target_owned = {
+            key: resource
+            for key, resource in target_resources.items()
+            if isinstance(resource, UnitResource)
+            and _unit_owned_by_stack(resource, target_stack.name, target_stack.metadata.uid)
+        }
+        if set(current_owned) != set(target_owned):
+            raise OperationError(
+                f"full rollback of Stack {current_stack.name!r} would change its owned Unit aggregate; "
+                "cross-incarnation aggregate rollback is not supported"
+            )
+        for key in current_owned:
+            if current_owned[key].metadata.uid != target_owned[key].metadata.uid:
+                raise OperationError(
+                    f"full rollback of Stack {current_stack.name!r} would publish a historical owned Unit "
+                    f"{current_owned[key].name!r} under the current projection"
+                )
 
 
 def command_rollback(args: argparse.Namespace) -> None:
@@ -6150,6 +6997,9 @@ def command_rollback(args: argparse.Namespace) -> None:
             raise OperationError("rollback target is not ancestral to the current desired head")
         materialize_revision(target_revision, target)
 
+        if mode == "full":
+            validate_full_rollback_stack_aggregate(current, target)
+
         target_inventory = validate_rollback_desired_inventory(target_revision, target, "rollback target")
         current_inventory = (
             validate_rollback_desired_inventory(current_revision, current, "current desired state")
@@ -6158,6 +7008,16 @@ def command_rollback(args: argparse.Namespace) -> None:
         )
         target_units = sorted(target_inventory.units)
         requested_units = sorted(set(args.unit or target_units))
+        if current_inventory is not None:
+            stack_owned = sorted(
+                unit_name
+                for unit_name in requested_units
+                if unit_name in current_inventory.units and _unit_is_stack_owned(current_inventory.units[unit_name])
+            )
+            if stack_owned:
+                raise OperationError(
+                    "targeted rollback of Stack-owned Unit(s) is not supported: " + ", ".join(stack_owned)
+                )
         unknown = (
             sorted((set(requested_units) - set(current_inventory.units)) | (set(requested_units) - set(target_units)))
             if current_inventory is not None
@@ -6214,7 +7074,11 @@ def command_rollback(args: argparse.Namespace) -> None:
                     candidate_path,
                 )
                 copy_unit_materialization(target, candidate, unit_name, historical_unit)
-        merge_current_cleanup_state(current, candidate)
+        merge_current_cleanup_state(
+            current,
+            candidate,
+            preserve_target_stack_semantics=mode == "full",
+        )
         current_cleanup_names = set(load_desired_cleanup_roots(current))
         finalized_incarnations = load_resource_incarnation_tombstones(candidate)
         for candidate_path in _current_desired_unit_paths(candidate).values():
@@ -6289,25 +7153,6 @@ def command_rollback(args: argparse.Namespace) -> None:
             return
         print(revision)
         write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
-
-
-def _release_stack_pin(environment: str, stack: StackResource) -> None:
-    if stack.metadata.uid is None:
-        raise OperationError(f"Stack {stack.name!r} has no UID")
-    _release_stack_source_pins(environment, stack.name, stack.metadata.uid)
-
-
-def _release_finalized_stack_pin(
-    environment: str,
-    name: str,
-    uid: str,
-    deletion_generation: int,
-    desired_root: Path,
-) -> bool:
-    tombstone = load_resource_incarnation_tombstones(desired_root).get((CORE_API_VERSION, "Stack", name))
-    if tombstone is None or tombstone.uid != uid or tombstone.deletion_generation != deletion_generation:
-        return False
-    return _release_stack_source_pins(environment, name, uid)
 
 
 def _release_finalized_unit_lease(
@@ -6391,8 +7236,16 @@ def _command_finalize(args: argparse.Namespace) -> bool:
             if resource.name == args.name and _resource_matches_category(resource, category)
         ]
         if len(matches) != 1:
-            if category == "Stack" and not args.dry:
-                return _release_finalized_stack_pin(
+            tombstone = finalized_incarnation_evidence(
+                current, CORE_API_VERSION, category, args.name, args.uid, args.deletion_generation
+            )
+            if category in {"Stack", "StackTemplate"} and (tombstone is None):
+                raise OperationError(
+                    f"missing desired {category} {args.name!r} without its matching incarnation tombstone; "
+                    "the desired graph is corrupt"
+                )
+            if category == "StackTemplate" and not args.dry:
+                return _release_finalized_stack_template_pins(
                     args.environment,
                     args.name,
                     args.uid,
@@ -6410,6 +7263,20 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                     lease_ref,
                 )
             return False
+        if category == "StackTemplate" and matches[0].metadata.uid != args.uid:
+            tombstone = finalized_incarnation_evidence(
+                current, CORE_API_VERSION, category, args.name, args.uid, args.deletion_generation
+            )
+            if tombstone is not None:
+                if not args.dry:
+                    return _release_finalized_stack_template_pins(
+                        args.environment,
+                        args.name,
+                        args.uid,
+                        args.deletion_generation,
+                        current,
+                    )
+                return False
         resource = matches[0]
         deletion = resource_deletion(resource)
         if deletion is None:
@@ -6420,6 +7287,22 @@ def _command_finalize(args: argparse.Namespace) -> bool:
             raise OperationError(f"stale {category} deletion generation fence for {args.name!r}")
         if resource_content_digest(resource) != deletion.resourceDigest:
             raise OperationError(f"{category} {args.name!r} changed after deletion started")
+
+        if isinstance(resource, StackResource) and resource.gvk.kind == "Stack":
+            if not isinstance(resource.spec, DesiredStackSpec):
+                raise OperationError(f"Stack {resource.name!r} has an invalid desired specification")
+            tombstones = load_resource_incarnation_tombstones(current)
+            for logical_name, projected in resource.spec.structuralProjection.units.items():
+                child_name = stack_generated_unit_name(resource.name, logical_name)
+                child_key = (projected.apiVersion, projected.kind, child_name)
+                if child_key in resources:
+                    continue
+                tombstone = tombstones.get(child_key)
+                if tombstone is None:
+                    raise OperationError(
+                        f"Stack {resource.name!r} child {child_name!r} is missing without a matching incarnation "
+                        "tombstone; the desired graph is corrupt"
+                    )
 
         children = []
         for child in resources.values():
@@ -6437,20 +7320,23 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                 "owned resources must be finalized first: " + ", ".join(sorted(child.name for child in children))
             )
         if isinstance(resource, StackResource) and resource.gvk.kind == "StackTemplate":
-            referencing_stacks = [
-                item.name
-                for item in resources.values()
-                if isinstance(item, StackResource)
-                and item.gvk.kind == "Stack"
-                and isinstance(item.spec, (StackSpec, DesiredStackSpec))
-                and (
-                    item.spec.template == resource.name
-                    or (
-                        isinstance(item.spec.template, StackTemplateReference)
-                        and item.spec.template.name == resource.name
-                    )
-                )
-            ]
+            from gitopsctr.registry import RESOURCE_REGISTRY
+
+            referencing_stacks: list[str] = []
+            for item in resources.values():
+                if not isinstance(item, StackResource) or item.gvk.kind != "Stack":
+                    continue
+                if not isinstance(item.spec, DesiredStackSpec):
+                    continue
+                if item.spec.templateRef.name != resource.name:
+                    continue
+                try:
+                    RESOURCE_REGISTRY.graph_relationship("stack-selects-stacktemplate").binding.validate(item, resource)
+                except Exception as exc:
+                    raise OperationError(
+                        f"Stack {item.name!r} has a stale StackTemplate identity fence: {exc}"
+                    ) from exc
+                referencing_stacks.append(item.name)
             if referencing_stacks:
                 raise OperationError("Stacks reference this StackTemplate: " + ", ".join(sorted(referencing_stacks)))
 
@@ -6564,6 +7450,14 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                 name=resource.name,
                 uid=args.uid,
                 deletion_generation=deletion.generation,
+                source_revision=(
+                    resource.spec.sourceContext.revision
+                    if isinstance(resource, StackResource)
+                    and resource.gvk.kind == "StackTemplate"
+                    and isinstance(resource.spec, DesiredStackTemplateSpec)
+                    and resource.spec.sourceContext is not None
+                    else None
+                ),
             ),
         )
         load_desired_resource_graph(candidate)
@@ -6603,8 +7497,19 @@ def _command_finalize(args: argparse.Namespace) -> bool:
                 }
             ),
         )
-        if not args.dry and isinstance(resource, StackResource) and resource.gvk.kind == "Stack" and outcome is None:
-            _release_stack_pin(args.environment, resource)
+        if (
+            not args.dry
+            and isinstance(resource, StackResource)
+            and resource.gvk.kind == "StackTemplate"
+            and outcome is None
+        ):
+            _release_finalized_stack_template_pins(
+                args.environment,
+                resource.name,
+                args.uid,
+                deletion.generation,
+                candidate,
+            )
         if not args.dry and lease_acquisition is not None and outcome is None:
             release_effect_lease(
                 desired_ref,
@@ -6652,96 +7557,6 @@ def command_recover_effect_lease(args: argparse.Namespace) -> None:
 def command_resolve_desired(args: argparse.Namespace) -> None:
     revision = resolve_ref(args.desired_ref, args.desired_revision)
     print(revision)
-
-
-def _selected_stack_template_resources(
-    stack_name: str,
-    resources: Sequence[StackTemplateResource],
-    selected: str | None,
-) -> tuple[StackTemplateResource, ...]:
-    """Select a dependency-closed Unit projection from a StackTemplate."""
-
-    if selected is None:
-        return tuple(resources)
-    names = [name.strip() for name in selected.split(",") if name.strip()]
-    if not names or len(set(names)) != len(names):
-        raise OperationError("--units must contain one or more unique Unit template names")
-    by_name = {resource.name: resource for resource in resources}
-    unknown = sorted(set(names) - set(by_name))
-    if unknown:
-        raise OperationError(f"Stack {stack_name!r} selects unknown Unit templates: {', '.join(unknown)}")
-    selected_names = set(names)
-    for resource in resources:
-        if resource.name in selected_names:
-            omitted = sorted(set(resource.dependsOn) - selected_names)
-            if omitted:
-                raise OperationError(
-                    f"Stack {stack_name!r} selects {resource.name!r} but omits dependencies: {', '.join(omitted)}"
-                )
-    return tuple(resource for resource in resources if resource.name in selected_names)
-
-
-def _stack_source_pin_prefix(environment: str, stack_name: str, uid: str) -> str:
-    """Return the controller-pin namespace owned by one Stack incarnation."""
-
-    return f"stacks/{environment}/{stack_name}/{uid}/"
-
-
-def _stack_source_pin_name(environment: str, stack_name: str, uid: str, revision: str) -> str:
-    """Name one immutable repository-local StackTemplate source pin."""
-
-    return f"{_stack_source_pin_prefix(environment, stack_name, uid)}{revision}"
-
-
-def _required_stack_source_pins(environment: str, desired_root: Path) -> tuple[tuple[str, str], ...]:
-    """Collect exact local source commits referenced by desired Stacks.
-
-    Remote Git sources cannot be retained by refs in the deployment repository;
-    their recorded remote and commit remain the external durability contract.
-    """
-
-    required: set[tuple[str, str]] = set()
-    for resource in load_desired_resource_graph(desired_root, validate=False).values():
-        if not isinstance(resource, StackResource) or resource.gvk.kind != "Stack":
-            continue
-        if not isinstance(resource.spec, DesiredStackSpec) or resource.spec.resolvedSource is None:
-            continue
-        source = resource.spec.resolvedSource.fromGit
-        if source.path is None:
-            continue
-        if resource.metadata.uid is None:
-            raise OperationError(f"Stack {resource.name!r} has no UID")
-        required.add(
-            (
-                _stack_source_pin_name(environment, resource.name, resource.metadata.uid, source.commit),
-                source.commit,
-            )
-        )
-    return tuple(sorted(required))
-
-
-def _ensure_stack_source_pins(environment: str, desired_root: Path) -> tuple[ControllerPin, ...]:
-    """Retain every repository-local template commit before desired publication."""
-
-    required = _required_stack_source_pins(environment, desired_root)
-    if not required:
-        return ()
-    return state_store().create_controller_pins(dict(required))
-
-
-def _release_stack_source_pins(environment: str, stack_name: str, uid: str) -> bool:
-    """Release all exact source pins owned by one finalized Stack incarnation."""
-
-    prefix = _stack_source_pin_prefix(environment, stack_name, uid)
-    store = state_store()
-    pins = tuple(pin for pin in store.list_controller_pins() if pin.name.startswith(prefix))
-    for pin in pins:
-        suffix = pin.name.removeprefix(prefix)
-        if not re.fullmatch(r"[0-9a-f]{40}", suffix) or suffix != pin.revision:
-            raise OperationError(f"Stack {stack_name!r}: controller source pin has an invalid identity")
-    for pin in pins:
-        store.release_controller_pin(pin.name, pin.revision)
-    return bool(pins)
 
 
 def _parse_stack_parameters(raw: str) -> JsonObjectValue:
@@ -7266,6 +8081,318 @@ def reconciliation_artifact_effects(
     return effects
 
 
+def _materialize_durable_projection_source(
+    current_desired: Path,
+    environment_name: str,
+    destination: Path,
+    context_digest: str,
+) -> None:
+    """Create the minimal authored view needed to re-project persisted Stacks.
+
+    This source tree contains only durable Stack inputs and Project/
+    Environment policy from a retained reviewed source revision. Repository-
+    backed Unit sources are read from each template's retained immutable
+    sourceContext by ``project_stack_resources``; the live worktree is never
+    consulted.
+    """
+
+    destination.mkdir(parents=True, exist_ok=True)
+    resources = load_desired_resource_graph(current_desired, validate=False)
+    context = load_projection_context(current_desired, context_digest, environment_name)
+    project_file = _safe_context_basename(context["projectFile"], "projectFile")
+    environment_file = _safe_context_basename(context["environmentFile"], "environmentFile")
+    try:
+        project_bytes = base64.b64decode(cast(str, context["projectBytes"]), validate=True)
+        environment_bytes = base64.b64decode(cast(str, context["environmentBytes"]), validate=True)
+    except (ValueError, TypeError) as exc:
+        raise OperationError("durable projection context contains invalid document bytes") from exc
+    (destination / project_file).write_bytes(project_bytes)
+    project = load_project_config(destination)
+
+    target_environment = project_environment_root(destination, environment_name)
+    target_environment.mkdir(parents=True, exist_ok=True)
+    (target_environment / environment_file).write_bytes(environment_bytes)
+
+    template_directory = destination.joinpath(*project.stack_templates_path.parts)
+    stack_directory = target_environment / "stacks"
+    template_directory.mkdir(parents=True, exist_ok=True)
+    stack_directory.mkdir(parents=True, exist_ok=True)
+    for resource in resources.values():
+        if not isinstance(resource, StackResource) or resource_deletion(resource) is not None:
+            continue
+        if resource.gvk.kind == "StackTemplate":
+            if not isinstance(resource.spec, DesiredStackTemplateSpec):
+                raise OperationError(f"desired StackTemplate {resource.name!r} has an invalid specification")
+            authored = StackResource(
+                resource.gvk,
+                ResourceMetadata(name=resource.name),
+                StackTemplateSpec(
+                    parameters=list(resource.spec.parameters),
+                    unitTemplates=dict(resource.spec.unitTemplates),
+                ),
+            )
+            write_document(
+                template_directory / f"{resource.name}.yaml",
+                RESOURCE_CATALOG.serialize_stack_resource(authored, profile="authored"),
+                format=DocumentFormat.YAML,
+            )
+        elif resource.gvk.kind == "Stack":
+            if not isinstance(resource.spec, DesiredStackSpec):
+                raise OperationError(f"desired Stack {resource.name!r} has an invalid specification")
+            authored = StackResource(
+                resource.gvk,
+                ResourceMetadata(name=resource.name),
+                StackSpec(
+                    template=resource.spec.templateRef.name,
+                    parameters=resource.spec.parameters,
+                    units=resource.spec.units,
+                    artifactImports=resource.spec.artifactImports,
+                ),
+            )
+            write_document(
+                stack_directory / f"{resource.name}.yaml",
+                RESOURCE_CATALOG.serialize_stack_resource(authored, profile="authored"),
+                format=DocumentFormat.YAML,
+            )
+
+
+@dataclass(frozen=True)
+class DurablePublicationPolicy:
+    """Publication controls that must be identical for one durable snapshot."""
+
+    change_gate: str
+    candidate_ref_template: str
+    effect_lease_ref: str | None
+
+
+def _durable_publication_policy(
+    environment_name: str,
+    desired_ref: str,
+    context_root: Path,
+) -> DurablePublicationPolicy:
+    return DurablePublicationPolicy(
+        change_gate=change_gate(context_root, environment_name),
+        candidate_ref_template=candidate_ref_template(context_root, environment_name),
+        effect_lease_ref=effect_lease_ref(environment_name, desired_ref, context_root),
+    )
+
+
+def _validate_durable_publication_policies(
+    environment_name: str,
+    desired_ref: str,
+    resources: Mapping[tuple[str, str, str], UnitResource[Any] | StackResource],
+    context_sources: Mapping[str, Path],
+) -> tuple[str, Path]:
+    """Return the common publication context, or fail before publication."""
+
+    context_digests: set[str] = set()
+    for resource in resources.values():
+        if not isinstance(resource, StackResource) or resource.gvk.kind != "Stack":
+            continue
+        if not isinstance(resource.spec, DesiredStackSpec):
+            raise OperationError(f"desired Stack {resource.name!r} has no desired projection")
+        context_digests.add(resource.spec.structuralProjection.identity.projectionContextDigest)
+        active = resource.spec.activeProjection
+        if active is not None and active.units:
+            # Active Units can retain effect leases even while the structural
+            # projection is blocked, so their old context is part of the
+            # publication policy fence as well.
+            context_digests.add(active.projectionContextDigest)
+    if not context_digests:
+        raise OperationError("durable Stack projection has no bound publication context")
+
+    policies: list[tuple[str, DurablePublicationPolicy]] = []
+    for digest in sorted(context_digests):
+        context_root = context_sources.get(digest)
+        if context_root is None:
+            raise OperationError(f"durable Stack projection context {digest!r} was not materialized")
+        policies.append((digest, _durable_publication_policy(environment_name, desired_ref, context_root)))
+    common_digest, common_policy = policies[0]
+    for digest, policy in policies[1:]:
+        if policy != common_policy:
+            raise OperationError(
+                "durable Stack projection contexts have incompatible publication policies: "
+                f"{common_digest} has changeGate={common_policy.change_gate!r}, "
+                f"candidateRefTemplate={common_policy.candidate_ref_template!r}, "
+                f"effectLeaseRef={common_policy.effect_lease_ref!r}; "
+                f"{digest} has changeGate={policy.change_gate!r}, "
+                f"candidateRefTemplate={policy.candidate_ref_template!r}, "
+                f"effectLeaseRef={policy.effect_lease_ref!r}"
+            )
+    return common_digest, context_sources[common_digest]
+
+
+def progress_durable_stack_projection(
+    environment_name: str,
+    desired_ref: str,
+    observed_ref: str,
+) -> str | None:
+    """Re-project persisted Stack inputs after new observation evidence.
+
+    The desired ref is read and published with compare-and-swap semantics on
+    every attempt.  A concurrent desired update simply causes the complete
+    projection to be rebuilt from the newer snapshot.
+    """
+
+    for attempt in range(5):
+        current_revision = fetch_ref(desired_ref)
+        if current_revision is None:
+            return None
+        if attempt:
+            log_status("RETRY", f"durable Stack projection publish attempt {attempt + 1}/5")
+        try:
+            with tempfile.TemporaryDirectory(prefix="gitopsctr-durable-projection-") as directory:
+                temporary = Path(directory)
+                source_root = temporary / "source"
+                current = temporary / "current"
+                observed = temporary / "observed"
+                materialize_revision(current_revision, current)
+                if not (
+                    _current_desired_stack_paths(current, "Stack")
+                    or _current_desired_stack_paths(current, "StackTemplate")
+                ):
+                    return current_revision
+                current_resources = load_desired_resource_graph(current, validate=False)
+                stack_contexts: dict[str, str] = {}
+                for resource in current_resources.values():
+                    if not isinstance(resource, StackResource) or resource.gvk.kind != "Stack":
+                        continue
+                    if not isinstance(resource.spec, DesiredStackSpec):
+                        raise OperationError(f"desired Stack {resource.name!r} has no desired projection")
+                    digest = resource.spec.structuralProjection.identity.projectionContextDigest
+                    load_projection_context(current, digest, environment_name)
+                    stack_contexts[resource.name] = digest
+                if not stack_contexts:
+                    return current_revision
+                observed_revision = observed_tree(observed_ref, observed)
+                context_groups: dict[str, frozenset[str]] = {}
+                context_sources: dict[str, Path] = {}
+                baseline = current
+                for context_digest in sorted(set(stack_contexts.values())):
+                    context_groups[context_digest] = frozenset(
+                        name for name, digest in stack_contexts.items() if digest == context_digest
+                    )
+                    context_source = temporary / f"source-{context_digest.removeprefix('sha256:')}"
+                    context_sources[context_digest] = context_source
+                    _materialize_durable_projection_source(
+                        current,
+                        environment_name,
+                        context_source,
+                        context_digest,
+                    )
+                    if not source_root.exists() or not any(source_root.iterdir()):
+                        source_root = context_source
+                    next_candidate = temporary / f"candidate-{context_digest.removeprefix('sha256:')}"
+                    candidate_units = next_candidate / "units"
+                    candidate_units.mkdir(parents=True, exist_ok=True)
+                    # Seed persisted Units so receipt/artifact lookups can
+                    # authenticate external producers while this group is
+                    # resolved.  The resulting tree is complete before it
+                    # becomes the next group's immutable baseline.
+                    for unit_name, baseline_path in _current_desired_unit_paths(baseline).items():
+                        target_path = candidate_units / baseline_path.name
+                        shutil.copy2(baseline_path, target_path)
+                        baseline_unit = load_desired_unit(baseline_path, unit_name)
+                        if getattr(baseline_unit.spec, "materialization", None) is not None:
+                            copy_unit_materialization(baseline, next_candidate, unit_name, baseline_unit)
+                    build_desired_candidate(
+                        environment_name,
+                        context_source,
+                        None,
+                        baseline,
+                        observed,
+                        observed_revision,
+                        next_candidate,
+                        verbose=False,
+                        projection_stack_names=context_groups[context_digest],
+                    )
+                    # Projection only rewrites this context group. Carry the
+                    # rest of the complete baseline, including owned
+                    # materializations, contexts, tombstones, and retained
+                    # transition/active state, before advancing.
+                    _copy_unrelated_desired_resources(baseline, next_candidate, frozenset(), None)
+                    for baseline_path in document_candidates(baseline, "promotion"):
+                        target_path = next_candidate / baseline_path.name
+                        shutil.copy2(baseline_path, target_path)
+                    load_desired_resource_graph(next_candidate)
+                    validate_desired_resource_transition(baseline, next_candidate)
+                    baseline = next_candidate
+
+                candidate = baseline
+                final_resources = load_desired_resource_graph(candidate)
+                for resource in final_resources.values():
+                    if not isinstance(resource, StackResource) or resource.gvk.kind != "Stack":
+                        continue
+                    if not isinstance(resource.spec, DesiredStackSpec):
+                        continue
+                    active = resource.spec.activeProjection
+                    digests = {resource.spec.structuralProjection.identity.projectionContextDigest}
+                    if active is not None and active.units:
+                        digests.add(active.projectionContextDigest)
+                    for context_digest in sorted(digests):
+                        if context_digest in context_sources:
+                            continue
+                        context_source = temporary / f"source-{context_digest.removeprefix('sha256:')}"
+                        _materialize_durable_projection_source(
+                            current,
+                            environment_name,
+                            context_source,
+                            context_digest,
+                        )
+                        context_sources[context_digest] = context_source
+                _common_digest, source_root = _validate_durable_publication_policies(
+                    environment_name,
+                    desired_ref,
+                    final_resources,
+                    context_sources,
+                )
+                for current_path in document_candidates(current, "promotion"):
+                    target_path = candidate / current_path.name
+                    shutil.copy2(current_path, target_path)
+                if directory_files(current) == directory_files(candidate):
+                    return current_revision
+                candidate_id = candidate_identifier(
+                    "apply",
+                    environment_name,
+                    candidate,
+                    desired_ref,
+                    current_revision,
+                    {"durableProjection": True, "observedRevision": observed_revision},
+                )
+                candidate_ref = resolve_candidate_ref(
+                    source_root,
+                    environment_name,
+                    "apply",
+                    candidate_id,
+                )
+                revision, outcome = publish_desired_change(
+                    environment_name,
+                    candidate,
+                    desired_ref,
+                    current_revision,
+                    candidate_ref,
+                    f"Advance durable Stack projections in {environment_name}",
+                    f"Advance durable Stack projections in {environment_name}",
+                    "Re-project persisted StackTemplate and Stack inputs after new observation evidence.",
+                    False,
+                    current,
+                    request_change=False,
+                    configuration_root=source_root,
+                )
+                if outcome is not None:
+                    log_status(
+                        "CANDIDATE",
+                        f"{style_branch(candidate_ref)} at {describe_revision(revision)} targets "
+                        f"{style_branch(desired_ref)}",
+                    )
+                    return current_revision
+                return revision
+        except subprocess.CalledProcessError as exc:
+            if attempt == 4 or not retryable_push_failure(exc):
+                raise
+    raise OperationError(f"could not advance durable Stack projection on {desired_ref} after concurrent updates")
+
+
 def _command_reconcile(args: argparse.Namespace) -> bool:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
         raise OperationError(f"invalid unit name: {args.unit!r}")
@@ -7275,7 +8402,11 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         if verbose:
             log_status(status, message)
 
-    load_environment(REPOSITORY_ROOT, args.environment)
+    explicit_configuration = args.desired_ref is not None and args.observed_ref is not None
+    if not explicit_configuration:
+        # Default ref discovery is intentionally live; callers that provide
+        # both refs are handled from the desired Stack context below.
+        load_environment(REPOSITORY_ROOT, args.environment)
     if verbose:
         log_heading(f"Reconcile {style_unit(args.unit)}")
         log_status("START", f"environment {style_environment(args.environment)}")
@@ -7287,17 +8418,53 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         temporary = Path(temporary_directory)
         desired = temporary / "desired"
         observed = temporary / "observed"
-        desired_ref, observed_ref = deployment_refs(
-            REPOSITORY_ROOT,
-            args.environment,
-            args.desired_ref,
-            args.observed_ref,
-        )
-        lease_ref = effect_lease_ref(args.environment, desired_ref)
+        if explicit_configuration:
+            desired_ref = cast(str, args.desired_ref)
+            observed_ref = cast(str, args.observed_ref)
+        else:
+            desired_ref, observed_ref = deployment_refs(
+                REPOSITORY_ROOT,
+                args.environment,
+                args.desired_ref,
+                args.observed_ref,
+            )
+        lease_ref: str | None = None
         detail("REFS", f"desired {style_branch(desired_ref)}; observed {style_branch(observed_ref)}")
         observed_revision = observed_tree(observed_ref, observed)
         desired_revision = resolve_ref(desired_ref, args.desired_revision)
         materialize_revision(desired_revision, desired)
+        configuration_root = REPOSITORY_ROOT
+        if explicit_configuration:
+            resources = load_desired_resource_graph(desired, validate=False)
+            selected_unit = next(
+                (
+                    resource
+                    for resource in resources.values()
+                    if isinstance(resource, UnitResource) and resource.name == args.unit
+                ),
+                None,
+            )
+            selected_owner = (
+                resource_owner_reference(selected_unit) if isinstance(selected_unit, UnitResource) else None
+            )
+            if selected_owner is not None and selected_owner.kind == "Stack":
+                selected_stack = resources.get((CORE_API_VERSION, "Stack", selected_owner.name))
+                if isinstance(selected_stack, StackResource) and isinstance(selected_stack.spec, DesiredStackSpec):
+                    configuration_root = temporary / "stack-context"
+                    structural = selected_stack.spec.structuralProjection
+                    active = selected_stack.spec.activeProjection
+                    context_digest = structural.identity.projectionContextDigest
+                    if active is not None and active.sourceProjectionDigest != structural.identity.projectionDigest:
+                        context_digest = active.projectionContextDigest
+                    _materialize_durable_projection_source(
+                        desired,
+                        args.environment,
+                        configuration_root,
+                        context_digest,
+                    )
+        if configuration_root != REPOSITORY_ROOT:
+            load_environment(configuration_root, args.environment)
+        lease_ref = effect_lease_ref(args.environment, desired_ref, configuration_root)
         detail("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(desired_revision)}")
         detail(
             "OBSERVED",
@@ -7645,6 +8812,13 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                     for effect_status, message in artifact_effects:
                         log_status(effect_status, message)
                 return True
+        progressed_desired_revision = progress_durable_stack_projection(
+            args.environment,
+            desired_ref,
+            observed_ref,
+        )
+        if progressed_desired_revision is not None:
+            desired_revision = progressed_desired_revision
         write_reconcile_outputs(True)
         if verbose:
             log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully")
@@ -7781,7 +8955,19 @@ def command_converge(args: argparse.Namespace) -> None:
         raise OperationError("--max-steps must be a positive integer")
     if args.partition is not None:
         _resource_name(args.partition, "partition name")
-    desired_ref, observed_ref = deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
+    explicit_configuration = args.desired_ref is not None and args.observed_ref is not None
+    if explicit_configuration:
+        desired_ref = cast(str, args.desired_ref)
+        observed_ref = cast(str, args.observed_ref)
+        if desired_ref == observed_ref:
+            raise OperationError(f"{args.environment} desired and observed refs must differ")
+    else:
+        desired_ref, observed_ref = deployment_refs(
+            REPOSITORY_ROOT,
+            args.environment,
+            args.desired_ref,
+            args.observed_ref,
+        )
     apply_arguments = None
     if args.files:
         apply_arguments = argparse.Namespace(
@@ -7811,6 +8997,16 @@ def command_converge(args: argparse.Namespace) -> None:
                     raise OperationError(
                         "apply produced a reviewed candidate; merge it before converging the target desired state"
                     )
+            else:
+                # A producer may have published evidence independently of this
+                # converge invocation.  Re-project durable Stack intent before
+                # calculating the next coverage set so newly resolvable consumers
+                # enter the same convergence run without authored source input.
+                progress_durable_stack_projection(
+                    args.environment,
+                    desired_ref,
+                    observed_ref,
+                )
             desired_revision = fetch_ref(desired_ref)
             if desired_revision is None:
                 raise OperationError(f"desired ref {desired_ref!r} has no state; apply resources first")
@@ -8010,7 +9206,7 @@ def _load_apply_documents(
     source_root: Path | None = None,
     operation: str = "apply",
     revision_option: str = "--source-revision",
-) -> list[tuple[str, JsonObject]]:
+) -> list[ApplyInputDocument]:
     """Load a deterministic resource stream from live or revision-backed paths."""
 
     _validate_apply_input_selection(
@@ -8019,15 +9215,22 @@ def _load_apply_documents(
         operation=operation,
         revision_option=revision_option,
     )
-    loaded: list[tuple[str, JsonObject]] = []
+    loaded: list[ApplyInputDocument] = []
     paths: list[Path] = []
     for value in files:
         if value == "-":
+            raw_input = sys.stdin.read()
             try:
-                values = list(yaml.safe_load_all(sys.stdin.read()))
+                values = list(yaml.safe_load_all(raw_input))
+                nodes = list(yaml.compose_all(raw_input))
             except yaml.YAMLError as exc:
                 raise OperationError(f"standard input is invalid YAML: {exc}") from exc
-            for index, value_document in enumerate(values, 1):
+            parsed_documents = [
+                (value_document, node)
+                for value_document, node in zip(values, nodes, strict=False)
+                if value_document is not None and node is not None
+            ]
+            for index, (value_document, node) in enumerate(parsed_documents, 1):
                 if value_document is None:
                     continue
                 try:
@@ -8036,7 +9239,33 @@ def _load_apply_documents(
                     raise OperationError(f"standard input document {index} is invalid: {exc}") from exc
                 if not isinstance(document, dict):
                     raise OperationError(f"standard input document {index} must be a resource mapping")
-                loaded.append((f"stdin#{index}", document))
+                if len(parsed_documents) == 1:
+                    # A single stdin document is acquired as one opaque byte
+                    # stream.  This deliberately includes comments,
+                    # document markers, trailing whitespace, and separators.
+                    raw_document = raw_input.encode()
+                else:
+                    # For multi-document stdin, assign each byte to the
+                    # adjacent parsed document.  The first segment starts at
+                    # byte zero so leading comments and ``---`` belong to the
+                    # first document; each later segment starts at its node's
+                    # parser offset.  This gives deterministic, contiguous
+                    # provenance without pretending the YAML parser can
+                    # preserve comments in a JSON value.
+                    start = 0 if index == 1 else node.start_mark.index
+                    end = (
+                        len(raw_input)
+                        if index == len(parsed_documents)
+                        else parsed_documents[index][1].start_mark.index
+                    )
+                    raw_document = raw_input[start:end].encode()
+                loaded.append(
+                    ApplyInputDocument(
+                        origin=f"stdin#{index}",
+                        document=document,
+                        document_digest=f"sha256:{hashlib.sha256(raw_document).hexdigest()}",
+                    )
+                )
             continue
         path = _resolve_apply_input_path(
             value,
@@ -8062,11 +9291,19 @@ def _load_apply_documents(
             raise OperationError(f"apply input must be YAML or JSON: {value}")
     for path in paths:
         try:
-            loaded.append((str(path), RESOURCE_CATALOG.load_document(path)))
+            raw_document = path.read_bytes()
+            loaded.append(
+                ApplyInputDocument(
+                    origin=str(path),
+                    document=RESOURCE_CATALOG.load_document(path),
+                    document_digest=f"sha256:{hashlib.sha256(raw_document).hexdigest()}",
+                )
+            )
         except (DocumentFormatError, OperationError, OSError, RuntimeError) as exc:
             raise OperationError(f"{path}: {exc}") from exc
     identities: dict[tuple[str, str], str] = {}
-    for origin, document in loaded:
+    for item in loaded:
+        origin, document = item.origin, item.document
         api_version = document.get("apiVersion")
         kind = document.get("kind")
         metadata = document.get("metadata")
@@ -8099,6 +9336,16 @@ def _copy_apply_source_base(source: Path, destination: Path, environment: str) -
     target_environment = project_environment_root(destination, environment)
     for collection in ("units", "stacks"):
         shutil.rmtree(target_environment / collection, ignore_errors=True)
+    project = load_project_config(destination)
+    template_root = destination.joinpath(*project.stack_templates_path.parts)
+    if template_root.is_dir():
+        # StackTemplate resource documents are selected inputs and are
+        # rewritten below.  Everything else under this directory is payload
+        # for repository-backed Unit sources and must survive the copy.
+        for path in _document_paths(template_root).values():
+            document = load_json(path)
+            if document.get("kind") == "StackTemplate":
+                path.unlink()
 
 
 def _materialize_apply_worktree(destination: Path) -> None:
@@ -8126,25 +9373,71 @@ def _materialize_apply_worktree(destination: Path) -> None:
 def _write_apply_authored_documents(
     source: Path,
     environment: str,
-    documents: Sequence[tuple[str, JsonObject]],
+    documents: Sequence[ApplyInputDocument],
+    document_digests: dict[str, str] | None = None,
 ) -> tuple[list[UnitResource[Any]], list[StackResource]]:
     environment_root = project_environment_root(source, environment)
     environment_root.mkdir(parents=True, exist_ok=True)
     units: list[UnitResource[Any]] = []
     stacks: list[StackResource] = []
-    for origin, document in documents:
-        if _document_is_canonical_desired(document):
-            continue
+    for item in documents:
+        document = item.document
+        if document_digests is not None and document.get("kind") == "StackTemplate":
+            metadata_value = document.get("metadata")
+            name = metadata_value.get("name") if isinstance(metadata_value, dict) else None
+            if isinstance(name, str):
+                document_digests[name] = item.document_digest
         kind = document.get("kind")
         metadata = document.get("metadata")
         assert isinstance(metadata, dict)
         name = cast(str, metadata["name"])
+        if _document_is_canonical_desired(document):
+            if kind == "StackTemplate":
+                desired = RESOURCE_CATALOG.parse_stack_template(document, profile="desired", expected_name=name)
+                if not desired.metadata.is_root or resource_deletion(desired) is not None:
+                    raise OperationError(f"canonical StackTemplate {name!r} must be a non-deleting root")
+                assert isinstance(desired.spec, DesiredStackTemplateSpec)
+                normalized = StackResource(
+                    desired.gvk,
+                    ResourceMetadata(name=name),
+                    StackTemplateSpec(
+                        parameters=list(desired.spec.parameters),
+                        unitTemplates=dict(desired.spec.unitTemplates),
+                    ),
+                )
+                directory = source.joinpath(*load_project_config(source).stack_templates_path.parts)
+                document = RESOURCE_CATALOG.serialize_stack_resource(normalized, profile="authored")
+            elif kind == "Stack":
+                desired = RESOURCE_CATALOG.parse_stack(document, profile="desired", expected_name=name)
+                if not desired.metadata.is_root or resource_deletion(desired) is not None:
+                    raise OperationError(f"canonical Stack {name!r} must be a non-deleting root")
+                assert isinstance(desired.spec, DesiredStackSpec)
+                normalized = StackResource(
+                    desired.gvk,
+                    ResourceMetadata(name=name),
+                    StackSpec(
+                        template=desired.spec.templateRef.name,
+                        parameters=desired.spec.parameters,
+                        units=desired.spec.units,
+                        artifactImports=desired.spec.artifactImports,
+                    ),
+                )
+                stacks.append(normalized)
+                directory = environment_root / "stacks"
+                document = RESOURCE_CATALOG.serialize_stack_resource(normalized, profile="authored")
+            else:
+                # Canonical materialized Units are checked and rejected in
+                # command_apply because their immutable materialization tree
+                # cannot be carried through -f input.
+                continue
         if kind == "Stack":
-            resource = RESOURCE_CATALOG.parse_stack(document, profile="authored", expected_name=name)
-            stacks.append(resource)
+            if not stacks or stacks[-1].name != name:
+                resource = RESOURCE_CATALOG.parse_stack(document, profile="authored", expected_name=name)
+                stacks.append(resource)
             directory = environment_root / "stacks"
         elif kind == "StackTemplate":
-            raise OperationError(f"{origin}: apply StackTemplate directly is not supported; apply a Stack")
+            RESOURCE_CATALOG.parse_stack_template(document, profile="authored", expected_name=name)
+            directory = source.joinpath(*load_project_config(source).stack_templates_path.parts)
         else:
             resource = RESOURCE_CATALOG.parse_unit(document, profile="authored", expected_name=name)
             units.append(resource)
@@ -8168,44 +9461,34 @@ def _validate_apply_source_revision(
             raise OperationError(
                 f"Unit {unit.name!r} uses repository-backed source; apply it with --source-revision <commit>"
             )
-    for stack in stacks:
-        assert isinstance(stack.spec, StackSpec)
-        template = _stack_template_reference(stack.spec)
-        requires_revision = isinstance(template.source, StackTemplateFromResource)
-        if isinstance(template.source, StackTemplateFromGit):
-            request = template.source.fromGit
-            requires_revision = request.path == "." and request.commit is None and request.ref is None
-        if requires_revision:
-            raise OperationError(
-                f"Stack {stack.name!r} uses repository-backed StackTemplate {template.name!r}; "
-                "apply it with --source-revision <commit>"
-            )
+    # Stack source selection is deliberately not a source mode. The desired
+    # StackTemplate is resolved from the complete candidate graph by the
+    # projection engine, which also validates any stored source context.
 
 
 def _applied_root_closure(
     candidate: Path,
     roots: Sequence[UnitResource[Any] | StackResource],
 ) -> frozenset[tuple[str, str, str]]:
-    """Return physical roots applied by this request, including selected resource templates."""
+    """Return only the independently supplied roots applied by this request."""
 
-    candidate_resources = load_desired_resource_graph(candidate, validate=False)
+    return frozenset((resource.gvk.api_version, resource.gvk.kind, resource.name) for resource in roots)
+
+
+def _explicit_applied_root_identities(
+    documents: Sequence[ApplyInputDocument],
+    roots: Sequence[UnitResource[Any] | StackResource],
+) -> frozenset[tuple[str, str, str]]:
+    """Return the independently supplied roots, including explicit templates."""
+
     applied = {(resource.gvk.api_version, resource.gvk.kind, resource.name) for resource in roots}
-    for resource in roots:
-        if not isinstance(resource, StackResource) or resource.gvk.kind != "Stack":
-            continue
-        projected = candidate_resources.get((resource.gvk.api_version, resource.gvk.kind, resource.name))
-        if not isinstance(projected, StackResource) or not isinstance(projected.spec, DesiredStackSpec):
-            raise OperationError(f"applied Stack {resource.name!r} was not projected into desired state")
-        template = cast(StackTemplateReference, projected.spec.template)
-        if not isinstance(template.source, StackTemplateFromResource):
-            continue
-        template_key = (CORE_API_VERSION, "StackTemplate", template.name)
-        selected_template = candidate_resources.get(template_key)
-        if not isinstance(selected_template, StackResource) or selected_template.gvk.kind != "StackTemplate":
-            raise OperationError(
-                f"applied Stack {resource.name!r} selected StackTemplate {template.name!r}, but it was not persisted"
-            )
-        applied.add(template_key)
+    for item in documents:
+        document = item.document
+        kind = document.get("kind")
+        metadata = document.get("metadata")
+        name = metadata.get("name") if isinstance(metadata, dict) else None
+        if kind == "StackTemplate" and isinstance(name, str):
+            applied.add((CORE_API_VERSION, "StackTemplate", name))
     return frozenset(applied)
 
 
@@ -8261,6 +9544,34 @@ def _prune_omitted_partition_resources(
             )
 
 
+def _reject_applied_stacks_against_deleting_templates(
+    candidate: Path,
+    applied: frozenset[tuple[str, str, str]],
+) -> None:
+    """Reject an explicitly applied active Stack whose template was omitted and marked deleting."""
+
+    resources = load_desired_resource_graph(candidate, validate=False)
+    templates = {
+        resource.name: resource
+        for resource in resources.values()
+        if isinstance(resource, StackResource) and resource.gvk.kind == "StackTemplate"
+    }
+    for key in sorted(applied):
+        if key[1] != "Stack":
+            continue
+        stack = resources.get(key)
+        if not isinstance(stack, StackResource) or not isinstance(stack.spec, DesiredStackSpec):
+            continue
+        if resource_deletion(stack) is not None:
+            continue
+        template = templates.get(stack.spec.templateRef.name)
+        if template is not None and resource_deletion(template) is not None:
+            raise OperationError(
+                f"desired Stack {stack.name!r} references deleting StackTemplate {template.name!r}; "
+                "apply the StackTemplate explicitly or wait for the referrer to be removed"
+            )
+
+
 def command_apply(args: argparse.Namespace) -> str | None:
     """Resolve explicit resources and atomically publish one desired snapshot."""
 
@@ -8306,10 +9617,26 @@ def command_apply(args: argparse.Namespace) -> str | None:
                 "apply produced zero documents; specify --partition for authoritative empty membership"
             )
         _copy_apply_source_base(source, apply_source, args.environment)
-        authored_units, authored_stacks = _write_apply_authored_documents(apply_source, args.environment, documents)
+        stack_template_document_digests: dict[str, str] = {}
+        authored_units, authored_stacks = _write_apply_authored_documents(
+            apply_source,
+            args.environment,
+            documents,
+            stack_template_document_digests,
+        )
         _validate_apply_source_revision(source_revision, authored_units, authored_stacks)
         current_revision = observed_tree(desired_ref, current)
         observed_revision = observed_tree(observed_ref, observed)
+        persisted_promotion = (
+            load_promotion_context(current, temporary)
+            if any(item.document.get("kind") in {"Stack", "StackTemplate"} for item in documents)
+            else None
+        )
+        projection_context = (
+            capture_projection_context(apply_source, args.environment, persisted_promotion)
+            if any(item.document.get("kind") in {"Stack", "StackTemplate"} for item in documents)
+            else None
+        )
         build_desired_candidate(
             args.environment,
             apply_source,
@@ -8321,27 +9648,29 @@ def command_apply(args: argparse.Namespace) -> str | None:
             dry=args.dry,
             verbose=getattr(args, "verbose", False),
             partition=partition,
+            source_context_root=source if source_revision is not None else None,
+            stack_template_document_digests=stack_template_document_digests,
+            projection_context=projection_context,
         )
-        applied = set(_applied_root_closure(candidate, [*authored_units, *authored_stacks]))
-        for origin, document in documents:
+        applied = set(_explicit_applied_root_identities(documents, [*authored_units, *authored_stacks]))
+        for item in documents:
+            origin, document = item.origin, item.document
             if not _document_is_canonical_desired(document):
                 continue
             kind = cast(str, document["kind"])
             metadata = cast(dict[str, Any], document["metadata"])
             name = cast(str, metadata["name"])
             if kind in {"Stack", "StackTemplate"}:
-                resource = (
-                    RESOURCE_CATALOG.parse_stack(document, profile="desired", expected_name=name)
-                    if kind == "Stack"
-                    else RESOURCE_CATALOG.parse_stack_template(document, profile="desired", expected_name=name)
+                # Canonical controller resources were normalized into the
+                # authored candidate before projection. Their caller-supplied
+                # identity, acquisition, and projection fields are ignored.
+                continue
+            resource = RESOURCE_CATALOG.parse_unit(document, profile="desired", expected_name=name)
+            if getattr(resource.spec, "materialization", None) is not None:
+                raise OperationError(
+                    f"{origin}: canonical materialized Unit input is not supported because --file cannot "
+                    "carry its persisted materialization tree; apply the authored Unit instead"
                 )
-            else:
-                resource = RESOURCE_CATALOG.parse_unit(document, profile="desired", expected_name=name)
-                if getattr(resource.spec, "materialization", None) is not None:
-                    raise OperationError(
-                        f"{origin}: canonical materialized Unit input is not supported because --file cannot "
-                        "carry its persisted materialization tree; apply the authored Unit instead"
-                    )
             if resource_owner_reference(resource) is not None or resource_deletion(resource) is not None:
                 raise OperationError(f"{origin}: apply accepts only non-deleting root resources")
             previous = (
@@ -8371,6 +9700,7 @@ def command_apply(args: argparse.Namespace) -> str | None:
             applied.add((resource.gvk.api_version, resource.gvk.kind, resource.name))
         _copy_unrelated_desired_resources(current, candidate, frozenset(applied), partition)
         _prune_omitted_partition_resources(current, candidate, frozenset(applied), partition)
+        _reject_applied_stacks_against_deleting_templates(candidate, frozenset(applied))
         load_desired_resource_graph(candidate)
         if current_revision is None and not directory_files(candidate):
             log_status("KEEP", f"{style_branch(desired_ref)} remains empty")
@@ -8379,7 +9709,17 @@ def command_apply(args: argparse.Namespace) -> str | None:
             current_revision = _initialize_gated_desired_ref(source, args.environment, desired_ref, current)
         if current_revision is not None and directory_files(current) == directory_files(candidate):
             if not args.dry:
-                _ensure_stack_source_pins(args.environment, current)
+                validate_desired_resource_transition(current, candidate)
+                lease_ref = effect_lease_ref(args.environment, desired_ref)
+                validate_effect_leases_preserved(
+                    desired_ref,
+                    current_revision,
+                    candidate,
+                    current,
+                    lease_ref=lease_ref,
+                )
+                acquisition = _acquire_stack_template_source_pins(args.environment, candidate)
+                _promote_stack_template_source_pins(args.environment, candidate, acquisition)
             log_status("KEEP", f"{style_branch(desired_ref)} is already resolved")
             return current_revision
         candidate_id = candidate_identifier(
@@ -9106,6 +10446,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--candidate-ref",
         help="new Git ref for the candidate; defaults to a deterministic promotion ref",
     )
+    promote.add_argument("--dry", action="store_true")
     promote.set_defaults(handler=command_promote)
 
     rollback = commands.add_parser(

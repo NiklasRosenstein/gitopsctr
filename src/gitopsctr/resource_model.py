@@ -388,17 +388,13 @@ class StackInspectionPresenter:
     ) -> tuple[str, ...]:
         metadata = _mapping_field(record.document, "metadata")
         specification = _mapping_field(record.document, "spec")
-        template = specification.get("template")
-        if isinstance(template, str):
-            template_name = template
-        elif isinstance(template, dict) and isinstance(template.get("name"), str):
+        template = specification.get("templateRef")
+        if isinstance(template, dict) and isinstance(template.get("name"), str):
             template_name = cast(str, template["name"])
         else:
             template_name = "-"
-        projection = specification.get("resolvedProjection")
+        projection = specification.get("structuralProjection")
         units = projection.get("units") if isinstance(projection, dict) else None
-        if not isinstance(units, (dict, list)):
-            units = specification.get("units")
         unit_count = len(units) if isinstance(units, (dict, list)) else 0
         return (
             record.name,
@@ -421,12 +417,11 @@ class StackTemplateInspectionPresenter:
     ) -> tuple[str, ...]:
         specification = _mapping_field(record.document, "spec")
         parameters = specification.get("parameters")
-        projection = specification.get("resolvedProjection")
-        units = specification.get("unitTemplates") or specification.get("resources")
-        if isinstance(projection, dict):
-            units = projection.get("units", units)
+        units = specification.get("unitTemplates")
+        digest = specification.get("contentDigest")
         return (
             record.name,
+            digest if isinstance(digest, str) else "-",
             str(len(parameters)) if isinstance(parameters, list) else "0",
             str(len(units)) if isinstance(units, (list, dict)) else "0",
         )
@@ -803,6 +798,120 @@ class RelationshipResource:
     media_type: str | None = None
 
 
+@runtime_checkable
+class ResourceGraphBinding(Protocol):
+    """Executable identity fence for a desired resource relationship."""
+
+    def validate(self, source: object, target: object) -> None: ...
+
+    def documentation(self) -> tuple[str, ...]: ...
+
+
+@dataclass(frozen=True)
+class StackTemplateSelectionBinding:
+    """Fence a Stack's selected StackTemplate by name, UID, and content digest."""
+
+    def validate(self, source: object, target: object) -> None:
+        from gitopsctr.contracts import DesiredStackSpec, DesiredStackTemplateSpec
+        from gitopsctr.resources import StackResource
+
+        if not isinstance(source, StackResource) or not isinstance(target, StackResource):
+            raise ResourceModelError("StackTemplate selection binding requires Stack resources")
+        if target.gvk != GVK("gitopsctr.io/v1", "StackTemplate") or source.gvk != GVK("gitopsctr.io/v1", "Stack"):
+            raise ResourceModelError("StackTemplate selection binding has the wrong resource kinds")
+        if not isinstance(source.spec, DesiredStackSpec):
+            raise ResourceModelError(f"Stack {source.name!r} has an invalid specification")
+        reference = source.spec.templateRef
+        if reference.name != target.name:
+            raise ResourceModelError(f"Stack {source.name!r} references a different StackTemplate name")
+        if target.metadata.uid != reference.uid:
+            raise ResourceModelError(f"Stack {source.name!r} StackTemplate reference has a different UID")
+        if not isinstance(target.spec, DesiredStackTemplateSpec):
+            raise ResourceModelError(f"StackTemplate {target.name!r} is not a desired StackTemplate")
+        actual_digest = target.spec.contentDigest
+        if actual_digest != reference.contentDigest:
+            raise ResourceModelError(f"Stack {source.name!r} StackTemplate reference has a different content digest")
+        identity = source.spec.structuralProjection.identity
+        if source.metadata.uid != identity.stackUid:
+            raise ResourceModelError(f"Stack {source.name!r} projection is fenced to a different Stack UID")
+        if target.metadata.uid != identity.templateUid:
+            raise ResourceModelError(f"Stack {source.name!r} projection is fenced to a different StackTemplate UID")
+        if actual_digest != identity.templateContentDigest:
+            raise ResourceModelError(
+                f"Stack {source.name!r} projection is fenced to a different StackTemplate content digest"
+            )
+
+    def documentation(self) -> tuple[str, ...]:
+        return (
+            "Stack.apiVersion",
+            "Stack.kind",
+            "Stack.metadata.name",
+            "Stack.metadata.uid",
+            "Stack.spec.templateRef.name",
+            "Stack.spec.templateRef.uid",
+            "Stack.spec.templateRef.contentDigest",
+            "Stack.spec.structuralProjection.identity.stackUid",
+            "Stack.spec.structuralProjection.identity.templateUid",
+            "Stack.spec.structuralProjection.identity.templateContentDigest",
+            "StackTemplate.apiVersion",
+            "StackTemplate.kind",
+            "StackTemplate.metadata.name",
+            "StackTemplate.metadata.uid",
+            "StackTemplate.spec.contentDigest",
+        )
+
+
+@dataclass(frozen=True)
+class StackOwnedUnitBinding:
+    """Validate that a desired Unit is owned by the exact desired Stack UID."""
+
+    def validate(self, source: object, target: object) -> None:
+        from gitopsctr.resources import StackResource, UnitResource
+
+        if not isinstance(source, StackResource) or source.gvk != GVK("gitopsctr.io/v1", "Stack"):
+            raise ResourceModelError("Stack ownership binding requires a Stack source")
+        if not isinstance(target, UnitResource):
+            raise ResourceModelError("Stack ownership binding requires a Unit target")
+        references = target.metadata.ownerReferences
+        if references is None or len(references) != 1:
+            raise ResourceModelError(f"Unit {target.name!r} is not owned by a Stack")
+        owner = references[0]
+        if source.metadata.uid is None:
+            raise ResourceModelError(f"Stack {source.name!r} has no UID for ownership binding")
+        expected = (source.gvk.api_version, source.gvk.kind, source.name, source.metadata.uid)
+        if (owner.apiVersion, owner.kind, owner.name, owner.uid) != expected:
+            raise ResourceModelError(f"Unit {target.name!r} is owned by a different Stack UID")
+
+    def documentation(self) -> tuple[str, ...]:
+        return (
+            "Stack.apiVersion",
+            "Stack.kind",
+            "Stack.metadata.name",
+            "Stack.metadata.uid",
+            "Unit.apiVersion",
+            "Unit.kind",
+            "Unit.metadata.name",
+            "Unit.metadata.ownerReferences[0].apiVersion",
+            "Unit.metadata.ownerReferences[0].kind",
+            "Unit.metadata.ownerReferences[0].name",
+            "Unit.metadata.ownerReferences[0].uid",
+        )
+
+
+@dataclass(frozen=True)
+class ResourceGraphRelationship:
+    """A registry-owned relationship between independently stored resources."""
+
+    name: str
+    source_family: str
+    source_plane: ResourcePlane
+    target_family: str
+    target_plane: ResourcePlane
+    source_gvk: GVK | None
+    target_gvk: GVK | None
+    binding: ResourceGraphBinding
+
+
 @dataclass(frozen=True)
 class JsonFieldPath:
     parts: tuple[str, ...]
@@ -1092,6 +1201,7 @@ class ResourceRegistry:
     families: tuple[ResourceFamilyDefinition, ...]
     observations: tuple[ObservationDefinition, ...] = ()
     artifact_descriptions: tuple[ArtifactDescriptionDefinition, ...] = ()
+    graph_relationships: tuple[ResourceGraphRelationship, ...] = ()
     _collections_by_name: Mapping[str, ResourceCollection] = field(init=False, repr=False)
     _families_by_name: Mapping[str, ResourceFamilyDefinition] = field(init=False, repr=False)
     _families_by_selector: Mapping[str, ResourceFamilyDefinition] = field(init=False, repr=False)
@@ -1133,6 +1243,9 @@ class ResourceRegistry:
         for description in self.artifact_descriptions:
             self._claim_relationship_name(description.name, relationship_names)
             self._validate_artifact_description(description, families)
+        for relationship in self.graph_relationships:
+            self._claim_relationship_name(relationship.name, relationship_names)
+            self._validate_graph_relationship(relationship, families)
         self._validate_inspection_relationships(families)
         artifact_outputs = self._validate_driver_artifact_outputs(family_by_gvk)
 
@@ -1295,6 +1408,31 @@ class ResourceRegistry:
         if not isinstance(definition.binding, ArtifactDescriptionBinding):
             raise ResourceModelError(f"artifact description {definition.name!r} has no executable binding")
 
+    def _validate_graph_relationship(
+        self, definition: ResourceGraphRelationship, families: Mapping[str, ResourceFamilyDefinition]
+    ) -> None:
+        source = families.get(definition.source_family)
+        target = families.get(definition.target_family)
+        if source is None or target is None:
+            raise ResourceModelError(f"graph relationship {definition.name!r} references an unknown family")
+        if not self._has_placement(source, definition.source_plane):
+            raise ResourceModelError(f"graph relationship {definition.name!r} source plane is not placed")
+        if not self._has_placement(target, definition.target_plane):
+            raise ResourceModelError(f"graph relationship {definition.name!r} target plane is not placed")
+        source_kind = self.api_kinds.get(definition.source_gvk) if definition.source_gvk is not None else None
+        target_kind = self.api_kinds.get(definition.target_gvk) if definition.target_gvk is not None else None
+        if definition.source_gvk is not None and source_kind is None:
+            raise ResourceModelError(f"graph relationship {definition.name!r} references an unknown source GVK")
+        if definition.target_gvk is not None and target_kind is None:
+            raise ResourceModelError(f"graph relationship {definition.name!r} references an unknown target GVK")
+        family_by_gvk, _ = self._resolve_api_membership(families)
+        if definition.source_gvk is not None and family_by_gvk.get(definition.source_gvk) is not source:
+            raise ResourceModelError(f"graph relationship {definition.name!r} source GVK is outside its family")
+        if definition.target_gvk is not None and family_by_gvk.get(definition.target_gvk) is not target:
+            raise ResourceModelError(f"graph relationship {definition.name!r} target GVK is outside its family")
+        if not isinstance(definition.binding, ResourceGraphBinding):
+            raise ResourceModelError(f"graph relationship {definition.name!r} has no executable binding")
+
     def _validate_inspection_relationships(self, families: Mapping[str, ResourceFamilyDefinition]) -> None:
         observations = {definition.name: definition for definition in self.observations}
         descriptions = {definition.name: definition for definition in self.artifact_descriptions}
@@ -1436,6 +1574,12 @@ class ResourceRegistry:
         except StopIteration as exc:
             raise KeyError(f"unknown artifact-description relationship: {name!r}") from exc
 
+    def graph_relationship(self, name: str) -> ResourceGraphRelationship:
+        try:
+            return next(definition for definition in self.graph_relationships if definition.name == name)
+        except StopIteration as exc:
+            raise KeyError(f"unknown graph relationship: {name!r}") from exc
+
     def api_kinds_for_family(self, family: str) -> tuple[ApiKind[object], ...]:
         definition = self.family(family)
         return tuple(
@@ -1568,7 +1712,7 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             core("StackTemplate"),
             inspection=InspectionViewDefinition(
                 desired,
-                ("NAME", "PARAMETERS", "UNITS"),
+                ("NAME", "CONTENT-DIGEST", "PARAMETERS", "UNITS"),
                 StackTemplateInspectionPresenter(),
             ),
         ),
@@ -1636,4 +1780,26 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             ),
         ),
     )
-    return ResourceRegistry(api_kinds, collections, families, observations, artifact_descriptions)
+    graph_relationships = (
+        ResourceGraphRelationship(
+            "stack-selects-stacktemplate",
+            source_family="stack",
+            source_plane=desired,
+            target_family="stacktemplate",
+            target_plane=desired,
+            source_gvk=GVK(CORE_API_VERSION, "Stack"),
+            target_gvk=GVK(CORE_API_VERSION, "StackTemplate"),
+            binding=StackTemplateSelectionBinding(),
+        ),
+        ResourceGraphRelationship(
+            "stack-owns-unit",
+            source_family="stack",
+            source_plane=desired,
+            target_family="unit",
+            target_plane=desired,
+            source_gvk=GVK(CORE_API_VERSION, "Stack"),
+            target_gvk=None,
+            binding=StackOwnedUnitBinding(),
+        ),
+    )
+    return ResourceRegistry(api_kinds, collections, families, observations, artifact_descriptions, graph_relationships)

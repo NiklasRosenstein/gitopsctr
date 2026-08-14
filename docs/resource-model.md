@@ -40,3 +40,13 @@ subject violates the declared cardinality.
 
 Receipt artifact descriptors identify separately stored Artifact resources and bind their producer, media
 type, and serialized-byte digest. Artifact resources are not Receipt fields and are not Unit status.
+
+## Desired graph relationships
+
+| Relationship | Source | Target | Identity fence |
+| --- | --- | --- | --- |
+| stack-owns-unit | desired/stack | desired/unit | `Stack.apiVersion`, `Stack.kind`, `Stack.metadata.name`, `Stack.metadata.uid`, `Unit.apiVersion`, `Unit.kind`, `Unit.metadata.name`, `Unit.metadata.ownerReferences[0].apiVersion`, `Unit.metadata.ownerReferences[0].kind`, `Unit.metadata.ownerReferences[0].name`, `Unit.metadata.ownerReferences[0].uid` |
+| stack-selects-stacktemplate | desired/stack | desired/stacktemplate | `Stack.apiVersion`, `Stack.kind`, `Stack.metadata.name`, `Stack.metadata.uid`, `Stack.spec.templateRef.name`, `Stack.spec.templateRef.uid`, `Stack.spec.templateRef.contentDigest`, `Stack.spec.structuralProjection.identity.stackUid`, `Stack.spec.structuralProjection.identity.templateUid`, `Stack.spec.structuralProjection.identity.templateContentDigest`, `StackTemplate.apiVersion`, `StackTemplate.kind`, `StackTemplate.metadata.name`, `StackTemplate.metadata.uid`, `StackTemplate.spec.contentDigest` |
+
+Desired Stack relationships are registry contracts: a StackTemplate selection may be fenced by the
+template name, UID, and semantic content digest, while generated Units are fenced by the Stack owner UID.

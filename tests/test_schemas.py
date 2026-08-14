@@ -268,14 +268,18 @@ def test_generated_desired_schema_rejects_lifecycle_and_invalid_partition_metada
         Draft202012Validator(schema).validate(document)
 
 
-def test_desired_stack_template_schema_exposes_resolved_source_fields():
+def test_desired_stack_template_schema_exposes_direct_input_contract():
     schema = schemas.core_resource_schema("StackTemplate", "desired")
     spec = schema["properties"]["spec"]
 
-    assert "requestedSource" in spec["properties"]
-    assert "resolvedSource" in spec["properties"]
+    assert "contentDigest" in spec["properties"]
+    assert "acquisition" in spec["properties"]
+    assert "sourceContext" in spec["properties"]
+    assert "requestedSource" not in spec["properties"]
+    assert "resolvedSource" not in spec["properties"]
     assert "unitTemplates" in spec["properties"]
     assert "resources" not in spec["properties"]
+    assert set(spec["required"]) >= {"parameters", "unitTemplates", "contentDigest", "acquisition"}
 
 
 def test_authored_stack_template_schema_exposes_only_canonical_unit_templates():

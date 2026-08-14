@@ -56,10 +56,6 @@
             "fromEnvironment": {
               "additionalProperties": false,
               "properties": {
-                "dryFallback": {
-                  "$ref": "#/$defs/TemplateValue",
-                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                },
                 "pointer": {
                   "description": "JSON Pointer relative to the target Environment resource.",
                   "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -318,6 +314,30 @@
     "spec": {
       "additionalProperties": false,
       "properties": {
+        "acquisition": {
+          "additionalProperties": false,
+          "properties": {
+            "documentDigest": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "fromInput": {
+              "additionalProperties": false,
+              "title": "StackTemplateFromInput",
+              "type": "object"
+            }
+          },
+          "required": [
+            "documentDigest",
+            "fromInput"
+          ],
+          "title": "StackTemplateAcquisition",
+          "type": "object"
+        },
+        "contentDigest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
         "parameters": {
           "items": {
             "additionalProperties": false,
@@ -346,208 +366,20 @@
           },
           "type": "array"
         },
-        "requestedSource": {
-          "anyOf": [
-            {
-              "anyOf": [
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "fromResource": {
-                      "additionalProperties": false,
-                      "properties": {
-                        "name": {
-                          "anyOf": [
-                            {
-                              "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "default": null
-                        },
-                        "uid": {
-                          "anyOf": [
-                            {
-                              "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "default": null
-                        }
-                      },
-                      "title": "StackTemplateResourceReference",
-                      "type": "object"
-                    }
-                  },
-                  "title": "StackTemplateFromResource",
-                  "type": "object"
-                },
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "fromGit": {
-                      "additionalProperties": false,
-                      "properties": {
-                        "commit": {
-                          "anyOf": [
-                            {
-                              "pattern": "^[0-9a-f]{40}$",
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "default": null
-                        },
-                        "path": {
-                          "anyOf": [
-                            {
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "default": null
-                        },
-                        "ref": {
-                          "anyOf": [
-                            {
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "default": null
-                        },
-                        "remote": {
-                          "anyOf": [
-                            {
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "default": null
-                        }
-                      },
-                      "title": "GitSourceRequest",
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "fromGit"
-                  ],
-                  "title": "StackTemplateFromGit",
-                  "type": "object"
-                },
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "fromPromotion": {
-                      "additionalProperties": false,
-                      "properties": {
-                        "stack": {
-                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                          "type": "string"
-                        }
-                      },
-                      "required": [
-                        "stack"
-                      ],
-                      "title": "StackTemplatePromotionReference",
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "fromPromotion"
-                  ],
-                  "title": "StackTemplateFromPromotion",
-                  "type": "object"
-                }
-              ]
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "resolvedSource": {
+        "sourceContext": {
           "anyOf": [
             {
               "additionalProperties": false,
               "properties": {
-                "fromGit": {
-                  "additionalProperties": false,
-                  "properties": {
-                    "commit": {
-                      "pattern": "^[0-9a-f]{40}$",
-                      "type": "string"
-                    },
-                    "digest": {
-                      "pattern": "^[0-9a-f]{64}$",
-                      "type": "string"
-                    },
-                    "path": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null
-                    },
-                    "ref": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null
-                    },
-                    "remote": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null
-                    },
-                    "resourcePath": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "commit",
-                    "resourcePath",
-                    "digest"
-                  ],
-                  "title": "ResolvedGitSource",
-                  "type": "object"
+                "revision": {
+                  "pattern": "^[0-9a-f]{40}$",
+                  "type": "string"
                 }
               },
               "required": [
-                "fromGit"
+                "revision"
               ],
-              "title": "ResolvedStackTemplateSource",
+              "title": "StackTemplateSourceContext",
               "type": "object"
             },
             {
@@ -608,6 +440,12 @@
           "type": "object"
         }
       },
+      "required": [
+        "parameters",
+        "unitTemplates",
+        "contentDigest",
+        "acquisition"
+      ],
       "type": "object"
     }
   },

@@ -59,7 +59,7 @@ The built-in views use these columns, with `ENVIRONMENT` added for `-A`:
 | Environments | `NAME`, `DESIRED`, `OBSERVED`, reconciliation counts |
 | Units | `NAME`, `KIND`, `DESIRED`, `OBSERVATION`, `RECONCILIATION`, `REASON` |
 | Stacks | `NAME`, `TEMPLATE`, `PARTITION`, `UNITS`, `STATE` |
-| StackTemplates | `NAME`, `PARAMETERS`, `UNITS` |
+| StackTemplates | `NAME`, `CONTENT-DIGEST`, `PARAMETERS`, `UNITS` |
 | Promotions | `NAME`, `SOURCE`, pinned desired, observed, and specification revisions |
 | Receipts | `NAME`, subject `KIND`, `OBSERVATION`, `ARTIFACTS` |
 
@@ -102,6 +102,7 @@ authored inputs, and atomically publishes the resulting desired snapshot:
 ```console
 gitopsctr apply --environment dev \
   --partition application \
+  --file deployment/stack-templates/application.yaml \
   --file deployment/environments/dev/stacks/application.yaml \
   --source-revision HEAD
 gitopsctr reconcile --environment dev --unit application --plan
@@ -119,9 +120,9 @@ the driver inspect its work without applying changes or publishing a receipt; no
 receipt only after the driver succeeds.
 
 Without `--source-revision`, apply reads its explicit documents and source-less configuration from the current
-worktree. It does not silently substitute `HEAD` or create a hidden commit. If an authored Unit uses
-repository-backed `spec.source`, or a Stack selects a repository-local StackTemplate without its own exact Git
-commit, apply fails and asks for `--source-revision <commit>`.
+worktree. It does not silently substitute `HEAD` or create a hidden commit. If an inline StackTemplate or authored
+Unit uses repository-backed `spec.source`, apply fails and asks for `--source-revision <commit>`; the selected
+revision is persisted as the desired template's `sourceContext`.
 
 `--source-revision` selects the exact committed snapshot used for repository-backed paths and pins. In that mode,
 working-tree changes are excluded and apply reports that exclusion. Commit the intended content and select that
@@ -140,13 +141,15 @@ converge retain those exact inputs for the invocation and alternate apply with d
 ```console
 gitopsctr converge --environment dev \
   --partition application \
+  --file deployment/stack-templates/application.yaml \
   --file deployment/environments/dev/stacks/application.yaml \
   --source-revision HEAD \
   --yes
 ```
 
-Without `--file`, converge only reconciles current desired state; it cannot reconstruct authored input. If an
-observation unlocks another dynamic reference, invoke apply again with the explicit input or use `converge --file`.
+Without `--file`, converge reconciles current desired state and can re-project persisted StackTemplate/Stack
+inputs when new observation evidence unlocks a dynamic reference. No re-application of the original source files is
+required; provide `--file` only when intentionally changing authored input.
 
 ## Promote and verify
 
@@ -157,6 +160,7 @@ selected values or artifacts from the reviewed source state:
 gitopsctr promote \
   --from-environment dev \
   --to-environment staging \
+  --file deployment/stack-templates/application.yaml \
   --file deployment/environments/staging/stacks/application.yaml \
   --partition application \
   --specification-revision SOURCE_SHA
@@ -171,11 +175,9 @@ contains the target Environment, project configuration, and template sources.
 Pass the latter explicitly when `HEAD` might have advanced beyond the source revision reviewed in the source
 environment.
 
-Within the target specification, each Stack still chooses its own template mode. `template: application` reads the
-target template at `--specification-revision`; `fromGit` resolves the target-authored Git request; and
-`template.source.fromPromotion` follows the source Stack's already-recorded template commit and digest before applying
-the target Stack's parameters. Promoted field values and artifact imports are separate selectors, so a target-owned
-Stack can use either without promoting its template.
+Within the target specification, StackTemplate acquisition is direct-inline only for this slice. A promotion input must
+carry the target StackTemplate and Stack together; external Git and template-promotion acquisition modes are rejected.
+Promoted field values and artifact imports remain separate features for their respective later slices.
 
 The target Environment decides whether promotion is published directly or through a pull-request candidate. After a
 gated candidate is merged, reconcile or converge the target without a source revision because its specification and

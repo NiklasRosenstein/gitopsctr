@@ -1,13 +1,13 @@
 # Kubernetes Stack demo
 
-This demo uses one `StackTemplate` in two explicit-input workflows:
+This demo documents one `StackTemplate` in explicit-input workflows:
 
 - Normal mode applies the `dev` Stack as the authoritative `application` partition, then promotes its exact image
   artifact into the explicitly selected `staging` Stack.
 - `--preview` applies an unpartitioned Stack in the `preview` environment. Acceptance also reapplies it at a newer
   source revision and requests UID-fenced deletion.
 
-Normal mode combines three pinned inputs rather than copying dev's entire desired tree:
+The deferred promotion workflow combines three pinned inputs rather than copying dev's entire desired tree:
 
 ```mermaid
 flowchart LR
@@ -19,12 +19,10 @@ flowchart LR
   import --> staging
 ```
 
-The staging Stack uses `template.source.fromPromotion`, so the controller loads the exact StackTemplate commit and
-digest recorded by dev, then expands that original parameterized template with staging's workload name, message, and
-cluster settings. Its separate `artifactImports[].fromPromotion` selects the exact `image/containers` artifact proven
-in dev. Template lineage and image lineage are therefore explicit and independently inspectable. See
-[Promotion](../../docs/apis/promotion.md#how-target-desired-state-is-built) and
-[Stacks and StackTemplates](../../docs/apis/stacks.md#promotion-and-template-selection).
+The current direct-inline slice supports the `preview` workflow and direct StackTemplate application. Template
+promotion is deferred; the staging example retains its artifact-lineage documentation for the follow-up promotion
+slice. See [Promotion](../../docs/apis/promotion.md#how-target-desired-state-is-built) and
+[Stacks and StackTemplates](../../docs/apis/stacks.md#desired-state-records).
 
 The provider comes from `GITOPSCTR_K8S_PROVIDER` and defaults to `kind`:
 

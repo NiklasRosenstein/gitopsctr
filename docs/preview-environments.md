@@ -26,6 +26,7 @@ Apply it at a trusted source revision:
 ```console
 gitopsctr apply \
   --environment preview \
+  --file deployment/stack-templates/application.yaml \
   --file deployment/previews/pr-123.yaml \
   --source-revision "$GITHUB_SHA"
 ```
@@ -40,6 +41,7 @@ Use a partition when one CI invocation owns a complete set of roots:
 gitopsctr apply \
   --environment preview \
   --partition pull-request-123 \
+  --file deployment/stack-templates/application.yaml \
   --file deployment/previews/pr-123/
 ```
 
@@ -54,14 +56,16 @@ Pass the same explicit input to apply and reconcile repeatedly until the preview
 ```console
 gitopsctr converge \
   --environment preview \
+  --file deployment/stack-templates/application.yaml \
   --file deployment/previews/pr-123.yaml \
   --source-revision "$GITHUB_SHA" \
   --yes
 ```
 
-`converge` without `--file` reconciles persisted desired Units only. It cannot reconstruct authored configuration.
-`--partition NAME` selects every Unit rooted in that partition and is shorthand for passing those Unit names through
-`--unit`; with neither selector, converge targets the whole Environment.
+`converge` without `--file` reconciles persisted desired Units and can re-project the durable StackTemplate/Stack
+inputs when new evidence arrives. It does not reconstruct unrelated authored configuration. `--partition NAME`
+selects every Unit rooted in that partition and is shorthand for passing those Unit names through `--unit`; with
+neither selector, converge targets the whole Environment.
 
 ## Inspect and delete
 

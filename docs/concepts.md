@@ -76,7 +76,9 @@ follow the desired and observed trees.
 - **Verify** checks supported units for external drift without writing receipts.
 
 Because observations can unlock downstream desired inputs, convergence with explicit input may produce several
-desired and observed commits before it becomes clean. Convergence without input cannot reconstruct authored intent.
+desired and observed commits before it becomes clean. Convergence without input re-projects the durable
+StackTemplate/Stack intent after evidence changes, while ordinary standalone authored input still requires an
+explicit apply when it changes.
 
 ## Promotion and rollback
 
@@ -103,13 +105,11 @@ target desired state = target specification at specificationRevision
                      + selected inputs from source desiredRevision and observedRevision
 ```
 
-For example, a target Stack may expand a local StackTemplate from the pinned specification revision while importing
-an exact image artifact evidenced by the pinned source desired and observed revisions. Alternatively,
-`template.source.fromPromotion` follows the source Stack's recorded StackTemplate commit, path, and digest, then
-expands that parameterized template with the target Stack's parameters. It does not copy the source Stack's expanded
-Units, and it is not the switch that makes an operation a promotion. See [Stacks and
-StackTemplates](apis/stacks.md#promotion-and-template-selection) for the source-mode matrix and
-[Promotion](apis/promotion.md) for the complete lineage record.
+For example, a target Stack may use the directly supplied StackTemplate while importing an exact image artifact
+evidenced by the pinned source desired and observed revisions. StackTemplate promotion and external acquisition are
+deferred; the current contract does not copy or implicitly acquire a source StackTemplate. See [Stacks and
+StackTemplates](apis/stacks.md#desired-state-records) for the direct-inline contract and [Promotion](apis/promotion.md)
+for the lineage record.
 
 `changeGate: pullRequest` publishes promotion and rollback candidates for review; `changeGate: none` publishes them
 directly. Promotion normally requires every source unit to have a current receipt. Environments that contain only

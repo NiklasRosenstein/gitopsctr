@@ -100,7 +100,7 @@ def test_get_validates_scope_overrides_and_named_misses(repository: Path, capsys
     [
         (("environment", "dev"), ("NAME", "DESIRED", "OBSERVED", "RECONCILIATION"), "dev"),
         (("stacks", "--environment", "staging"), ("NAME", "TEMPLATE", "PARTITION", "UNITS", "STATE"), "web"),
-        (("stacktemplates", "--environment", "staging"), ("NAME", "PARAMETERS", "UNITS"), "web"),
+        (("stacktemplates", "--environment", "staging"), ("NAME", "CONTENT-DIGEST", "PARAMETERS", "UNITS"), "web"),
         (
             ("promotions", "--environment", "staging"),
             ("NAME", "SOURCE", "DESIRED-REVISION", "OBSERVED-REVISION", "SPECIFICATION-REVISION"),
