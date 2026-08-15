@@ -47,6 +47,12 @@ def test_get_all_renders_registry_defined_environment_tables(
     assert "CURRENT" in output
     assert "ENVIRONMENTS" not in output
 
+    wide = run_get(repository, capsys, "all", "--environment", "dev", "-o", "wide")
+    lines = wide.splitlines()
+    stack_section = lines.index("STACKS")
+    assert "UID" in lines[stack_section + 1].split()
+    assert "STRUCTURAL" in lines[stack_section + 1].split()
+
 
 def test_get_all_raw_output_is_always_one_provenance_list(repository: Path, capsys: pytest.CaptureFixture[str]) -> None:
     result = json.loads(run_get(repository, capsys, "all", "--environment", "dev", "-o", "json"))
@@ -56,6 +62,54 @@ def test_get_all_raw_output_is_always_one_provenance_list(repository: Path, caps
     assert {item["document"]["kind"] for item in result["items"]} >= {"Terraform", "Receipt"}
     assert {item["provenance"]["environment"] for item in result["items"]} == {"dev"}
     assert {item["provenance"]["plane"] for item in result["items"]} == {"desired", "observed"}
+
+
+def test_stack_tables_are_compact_by_default_and_preserve_details_in_wide_output(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stack = json.loads(run_get(repository, capsys, "stack", "web", "--environment", "staging", "-o", "json"))
+    template = json.loads(run_get(repository, capsys, "stacktemplate", "web", "--environment", "staging", "-o", "json"))
+    stack_uid = stack["metadata"]["uid"]
+    template_uid = template["metadata"]["uid"]
+    content_digest = template["spec"]["contentDigest"]
+
+    stacks = run_get(repository, capsys, "stacks", "--environment", "staging")
+    assert stacks.splitlines()[0].split() == [
+        "NAME",
+        "TEMPLATE",
+        "TEMPLATE-DIGEST",
+        "PARTITION",
+        "UNITS",
+        "OBSERVATION",
+        "STATE",
+    ]
+    assert stack_uid not in stacks
+    assert template_uid not in stacks
+    assert content_digest not in stacks
+    assert f"{content_digest[:19]}..." in stacks
+
+    templates = run_get(repository, capsys, "stacktemplates", "--environment", "staging")
+    assert templates.splitlines()[0].split() == [
+        "NAME",
+        "CONTENT-DIGEST",
+        "SOURCE",
+        "PARAMETERS",
+        "UNITS",
+        "PARTITION",
+        "REFERENCES",
+        "STATE",
+    ]
+    assert template_uid not in templates
+    assert content_digest not in templates
+    assert f"{content_digest[:19]}..." in templates
+
+    wide_stacks = run_get(repository, capsys, "stacks", "--environment", "staging", "-o", "wide")
+    wide_templates = run_get(repository, capsys, "stacktemplates", "--environment", "staging", "-o", "wide")
+    assert stack_uid in wide_stacks
+    assert template_uid in wide_stacks
+    assert content_digest in wide_stacks
+    assert template_uid in wide_templates
+    assert content_digest in wide_templates
 
 
 def test_get_all_across_environments_keeps_family_tables_and_namespace_columns(
@@ -176,7 +230,7 @@ def test_get_validates_scope_overrides_and_named_misses(repository: Path, capsys
     [
         (("environment", "dev"), ("NAME", "DESIRED", "OBSERVED", "RECONCILIATION"), "dev"),
         (
-            ("stacks", "--environment", "staging"),
+            ("stacks", "--environment", "staging", "-o", "wide"),
             (
                 "NAME",
                 "UID",
@@ -193,7 +247,7 @@ def test_get_validates_scope_overrides_and_named_misses(repository: Path, capsys
             "web",
         ),
         (
-            ("stacktemplates", "--environment", "staging"),
+            ("stacktemplates", "--environment", "staging", "-o", "wide"),
             (
                 "NAME",
                 "UID",
@@ -254,8 +308,8 @@ def test_get_stack_and_template_documents_preserve_fences_and_content(
         stack["spec"]["structuralProjection"]["identity"]["templateContentDigest"] == template["spec"]["contentDigest"]
     )
 
-    template_table = run_get(repository, capsys, "stacktemplate", "web", "--environment", "staging")
-    stack_table = run_get(repository, capsys, "stack", "web", "--environment", "staging")
+    template_table = run_get(repository, capsys, "stacktemplate", "web", "--environment", "staging", "-o", "wide")
+    stack_table = run_get(repository, capsys, "stack", "web", "--environment", "staging", "-o", "wide")
     assert "input(document=sha256:" in template_table
     assert "REFERENCES" in template_table and "web" in template_table
     assert "uid-web" in stack_table
@@ -327,6 +381,8 @@ def test_get_stacktemplate_inspection_renders_all_acquisition_modes(
         "staging",
         "--desired-ref",
         "gitopsctr/desired/acquisition-modes",
+        "-o",
+        "wide",
     )
 
     assert "input(document=sha256:" in output

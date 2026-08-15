@@ -54,11 +54,12 @@ resource and Environment.
 
 ### Tables and raw resources
 
-`-o table` is the default. Tables are operational views rather than stored API documents. In particular, the Units
-table joins desired Units with their separately stored Receipts to show `OBSERVATION` (`CURRENT`, `STALE`, `MISSING`,
-or `N/A`) and `RECONCILIATION` (`CLEAN`, `READY`, `WAIT`, or `MATERIALIZED`). The Receipts table reports `CURRENT`,
-`STALE`, or `ORPHAN` relative to the selected desired snapshot. These relationships are derived at read time; a
-Receipt is not embedded into Unit `status`.
+`-o table` is the default. Tables are operational views rather than stored API documents. `-o wide` adds identity
+fences, complete digests, acquisition lineage, and projection details where a resource family defines an expanded
+view. The Units table joins desired Units with their separately stored Receipts to show `OBSERVATION` (`CURRENT`,
+`STALE`, `MISSING`, or `N/A`) and `RECONCILIATION` (`CLEAN`, `READY`, `WAIT`, or `MATERIALIZED`). The Receipts table
+reports `CURRENT`, `STALE`, or `ORPHAN` relative to the selected desired snapshot. These relationships are derived at
+read time; a Receipt is not embedded into Unit `status`.
 
 The built-in views use these columns, with `ENVIRONMENT` added for `-A`:
 
@@ -66,18 +67,21 @@ The built-in views use these columns, with `ENVIRONMENT` added for `-A`:
 | --- | --- |
 | Environments | `NAME`, `DESIRED`, `OBSERVED`, reconciliation counts |
 | Units | `NAME`, `KIND`, `DESIRED`, `OBSERVATION`, `RECONCILIATION`, `REASON` |
-| Stacks | `NAME`, `UID`, `TEMPLATE`, `TEMPLATE-UID`, `TEMPLATE-DIGEST`, `PARTITION`, `STRUCTURAL`, `ACTIVE`, `TOPOLOGY`, `OBSERVATION`, `STATE` |
-| StackTemplates | `NAME`, `UID`, `CONTENT-DIGEST`, `ACQUISITION`, `SOURCE`, `PARAMETERS`, `UNITS`, `PARTITION`, `REFERENCES`, `STATE` |
+| Stacks | `NAME`, `TEMPLATE`, short `TEMPLATE-DIGEST`, `PARTITION`, active/structural `UNITS`, `OBSERVATION`, `STATE` |
+| StackTemplates | `NAME`, short `CONTENT-DIGEST`, short `SOURCE`, `PARAMETERS`, `UNITS`, `PARTITION`, `REFERENCES`, `STATE` |
 | Promotions | `NAME`, `SOURCE`, pinned desired, observed, and specification revisions |
 | Receipts | `NAME`, subject `KIND`, `OBSERVATION`, `ARTIFACTS` |
 
-Stack `TEMPLATE`, `TEMPLATE-UID`, and `TEMPLATE-DIGEST` are the name/UID/content fences for its selected desired
-StackTemplate. `STRUCTURAL` shows the intended projection identity, context, generated Unit kinds, and topology;
+The default Stack view keeps `TEMPLATE` and a short `TEMPLATE-DIGEST` for quick identification; `UNITS` is the
+active/structural projection count. In `-o wide`, Stack `TEMPLATE`, `TEMPLATE-UID`, and `TEMPLATE-DIGEST` are the
+name/UID/content fences for its selected desired StackTemplate. `STRUCTURAL` shows the intended projection identity,
+context, generated Unit kinds, and topology;
 `ACTIVE` shows the concrete activated projection and its source projection. `TOPOLOGY` shows each logical Unit and its
 dependencies. `OBSERVATION` is derived from UID-fenced child Units and their separate receipts, so it reports child
 observation states rather than embedded Stack status. `STATE` reports the Stack's deletion state.
 
-StackTemplate `ACQUISITION` reports `input`, `git`, or `promotion` distinctly. It includes the document digest and,
+The default StackTemplate view shortens its content digest and source revision. In `-o wide`, `ACQUISITION` reports
+`input`, `git`, or `promotion` distinctly. It includes the document digest and,
 for Git and promotion, the requested selector plus the resolved exact revision/lineage. Repository values are shown
 without credentials. `SOURCE` reports retained repository and exact revision context, and `REFERENCES` lists Stacks
 whose name/UID/content-digest binding selects that template. `PARTITION` follows the resource's authoritative apply

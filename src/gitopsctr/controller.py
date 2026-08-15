@@ -12577,7 +12577,7 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument("--desired-revision", help="exact desired commit; defaults to the desired ref head")
     get.add_argument("--observed-ref", help="override the environment's observed ref")
     get.add_argument("--observed-revision", help="exact observed commit; defaults to the observed ref head")
-    get.add_argument("-o", "--output", choices=("table", "yaml", "json"), default="table")
+    get.add_argument("-o", "--output", choices=("table", "wide", "yaml", "json"), default="table")
     get_artifacts = get.add_mutually_exclusive_group()
     get_artifacts.add_argument("--artifact", help="show one validated Artifact described by the Receipt")
     get_artifacts.add_argument(

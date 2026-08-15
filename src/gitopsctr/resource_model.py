@@ -94,6 +94,18 @@ class InspectionPresenter(Protocol):
     ) -> tuple[str, ...]: ...
 
 
+@runtime_checkable
+class WideInspectionPresenter(Protocol):
+    """Optional expanded table presenter for one inspectable resource family."""
+
+    def wide_row(
+        self,
+        record: InspectionRecord,
+        relationship: object | None,
+        runtime: InspectionRuntime,
+    ) -> tuple[str, ...]: ...
+
+
 class ObservationCardinality(StrEnum):
     ZERO_OR_ONE = "zero-or-one"
 
@@ -440,12 +452,14 @@ def _acquisition(specification: Mapping[str, JsonValue]) -> str:
     return f"{mode}(document={document_digest})"
 
 
-def _source_context(specification: Mapping[str, JsonValue]) -> str:
+def _source_context(specification: Mapping[str, JsonValue], *, short_revision: bool = False) -> str:
     context = _mapping_field(specification, "sourceContext")
     if not context:
         return "-"
     repository = _credential_free_repository(context.get("repository"))
     revision = context.get("revision", "-")
+    if short_revision:
+        revision = _short_revision(revision)
     return f"{repository}@{revision}"
 
 
@@ -487,6 +501,12 @@ def _projection_summary(projection: object, *, active: bool) -> str:
             else:
                 rendered_units.append(f"{logical_name}:{unit.get('kind', '-')}")
     return f"{prefix} context={_short_digest(context_digest)} units={','.join(rendered_units) or '-'}"
+
+
+def _projection_unit_readiness(specification: Mapping[str, JsonValue]) -> str:
+    structural = _mapping_field(_mapping_field(specification, "structuralProjection"), "units")
+    active = _mapping_field(_mapping_field(specification, "activeProjection"), "units")
+    return f"{len(active)}/{len(structural)}"
 
 
 def _enum_value(value: object, description: str) -> str:
@@ -551,6 +571,25 @@ class StackInspectionPresenter:
     ) -> tuple[str, ...]:
         metadata = _mapping_field(record.document, "metadata")
         specification = _mapping_field(record.document, "spec")
+        summary = runtime.stack_inspection_summary(record)
+        return (
+            record.name,
+            summary.template_name or "-",
+            _short_digest(summary.template_digest),
+            runtime.resource_partition(record) or "-",
+            _projection_unit_readiness(specification),
+            ",".join(summary.child_observations) or "N/A",
+            _deletion_state(metadata),
+        )
+
+    def wide_row(
+        self,
+        record: InspectionRecord,
+        relationship: object | None,
+        runtime: InspectionRuntime,
+    ) -> tuple[str, ...]:
+        metadata = _mapping_field(record.document, "metadata")
+        specification = _mapping_field(record.document, "spec")
         structural_projection = specification.get("structuralProjection")
         if not isinstance(structural_projection, dict):
             structural_projection = {}
@@ -575,6 +614,28 @@ class StackTemplateInspectionPresenter:
     """Present desired StackTemplate provenance, partition, and references."""
 
     def row(
+        self,
+        record: InspectionRecord,
+        relationship: object | None,
+        runtime: InspectionRuntime,
+    ) -> tuple[str, ...]:
+        metadata = _mapping_field(record.document, "metadata")
+        specification = _mapping_field(record.document, "spec")
+        parameters = specification.get("parameters")
+        units = specification.get("unitTemplates")
+        summary = runtime.stack_inspection_summary(record)
+        return (
+            record.name,
+            _short_digest(specification.get("contentDigest")),
+            _source_context(specification, short_revision=True),
+            str(len(parameters)) if isinstance(parameters, list) else "0",
+            str(len(units)) if isinstance(units, (list, dict)) else "0",
+            runtime.resource_partition(record) or "-",
+            ",".join(summary.references) or "-",
+            _deletion_state(metadata),
+        )
+
+    def wide_row(
         self,
         record: InspectionRecord,
         relationship: object | None,
@@ -656,6 +717,10 @@ class InspectionViewDefinition:
     presenter: InspectionPresenter
     observation: str | None = None
     artifact_description: str | None = None
+    wide_columns: tuple[str, ...] | None = None
+
+    def columns_for(self, *, wide: bool) -> tuple[str, ...]:
+        return self.wide_columns if wide and self.wide_columns is not None else self.columns
 
 
 @dataclass(frozen=True)
@@ -1506,6 +1571,17 @@ class ResourceRegistry:
                 raise ResourceModelError(f"resource family {family.name!r} inspection columns must be headings")
             if not isinstance(family.inspection.presenter, InspectionPresenter):
                 raise ResourceModelError(f"resource family {family.name!r} inspection has no executable presenter")
+            if family.inspection.wide_columns is not None:
+                if (
+                    not family.inspection.wide_columns
+                    or len(set(family.inspection.wide_columns)) != len(family.inspection.wide_columns)
+                    or any(not column or column.upper() != column for column in family.inspection.wide_columns)
+                ):
+                    raise ResourceModelError(f"resource family {family.name!r} has invalid wide inspection columns")
+                if not isinstance(family.inspection.presenter, WideInspectionPresenter):
+                    raise ResourceModelError(
+                        f"resource family {family.name!r} wide inspection has no executable presenter"
+                    )
             default = next(placement for placement in family.placements if placement.default_for_inspection)
             if family.inspection.default_plane is not default.plane:
                 raise ResourceModelError(
@@ -1871,6 +1947,16 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
                 desired,
                 (
                     "NAME",
+                    "TEMPLATE",
+                    "TEMPLATE-DIGEST",
+                    "PARTITION",
+                    "UNITS",
+                    "OBSERVATION",
+                    "STATE",
+                ),
+                StackInspectionPresenter(),
+                wide_columns=(
+                    "NAME",
                     "UID",
                     "TEMPLATE",
                     "TEMPLATE-UID",
@@ -1882,7 +1968,6 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
                     "OBSERVATION",
                     "STATE",
                 ),
-                StackInspectionPresenter(),
             ),
         ),
         ResourceFamilyDefinition(
@@ -1898,6 +1983,17 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
                 desired,
                 (
                     "NAME",
+                    "CONTENT-DIGEST",
+                    "SOURCE",
+                    "PARAMETERS",
+                    "UNITS",
+                    "PARTITION",
+                    "REFERENCES",
+                    "STATE",
+                ),
+                StackTemplateInspectionPresenter(),
+                wide_columns=(
+                    "NAME",
                     "UID",
                     "CONTENT-DIGEST",
                     "ACQUISITION",
@@ -1908,7 +2004,6 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
                     "REFERENCES",
                     "STATE",
                 ),
-                StackTemplateInspectionPresenter(),
             ),
         ),
         ResourceFamilyDefinition(

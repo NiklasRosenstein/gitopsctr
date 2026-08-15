@@ -24,6 +24,7 @@ from gitopsctr.resource_model import (
     ResourceModelError,
     ResourcePlane,
     ResourceScope,
+    WideInspectionPresenter,
 )
 
 
@@ -288,20 +289,27 @@ def _table_rows(
     *,
     include_environment: bool,
     inventory: InventorySession,
+    wide: bool = False,
 ) -> list[list[str]]:
     rows: list[list[str]] = []
     for result in results:
         assert family.inspection is not None
         try:
-            values = list(family.inspection.presenter.row(result.record, result.relationship, inventory))
+            if wide and family.inspection.wide_columns is not None:
+                presenter = family.inspection.presenter
+                if not isinstance(presenter, WideInspectionPresenter):
+                    raise ResourceModelError(f"{family.name} has no wide inspection presenter")
+                values = list(presenter.wide_row(result.record, result.relationship, inventory))
+            else:
+                values = list(family.inspection.presenter.row(result.record, result.relationship, inventory))
         except ResourceModelError as exc:
             raise OperationError(
                 f"could not present {family.singular} {result.record.name!r} at {result.record.path}: {exc}"
             ) from exc
-        if len(values) != len(family.inspection.columns):
+        columns = family.inspection.columns_for(wide=wide)
+        if len(values) != len(columns):
             raise OperationError(
-                f"resource family {family.name!r} presenter returned {len(values)} values for "
-                f"{len(family.inspection.columns)} columns"
+                f"resource family {family.name!r} presenter returned {len(values)} values for {len(columns)} columns"
             )
         if include_environment:
             values.insert(0, result.record.environment or "-")
@@ -402,13 +410,14 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
         _validate_all_options(args)
         with InventorySession(repository_root, RESOURCE_REGISTRY) as inventory:
             selected: list[tuple[ResourceFamilyDefinition, tuple[InspectionResult, ...]]] = []
+            table = args.output in {"table", "wide"}
             for family in _aggregate_families():
-                evaluate = args.output == "table" and (
+                evaluate = table and (
                     bool(family.inspection and family.inspection.observation)
                     or family.name in {"stack", "stacktemplate"}
                 )
                 selected.append((family, _select(inventory, family, args, evaluate=evaluate)))
-            if args.output == "table":
+            if table:
                 populated = tuple((family, results) for family, results in selected if results)
                 if not populated:
                     print("No resources found.")
@@ -418,7 +427,7 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
                         print()
                     print(family.plural.upper())
                     assert family.inspection is not None
-                    headers = list(family.inspection.columns)
+                    headers = list(family.inspection.columns_for(wide=args.output == "wide"))
                     if args.all_environments:
                         headers.insert(0, "ENVIRONMENT")
                     rows = _table_rows(
@@ -426,6 +435,7 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
                         results,
                         include_environment=args.all_environments,
                         inventory=inventory,
+                        wide=args.output == "wide",
                     )
                     _print_table(headers, rows)
             else:
@@ -442,7 +452,8 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
     _validate_options(args, family)
     with InventorySession(repository_root, RESOURCE_REGISTRY) as inventory:
         wants_artifacts = args.artifact is not None or args.artifacts
-        table = args.output == "table" and not wants_artifacts
+        table_output = args.output in {"table", "wide"}
+        table = table_output and not wants_artifacts
         evaluate = (table or wants_artifacts) and (
             bool(family.inspection.observation) or family.name in {"stack", "stacktemplate"}
         )
@@ -455,10 +466,11 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
                 results,
                 include_environment=args.all_environments,
                 inventory=inventory,
+                wide=args.output == "wide",
             )
-            headers = list(family.inspection.columns)
+            headers = list(family.inspection.columns_for(wide=args.output == "wide"))
             if args.all_environments and family is not inventory.registry.namespace_family:
                 headers.insert(0, "ENVIRONMENT")
             _print_table(headers, rows)
         else:
-            _print_documents(results, "yaml" if args.output == "table" else args.output)
+            _print_documents(results, "yaml" if table_output else args.output)
