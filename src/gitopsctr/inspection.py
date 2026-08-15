@@ -35,11 +35,27 @@ class InspectionResult:
     relationship: object | None = None
 
 
+ALL_SELECTOR = "all"
+
+
 def inspectable_selectors() -> tuple[str, ...]:
     """Return selectors from the semantic registry, not a CLI-owned kind list."""
 
+    selectors = {
+        selector for family in RESOURCE_REGISTRY.families if family.inspection for selector in family.selectors
+    }
+    selectors.add(ALL_SELECTOR)
+    return tuple(sorted(selectors))
+
+
+def _aggregate_families() -> tuple[ResourceFamilyDefinition, ...]:
+    """Return registry-defined inspection families inside an Environment namespace."""
+
     return tuple(
-        sorted(selector for family in RESOURCE_REGISTRY.families if family.inspection for selector in family.selectors)
+        family
+        for family in RESOURCE_REGISTRY.families
+        if family.inspection is not None
+        and next(item for item in family.placements if item.default_for_inspection).scope is ResourceScope.ENVIRONMENT
     )
 
 
@@ -79,6 +95,21 @@ def _validate_options(args: argparse.Namespace, family: ResourceFamilyDefinition
             raise OperationError("--artifact and --artifacts are available only for Receipt queries")
         if args.name is None:
             raise OperationError("Receipt artifact inspection requires a receipt name")
+
+
+def _validate_all_options(args: argparse.Namespace) -> None:
+    """Validate aggregate inspection without imposing one family's plane."""
+
+    if args.name is not None:
+        raise OperationError("get all does not accept a resource name")
+    if args.artifact is not None or args.artifacts:
+        raise OperationError("get all does not accept --artifact or --artifacts")
+    if args.environment is None and not args.all_environments:
+        raise OperationError("get all requires --environment or --all-environments")
+    desired_override = args.desired_ref is not None or args.desired_revision is not None
+    observed_override = args.observed_ref is not None or args.observed_revision is not None
+    if args.all_environments and (desired_override or observed_override):
+        raise OperationError("deployment-ref overrides cannot be combined with --all-environments")
 
 
 def _records_for_environment(
@@ -309,8 +340,8 @@ def _envelope(results: Sequence[InspectionResult]) -> JsonObject:
     }
 
 
-def _print_documents(results: Sequence[InspectionResult], output: str) -> None:
-    document: JsonObject = results[0].record.document if len(results) == 1 else _envelope(results)
+def _print_documents(results: Sequence[InspectionResult], output: str, *, force_list: bool = False) -> None:
+    document: JsonObject = _envelope(results) if force_list or len(results) != 1 else results[0].record.document
     if output == "json":
         print(json.dumps(document, indent=2, sort_keys=False))
     else:
@@ -366,6 +397,41 @@ def _artifact_results(
 
 def command_get(repository_root: Path, args: argparse.Namespace) -> None:
     """Inspect persisted resources through registry-defined collections and relationships."""
+
+    if args.selector == ALL_SELECTOR:
+        _validate_all_options(args)
+        with InventorySession(repository_root, RESOURCE_REGISTRY) as inventory:
+            selected: list[tuple[ResourceFamilyDefinition, tuple[InspectionResult, ...]]] = []
+            for family in _aggregate_families():
+                evaluate = args.output == "table" and (
+                    bool(family.inspection and family.inspection.observation)
+                    or family.name in {"stack", "stacktemplate"}
+                )
+                selected.append((family, _select(inventory, family, args, evaluate=evaluate)))
+            if args.output == "table":
+                populated = tuple((family, results) for family, results in selected if results)
+                if not populated:
+                    print("No resources found.")
+                    return
+                for index, (family, results) in enumerate(populated):
+                    if index:
+                        print()
+                    print(family.plural.upper())
+                    assert family.inspection is not None
+                    headers = list(family.inspection.columns)
+                    if args.all_environments:
+                        headers.insert(0, "ENVIRONMENT")
+                    rows = _table_rows(
+                        family,
+                        results,
+                        include_environment=args.all_environments,
+                        inventory=inventory,
+                    )
+                    _print_table(headers, rows)
+            else:
+                results = tuple(result for _family, family_results in selected for result in family_results)
+                _print_documents(results, args.output, force_list=True)
+        return
 
     try:
         family = RESOURCE_REGISTRY.family(args.selector)

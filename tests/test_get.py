@@ -34,6 +34,43 @@ def test_get_environments_and_units_vertical_slice(repository: Path, capsys: pyt
     assert "external" in units and "N/A" in units and "MATERIALIZED" in units
 
 
+def test_get_all_renders_registry_defined_environment_tables(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = run_get(repository, capsys, "all", "--environment", "dev")
+    lines = output.splitlines()
+
+    assert lines[0] == "UNITS"
+    assert lines[1].split() == ["NAME", "KIND", "DESIRED", "OBSERVATION", "RECONCILIATION", "REASON"]
+    assert "application" in output and "external" in output
+    assert "\n\nRECEIPTS\n" in output
+    assert "CURRENT" in output
+    assert "ENVIRONMENTS" not in output
+
+
+def test_get_all_raw_output_is_always_one_provenance_list(repository: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    result = json.loads(run_get(repository, capsys, "all", "--environment", "dev", "-o", "json"))
+
+    assert result["apiVersion"] == "inspection.gitopsctr.io/v1"
+    assert result["kind"] == "ResourceList"
+    assert {item["document"]["kind"] for item in result["items"]} >= {"Terraform", "Receipt"}
+    assert {item["provenance"]["environment"] for item in result["items"]} == {"dev"}
+    assert {item["provenance"]["plane"] for item in result["items"]} == {"desired", "observed"}
+
+
+def test_get_all_across_environments_keeps_family_tables_and_namespace_columns(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = run_get(repository, capsys, "all", "-A")
+    lines = output.splitlines()
+
+    section_indexes = [index for index, line in enumerate(lines) if line in {"UNITS", "STACKS", "STACKTEMPLATES"}]
+    assert section_indexes
+    for index in section_indexes:
+        assert lines[index + 1].split()[0] == "ENVIRONMENT"
+    assert "dev" in output and "staging" in output
+
+
 def test_get_named_raw_document_and_multi_result_envelope(repository: Path, capsys: pytest.CaptureFixture[str]):
     raw = json.loads(run_get(repository, capsys, "unit", "application", "--environment", "dev", "-o", "json"))
     assert raw["apiVersion"] == "unit.gitopsctr.io/v1"
@@ -124,6 +161,14 @@ def test_get_validates_scope_overrides_and_named_misses(repository: Path, capsys
         run_get(repository, capsys, "units", "-A", "--desired-revision", "a" * 40)
     with pytest.raises(OperationError, match="no unit named 'missing'"):
         run_get(repository, capsys, "unit", "missing", "--environment", "dev")
+    with pytest.raises(OperationError, match="get all requires"):
+        run_get(repository, capsys, "all")
+    with pytest.raises(OperationError, match="does not accept a resource name"):
+        run_get(repository, capsys, "all", "application", "--environment", "dev")
+    with pytest.raises(OperationError, match="does not accept --artifact"):
+        run_get(repository, capsys, "all", "--environment", "dev", "--artifacts")
+    with pytest.raises(OperationError, match="cannot be combined"):
+        run_get(repository, capsys, "all", "-A", "--observed-revision", "a" * 40)
 
 
 @pytest.mark.parametrize(
@@ -544,6 +589,8 @@ def test_documented_get_commands_execute_across_dev_and_staging(repository: Path
     commands = (
         ("environments",),
         ("environment", "dev"),
+        ("all", "--environment", "dev"),
+        ("all", "-A"),
         ("units", "--environment", "dev"),
         ("unit", "application", "--environment", "dev"),
         ("units", "-A"),

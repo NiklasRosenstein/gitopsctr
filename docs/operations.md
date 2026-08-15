@@ -17,6 +17,8 @@ environment.
 ```console
 gitopsctr get environments
 gitopsctr get environment dev
+gitopsctr get all --environment dev
+gitopsctr get all -A
 gitopsctr get units --environment dev
 gitopsctr get units -A
 gitopsctr get unit application--deploy --environment dev
@@ -39,6 +41,12 @@ every matching resource and includes its Environment, which is useful when names
 ```console
 gitopsctr get unit application--deploy -A
 ```
+
+`get all` is the namespace overview, analogous to `kubectl get all`. It queries every registry-defined,
+environment-scoped inspection family and prints one table section per family that has results. This includes Units,
+Stacks, StackTemplates, Promotions, and Receipts; project-scoped Environments and Receipt-owned Artifacts keep their
+dedicated selectors. With `-o yaml` or `-o json`, the aggregate is always one provenance-bearing `ResourceList`, even
+when it contains zero or one resource.
 
 `--environment` and `-A/--all-environments` are mutually exclusive. Project-scoped Environment queries need neither.
 A collection with no matches succeeds with an empty table; a named lookup with no matches fails and identifies the
