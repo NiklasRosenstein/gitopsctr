@@ -29,9 +29,27 @@ def test_get_environments_and_units_vertical_slice(repository: Path, capsys: pyt
     assert "wait=1" in environments
 
     units = run_get(repository, capsys, "units", "--environment", "dev")
-    assert units.splitlines()[0].split() == ["NAME", "KIND", "DESIRED", "OBSERVATION", "RECONCILIATION", "REASON"]
+    assert units.splitlines()[0].split() == [
+        "NAME",
+        "KIND",
+        "PARTITION",
+        "DESIRED",
+        "OBSERVATION",
+        "RECONCILIATION",
+        "REASON",
+    ]
     assert "application" in units and "CURRENT" in units and "CLEAN" in units
     assert "external" in units and "N/A" in units and "MATERIALIZED" in units
+    rows = {parts[0]: parts for line in units.splitlines()[1:] if (parts := line.split())}
+    assert rows["application"][2] == "application"
+
+    receipts = run_get(repository, capsys, "receipts", "--environment", "dev")
+    receipt_rows = {parts[0]: parts for line in receipts.splitlines()[1:] if (parts := line.split())}
+    assert receipt_rows["application"][2] == "application"
+
+    promotions = run_get(repository, capsys, "promotions", "--environment", "dev")
+    promotion_rows = {parts[0]: parts for line in promotions.splitlines()[1:] if (parts := line.split())}
+    assert promotion_rows["dev"][2] == "-"
 
 
 def test_get_all_renders_registry_defined_environment_tables(
@@ -41,7 +59,15 @@ def test_get_all_renders_registry_defined_environment_tables(
     lines = output.splitlines()
 
     assert lines[0] == "UNITS"
-    assert lines[1].split() == ["NAME", "KIND", "DESIRED", "OBSERVATION", "RECONCILIATION", "REASON"]
+    assert lines[1].split() == [
+        "NAME",
+        "KIND",
+        "PARTITION",
+        "DESIRED",
+        "OBSERVATION",
+        "RECONCILIATION",
+        "REASON",
+    ]
     assert "application" in output and "external" in output
     assert "\n\nRECEIPTS\n" in output
     assert "CURRENT" in output
@@ -264,10 +290,21 @@ def test_get_validates_scope_overrides_and_named_misses(repository: Path, capsys
         ),
         (
             ("promotions", "--environment", "staging"),
-            ("NAME", "SOURCE", "DESIRED-REVISION", "OBSERVED-REVISION", "SPECIFICATION-REVISION"),
+            (
+                "NAME",
+                "SOURCE",
+                "PARTITION",
+                "DESIRED-REVISION",
+                "OBSERVED-REVISION",
+                "SPECIFICATION-REVISION",
+            ),
             "dev",
         ),
-        (("receipts", "--environment", "dev"), ("NAME", "KIND", "OBSERVATION", "ARTIFACTS"), "application"),
+        (
+            ("receipts", "--environment", "dev"),
+            ("NAME", "KIND", "PARTITION", "OBSERVATION", "ARTIFACTS"),
+            "application",
+        ),
     ],
 )
 def test_get_all_initial_inspection_tables(
@@ -511,7 +548,7 @@ def test_get_stack_tables_batch_inspection_preparation(
 
 def test_get_unit_desired_column_is_the_resource_blob(repository: Path, capsys: pytest.CaptureFixture[str]):
     output = run_get(repository, capsys, "unit", "application", "--environment", "dev")
-    desired = output.splitlines()[1].split()[2]
+    desired = output.splitlines()[1].split()[3]
     assert len(desired) == 12
     assert all(character in "0123456789abcdef" for character in desired)
 

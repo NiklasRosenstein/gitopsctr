@@ -66,11 +66,11 @@ The built-in views use these columns, with `ENVIRONMENT` added for `-A`:
 | Resource | Default columns |
 | --- | --- |
 | Environments | `NAME`, `DESIRED`, `OBSERVED`, reconciliation counts |
-| Units | `NAME`, `KIND`, `DESIRED`, `OBSERVATION`, `RECONCILIATION`, `REASON` |
+| Units | `NAME`, `KIND`, `PARTITION`, `DESIRED`, `OBSERVATION`, `RECONCILIATION`, `REASON` |
 | Stacks | `NAME`, `TEMPLATE`, short `TEMPLATE-DIGEST`, `PARTITION`, active/structural `UNITS`, `OBSERVATION`, `STATE` |
 | StackTemplates | `NAME`, short `CONTENT-DIGEST`, short `SOURCE`, `PARAMETERS`, `UNITS`, `PARTITION`, `REFERENCES`, `STATE` |
-| Promotions | `NAME`, `SOURCE`, pinned desired, observed, and specification revisions |
-| Receipts | `NAME`, subject `KIND`, `OBSERVATION`, `ARTIFACTS` |
+| Promotions | `NAME`, `SOURCE`, `PARTITION`, pinned desired, observed, and specification revisions |
+| Receipts | `NAME`, subject `KIND`, subject `PARTITION`, `OBSERVATION`, `ARTIFACTS` |
 
 The default Stack view keeps `TEMPLATE` and a short `TEMPLATE-DIGEST` for quick identification; `UNITS` is the
 active/structural projection count. In `-o wide`, Stack `TEMPLATE`, `TEMPLATE-UID`, and `TEMPLATE-DIGEST` are the
@@ -91,6 +91,10 @@ the selected desired and observed snapshots at read time.
 For Units, `DESIRED` is the short Git blob identity of that exact persisted Unit document—the same identity used by a
 Receipt's freshness binding. It is intentionally per-resource rather than repeating the desired snapshot commit on
 every row.
+
+Every environment-scoped table includes `PARTITION`. Desired resources resolve it through their UID-fenced ownership
+chain; Receipts inherit it from the exact desired Unit authenticated by their subject fence. Unpartitioned and orphaned
+resources render `-`.
 
 Use `-o yaml` or `-o json` for machine-readable output:
 

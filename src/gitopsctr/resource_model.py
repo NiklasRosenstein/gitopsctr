@@ -556,7 +556,15 @@ class UnitInspectionPresenter:
         reason = getattr(relationship, "reason", None)
         if not isinstance(reason, str):
             raise ResourceModelError(f"Unit {record.name!r} has no reconciliation reason")
-        return record.name, record.gvk.kind, _short_revision(record.blob_id), observation, reconciliation, reason
+        return (
+            record.name,
+            record.gvk.kind,
+            runtime.resource_partition(record) or "-",
+            _short_revision(record.blob_id),
+            observation,
+            reconciliation,
+            reason,
+        )
 
 
 @dataclass(frozen=True)
@@ -676,6 +684,7 @@ class PromotionInspectionPresenter:
         return (
             record.name,
             environment if isinstance(environment, str) else "-",
+            runtime.resource_partition(record) or "-",
             _short_revision(source.get("desiredRevision")),
             _short_revision(source.get("observedRevision")),
             _short_revision(specification.get("specificationRevision")),
@@ -700,9 +709,12 @@ class ReceiptInspectionPresenter:
         artifact_count = getattr(relationship, "artifact_count", None)
         if not isinstance(artifact_count, int):
             raise ResourceModelError(f"Receipt {record.name!r} has no artifact descriptor count")
+        unit = getattr(relationship, "unit", None)
+        partition = runtime.resource_partition(unit) if isinstance(unit, InspectionRecord) else None
         return (
             record.name,
             kind if isinstance(kind, str) else "-",
+            partition or "-",
             _enum_value(getattr(relationship, "observation", None), "observation state"),
             str(artifact_count),
         )
@@ -1928,7 +1940,7 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             (UnitApiMembership(UnitDriver),),
             inspection=InspectionViewDefinition(
                 desired,
-                ("NAME", "KIND", "DESIRED", "OBSERVATION", "RECONCILIATION", "REASON"),
+                ("NAME", "KIND", "PARTITION", "DESIRED", "OBSERVATION", "RECONCILIATION", "REASON"),
                 UnitInspectionPresenter(),
                 observation="receipt-observes-unit",
                 artifact_description="receipt-describes-artifacts",
@@ -2014,7 +2026,14 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             core("Promotion"),
             inspection=InspectionViewDefinition(
                 desired,
-                ("NAME", "SOURCE", "DESIRED-REVISION", "OBSERVED-REVISION", "SPECIFICATION-REVISION"),
+                (
+                    "NAME",
+                    "SOURCE",
+                    "PARTITION",
+                    "DESIRED-REVISION",
+                    "OBSERVED-REVISION",
+                    "SPECIFICATION-REVISION",
+                ),
                 PromotionInspectionPresenter(),
             ),
         ),
@@ -2026,7 +2045,7 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             (ReceiptApiMembership(GVK(CORE_API_VERSION, "Receipt"), CoreResourceApi, api_kinds),),
             inspection=InspectionViewDefinition(
                 observed,
-                ("NAME", "KIND", "OBSERVATION", "ARTIFACTS"),
+                ("NAME", "KIND", "PARTITION", "OBSERVATION", "ARTIFACTS"),
                 ReceiptInspectionPresenter(),
                 observation="receipt-observes-unit",
                 artifact_description="receipt-describes-artifacts",
