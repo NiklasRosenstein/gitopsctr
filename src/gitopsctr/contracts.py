@@ -1509,6 +1509,68 @@ class DesiredStackDocument(SchemaDocument):
             raise ValueError("desired Stack metadata.uid is required")
 
 
+type InspectionPlane = Literal["source", "desired", "observed"]
+type InspectionScope = Literal["project", "environment"]
+type InspectionAuthentication = Literal["CURRENT", "STALE", "ORPHAN"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class InspectionResourceListMetadata(StrictModel):
+    """Reserved metadata for an inspection result list."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class InspectionProvenance(StrictModel):
+    """Exact persisted snapshot that supplied one inspection result."""
+
+    environment: str | None
+    plane: InspectionPlane
+    ref: str | None
+    revision: str | None
+    path: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class InspectionAddress(StrictModel):
+    """Registry-owned logical address for one inspection result."""
+
+    family: str
+    scope: InspectionScope
+    namespace: str | None
+    qualifiedName: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class InspectionDetails(StrictModel):
+    """Derived relationship state authenticated during inspection."""
+
+    authentication: InspectionAuthentication
+
+
+@dataclass(frozen=True, kw_only=True)
+class InspectionResourceItem(StrictModel):
+    """One persisted resource plus its address, provenance, and optional derived state."""
+
+    provenance: InspectionProvenance
+    address: InspectionAddress
+    document: JsonObjectValue
+    inspection: InspectionDetails | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class InspectionResourceListDocument(SchemaDocument):
+    """Typed machine-output envelope for zero, one, or many inspected resources."""
+
+    apiVersion: Literal["inspection.gitopsctr.io/v1"]
+    kind: Literal["ResourceList"]
+    metadata: InspectionResourceListMetadata
+    items: list[InspectionResourceItem]
+
+    def __post_init__(self) -> None:
+        if self.apiVersion != "inspection.gitopsctr.io/v1" or self.kind != "ResourceList":
+            raise ValueError("inspection ResourceList has an invalid apiVersion/kind")
+
+
 @dataclass(frozen=True, kw_only=True)
 class EmptyResultModel(StrictModel):
     pass
@@ -1806,6 +1868,11 @@ CORE_CONTRACTS: dict[str, DocumentContract] = {
         f"{SCHEMA_ROOT}/core/v1/stack-desired.schema.json",
     ),
 }
+
+INSPECTION_RESOURCE_LIST_CONTRACT = MashumaroContract(
+    InspectionResourceListDocument,
+    f"{SCHEMA_ROOT}/apis/inspection.gitopsctr.io/v1/ResourceList.schema.json",
+)
 
 
 def schema_url(scope: str, version: int, kind: str) -> str:

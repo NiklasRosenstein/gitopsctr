@@ -107,12 +107,16 @@ gitopsctr get unit application--deploy --environment dev -o yaml
 gitopsctr get receipts -A -o json
 ```
 
-A single result is normally the exact persisted resource document. Multi-result output is a schema-versioned
+A single result is the exact persisted resource document. Multi-result output is a schema-versioned
 inspection envelope: every item contains its generic family/scope/qualified-name address plus Environment, plane, ref,
-revision, and path provenance alongside the exact document. Relationship-authenticated Artifact output always uses the
-envelope—even for one result—and includes `inspection.authentication`, so machine consumers cannot confuse `CURRENT`,
-`STALE`, and `ORPHAN` resources.
-The envelope does not synthesize a joined API resource.
+revision, and path provenance alongside the exact document. The envelope is the registered, typed
+`inspection.gitopsctr.io/v1 ResourceList` output API; it is not a persisted resource family.
+
+An item's optional `inspection` object contains state derived while traversing registered relationships; it is never
+part of the persisted `document`. For Artifacts, `inspection.authentication` is `CURRENT` when the Receipt descriptor,
+Artifact identity/content bindings, and exact current desired producer all match; `STALE` when the descriptor is valid
+for an older desired producer; and `ORPHAN` when no matching Receipt/current producer relationship authenticates the
+Artifact. These values do not assert that an external image, bundle, or deployment is reachable or healthy.
 
 Queries accept ref/revision overrides for every plane used by their registry-defined inspection relationships. Artifact
 and Receipt authentication can therefore select both historical desired and observed snapshots. Explicit ref or

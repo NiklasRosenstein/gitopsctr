@@ -1,0 +1,169 @@
+{
+  "$id": "https://niklasrosenstein.github.io/gitopsctr/schemas/apis/inspection.gitopsctr.io/v1/ResourceList.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "apiVersion": {
+      "const": "inspection.gitopsctr.io/v1"
+    },
+    "items": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "address": {
+            "additionalProperties": false,
+            "properties": {
+              "family": {
+                "type": "string"
+              },
+              "namespace": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "qualifiedName": {
+                "type": "string"
+              },
+              "scope": {
+                "enum": [
+                  "project",
+                  "environment"
+                ]
+              }
+            },
+            "required": [
+              "family",
+              "scope",
+              "namespace",
+              "qualifiedName"
+            ],
+            "title": "InspectionAddress",
+            "type": "object"
+          },
+          "document": {
+            "type": "object"
+          },
+          "inspection": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "authentication": {
+                    "enum": [
+                      "CURRENT",
+                      "STALE",
+                      "ORPHAN"
+                    ]
+                  }
+                },
+                "required": [
+                  "authentication"
+                ],
+                "title": "InspectionDetails",
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "provenance": {
+            "additionalProperties": false,
+            "properties": {
+              "environment": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "path": {
+                "type": "string"
+              },
+              "plane": {
+                "enum": [
+                  "source",
+                  "desired",
+                  "observed"
+                ]
+              },
+              "ref": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "revision": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "environment",
+              "plane",
+              "ref",
+              "revision",
+              "path"
+            ],
+            "title": "InspectionProvenance",
+            "type": "object"
+          }
+        },
+        "required": [
+          "provenance",
+          "address",
+          "document"
+        ],
+        "title": "InspectionResourceItem",
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "kind": {
+      "const": "ResourceList"
+    },
+    "metadata": {
+      "additionalProperties": false,
+      "title": "InspectionResourceListMetadata",
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "items"
+  ],
+  "title": "InspectionResourceListDocument",
+  "type": "object"
+}

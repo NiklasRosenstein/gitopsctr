@@ -31,9 +31,12 @@ descriptor and the Receipt's exact desired producer before reporting it as `CURR
 desired resource supplies the Artifact's partition. The existing Receipt shortcuts remain useful for relationship-first
 navigation: `gitopsctr get receipt PRODUCER --environment dev --artifact NAME` or `--artifacts`.
 
-Machine-readable Artifact output always uses the inspection `ResourceList` envelope, including for one qualified name.
-Each item carries `inspection.authentication`. Historical inspection may set both the desired and observed ref/revision
-overrides; an Artifact whose Receipt or exact desired producer is unavailable is shown as `ORPHAN` with no partition.
+A named query with one result returns the exact Artifact document, matching other `get` selectors. Multi-result and
+aggregate machine output uses the typed `inspection.gitopsctr.io/v1 ResourceList` contract. Its optional per-item
+`inspection.authentication` field is derived inspection state, not part of the persisted Artifact: `CURRENT` means the
+Receipt descriptor and exact current desired producer authenticate the Artifact; `STALE` means the descriptor is valid
+for an older desired producer; and `ORPHAN` means no matching Receipt/current producer relationship can authenticate it.
+Historical inspection may set both the desired and observed ref/revision overrides.
 
 ## How `fromArtifact` resolves
 

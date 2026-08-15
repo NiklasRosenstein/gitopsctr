@@ -15,10 +15,13 @@ from gitopsctr.driver import (
     VerificationCapability,
     load_unit_drivers,
 )
+from gitopsctr.inspection_api import InspectionOutputApi
 from gitopsctr.resource_model import build_resource_registry
 
 API_KINDS = api_kinds()
-RESOURCE_REGISTRY = build_resource_registry(API_KINDS)
+RESOURCE_REGISTRY = build_resource_registry(
+    {gvk: api_kind for gvk, api_kind in API_KINDS.items() if not isinstance(api_kind.spec, InspectionOutputApi)}
+)
 UNIT_DRIVERS = load_unit_drivers(API_KINDS)
 DRIVER_GVKS = {name: f"{driver.api_version}/{driver.kind}" for name, driver in UNIT_DRIVERS.items()}
 DRIVER_NAMES_BY_GVK = {gvk: name for name, gvk in DRIVER_GVKS.items()}

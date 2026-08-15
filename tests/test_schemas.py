@@ -10,7 +10,14 @@ from jsonschema import Draft202012Validator, ValidationError
 from referencing import Registry, Resource
 
 from gitopsctr import controller, schemas
-from gitopsctr.contracts import CORE_CONTRACTS, AuthoredSource, ContractError, DesiredSource, MaterializationDocument
+from gitopsctr.contracts import (
+    CORE_CONTRACTS,
+    INSPECTION_RESOURCE_LIST_CONTRACT,
+    AuthoredSource,
+    ContractError,
+    DesiredSource,
+    MaterializationDocument,
+)
 from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import DriverError, MaterializationCapability, UnitResolutionContext
 from gitopsctr.errors import ReferenceUnavailable
@@ -177,6 +184,41 @@ def test_resource_contracts_use_api_version_instead_of_envelope_schema_field():
             assert "schema" not in contract.json_schema().get("properties", {})
     for contract in CORE_CONTRACTS.values():
         assert "schema" not in contract.json_schema().get("properties", {})
+
+
+def test_inspection_resource_list_has_a_strict_generated_contract():
+    document = {
+        "apiVersion": "inspection.gitopsctr.io/v1",
+        "kind": "ResourceList",
+        "metadata": {},
+        "items": [
+            {
+                "provenance": {
+                    "environment": "dev",
+                    "plane": "observed",
+                    "ref": "gitopsctr/observed/dev",
+                    "revision": REVISION,
+                    "path": "artifacts/images/containers.yaml",
+                },
+                "address": {
+                    "family": "artifact",
+                    "scope": "environment",
+                    "namespace": "dev",
+                    "qualifiedName": "images/containers",
+                },
+                "document": {"apiVersion": "artifact.gitopsctr.io/v1", "kind": "ContainerImages"},
+                "inspection": {"authentication": "CURRENT"},
+            }
+        ],
+    }
+    assert INSPECTION_RESOURCE_LIST_CONTRACT.validate(document) == document
+    with pytest.raises(ContractError):
+        INSPECTION_RESOURCE_LIST_CONTRACT.validate(
+            {
+                **document,
+                "items": [{**document["items"][0], "inspection": {"authentication": "UNKNOWN"}}],
+            }
+        )
 
 
 RESULTS = {

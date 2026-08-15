@@ -11,6 +11,7 @@ from gitopsctr.api import GVK
 from gitopsctr.artifacts import ArtifactApi, require_artifact_api
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
+    INSPECTION_RESOURCE_LIST_CONTRACT,
     SCHEMA_ROOT,
     DesiredResourceMetadata,
     DesiredStackSpec,
@@ -292,6 +293,10 @@ def driver_schema(driver: str, kind: str) -> JsonObject:
 
 
 def show_schema(scope: str, kind: str) -> JsonObject:
+    if scope == "inspection.gitopsctr.io/v1":
+        if kind != "ResourceList":
+            raise ValueError(f"unknown inspection API kind: {kind}")
+        return deepcopy(INSPECTION_RESOURCE_LIST_CONTRACT.json_schema())
     if scope == "gitopsctr.io/v1":
         if kind == "Project":
             return project_resource_schema()
@@ -331,6 +336,9 @@ def schema_documents() -> dict[Path, JsonObject]:
         path = Path("apis/gitopsctr.io/v1") / f"{kind}.schema.json"
         documents[path] = project_resource_schema() if kind == "Project" else core_resource_schema(kind)
         index["apis"][f"gitopsctr.io/v1/{kind}"] = path.as_posix()
+    inspection_path = Path("apis/inspection.gitopsctr.io/v1/ResourceList.schema.json")
+    documents[inspection_path] = INSPECTION_RESOURCE_LIST_CONTRACT.json_schema()
+    index["apis"]["inspection.gitopsctr.io/v1/ResourceList"] = inspection_path.as_posix()
     for kind in ("StackTemplate", "Stack"):
         for profile in ("authored", "desired"):
             path = Path("apis/gitopsctr.io/v1") / kind / f"{profile}.schema.json"

@@ -10,6 +10,7 @@
     "gitopsctr.io/v1/Stack/desired": "apis/gitopsctr.io/v1/Stack/desired.schema.json",
     "gitopsctr.io/v1/StackTemplate/authored": "apis/gitopsctr.io/v1/StackTemplate/authored.schema.json",
     "gitopsctr.io/v1/StackTemplate/desired": "apis/gitopsctr.io/v1/StackTemplate/desired.schema.json",
+    "inspection.gitopsctr.io/v1/ResourceList": "apis/inspection.gitopsctr.io/v1/ResourceList.schema.json",
     "unit.gitopsctr.io/v1/FrontendS3Cloudfront/authored": "apis/unit.gitopsctr.io/v1/FrontendS3Cloudfront/authored.schema.json",
     "unit.gitopsctr.io/v1/FrontendS3Cloudfront/desired": "apis/unit.gitopsctr.io/v1/FrontendS3Cloudfront/desired.schema.json",
     "unit.gitopsctr.io/v1/FrontendS3Cloudfront/receipt": "apis/unit.gitopsctr.io/v1/FrontendS3Cloudfront/receipt.schema.json",

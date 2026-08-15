@@ -11,7 +11,17 @@ from typing import cast
 
 import yaml
 
-from gitopsctr.document import JsonObject
+from gitopsctr.contracts import (
+    INSPECTION_RESOURCE_LIST_CONTRACT,
+    InspectionAddress,
+    InspectionAuthentication,
+    InspectionDetails,
+    InspectionProvenance,
+    InspectionResourceItem,
+    InspectionResourceListDocument,
+    InspectionResourceListMetadata,
+)
+from gitopsctr.document import JsonObject, JsonObjectValue
 from gitopsctr.errors import OperationError
 from gitopsctr.inventory import (
     InventoryRecord,
@@ -482,37 +492,40 @@ def _print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
 
 
 def _envelope(results: Sequence[InspectionResult]) -> JsonObject:
-    items: list[JsonObject] = []
+    items: list[InspectionResourceItem] = []
     for result in results:
-        item: JsonObject = {
-            "provenance": {
-                "environment": result.record.environment,
-                "plane": result.record.plane.value,
-                "ref": result.record.ref,
-                "revision": result.record.revision,
-                "path": result.record.path.as_posix(),
-            },
-            "address": {
-                "family": result.record.family.name,
-                "scope": result.record.address.scope.value,
-                "namespace": result.record.address.namespace,
-                "qualifiedName": result.record.qualified_name,
-            },
-            "document": result.record.document,
-        }
         authentication = getattr(result.relationship, "authentication", None)
         authentication_value = getattr(authentication, "value", None)
-        if isinstance(authentication_value, str):
-            item["inspection"] = {"authentication": authentication_value}
-        items.append(item)
-    return cast(
-        JsonObject,
-        {
-            "apiVersion": "inspection.gitopsctr.io/v1",
-            "kind": "ResourceList",
-            "metadata": {},
-            "items": items,
-        },
+        items.append(
+            InspectionResourceItem(
+                provenance=InspectionProvenance(
+                    environment=result.record.environment,
+                    plane=result.record.plane.value,
+                    ref=result.record.ref,
+                    revision=result.record.revision,
+                    path=result.record.path.as_posix(),
+                ),
+                address=InspectionAddress(
+                    family=result.record.family.name,
+                    scope=result.record.address.scope.value,
+                    namespace=result.record.address.namespace,
+                    qualifiedName=result.record.qualified_name,
+                ),
+                document=JsonObjectValue(result.record.document),
+                inspection=(
+                    InspectionDetails(authentication=cast(InspectionAuthentication, authentication_value))
+                    if isinstance(authentication_value, str)
+                    else None
+                ),
+            )
+        )
+    return INSPECTION_RESOURCE_LIST_CONTRACT.dump(
+        InspectionResourceListDocument(
+            apiVersion="inspection.gitopsctr.io/v1",
+            kind="ResourceList",
+            metadata=InspectionResourceListMetadata(),
+            items=items,
+        )
     )
 
 
@@ -652,5 +665,4 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
             _print_documents(
                 results,
                 "yaml" if table_output else args.output,
-                force_list=_is_authenticated_artifact_family(family),
             )

@@ -26,6 +26,7 @@ from gitopsctr.core_api import CORE_API_VERSION, CoreResourceApi
 from gitopsctr.document import ContractError, JsonObject, JsonObjectValue
 from gitopsctr.driver import UnitDriver
 from gitopsctr.formats import Project
+from gitopsctr.inspection_api import InspectionOutputApi
 from gitopsctr.registry import API_KINDS, RESOURCE_REGISTRY
 from gitopsctr.resource_model import (
     ArtifactResolutionContext,
@@ -54,7 +55,7 @@ def rebuild(
     *, collections=None, families=None, observations=None, artifact_descriptions=None, graph_relationships=None
 ) -> ResourceRegistry:
     return ResourceRegistry(
-        API_KINDS,
+        RESOURCE_REGISTRY.api_kinds,
         RESOURCE_REGISTRY.collections if collections is None else collections,
         RESOURCE_REGISTRY.families if families is None else families,
         RESOURCE_REGISTRY.observations if observations is None else observations,
@@ -90,8 +91,9 @@ def relationship_resource(
 
 
 def test_builtin_registry_derives_core_driver_and_artifact_family_membership():
-    assert len(API_KINDS) == 13
-    assert {RESOURCE_REGISTRY.family_for_api_kind(gvk).name for gvk in API_KINDS} == {
+    assert len(API_KINDS) == 14
+    assert isinstance(API_KINDS[GVK("inspection.gitopsctr.io/v1", "ResourceList")].spec, InspectionOutputApi)
+    assert {RESOURCE_REGISTRY.family_for_api_kind(gvk).name for gvk in RESOURCE_REGISTRY.api_kinds} == {
         "artifact",
         "environment",
         "project",

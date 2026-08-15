@@ -851,10 +851,7 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
         "json",
     )
     exact_result = json.loads(exact)
-    assert exact_result["kind"] == "ResourceList"
-    assert exact_result["items"][0]["address"]["qualifiedName"] == "images/containers"
-    assert exact_result["items"][0]["inspection"] == {"authentication": "CURRENT"}
-    assert exact_result["items"][0]["document"] == artifact
+    assert exact_result == artifact
 
     inventory_support.git(repository, "checkout", "observed")
     orphan_artifact = json.loads(json.dumps(artifact))
@@ -906,8 +903,7 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
             "json",
         )
     )
-    assert stale_output["items"][0]["inspection"] == {"authentication": "STALE"}
-    assert stale_output["items"][0]["address"]["qualifiedName"] == "images/containers"
+    assert stale_output == artifact
     stale_table = run_get(
         repository,
         capsys,
@@ -949,6 +945,11 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
     aggregate = run_get(repository, capsys, "all", "--environment", "dev")
     assert "\n\nARTIFACTS\n" in aggregate
     assert "images/containers" in aggregate
+    aggregate_document = json.loads(run_get(repository, capsys, "all", "--environment", "dev", "-o", "json"))
+    aggregate_artifact = next(
+        item for item in aggregate_document["items"] if item["address"]["qualifiedName"] == "images/containers"
+    )
+    assert aggregate_artifact["inspection"] == {"authentication": "CURRENT"}
 
     with pytest.raises(OperationError, match="--producer is not available for units"):
         run_get(repository, capsys, "units", "--environment", "dev", "--producer", "images")
