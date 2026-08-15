@@ -10,6 +10,7 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Protocol, cast, runtime_checkable
+from urllib.parse import urlsplit, urlunsplit
 
 from gitopsctr.api import GVK, ApiKind
 from gitopsctr.document import ContractError, JsonObject, JsonValue, TypedDocumentContract, require_json_value
@@ -363,6 +364,27 @@ def _digest(value: object) -> str:
     return value if isinstance(value, str) and value else "-"
 
 
+def _credential_free_repository(value: object) -> str:
+    """Return a repository identifier without URL userinfo or credentials."""
+
+    if not isinstance(value, str) or not value:
+        return "-"
+    try:
+        parsed = urlsplit(value)
+        if parsed.netloc:
+            hostname = parsed.hostname or ""
+            if ":" in hostname and not hostname.startswith("["):
+                hostname = f"[{hostname}]"
+            netloc = hostname
+            if parsed.port is not None:
+                netloc = f"{netloc}:{parsed.port}"
+            return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    except ValueError:
+        pass
+    # Also cover scp-like repository identifiers such as user@host:path.
+    return value.rsplit("@", 1)[-1]
+
+
 def _deletion_state(metadata: Mapping[str, JsonValue]) -> str:
     deletion = _mapping_field(metadata, "deletion")
     if not deletion:
@@ -373,16 +395,58 @@ def _deletion_state(metadata: Mapping[str, JsonValue]) -> str:
 
 def _acquisition(specification: Mapping[str, JsonValue]) -> str:
     acquisition = _mapping_field(specification, "acquisition")
-    modes = [
-        {"fromInput": "input", "fromGit": "git", "fromPromotion": "promotion"}.get(key, key)
-        for key in acquisition
-        if key != "documentDigest"
-    ]
-    mode = "+".join(modes) or "-"
-    document_digest = acquisition.get("documentDigest")
-    if document_digest is None:
-        return mode
-    return f"{mode}(document={_short_digest(document_digest)})"
+    requested = _mapping_field(acquisition, "requestedSource")
+    resolved = _mapping_field(acquisition, "resolvedSource")
+    document_digest = _digest(acquisition.get("documentDigest"))
+
+    requested_mode = next(iter(requested), None)
+    resolved_mode = next(iter(resolved), None)
+    mode_names = {"fromInput": "input", "fromGit": "git", "fromPromotion": "promotion"}
+    mode = mode_names.get(requested_mode, requested_mode or mode_names.get(resolved_mode, resolved_mode or "-"))
+    if mode == "input":
+        return f"input(document={document_digest})"
+
+    if mode == "git":
+        requested_git = _mapping_field(requested, "fromGit")
+        resolved_git = _mapping_field(resolved, "fromGit")
+        repository = _credential_free_repository(resolved_git.get("repository", requested_git.get("repository")))
+        requested_revision = requested_git.get("revision", "-")
+        resolved_revision = resolved_git.get("revision", "-")
+        path = resolved_git.get("path", requested_git.get("path", "-"))
+        return (
+            f"git(repository={repository};requested={requested_revision};resolved={resolved_revision};"
+            f"path={path};document={document_digest})"
+        )
+
+    if mode == "promotion":
+        requested_promotion = _mapping_field(requested, "fromPromotion")
+        resolved_promotion = _mapping_field(resolved, "fromPromotion")
+        requested_stack = requested_promotion.get("stack", "-")
+        resolved_source = "/".join(
+            str(value)
+            for value in (
+                resolved_promotion.get("environment", "-"),
+                resolved_promotion.get("desiredRef", "-"),
+            )
+        )
+        resolved_revision = resolved_promotion.get("desiredRevision", "-")
+        template = resolved_promotion.get("template", "-")
+        template_uid = resolved_promotion.get("templateUid", "-")
+        return (
+            f"promotion(requested={requested_stack};resolved={resolved_source}@{resolved_revision};"
+            f"template={template}@{template_uid};document={document_digest})"
+        )
+
+    return f"{mode}(document={document_digest})"
+
+
+def _source_context(specification: Mapping[str, JsonValue]) -> str:
+    context = _mapping_field(specification, "sourceContext")
+    if not context:
+        return "-"
+    repository = _credential_free_repository(context.get("repository"))
+    revision = context.get("revision", "-")
+    return f"{repository}@{revision}"
 
 
 def _projection_topology(projection: Mapping[str, JsonValue]) -> str:
@@ -526,9 +590,7 @@ class StackTemplateInspectionPresenter:
             str(metadata.get("uid", "-")),
             _digest(specification.get("contentDigest")),
             _acquisition(specification),
-            f"context@{_short_revision(_mapping_field(specification, 'sourceContext').get('revision'))}"
-            if _mapping_field(specification, "sourceContext")
-            else "-",
+            _source_context(specification),
             str(len(parameters)) if isinstance(parameters, list) else "0",
             str(len(units)) if isinstance(units, (list, dict)) else "0",
             runtime.resource_partition(record) or "-",

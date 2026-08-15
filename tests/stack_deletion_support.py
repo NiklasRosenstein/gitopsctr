@@ -20,6 +20,8 @@ from gitopsctr.contracts import (
     StackTemplateAcquisition,
     StackTemplateFromInput,
     StackTemplateReference,
+    StackTemplateRequestedFromInput,
+    StackTemplateResolvedFromInput,
     StackTemplateSpec,
     StackTemplateUnitTemplate,
 )
@@ -72,7 +74,8 @@ def stack_tree(root: Path) -> tuple[str, str]:
         contentDigest=template_content.semantic_content_digest(),
         acquisition=StackTemplateAcquisition(
             documentDigest="sha256:" + "b" * 64,
-            fromInput=StackTemplateFromInput(),
+            requestedSource=StackTemplateRequestedFromInput(fromInput=StackTemplateFromInput()),
+            resolvedSource=StackTemplateResolvedFromInput(fromInput=StackTemplateFromInput()),
         ),
     )
     template = StackResource(

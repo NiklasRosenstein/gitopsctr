@@ -69,10 +69,12 @@ StackTemplate. `STRUCTURAL` shows the intended projection identity, context, gen
 dependencies. `OBSERVATION` is derived from UID-fenced child Units and their separate receipts, so it reports child
 observation states rather than embedded Stack status. `STATE` reports the Stack's deletion state.
 
-StackTemplate `ACQUISITION` reports the direct-input mode and document digest, `SOURCE` reports retained repository
-context, and `REFERENCES` lists Stacks whose name/UID/content-digest binding selects that template. `PARTITION` follows
-the resource's authoritative apply membership; `PARAMETERS` and `UNITS` are counts. These relationship and child
-observation facts are evaluated against the selected desired and observed snapshots at read time.
+StackTemplate `ACQUISITION` reports `input`, `git`, or `promotion` distinctly. It includes the document digest and,
+for Git and promotion, the requested selector plus the resolved exact revision/lineage. Repository values are shown
+without credentials. `SOURCE` reports retained repository and exact revision context, and `REFERENCES` lists Stacks
+whose name/UID/content-digest binding selects that template. `PARTITION` follows the resource's authoritative apply
+membership; `PARAMETERS` and `UNITS` are counts. These relationship and child observation facts are evaluated against
+the selected desired and observed snapshots at read time.
 
 For Units, `DESIRED` is the short Git blob identity of that exact persisted Unit document—the same identity used by a
 Receipt's freshness binding. It is intentionally per-resource rather than repeating the desired snapshot commit on
@@ -196,7 +198,8 @@ gitopsctr verify --environment staging
 Promotion applies the explicit target resources passed with `--file`; `--partition` gives that target apply set the
 same omission-based pruning semantics as ordinary apply. A Stack-only promotion may reuse a retained target
 StackTemplate only when no authoritative partition selects it. When an authoritative partition selects that template,
-the target StackTemplate must be supplied inline. The Promotion resource pins three independently selected revisions:
+the target StackTemplate must be supplied explicitly with its `inline`, `fromGit`, or `fromPromotion` mode. The
+Promotion resource pins three independently selected revisions:
 the source desired revision, its matching source observed
 revision, and `--specification-revision`, which authenticates the target Project/Environment configuration and the
 exact bytes of the explicit target input files.
@@ -205,11 +208,13 @@ Pass the latter explicitly when `HEAD` might have advanced beyond the source rev
 environment.
 
 Promotion is a resolution context, not a source-tree copy. A target StackTemplate is reused only from target desired
-state when no authoritative partition selects the retained template, or supplied as direct-inline content by the
-explicit `--file` input; it is never implicitly acquired from source promotion state or Git. External/historical Git and
-promotion-backed StackTemplate acquisition are not supported by the
-current contract. Field-level `fromPromotion` values and `artifactImports[].fromPromotion` are resolved against the
-pinned source desired and observed revisions, with receipt, producer, artifact, and digest validation before publication.
+state when no authoritative partition selects the retained template, or supplied explicitly by `--file` input in its
+`inline`, `fromGit`, or `fromPromotion` mode. A target
+StackTemplate owned by an authoritative partition must be supplied explicitly so omission-based pruning remains
+deterministic. `apply` rejects `fromPromotion`; it requires the explicit `promote` transaction and its pinned source
+desired revision. `fromGit` is resolved from its requested ref and can be used where a StackTemplate input is accepted.
+Field-level `fromPromotion` values and `artifactImports[].fromPromotion` are resolved against the pinned source desired
+and observed revisions, with receipt, producer, artifact, and digest validation before publication.
 
 Repository-backed Unit paths inherit the exact source context retained by the desired StackTemplate. The current
 authored Unit source contract has no independent per-Stack revision selector. Updating the inline template's source

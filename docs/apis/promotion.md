@@ -23,9 +23,10 @@ The source block pins the exact desired and observed histories reviewed for prom
 the commit that authenticates the target Project and Environment configuration and the exact bytes of every explicit
 target input file. This prevents later branch movement from silently changing either the target specification or
 promoted inputs. A Stack-only promotion may reuse a retained target StackTemplate only when no authoritative partition
-selects it; when an authoritative partition selects that template, it must be supplied inline as an explicit input. It
-is never implicitly acquired from the source promotion state or from Git. `observedRevision` may be `null` when the
-source Environment uses materialized promotion evidence.
+selects it; when an authoritative partition selects that template, it must be supplied explicitly as target input. A
+StackTemplate `source.fromPromotion` selector is another explicit target input: it selects the source StackTemplate
+from the pinned source desired revision and is legal only for `promote`, never `apply`. It is not an implicit copy from
+the source tree. `observedRevision` may be `null` when the source Environment uses materialized promotion evidence.
 
 | Revision | Supplies |
 | --- | --- |
@@ -74,9 +75,11 @@ spec:
 ```
 
 A target StackTemplate is reused from target desired state only when the promotion input is Stack-only and no
-authoritative partition selects the retained template. Otherwise, supply it as inline content with the promotion
-input. The target Stack then references that target desired StackTemplate and can import only the exact artifact that
-dev produced:
+authoritative partition selects the retained template. Otherwise, supply it as inline content or an explicit
+`source.fromPromotion` selector with the promotion input. If the selector is used, its resolved acquisition records the
+requested Stack name and the source environment, desired ref, exact desired revision, Stack UID, template UID, and
+template content digest. The target Stack then references that target desired StackTemplate and can import only the
+exact artifact that dev produced:
 
 ```yaml
 apiVersion: gitopsctr.io/v1
@@ -98,15 +101,16 @@ spec:
         stack: application
 ```
 
-Here, the authoritative `application` partition means the template is supplied explicitly above; `template: application`
-resolves that target desired StackTemplate. The artifact import resolves `image/containers` from the source Stack using
+Here, the authoritative `application` partition means the template is supplied explicitly in the target input;
+`template: application` resolves that target desired StackTemplate. The artifact import resolves `image/containers` from the source Stack using
 the pinned source desired and observed trees, validates its receipt,
 producer identity, and digest, and records immutable import lineage in the target desired Stack. Field-level
 `fromPromotion` expressions use the same source desired revision to read public source Unit `spec` values.
 
-Repository-backed Unit paths inherit the exact source context retained by the target desired StackTemplate. Template-level
-external Git or promotion-backed acquisition is not part of the current contract; add it as a contracts/controller/test
-slice before relying on it.
+Repository-backed Unit paths inherit the exact source context retained by the target desired StackTemplate. A Git
+acquisition retains the credential-free repository and exact resolved commit in both acquisition lineage and
+`sourceContext`; a promoted acquisition carries forward the source template's context. The target can therefore
+project those paths again without the original source checkout.
 
 During desired-state resolution, [`fromPromotion`](../references.md#promotion-selectors) reads public unit `spec`
 values from the pinned source desired revision. Broken selectors in an active Promotion are errors. They do not make

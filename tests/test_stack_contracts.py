@@ -25,7 +25,17 @@ from gitopsctr.contracts import (
     StackSpec,
     StackTemplateAcquisition,
     StackTemplateFromInput,
+    StackTemplateGitRequest,
+    StackTemplatePromotionRequest,
     StackTemplateReference,
+    StackTemplateRequestedFromGit,
+    StackTemplateRequestedFromInput,
+    StackTemplateRequestedFromPromotion,
+    StackTemplateResolvedFromGit,
+    StackTemplateResolvedFromGitSource,
+    StackTemplateResolvedFromInput,
+    StackTemplateResolvedFromPromotion,
+    StackTemplateResolvedFromPromotionSource,
     StackTemplateSourceContext,
 )
 from gitopsctr.document import ContractError, JsonObjectValue
@@ -53,10 +63,10 @@ def template_document(resources: list[dict[str, object]], parameters: list[dict[
     }
 
 
-def unit_resource(name: str, spec: dict[str, object], **extra: object) -> dict[str, object]:
+def unit_resource(name: str, spec: dict[str, object], *, kind: str = "Terraform", **extra: object) -> dict[str, object]:
     return {
         "apiVersion": "unit.gitopsctr.io/v1",
-        "kind": "Terraform",
+        "kind": kind,
         "name": name,
         "spec": spec,
         **extra,
@@ -76,7 +86,8 @@ def desired_template_document(authored: dict[str, object]) -> dict[str, object]:
             "contentDigest": digest,
             "acquisition": {
                 "documentDigest": "sha256:" + "b" * 64,
-                "fromInput": {},
+                "requestedSource": {"fromInput": {}},
+                "resolvedSource": {"fromInput": {}},
             },
         },
     }
@@ -93,7 +104,8 @@ def test_direct_inline_template_and_stack_contracts_are_typed_and_round_trip():
     desired = CORE_CONTRACTS["stack-template-desired"].parse(desired_template_document(authored))
     assert isinstance(desired, DesiredStackTemplateDocument)
     assert desired.spec.sourceContext is None
-    assert isinstance(desired.spec.acquisition.fromInput, StackTemplateFromInput)
+    assert isinstance(desired.spec.acquisition.requestedSource.fromInput, StackTemplateFromInput)
+    assert isinstance(desired.spec.acquisition.resolvedSource.fromInput, StackTemplateFromInput)
     assert desired.spec.contentDigest == desired.spec.semantic_content_digest()
 
     stack = StackDocument(
@@ -185,6 +197,298 @@ def test_stack_only_input_references_an_existing_target_template_by_name():
     assert stack.spec.template == template.metadata.name
 
 
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {
+            "source": {
+                "fromGit": {
+                    "repository": "https://example.invalid/templates.git",
+                    "revision": "main",
+                    "path": "stacks/web.yaml",
+                    "documentDigest": "sha256:" + "a" * 64,
+                }
+            }
+        },
+        {"source": {"fromPromotion": {"stack": "application"}}},
+    ],
+)
+def test_repository_and_promotion_stack_template_sources_are_typed(spec):
+    document = {
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "StackTemplate",
+        "metadata": {"name": "preview"},
+        "spec": spec,
+    }
+    parsed = CORE_CONTRACTS["stack-template-authored"].parse(document)
+    assert (
+        parsed.spec
+        == CORE_CONTRACTS["stack-template-authored"].parse(CORE_CONTRACTS["stack-template-authored"].dump(parsed)).spec
+    )
+
+
+@pytest.mark.parametrize(
+    "path", ["", "/template.yaml", "templates//web.yaml", "templates/./web.yaml", "../web.yaml", "templates\\web.yaml"]
+)
+def test_stack_template_repository_paths_are_safe_relative_posix_paths(path):
+    document = {
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "StackTemplate",
+        "metadata": {"name": "preview"},
+        "spec": {
+            "source": {
+                "fromGit": {
+                    "repository": "https://example.invalid/templates.git",
+                    "revision": "main",
+                    "path": path,
+                }
+            }
+        },
+    }
+    with pytest.raises(ContractError):
+        CORE_CONTRACTS["stack-template-authored"].parse(document)
+
+
+def test_stack_template_acquisition_preserves_requested_and_resolved_lineage_variants():
+    authored = template_document([unit_resource("app", {})], [])
+    typed = CORE_CONTRACTS["stack-template-authored"].parse(authored)
+    desired = DesiredStackTemplateDocument(
+        apiVersion="gitopsctr.io/v1",
+        kind="StackTemplate",
+        metadata=DesiredResourceMetadata(name="preview", uid="template-uid"),
+        spec=DesiredStackTemplateSpec(
+            parameters=typed.spec.parameters,
+            unitTemplates=typed.spec.unitTemplates,
+            contentDigest=typed.spec.semantic_content_digest(),
+            acquisition=StackTemplateAcquisition(
+                documentDigest="sha256:" + "b" * 64,
+                requestedSource=StackTemplateRequestedFromGit(
+                    fromGit=StackTemplateGitRequest(
+                        repository="https://example.invalid/templates.git",
+                        revision="main",
+                        path="stacks/web.yaml",
+                    )
+                ),
+                resolvedSource=StackTemplateResolvedFromGitSource(
+                    fromGit=StackTemplateResolvedFromGit(
+                        repository="https://example.invalid/templates.git",
+                        revision="a" * 40,
+                        path="stacks/web.yaml",
+                    )
+                ),
+            ),
+            sourceContext=StackTemplateSourceContext(
+                repository="https://example.invalid/templates.git",
+                revision="a" * 40,
+            ),
+        ),
+    )
+    dumped = CORE_CONTRACTS["stack-template-desired"].dump(desired)
+    assert CORE_CONTRACTS["stack-template-desired"].parse(dumped) == desired
+
+    promotion = replace(
+        desired.spec,
+        acquisition=StackTemplateAcquisition(
+            documentDigest="sha256:" + "c" * 64,
+            requestedSource=StackTemplateRequestedFromPromotion(
+                fromPromotion=StackTemplatePromotionRequest(stack="application")
+            ),
+            resolvedSource=StackTemplateResolvedFromPromotionSource(
+                fromPromotion=StackTemplateResolvedFromPromotion(
+                    environment="staging",
+                    desiredRef="refs/heads/main",
+                    desiredRevision="d" * 40,
+                    stack="application",
+                    stackUid="stack-uid",
+                    template="preview",
+                    templateUid="source-template-uid",
+                    templateContentDigest=desired.spec.contentDigest,
+                )
+            ),
+        ),
+        sourceContext=None,
+    )
+    assert (
+        CORE_CONTRACTS["stack-template-desired"]
+        .parse(CORE_CONTRACTS["stack-template-desired"].dump(replace(desired, spec=promotion)))
+        .spec.acquisition.requestedSource.fromPromotion.stack
+        == "application"
+    )
+
+
+def test_stack_template_acquisition_rejects_mismatched_modes_and_fences_corresponding_fields():
+    request = StackTemplateGitRequest(
+        repository="https://example.invalid/templates.git", revision="main", path="templates/web.yaml"
+    )
+    resolved = StackTemplateResolvedFromGit(
+        repository="https://other.invalid/templates.git", revision="a" * 40, path="templates/other.yaml"
+    )
+    with pytest.raises(ValueError, match="repository and path"):
+        StackTemplateAcquisition(
+            documentDigest="sha256:" + "b" * 64,
+            requestedSource=StackTemplateRequestedFromGit(fromGit=request),
+            resolvedSource=StackTemplateResolvedFromGitSource(fromGit=resolved),
+        )
+
+    with pytest.raises(ValueError, match="modes must match"):
+        StackTemplateAcquisition(
+            documentDigest="sha256:" + "b" * 64,
+            requestedSource=StackTemplateRequestedFromPromotion(
+                fromPromotion=StackTemplatePromotionRequest(stack="application")
+            ),
+            resolvedSource=StackTemplateResolvedFromInput(fromInput=StackTemplateFromInput()),
+        )
+
+
+def test_stack_template_acquisition_rejects_an_exact_requested_git_sha_that_resolves_elsewhere():
+    with pytest.raises(ValueError, match="exact requested SHA"):
+        StackTemplateAcquisition(
+            documentDigest="sha256:" + "b" * 64,
+            requestedSource=StackTemplateRequestedFromGit(
+                fromGit=StackTemplateGitRequest(
+                    repository="https://example.invalid/templates.git",
+                    revision="a" * 40,
+                    path="templates/web.yaml",
+                )
+            ),
+            resolvedSource=StackTemplateResolvedFromGitSource(
+                fromGit=StackTemplateResolvedFromGit(
+                    repository="https://example.invalid/templates.git",
+                    revision="b" * 40,
+                    path="templates/web.yaml",
+                )
+            ),
+        )
+
+
+def test_desired_git_stack_template_source_context_is_fenced_to_resolution():
+    authored = CORE_CONTRACTS["stack-template-authored"].parse(template_document([unit_resource("app", {})], []))
+    acquisition = StackTemplateAcquisition(
+        documentDigest="sha256:" + "b" * 64,
+        requestedSource=StackTemplateRequestedFromGit(
+            fromGit=StackTemplateGitRequest(
+                repository="https://example.invalid/templates.git", revision="main", path="templates/web.yaml"
+            )
+        ),
+        resolvedSource=StackTemplateResolvedFromGitSource(
+            fromGit=StackTemplateResolvedFromGit(
+                repository="https://example.invalid/templates.git", revision="a" * 40, path="templates/web.yaml"
+            )
+        ),
+    )
+    with pytest.raises(ValueError, match="sourceContext"):
+        DesiredStackTemplateSpec(
+            parameters=authored.spec.parameters,
+            unitTemplates=authored.spec.unitTemplates,
+            contentDigest=authored.spec.semantic_content_digest(),
+            acquisition=acquisition,
+            sourceContext=StackTemplateSourceContext(repository=".", revision="a" * 40),
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "source", "parameters", "requires_context"),
+    [
+        ("Terraform", None, [], False),
+        ("FrontendS3Cloudfront", None, [], False),
+        ("Terraform", {"path": "."}, [], True),
+        ("Terraform", {"fromParameter": {"name": "source"}}, [{"name": "source", "type": "object"}], True),
+        (
+            "Terraform",
+            {"path": {"fromParameter": {"name": "source"}}},
+            [{"name": "source", "type": "string"}],
+            True,
+        ),
+    ],
+)
+def test_desired_stack_template_source_context_matrix(
+    kind: str, source: object, parameters: list[dict[str, str]], requires_context: bool
+):
+    authored = CORE_CONTRACTS["stack-template-authored"].parse(
+        template_document([unit_resource("app", {"source": source}, kind=kind)], parameters)
+    )
+    desired_kwargs = {
+        "parameters": authored.spec.parameters,
+        "unitTemplates": authored.spec.unitTemplates,
+        "contentDigest": authored.spec.semantic_content_digest(),
+        "acquisition": StackTemplateAcquisition(
+            documentDigest="sha256:" + "c" * 64,
+            requestedSource=StackTemplateRequestedFromInput(fromInput=StackTemplateFromInput()),
+            resolvedSource=StackTemplateResolvedFromInput(fromInput=StackTemplateFromInput()),
+        ),
+    }
+    if requires_context:
+        with pytest.raises(ValueError, match="repository-backed Unit sources"):
+            DesiredStackTemplateSpec(**desired_kwargs)
+        desired_kwargs["sourceContext"] = StackTemplateSourceContext(repository=".", revision="a" * 40)
+    desired = DesiredStackTemplateSpec(**desired_kwargs)
+    if requires_context:
+        assert desired.sourceContext is not None
+    else:
+        assert desired.sourceContext is None
+
+
+def test_desired_promotion_template_digest_and_name_are_fenced():
+    authored = CORE_CONTRACTS["stack-template-authored"].parse(template_document([unit_resource("app", {})], []))
+    digest = authored.spec.semantic_content_digest()
+
+    with pytest.raises(ValueError, match="templateContentDigest"):
+        DesiredStackTemplateSpec(
+            parameters=authored.spec.parameters,
+            unitTemplates=authored.spec.unitTemplates,
+            contentDigest=digest,
+            acquisition=StackTemplateAcquisition(
+                documentDigest="sha256:" + "c" * 64,
+                requestedSource=StackTemplateRequestedFromPromotion(
+                    fromPromotion=StackTemplatePromotionRequest(stack="application")
+                ),
+                resolvedSource=StackTemplateResolvedFromPromotionSource(
+                    fromPromotion=StackTemplateResolvedFromPromotion(
+                        environment="staging",
+                        desiredRef="refs/heads/main",
+                        desiredRevision="d" * 40,
+                        stack="application",
+                        stackUid="stack-uid",
+                        template="other",
+                        templateUid="source-template-uid",
+                        templateContentDigest="sha256:" + "e" * 64,
+                    )
+                ),
+            ),
+        )
+
+    spec = DesiredStackTemplateSpec(
+        parameters=authored.spec.parameters,
+        unitTemplates=authored.spec.unitTemplates,
+        contentDigest=digest,
+        acquisition=StackTemplateAcquisition(
+            documentDigest="sha256:" + "c" * 64,
+            requestedSource=StackTemplateRequestedFromPromotion(
+                fromPromotion=StackTemplatePromotionRequest(stack="application")
+            ),
+            resolvedSource=StackTemplateResolvedFromPromotionSource(
+                fromPromotion=StackTemplateResolvedFromPromotion(
+                    environment="staging",
+                    desiredRef="refs/heads/main",
+                    desiredRevision="d" * 40,
+                    stack="application",
+                    stackUid="stack-uid",
+                    template="other",
+                    templateUid="source-template-uid",
+                    templateContentDigest=digest,
+                )
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="template name"):
+        DesiredStackTemplateDocument(
+            apiVersion="gitopsctr.io/v1",
+            kind="StackTemplate",
+            metadata=DesiredResourceMetadata(name="preview", uid="template-uid"),
+            spec=spec,
+        )
+
+
 def test_template_semantic_identity_and_source_context_are_fenced():
     authored = CORE_CONTRACTS["stack-template-authored"].parse(
         template_document(
@@ -199,9 +503,13 @@ def test_template_semantic_identity_and_source_context_are_fenced():
         contentDigest=digest,
         acquisition=StackTemplateAcquisition(
             documentDigest="sha256:" + "c" * 64,
-            fromInput=StackTemplateFromInput(),
+            requestedSource=StackTemplateRequestedFromInput(fromInput=StackTemplateFromInput()),
+            resolvedSource=StackTemplateResolvedFromInput(fromInput=StackTemplateFromInput()),
         ),
-        sourceContext=StackTemplateSourceContext(revision="a" * 40),
+        sourceContext=StackTemplateSourceContext(
+            repository="https://example.invalid/templates.git",
+            revision="a" * 40,
+        ),
     )
     assert desired.semantic_content_digest() == digest
     assert (

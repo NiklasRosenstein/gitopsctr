@@ -197,7 +197,8 @@ def test_get_stack_and_template_documents_preserve_fences_and_content(
     assert template["metadata"]["uid"] == "uid-web"
     assert template["spec"]["contentDigest"].startswith("sha256:")
     assert template["spec"]["acquisition"]["documentDigest"].startswith("sha256:")
-    assert template["spec"]["acquisition"]["fromInput"] == {}
+    assert template["spec"]["acquisition"]["requestedSource"] == {"fromInput": {}}
+    assert template["spec"]["acquisition"]["resolvedSource"] == {"fromInput": {}}
     assert stack["spec"]["templateRef"] == {
         "name": "web",
         "uid": "uid-web",
@@ -216,6 +217,79 @@ def test_get_stack_and_template_documents_preserve_fences_and_content(
     assert template["spec"]["contentDigest"] in stack_table
     assert "context=sha256:" in stack_table
     assert "application<-" in stack_table
+
+
+def test_get_stacktemplate_inspection_renders_all_acquisition_modes(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+):
+    inventory_support.git(repository, "checkout", "desired")
+    inline = inventory_support.stack_template("inline", desired=True)
+    git_template = inventory_support.stack_template("git", desired=True)
+    git_spec = git_template["spec"]
+    assert isinstance(git_spec, dict)
+    git_spec["acquisition"] = {
+        "documentDigest": "sha256:" + "d" * 64,
+        "requestedSource": {
+            "fromGit": {
+                "repository": "https://deploy:secret@example.com/org/templates.git",
+                "revision": "main",
+                "path": "templates/git.yaml",
+            }
+        },
+        "resolvedSource": {
+            "fromGit": {
+                "repository": "https://deploy:secret@example.com/org/templates.git",
+                "revision": "c" * 40,
+                "path": "templates/git.yaml",
+            }
+        },
+    }
+    git_spec["sourceContext"] = {
+        "repository": "https://deploy:secret@example.com/org/templates.git",
+        "revision": "c" * 40,
+    }
+    promotion_template = inventory_support.stack_template("promotion", desired=True)
+    promotion_spec = promotion_template["spec"]
+    assert isinstance(promotion_spec, dict)
+    promotion_spec["acquisition"] = {
+        "documentDigest": "sha256:" + "e" * 64,
+        "requestedSource": {"fromPromotion": {"stack": "application"}},
+        "resolvedSource": {
+            "fromPromotion": {
+                "environment": "dev",
+                "desiredRef": "gitopsctr/desired/dev",
+                "desiredRevision": "b" * 40,
+                "stack": "application",
+                "stackUid": "uid-application",
+                "template": "promotion",
+                "templateUid": "uid-application-template",
+                "templateContentDigest": promotion_spec["contentDigest"],
+            }
+        },
+    }
+    inventory_support.write_json(repository / "stack-templates/inline.yaml", inline)
+    inventory_support.write_json(repository / "stack-templates/git.yaml", git_template)
+    inventory_support.write_json(repository / "stack-templates/promotion.yaml", promotion_template)
+    revision = inventory_support.commit(repository, "add StackTemplate acquisition inspection cases")
+    inventory_support.git(repository, "push", "origin", f"{revision}:refs/heads/gitopsctr/desired/acquisition-modes")
+    inventory_support.git(repository, "checkout", "main")
+
+    output = run_get(
+        repository,
+        capsys,
+        "stacktemplates",
+        "--environment",
+        "staging",
+        "--desired-ref",
+        "gitopsctr/desired/acquisition-modes",
+    )
+
+    assert "input(document=sha256:" in output
+    assert "git(repository=https://example.com/org/templates.git;requested=main;resolved=" in output
+    assert "promotion(requested=application;resolved=dev/gitopsctr/desired/dev@" in output
+    assert "https://deploy:secret@example.com" not in output
+    assert "c" * 40 in output
+    assert "b" * 40 in output
 
 
 def test_get_stack_table_prepares_with_explicit_observed_snapshot(

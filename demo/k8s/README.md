@@ -9,9 +9,11 @@ This demo documents one `StackTemplate` in explicit-input workflows:
   remains visibly waiting because it has no controller-owned teardown capability; Argo CD delivery can converge once
   the observed Application is gone.
 
-The promotion workflow combines three pinned inputs rather than copying dev's entire desired tree. This demo supplies
-the target StackTemplate and Stack explicitly; a Stack-only promotion may instead reuse a target StackTemplate already
-present in target desired state. Only the image artifact is selected from dev's pinned desired and observed state:
+The promotion workflow combines three pinned inputs rather than copying dev's entire desired tree. This demo keeps the
+target StackTemplate inline in `deployment/stack-templates/application.yaml` and supplies it explicitly together with
+the target Stack. A Stack-only promotion may instead reuse a target StackTemplate already present in target desired
+state, but only when no authoritative partition selects it. An authoritative partition must include its complete target
+template input. Only the image artifact is selected from dev's pinned desired and observed state:
 
 ```mermaid
 flowchart LR
@@ -22,8 +24,9 @@ flowchart LR
 ```
 
 The target specification revision authenticates the Project/Environment configuration and the exact bytes of explicit
-target input files. The source desired and observed revisions provide artifact lineage; they do not acquire or reload a
-StackTemplate from external Git or from source desired state. See [Promotion](../../docs/apis/promotion.md#how-target-desired-state-is-built) and
+target input files. The source desired and observed revisions provide artifact lineage. This demo uses direct-inline
+StackTemplate input; repository-backed `fromGit` and explicit template `fromPromotion` are separate acquisition modes
+and are described in [Stacks and StackTemplates](../../docs/apis/stacks.md#acquisition-modes). See [Promotion](../../docs/apis/promotion.md#how-target-desired-state-is-built) and
 [Stacks and StackTemplates](../../docs/apis/stacks.md#desired-state-records).
 
 The provider comes from `GITOPSCTR_K8S_PROVIDER` and defaults to `kind`:
@@ -36,6 +39,13 @@ mise run demo-k8s acceptance
 mise run demo-k8s clean
 
 GITOPSCTR_K8S_PROVIDER=minikube mise run demo-k8s run
+```
+
+Inspect the resolved template and its acquisition lineage after a run:
+
+```console
+gitopsctr get stacktemplates --environment dev
+gitopsctr get stacktemplate application --environment dev -o yaml
 ```
 
 Run the unpartitioned preview workflow with:

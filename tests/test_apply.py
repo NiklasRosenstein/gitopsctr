@@ -28,7 +28,7 @@ def _repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, 
     baseline = tmp_path / "baseline"
     baseline.mkdir()
     (baseline / ".gitkeep").write_text("")
-    store.publish("deploy/dev", baseline, None, "initialize desired state")
+    store.publish("deploy/dev", baseline, None, "initialize desired state", expected_publication_head=None)
     monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
     return source, store, revision
 
@@ -85,7 +85,13 @@ def _authored_source_less_unit(path: Path, name: str) -> Path:
     return path
 
 
-def _apply(source: Path, revision: str, *files: Path, partition: str | None = None):
+def _apply(
+    source: Path,
+    revision: str,
+    *files: Path,
+    partition: str | None = None,
+    candidate_ref: str | None = None,
+):
     arguments = [
         "apply",
         "--environment",
@@ -99,6 +105,8 @@ def _apply(source: Path, revision: str, *files: Path, partition: str | None = No
     ]
     if partition is not None:
         arguments.extend(("--partition", partition))
+    if candidate_ref is not None:
+        arguments.extend(("--candidate-ref", candidate_ref))
     for path in files:
         arguments.extend(("-f", str(path)))
     return controller.command_apply(controller.build_parser().parse_args(arguments))
@@ -169,6 +177,18 @@ def test_apply_resolves_authored_unit_and_is_noop(tmp_path: Path, monkeypatch: p
 
     second = _apply(source, revision, authored, partition="application")
     assert second == first
+
+
+@pytest.mark.parametrize("candidate_ref", ["observed/dev", "refs/heads/observed/dev"])
+def test_apply_rejects_candidate_ref_matching_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidate_ref: str
+):
+    source, _store, revision = _repository(tmp_path, monkeypatch)
+    authored = _authored_unit(source / "application.yaml", "application")
+    revision = commit(source, "add application")
+
+    with pytest.raises(OperationError, match="conflicts with deployment state"):
+        _apply(source, revision, authored, partition="application", candidate_ref=candidate_ref)
 
 
 def test_apply_without_source_revision_uses_worktree_for_source_less_input(
@@ -530,7 +550,9 @@ def test_apply_carries_promotion_lineage_through_unrelated_and_noop_updates(
     promotion_path = baseline / "promotion.yaml"
     promotion_path.write_text(yaml.safe_dump(promotion, sort_keys=False))
     promotion_bytes = promotion_path.read_bytes()
-    store.publish("deploy/dev", baseline, desired_revision, "seed promotion lineage")
+    store.publish(
+        "deploy/dev", baseline, desired_revision, "seed promotion lineage", expected_publication_head=desired_revision
+    )
 
     unrelated = _authored_source_less_unit(source / "unrelated.yaml", "unrelated")
     revision = commit(source, "add unrelated root")

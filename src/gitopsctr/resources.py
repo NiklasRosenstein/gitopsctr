@@ -29,7 +29,7 @@ from gitopsctr.contracts import (
     StackDocument,
     StackSpec,
     StackTemplateDocument,
-    StackTemplateSpec,
+    StackTemplateDocumentSpec,
     StrictModel,
     stack_generated_unit_name,
 )
@@ -173,7 +173,7 @@ class StackResource:
 
     gvk: GVK
     metadata: ResourceMetadata
-    spec: StackSpec | DesiredStackSpec | StackTemplateSpec | DesiredStackTemplateSpec
+    spec: StackSpec | DesiredStackSpec | StackTemplateDocumentSpec | DesiredStackTemplateSpec
 
     @property
     def name(self) -> str:
@@ -775,7 +775,7 @@ class ResourceCatalog:
         profile: Literal["authored", "desired"],
     ) -> JsonObject:
         if resource.gvk.kind == "StackTemplate":
-            if not isinstance(resource.spec, StackTemplateSpec):
+            if not isinstance(resource.spec, StackTemplateDocumentSpec):
                 raise OperationError("StackTemplate resource has an invalid spec")
             if profile == "authored":
                 document = StackTemplateDocument(

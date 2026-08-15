@@ -1,4 +1,4 @@
-"""Durable StackTemplate source retention across desired-state publication."""
+"""StackTemplate source ownership across desired-state publication."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import pytest
 
 from gitopsctr import controller
 from gitopsctr.errors import OperationError
-from gitopsctr.state import ControllerPin
+from gitopsctr.state import AcceptedDesiredTarget, ControllerPin
 from tests.stack_deletion_support import stack_tree
 from tests.stack_support import commit, git, project_repository, write_stack_source
 
@@ -26,7 +26,7 @@ def _source_backed_tree(root: Path) -> tuple[str, str, str]:
     path = root / "stack-templates/preview.json"
     document = json.loads(path.read_text())
     revision = "a" * 40
-    document["spec"]["sourceContext"] = {"revision": revision}
+    document["spec"]["sourceContext"] = {"repository": ".", "revision": revision}
     path.write_text(json.dumps(document))
     return template_uid, unit_name, revision
 
@@ -46,7 +46,7 @@ def test_publish_pins_template_source_before_advancing_desired(tmp_path: Path, m
     monkeypatch.setattr(
         controller,
         "publish_tree",
-        lambda *_args: events.append(("publish",)) or "d" * 40,
+        lambda *_args, **_kwargs: events.append(("publish",)) or "d" * 40,
     )
 
     revision, outcome = controller.publish_desired_change(
@@ -72,7 +72,7 @@ def test_pin_acquisition_failure_cannot_publish_desired_state(tmp_path: Path, mo
     _source_backed_tree(candidate)
     published = False
 
-    def publish_tree(*_args: object) -> str:
+    def publish_tree(*_args: object, **_kwargs: object) -> str:
         nonlocal published
         published = True
         return "d" * 40
@@ -103,7 +103,7 @@ def test_pin_acquisition_failure_cannot_publish_desired_state(tmp_path: Path, mo
     assert not published
 
 
-def test_successful_publication_keeps_attempt_claim_when_canonical_promotion_fails(
+def test_successful_publication_releases_attempt_claim_after_atomic_owner_push(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -133,7 +133,7 @@ def test_successful_publication_keeps_attempt_claim_when_canonical_promotion_fai
     )
     monkeypatch.setattr(controller, "validate_effect_leases_preserved", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(controller, "change_gate", lambda *_args: "direct")
-    monkeypatch.setattr(controller, "publish_tree", lambda *_args: "d" * 40)
+    monkeypatch.setattr(controller, "publish_tree", lambda *_args, **_kwargs: "d" * 40)
 
     with pytest.raises(OperationError, match="canonical pin unavailable"):
         controller.publish_desired_change(
@@ -147,7 +147,7 @@ def test_successful_publication_keeps_attempt_claim_when_canonical_promotion_fai
             "Apply one Stack.",
             False,
         )
-    assert released == []
+    assert released == [claim.name]
 
     acquisition = controller.ControllerPinAcquisition(pins=(claim,), newly_created=(claim,), claims=(claim,))
     monkeypatch.setattr(
@@ -160,7 +160,7 @@ def test_successful_publication_keeps_attempt_claim_when_canonical_promotion_fai
         ),
     )
     controller._promote_stack_template_source_pins("dev", candidate, acquisition)
-    assert released == [claim.name]
+    assert released == [claim.name, claim.name]
 
 
 def test_failed_publication_releases_only_its_attempt_claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -181,7 +181,7 @@ def test_failed_publication_releases_only_its_attempt_claim(tmp_path: Path, monk
     monkeypatch.setattr(
         controller,
         "publish_tree",
-        lambda *_args: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["git", "push"])),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["git", "push"])),
     )
 
     with pytest.raises(subprocess.CalledProcessError):
@@ -196,6 +196,56 @@ def test_failed_publication_releases_only_its_attempt_claim(tmp_path: Path, monk
             "Apply one Stack.",
             False,
         )
+    assert released == [claim.name]
+
+
+def test_ambiguous_publication_releases_claim_only_after_owner_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    candidate = tmp_path / "candidate"
+    template_uid, _unit_name, source_revision = _source_backed_tree(candidate)
+    claim = _pin(f"claims/attempt/stack-templates/dev/preview/{template_uid}/{source_revision}", source_revision)
+    released: list[str] = []
+    promoted: list[dict[str, str]] = []
+    verified: list[tuple[str, str | None]] = []
+
+    def fail_promotion(revisions: dict[str, str]) -> tuple[ControllerPin, ...]:
+        promoted.append(revisions)
+        raise OperationError("canonical pin unavailable")
+
+    monkeypatch.setattr(
+        controller,
+        "state_store",
+        lambda: SimpleNamespace(
+            create_controller_pin_claims=lambda _revisions, _token: (claim,),
+            verify_published_tree=lambda ref, _candidate, parent: verified.append((ref, parent)) or object(),
+            create_controller_pins=fail_promotion,
+            release_controller_pin=lambda name, _revision: released.append(name) or True,
+        ),
+    )
+    monkeypatch.setattr(controller, "validate_effect_leases_preserved", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(controller, "change_gate", lambda *_args: "direct")
+    monkeypatch.setattr(
+        controller,
+        "publish_tree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["git", "push"])),
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        controller.publish_desired_change(
+            "dev",
+            candidate,
+            "deploy/dev",
+            "c" * 40,
+            "candidate/dev",
+            "Apply Stack",
+            "Apply Stack",
+            "Apply one Stack.",
+            False,
+        )
+
+    assert verified == [("deploy/dev", "c" * 40)]
+    assert promoted
     assert released == [claim.name]
 
 
@@ -306,7 +356,7 @@ def test_failed_desired_publication_retains_source_pins_for_race_safety(
     monkeypatch.setattr(controller, "validate_effect_leases_preserved", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(controller, "change_gate", lambda *_args: "direct")
 
-    def fail_publish(*_args: object) -> str:
+    def fail_publish(*_args: object, **_kwargs: object) -> str:
         raise subprocess.CalledProcessError(1, ["git", "push"], stderr="non-fast-forward")
 
     monkeypatch.setattr(controller, "publish_tree", fail_publish)
@@ -354,7 +404,7 @@ def test_failed_publication_does_not_release_a_preexisting_live_pin(
     monkeypatch.setattr(
         controller,
         "publish_tree",
-        lambda *_args: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["git", "push"])),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["git", "push"])),
     )
 
     with pytest.raises(subprocess.CalledProcessError):
@@ -417,6 +467,55 @@ def test_finalized_template_releases_all_incarnation_pins(tmp_path: Path, monkey
 
     assert controller._release_finalized_stack_template_pins("dev", "preview", template_uid, 1, candidate) is True
     assert released == [(pin.name, pin.revision) for pin in pins]
+
+
+def test_finalization_does_not_delete_live_candidate_publication_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    candidate = tmp_path / "candidate"
+    template_uid, _unit_name, source_revision = _source_backed_tree(candidate)
+    (candidate / "stack-templates/preview.json").unlink()
+    (candidate / "stacks/preview.json").unlink()
+    (candidate / "units/preview--preview-app.json").unlink()
+    controller.write_resource_incarnation_tombstone(
+        candidate,
+        controller.ResourceIncarnationTombstone(
+            api_version=controller.CORE_API_VERSION,
+            kind="StackTemplate",
+            name="preview",
+            uid=template_uid,
+            deletion_generation=1,
+        ),
+    )
+    pin = _pin(f"stack-templates/dev/preview/{template_uid}/{source_revision}", source_revision)
+    owner = SimpleNamespace(
+        source_pin_name=pin.name,
+        revision=source_revision,
+        publication_ref="custom/candidate",
+        publication_revision="b" * 40,
+    )
+    released: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "state_store",
+        lambda: SimpleNamespace(
+            list_controller_publication_owners=lambda: (owner,),
+            publication_owner_is_live_candidate=lambda _owner, _target: True,
+            list_controller_pins=lambda: (pin,),
+            release_controller_pin=lambda name, _revision: released.append(name) or True,
+        ),
+    )
+
+    assert (
+        controller._release_finalized_stack_template_pins(
+            "dev",
+            "preview",
+            template_uid,
+            1,
+            candidate,
+            AcceptedDesiredTarget("deploy/dev", "c" * 40),
+        )
+        is False
+    )
+    assert released == []
 
 
 def test_finalization_releases_source_pins_for_source_less_tombstone_with_new_uid(
@@ -558,7 +657,7 @@ def test_noop_apply_repairs_a_missing_template_source_pin(tmp_path: Path, monkey
     baseline = tmp_path / "baseline"
     baseline.mkdir()
     (baseline / ".gitkeep").write_text("")
-    store.publish("deploy/dev", baseline, None, "initialize desired state")
+    store.publish("deploy/dev", baseline, None, "initialize desired state", expected_publication_head=None)
     monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
     controller._state_store.cache_clear()
     stack = environment / "stacks/web.json"

@@ -49,7 +49,7 @@ class _DeletionHarness:
             else:
                 output.mkdir(parents=True)
 
-        def publish_observed(_ref: str, directory: Path, _parent: str | None, _message: str):
+        def publish_observed(_ref: str, directory: Path, _parent: str | None, _message: str, **_kwargs: object):
             snapshot = self.observed.parent / f"observed-{len(self.observed_publications)}"
             shutil.copytree(directory, snapshot)
             self.observed_publications.append(snapshot)

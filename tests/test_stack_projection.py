@@ -294,7 +294,7 @@ def test_apply_template_and_stack_together_publishes_one_fenced_projection(
     assert isinstance(desired_template.spec, DesiredStackTemplateSpec)
     assert isinstance(desired_stack.spec, DesiredStackSpec)
     assert desired_template.spec.unitTemplates["app"].spec["source"] == {"path": "."}
-    assert desired_template.spec.acquisition.fromInput.__class__.__name__ == "StackTemplateFromInput"
+    assert desired_template.spec.acquisition.requestedSource.fromInput.__class__.__name__ == "StackTemplateFromInput"
     assert desired_template.spec.acquisition.documentDigest == (
         "sha256:" + hashlib.sha256(template.read_bytes()).hexdigest()
     )
@@ -418,7 +418,7 @@ def test_stack_projection_wait_retains_prior_active_set_then_durable_evidence_sw
         controller.RESOURCE_CATALOG.serialize_receipt(receipt),
         format=controller.DocumentFormat.JSON,
     )
-    store.publish("observed/dev", observed, None, "publish producer evidence")
+    store.publish("observed/dev", observed, None, "publish producer evidence", expected_publication_head=None)
 
     # Durable progression must use the reviewed Project/Environment context,
     # not a later dirty worktree (including a tracked Environment deletion).
@@ -541,7 +541,9 @@ def test_durable_projection_evaluates_every_saved_context_group(tmp_path: Path, 
         controller.RESOURCE_CATALOG.serialize_receipt(receipt),
         format=controller.DocumentFormat.JSON,
     )
-    store.publish("observed/dev", observed, None, "publish non-minimum context evidence")
+    store.publish(
+        "observed/dev", observed, None, "publish non-minimum context evidence", expected_publication_head=None
+    )
 
     # Durable progression must use the saved context group roots, even when
     # the live source configuration has disappeared.
@@ -585,7 +587,7 @@ def test_durable_projection_cumulates_two_ready_context_groups(tmp_path: Path, m
             controller.RESOURCE_CATALOG.serialize_receipt(receipt),
             format=controller.DocumentFormat.JSON,
         )
-    store.publish("observed/dev", observed, None, "publish both Stack inputs")
+    store.publish("observed/dev", observed, None, "publish both Stack inputs", expected_publication_head=None)
 
     controller.progress_durable_stack_projection("dev", "deploy/dev", "observed/dev")
     final_revision = store.fetch("deploy/dev").revision
@@ -624,7 +626,7 @@ def test_durable_projection_preserves_an_earlier_ready_group_when_later_group_wa
         controller.RESOURCE_CATALOG.serialize_receipt(receipt),
         format=controller.DocumentFormat.JSON,
     )
-    store.publish("observed/dev", observed, None, "publish only earlier Stack input")
+    store.publish("observed/dev", observed, None, "publish only earlier Stack input", expected_publication_head=None)
 
     controller.progress_durable_stack_projection("dev", "deploy/dev", "observed/dev")
     final_revision = store.fetch("deploy/dev").revision
@@ -753,6 +755,7 @@ def test_canonical_stacktemplate_update_recomputes_fanout_and_ignores_caller_ide
         unitTemplates=updated_content.unitTemplates,
         contentDigest=updated_content.semantic_content_digest(),
         acquisition=first_template.spec.acquisition,
+        sourceContext=first_template.spec.sourceContext,
     )
     canonical_template = replace(
         first_template,

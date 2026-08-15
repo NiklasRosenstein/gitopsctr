@@ -126,8 +126,10 @@ def stack_template(name: str, *, desired: bool) -> dict[str, object]:
             "contentDigest": parsed.spec.semantic_content_digest(),
             "acquisition": {
                 "documentDigest": "sha256:" + "b" * 64,
-                "fromInput": {},
+                "requestedSource": {"fromInput": {}},
+                "resolvedSource": {"fromInput": {}},
             },
+            "sourceContext": {"repository": ".", "revision": "a" * 40},
         }
     )
     return authored

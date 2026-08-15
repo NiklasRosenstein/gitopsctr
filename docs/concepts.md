@@ -137,12 +137,12 @@ target desired state = target specification at specificationRevision
                      + selected inputs from source desiredRevision and observedRevision
 ```
 
-For example, a target Stack may reuse a StackTemplate already in target desired state, or the promotion may supply that
-StackTemplate inline. It can then import an exact image artifact evidenced by the pinned source desired and observed
-revisions. StackTemplate acquisition is never implicit from source promotion state or Git. See [Stacks and
-StackTemplates](apis/stacks.md#repository-backed-unit-sources) for source-context propagation and [Promotion](apis/promotion.md)
-for the lineage record. External/historical Git and promotion-backed StackTemplate acquisition remains a residual
-backlog item.
+For example, a target Stack may reuse a StackTemplate already in target desired state, or promotion may supply that
+StackTemplate inline, from Git, or with an explicit `source.fromPromotion` selector. The latter resolves only against
+the pinned source desired revision; acquisition is never implicit. A StackTemplate's desired acquisition record keeps
+the requested and resolved source lineage, while `documentDigest` checks the serialized selected document and
+`contentDigest` identifies its semantic inline content. See [Stacks and StackTemplates](apis/stacks.md) for
+source-context propagation and [Promotion](apis/promotion.md) for the lineage record.
 
 `changeGate: pullRequest` publishes promotion and rollback candidates for review; `changeGate: none` publishes them
 directly. Promotion normally requires every source unit to have a current receipt. Environments that contain only

@@ -275,13 +275,106 @@ def test_desired_stack_template_schema_exposes_direct_input_contract():
     assert "unitTemplates" in spec["properties"]
     assert "resources" not in spec["properties"]
     assert set(spec["required"]) >= {"parameters", "unitTemplates", "contentDigest", "acquisition"}
+    acquisition = spec["properties"]["acquisition"]
+    assert set(acquisition["required"]) == {"documentDigest", "requestedSource", "resolvedSource"}
+    assert "fromInput" not in acquisition["properties"]
+
+
+def test_desired_stack_template_schema_requires_non_null_git_source_context():
+    schema = schemas.core_resource_schema("StackTemplate", "desired")
+    document = {
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "StackTemplate",
+        "metadata": {"name": "application", "uid": "template-uid"},
+        "spec": {
+            "parameters": [],
+            "unitTemplates": {
+                "app": {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "spec": {},
+                }
+            },
+            "contentDigest": DIGEST,
+            "acquisition": {
+                "documentDigest": DIGEST,
+                "requestedSource": {
+                    "fromGit": {
+                        "repository": "https://example.invalid/templates.git",
+                        "revision": "main",
+                        "path": "templates/application.yaml",
+                    }
+                },
+                "resolvedSource": {
+                    "fromGit": {
+                        "repository": "https://example.invalid/templates.git",
+                        "revision": "a" * 40,
+                        "path": "templates/application.yaml",
+                    }
+                },
+            },
+            "sourceContext": None,
+        },
+    }
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
+
+
+@pytest.mark.parametrize(
+    ("kind", "source", "parameters", "requires_context"),
+    [
+        ("Terraform", None, [], False),
+        ("FrontendS3Cloudfront", None, [], False),
+        ("Terraform", {"path": "."}, [], True),
+        ("Terraform", {"fromParameter": {"name": "source"}}, [{"name": "source", "type": "object"}], True),
+        (
+            "Terraform",
+            {"path": {"fromParameter": {"name": "source"}}},
+            [{"name": "source", "type": "string"}],
+            True,
+        ),
+    ],
+)
+def test_desired_stack_template_schema_source_context_matrix(
+    kind: str, source: object, parameters: list[dict[str, str]], requires_context: bool
+):
+    schema = schemas.core_resource_schema("StackTemplate", "desired")
+    document = {
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "StackTemplate",
+        "metadata": {"name": "application", "uid": "template-uid"},
+        "spec": {
+            "parameters": parameters,
+            "unitTemplates": {
+                "app": {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": kind,
+                    "spec": {"source": source},
+                }
+            },
+            "contentDigest": DIGEST,
+            "acquisition": {
+                "documentDigest": DIGEST,
+                "requestedSource": {"fromInput": {}},
+                "resolvedSource": {"fromInput": {}},
+            },
+        },
+    }
+
+    validator = Draft202012Validator(schema)
+    if requires_context:
+        with pytest.raises(ValidationError):
+            validator.validate(document)
+        document["spec"]["sourceContext"] = {"repository": ".", "revision": "a" * 40}
+    Draft202012Validator(schema).validate(document)
 
 
 def test_authored_stack_template_schema_exposes_only_canonical_unit_templates():
     spec = schemas.core_resource_schema("StackTemplate", "authored")["properties"]["spec"]
+    inline = next(variant for variant in spec["anyOf"] if "unitTemplates" in variant.get("properties", {}))
 
-    assert "unitTemplates" in spec["properties"]
-    assert "resources" not in spec["properties"]
+    assert "unitTemplates" in inline["properties"]
+    assert "resources" not in inline["properties"]
 
 
 @pytest.mark.parametrize(
@@ -306,7 +399,14 @@ def test_stack_schemas_reject_unsupported_acquisition_shapes(schema_kind, profil
             },
         }
         if profile == "desired":
-            spec.update(contentDigest=DIGEST, acquisition={"documentDigest": DIGEST, "fromInput": {}})
+            spec.update(
+                contentDigest=DIGEST,
+                acquisition={
+                    "documentDigest": DIGEST,
+                    "requestedSource": {"fromInput": {}},
+                    "resolvedSource": {"fromInput": {}},
+                },
+            )
         document = {
             "apiVersion": "gitopsctr.io/v1",
             "kind": "StackTemplate",
@@ -322,6 +422,41 @@ def test_stack_schemas_reject_unsupported_acquisition_shapes(schema_kind, profil
         }
     mutation(document["spec"])
     schema = schemas.core_resource_schema(schema_kind, profile)
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
+
+
+def test_desired_stack_template_schema_rejects_mismatched_acquisition_modes():
+    document = {
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "StackTemplate",
+        "metadata": {"name": "preview", "uid": "template-uid"},
+        "spec": {
+            "parameters": [],
+            "unitTemplates": {
+                "app": {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "spec": {},
+                }
+            },
+            "contentDigest": DIGEST,
+            "acquisition": {
+                "documentDigest": DIGEST,
+                "requestedSource": {"fromInput": {}},
+                "resolvedSource": {"fromInput": {}},
+            },
+        },
+    }
+    document["spec"]["acquisition"]["resolvedSource"] = {
+        "fromGit": {
+            "repository": "https://example.invalid/templates.git",
+            "revision": "a" * 40,
+            "path": "templates/web.yaml",
+        }
+    }
+    schema = schemas.core_resource_schema("StackTemplate", "desired")
+
     with pytest.raises(ValidationError):
         Draft202012Validator(schema).validate(document)
 

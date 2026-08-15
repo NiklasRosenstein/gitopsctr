@@ -7,9 +7,9 @@ and can appear in template-bearing fields supported by a unit kind.
 
     This page describes the field-level `fromPromotion` reference expression, which reads a source Unit's public
     `spec`. A Stack's `artifactImports[].fromPromotion` instead imports a validated artifact from source desired and
-    observed state. StackTemplate acquisition has no external Git or source-promotion mode: promotion either reuses a
-    target desired StackTemplate or receives it as explicit direct-inline input. See [Stacks and
-    StackTemplates](apis/stacks.md#desired-state-records).
+    observed state. StackTemplate acquisition is separate: `fromGit` resolves a repository source, while
+    `fromPromotion` explicitly selects a source StackTemplate during `promote`; neither mode is implicit. See [Stacks
+    and StackTemplates](apis/stacks.md#acquisition-modes).
 
 | Expression | Reads | Pointer scope | Required selectors |
 | --- | --- | --- | --- |

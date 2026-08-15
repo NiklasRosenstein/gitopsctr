@@ -17,6 +17,8 @@ from gitopsctr.contracts import (
     StackTemplateAcquisition,
     StackTemplateFromInput,
     StackTemplateReference,
+    StackTemplateRequestedFromInput,
+    StackTemplateResolvedFromInput,
     StackTemplateSpec,
     StackTemplateUnitTemplate,
 )
@@ -128,7 +130,8 @@ def test_registered_stack_template_selection_binding_checks_uid_and_content_dige
         contentDigest=content.semantic_content_digest(),
         acquisition=StackTemplateAcquisition(
             documentDigest="sha256:" + "b" * 64,
-            fromInput=StackTemplateFromInput(),
+            requestedSource=StackTemplateRequestedFromInput(fromInput=StackTemplateFromInput()),
+            resolvedSource=StackTemplateResolvedFromInput(fromInput=StackTemplateFromInput()),
         ),
         unitTemplates=unit_templates,
     )

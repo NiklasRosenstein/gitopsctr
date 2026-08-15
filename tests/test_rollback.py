@@ -490,7 +490,7 @@ def _install_rollback_simulation(
             )
         return revisions["current"]
 
-    def publish(ref, directory, parent, message):
+    def publish(ref, directory, parent, message, **_kwargs):
         publications.append(
             {
                 "ref": ref,
@@ -917,6 +917,7 @@ def test_pull_request_gate_routes_rollback_through_candidate_submission(tmp_path
     [
         (None, "gitopsctr/candidates/dev/candidate123"),
         ("manual/rollback", "manual/rollback"),
+        ("refs/heads/manual/rollback", "manual/rollback"),
     ],
 )
 def test_gated_rollback_uses_candidate_template_or_exact_override(override, expected_ref, monkeypatch):
@@ -946,6 +947,27 @@ def test_gated_rollback_uses_candidate_template_or_exact_override(override, expe
     args.handler(args)
 
     assert captured[0][:3] == (expected_ref, "deploy/dev", revisions["current"])
+
+
+@pytest.mark.parametrize("candidate_ref", ["observed/dev", "refs/heads/observed/dev"])
+def test_gated_rollback_rejects_candidate_ref_matching_observed(candidate_ref, monkeypatch):
+    revisions, _publications = _install_rollback_simulation(monkeypatch, gate="pullRequest")
+    args = deploy_release.build_parser().parse_args(
+        [
+            "rollback",
+            "--environment",
+            "dev",
+            "--to-desired-revision",
+            revisions["target"],
+            "--reason",
+            "Known-bad release",
+            "--candidate-ref",
+            candidate_ref,
+        ]
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="conflicts with deployment state"):
+        args.handler(args)
 
 
 def test_direct_rollback_rejects_candidate_ref_override(monkeypatch):

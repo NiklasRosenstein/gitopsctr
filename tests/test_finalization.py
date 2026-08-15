@@ -117,7 +117,7 @@ def _prepare_finalization(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docum
         shutil.copytree(source, output)
         return desired_revision if ref == "deploy/dev" else None
 
-    def publish_tree(_ref: str, directory: Path, _parent: str | None, _message: str):
+    def publish_tree(_ref: str, directory: Path, _parent: str | None, _message: str, **_kwargs: object):
         snapshot = tmp_path / f"observed-{len(teardown_publications)}"
         shutil.copytree(directory, snapshot)
         teardown_publications.append(snapshot)

@@ -18,7 +18,7 @@ from gitopsctr.contracts import (
     MashumaroContract,
     ResolvedInputs,
     StackSpec,
-    StackTemplateSpec,
+    StackTemplateDocumentSpec,
     artifact_descriptors_schema,
 )
 from gitopsctr.document import DocumentContract, JsonObject
@@ -241,7 +241,7 @@ def core_resource_schema(kind: str, profile: str = "authored") -> JsonObject:
         return schema
     elif kind == "StackTemplate":
         specification = _model_specification_schema(
-            DesiredStackTemplateSpec if profile == "desired" else StackTemplateSpec,
+            cast(type[Any], DesiredStackTemplateSpec if profile == "desired" else StackTemplateDocumentSpec),
             "stack-template-spec",
         )
         # `resources` is an internal computed expansion view. Authored and

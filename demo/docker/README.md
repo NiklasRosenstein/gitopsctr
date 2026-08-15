@@ -6,13 +6,23 @@ This demo applies one authored `Stack` as the authoritative `application` partit
 2. Its `containers` artifact carries the immutable image digest.
 3. `application--deploy` resolves that artifact and uses Terraform's Docker provider to run the container.
 
-Both Units are generated from `deployment/stack-templates/application.yaml`; there are no separately authored Units.
+Both Units are generated from the inline `StackTemplate` in `deployment/stack-templates/application.yaml`; there are no
+separately authored Units. The demo passes that template explicitly with the Stack, so its desired acquisition mode is
+`input`; the desired record's `documentDigest` identifies the serialized input bytes and `contentDigest` identifies the
+semantic template content.
 
 ```console
 mise install
 mise run sync
 mise run demo-docker run
 mise run demo-docker clean
+```
+
+Inspect the template root and its generated Stack while the demo repository is available:
+
+```console
+gitopsctr get stacktemplates --environment dev
+gitopsctr get stack application --environment dev
 ```
 
 Override the default ports when necessary:

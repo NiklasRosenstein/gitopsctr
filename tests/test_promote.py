@@ -205,7 +205,9 @@ def test_command_promote_resolves_unit_and_direct_inline_stack_inputs(tmp_path: 
         source_candidate,
         verbose=False,
     )
-    source_desired_revision = store.publish("gitopsctr/desired/dev", source_candidate, None, "source desired").revision
+    source_desired_revision = store.publish(
+        "gitopsctr/desired/dev", source_candidate, None, "source desired", expected_publication_head=None
+    ).revision
     monkeypatch.setattr(controller, "require_clean_source", lambda *_args: None)
 
     args = controller.build_parser().parse_args(
@@ -263,7 +265,9 @@ def test_command_promote_resolves_unit_and_direct_inline_stack_inputs(tmp_path: 
         controller.RESOURCE_CATALOG.serialize_receipt(receipt),
         format=controller.DocumentFormat.JSON,
     )
-    store.publish("gitopsctr/observed/staging", target_observed, None, "publish target evidence")
+    store.publish(
+        "gitopsctr/observed/staging", target_observed, None, "publish target evidence", expected_publication_head=None
+    )
 
     progressed = controller.progress_durable_stack_projection(
         "staging",
@@ -283,6 +287,92 @@ def test_command_promote_resolves_unit_and_direct_inline_stack_inputs(tmp_path: 
     )
     assert promoted_after_progress.spec.terraform.variables == {"value": "source"}  # type: ignore[union-attr]
     assert waiting_after_progress.spec.terraform.variables == {"value": "evidence"}  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("lease_environment", "candidate_ref", "configured_lease_ref"),
+    [
+        ("dev", "refs/heads/lease/dev", "lease/dev"),
+        ("staging", "lease/staging", "refs/heads/lease/staging"),
+    ],
+)
+def test_command_promote_rejects_candidate_ref_matching_absent_promotion_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lease_environment: str,
+    candidate_ref: str,
+    configured_lease_ref: str,
+):
+    source = _promotion_repository(tmp_path / "source")
+    staging_environment = source / "deployment/environments/staging/environment.json"
+    staging = json.loads(staging_environment.read_text())
+    staging["spec"]["changeGate"] = "pullRequest"
+    _write(staging_environment, staging)
+    git(source, "init", "-b", "main")
+    remote = tmp_path / "origin.git"
+    git(tmp_path, "init", "--bare", str(remote))
+    git(source, "remote", "add", "origin", str(remote))
+    specification_revision = commit(source, "review target promotion lease conflict")
+    git(source, "push", "-u", "origin", "main")
+    monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
+    controller._state_store.cache_clear()
+    store = controller.GitStateStore(source)
+
+    current = tmp_path / "source-desired"
+    observed = tmp_path / "source-observed"
+    current.mkdir()
+    observed.mkdir()
+    source_candidate = tmp_path / "source-candidate"
+    controller.build_desired_candidate(
+        "dev",
+        source,
+        specification_revision,
+        current,
+        observed,
+        None,
+        source_candidate,
+        verbose=False,
+    )
+    store.publish("gitopsctr/desired/dev", source_candidate, None, "source desired", expected_publication_head=None)
+    monkeypatch.setattr(controller, "require_clean_source", lambda *_args: None)
+    monkeypatch.setattr(
+        controller,
+        "effect_lease_ref",
+        lambda environment, _desired_ref, _configuration_root: (
+            configured_lease_ref if environment == lease_environment else None
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "publish_change_candidate",
+        lambda *_args, **_kwargs: pytest.fail("promotion candidate was published"),
+    )
+
+    args = controller.build_parser().parse_args(
+        [
+            "promote",
+            "--from-environment",
+            "dev",
+            "--to-environment",
+            "staging",
+            "--specification-revision",
+            specification_revision,
+            "--candidate-ref",
+            candidate_ref,
+            "-f",
+            "target-template.yaml",
+            "-f",
+            "target-stack.yaml",
+            "-f",
+            "promoted.yaml",
+            "-f",
+            "producer.yaml",
+        ]
+    )
+
+    monkeypatch.chdir(source)
+    with pytest.raises(OperationError, match="conflicts with deployment state"):
+        controller.command_promote(args)
 
 
 @pytest.mark.parametrize("value", ["-", "outside.yaml"])
@@ -403,7 +493,7 @@ def test_command_promote_empty_first_partition_is_a_noop(tmp_path: Path, monkeyp
         candidate,
         verbose=False,
     )
-    store.publish("gitopsctr/desired/dev", candidate, None, "publish source desired")
+    store.publish("gitopsctr/desired/dev", candidate, None, "publish source desired", expected_publication_head=None)
     monkeypatch.setattr(controller, "require_clean_source", lambda *_args: None)
     empty = source / "empty"
     empty.mkdir()
