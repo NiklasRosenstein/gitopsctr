@@ -153,12 +153,17 @@ def test_get_all_across_environments_keeps_family_tables_and_namespace_columns(
     assert "dev" in output and "staging" in output
 
 
-def test_get_named_raw_document_and_multi_result_envelope(repository: Path, capsys: pytest.CaptureFixture[str]):
+def test_get_named_raw_document_and_collection_envelope(repository: Path, capsys: pytest.CaptureFixture[str]):
     raw = json.loads(run_get(repository, capsys, "unit", "application", "--environment", "dev", "-o", "json"))
     assert raw["apiVersion"] == "unit.gitopsctr.io/v1"
     assert raw["kind"] == "Terraform"
     assert raw["metadata"]["name"] == "application"
     assert "provenance" not in raw
+
+    collection = json.loads(run_get(repository, capsys, "units", "--environment", "staging", "-o", "json"))
+    assert collection["apiVersion"] == "inspection.gitopsctr.io/v1"
+    assert collection["kind"] == "ResourceList"
+    assert collection["items"]
 
     result = json.loads(run_get(repository, capsys, "unit", "application", "-A", "-o", "json"))
     assert result["apiVersion"] == "inspection.gitopsctr.io/v1"
@@ -818,7 +823,14 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
         "-o",
         "json",
     )
-    assert json.loads(all_output) == artifact
+    all_result = json.loads(all_output)
+    assert all_result["kind"] == "ResourceList"
+    assert [item["document"] for item in all_result["items"]] == [artifact]
+
+    artifact_collection = json.loads(run_get(repository, capsys, "artifacts", "--environment", "dev", "-o", "json"))
+    assert artifact_collection["kind"] == "ResourceList"
+    assert [item["document"] for item in artifact_collection["items"]] == [artifact]
+    assert artifact_collection["items"][0]["inspection"]["authentication"] == "CURRENT"
 
     artifacts = run_get(repository, capsys, "artifacts", "--environment", "dev")
     assert artifacts.splitlines()[0].split() == ["NAME", "KIND", "PARTITION", "AUTHENTICATION"]

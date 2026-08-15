@@ -107,10 +107,11 @@ gitopsctr get unit application--deploy --environment dev -o yaml
 gitopsctr get receipts -A -o json
 ```
 
-A single result is the exact persisted resource document. Multi-result output is a schema-versioned
-inspection envelope: every item contains its generic family/scope/qualified-name address plus Environment, plane, ref,
-revision, and path provenance alongside the exact document. The envelope is the registered, typed
-`inspection.gitopsctr.io/v1 ResourceList` output API; it is not a persisted resource family.
+A named lookup with one match returns the exact persisted resource document. A collection query or `get all` always
+returns a schema-versioned inspection envelope, even when it contains zero or one item; a named all-Environment query
+uses the envelope when it matches multiple resources. Every item contains its generic family/scope/qualified-name
+address plus Environment, plane, ref, revision, and path provenance alongside the exact document. The envelope is the
+registered, typed `inspection.gitopsctr.io/v1 ResourceList` output API; it is not a persisted resource family.
 
 An item's optional `inspection` object contains state derived while traversing registered relationships; it is never
 part of the persisted `document`. For Artifacts, `inspection.authentication` is `CURRENT` when the Receipt descriptor,

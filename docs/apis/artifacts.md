@@ -31,8 +31,10 @@ descriptor and the Receipt's exact desired producer before reporting it as `CURR
 desired resource supplies the Artifact's partition. The existing Receipt shortcuts remain useful for relationship-first
 navigation: `gitopsctr get receipt PRODUCER --environment dev --artifact NAME` or `--artifacts`.
 
-A named query with one result returns the exact Artifact document, matching other `get` selectors. Multi-result and
-aggregate machine output uses the typed `inspection.gitopsctr.io/v1 ResourceList` contract. Its optional per-item
+A named query with one result returns the exact Artifact document, matching other `get` selectors. Collection and
+aggregate machine queries always use the typed `inspection.gitopsctr.io/v1 ResourceList` contract, even when the
+collection contains zero or one item. A named all-Environment query uses the list only if it matches multiple
+resources. The list's optional per-item
 `inspection.authentication` field is derived inspection state, not part of the persisted Artifact: `CURRENT` means the
 Receipt descriptor and exact current desired producer authenticate the Artifact; `STALE` means the descriptor is valid
 for an older desired producer; and `ORPHAN` means no matching Receipt/current producer relationship can authenticate it.

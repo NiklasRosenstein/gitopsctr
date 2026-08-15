@@ -529,8 +529,8 @@ def _envelope(results: Sequence[InspectionResult]) -> JsonObject:
     )
 
 
-def _print_documents(results: Sequence[InspectionResult], output: str, *, force_list: bool = False) -> None:
-    document: JsonObject = _envelope(results) if force_list or len(results) != 1 else results[0].record.document
+def _print_documents(results: Sequence[InspectionResult], output: str, *, collection_result: bool) -> None:
+    document = _envelope(results) if collection_result or len(results) != 1 else results[0].record.document
     if output == "json":
         print(json.dumps(document, indent=2, sort_keys=False))
     else:
@@ -628,7 +628,7 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
                     _print_table(headers, rows)
             else:
                 results = tuple(result for _family, family_results in selected for result in family_results)
-                _print_documents(results, args.output, force_list=True)
+                _print_documents(results, args.output, collection_result=True)
         return
 
     try:
@@ -665,4 +665,5 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
             _print_documents(
                 results,
                 "yaml" if table_output else args.output,
+                collection_result=args.name is None or args.artifacts,
             )
