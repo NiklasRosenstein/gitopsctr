@@ -30,6 +30,9 @@ gitopsctr get promotions --environment staging
 gitopsctr get promotion dev --environment staging
 gitopsctr get receipts --environment dev
 gitopsctr get receipt application--image --environment dev
+gitopsctr get artifacts --environment dev
+gitopsctr get artifacts --environment dev --producer application--image
+gitopsctr get artifact application--image/containers --environment dev
 gitopsctr status --environment dev
 gitopsctr dependencies --environment dev --unit application
 gitopsctr validate
@@ -44,8 +47,8 @@ gitopsctr get unit application--deploy -A
 
 `get all` is the namespace overview, analogous to `kubectl get all`. It queries every registry-defined,
 environment-scoped inspection family and prints one table section per family that has results. This includes Units,
-Stacks, StackTemplates, Promotions, and Receipts; project-scoped Environments and Receipt-owned Artifacts keep their
-dedicated selectors. With `-o yaml` or `-o json`, the aggregate is always one provenance-bearing `ResourceList`, even
+Stacks, StackTemplates, Promotions, Receipts, and Artifacts; project-scoped Environments keep their
+dedicated selector. With `-o yaml` or `-o json`, the aggregate is always one provenance-bearing `ResourceList`, even
 when it contains zero or one resource.
 
 `--environment` and `-A/--all-environments` are mutually exclusive. Project-scoped Environment queries need neither.
@@ -71,6 +74,7 @@ The built-in views use these columns, with `ENVIRONMENT` added for `-A`:
 | StackTemplates | `NAME`, short `CONTENT-DIGEST`, short `SOURCE`, `PARAMETERS`, `UNITS`, `PARTITION`, `REFERENCES`, `STATE` |
 | Promotions | `NAME`, `SOURCE`, `PARTITION`, pinned desired, observed, and specification revisions |
 | Receipts | `NAME`, subject `KIND`, subject `PARTITION`, `OBSERVATION`, `ARTIFACTS` |
+| Artifacts | qualified `NAME` (`producer/name`), `KIND`, producer `PARTITION`, `AUTHENTICATION` |
 
 The default Stack view keeps `TEMPLATE` and a short `TEMPLATE-DIGEST` for quick identification; `UNITS` is the
 active/structural projection count. In `-o wide`, Stack `TEMPLATE`, `TEMPLATE-UID`, and `TEMPLATE-DIGEST` are the
@@ -93,8 +97,8 @@ Receipt's freshness binding. It is intentionally per-resource rather than repeat
 every row.
 
 Every environment-scoped table includes `PARTITION`. Desired resources resolve it through their UID-fenced ownership
-chain; Receipts inherit it from the exact desired Unit authenticated by their subject fence. Unpartitioned and orphaned
-resources render `-`.
+chain; Receipts and Artifacts inherit it from the exact desired Unit authenticated by their registered relationships.
+Unpartitioned and orphaned resources render `-`.
 
 Use `-o yaml` or `-o json` for machine-readable output:
 
@@ -103,24 +107,40 @@ gitopsctr get unit application--deploy --environment dev -o yaml
 gitopsctr get receipts -A -o json
 ```
 
-A single result is the exact persisted resource document. Multi-result output is a schema-versioned inspection
-envelope: every item contains its Environment, plane, ref, revision, and path provenance alongside the exact document.
+A single result is normally the exact persisted resource document. Multi-result output is a schema-versioned
+inspection envelope: every item contains its generic family/scope/qualified-name address plus Environment, plane, ref,
+revision, and path provenance alongside the exact document. Relationship-authenticated Artifact output always uses the
+envelope—even for one result—and includes `inspection.authentication`, so machine consumers cannot confuse `CURRENT`,
+`STALE`, and `ORPHAN` resources.
 The envelope does not synthesize a joined API resource.
 
-Desired resource queries accept `--desired-ref` and `--desired-revision`; Receipt queries accept `--observed-ref` and
-`--observed-revision`. Explicit ref or revision overrides cannot be combined with `-A`, because each Environment may
-resolve different deployment refs.
+Queries accept ref/revision overrides for every plane used by their registry-defined inspection relationships. Artifact
+and Receipt authentication can therefore select both historical desired and observed snapshots. Explicit ref or
+revision overrides cannot be combined with `-A`, because each Environment may resolve different deployment refs.
 
-Receipt artifacts remain explicitly subordinate to their producing Receipt. `--artifact NAME` prints one typed
-Artifact resource and `--artifacts` prints every artifact described by the Receipt:
+Artifacts are first-class inspectable resources with a producer-qualified local identity. The table renders this exact
+address in `NAME`, so it can be copied into a named lookup. `--producer` filters a collection by its first identity
+segment:
+
+```console
+gitopsctr get artifacts --environment dev
+gitopsctr get artifacts --environment dev --producer application--image
+gitopsctr get artifact application--image/containers --environment dev
+```
+
+Artifact identity and authentication are separate. Inspection follows the registered Receipt-to-Artifact description
+and Receipt-to-desired-Unit observation before reporting `CURRENT`; the authenticated Unit supplies `PARTITION`.
+The generic resource model declares identity segments per family rather than hardcoding a three-level Artifact address.
+
+The Receipt relationship shortcuts remain available. `--artifact NAME` prints one typed Artifact resource and
+`--artifacts` prints every artifact described by the Receipt:
 
 ```console
 gitopsctr get receipt application--image --environment dev --artifact containers
 gitopsctr get receipt application--image --environment dev --artifacts
 ```
 
-There is no standalone Artifact selector in this release because Artifact identity is producer-qualified. `status`
-remains the higher-level diagnostic view and includes authored resources that have not yet resolved into persisted
+`status` remains the higher-level diagnostic view and includes authored resources that have not yet resolved into persisted
 desired Units; `get units` lists persisted desired Units only.
 
 ## Apply and reconcile

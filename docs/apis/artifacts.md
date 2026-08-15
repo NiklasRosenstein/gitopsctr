@@ -14,6 +14,27 @@ The current bundled artifact kinds are:
 Plugins can register additional `artifact.gitopsctr.io` kinds. The table describes the bundled set, not a complete
 ecosystem.
 
+## Inspect artifacts
+
+Artifact local identity has two registry-declared segments: `producer/name`. It composes with the Environment scope;
+it does not introduce a separate Unit namespace. The qualified name rendered by the table is also the exact lookup
+address:
+
+```console
+gitopsctr get artifacts --environment dev
+gitopsctr get artifacts --environment dev --producer application--image
+gitopsctr get artifact application--image/containers --environment dev
+```
+
+`get all --environment dev` includes an `ARTIFACTS` section. Inspection authenticates each Artifact through its Receipt
+descriptor and the Receipt's exact desired producer before reporting it as `CURRENT`. The producer's authenticated
+desired resource supplies the Artifact's partition. The existing Receipt shortcuts remain useful for relationship-first
+navigation: `gitopsctr get receipt PRODUCER --environment dev --artifact NAME` or `--artifacts`.
+
+Machine-readable Artifact output always uses the inspection `ResourceList` envelope, including for one qualified name.
+Each item carries `inspection.authentication`. Historical inspection may set both the desired and observed ref/revision
+overrides; an Artifact whose Receipt or exact desired producer is unavailable is shown as `ORPHAN` with no partition.
+
 ## How `fromArtifact` resolves
 
 ```mermaid

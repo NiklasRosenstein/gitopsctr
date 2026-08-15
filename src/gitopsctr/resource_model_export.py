@@ -73,14 +73,19 @@ def render_resource_model(registry: ResourceRegistry) -> str:
         "",
         "## Families and placements",
         "",
-        "| Family | Selectors | Installed API kinds | Source | Desired | Observed |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Family | Selectors | Local identity | Installed API kinds | Source | Desired | Observed |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for family in sorted(registry.families, key=lambda item: item.name):
         selectors = ", ".join(f"`{selector}`" for selector in family.selectors)
+        identity = family.identity.separator.join(segment.name for segment in family.identity.segments)
+        filters = ", ".join(
+            segment.filter_option for segment in family.identity.segments if segment.filter_option is not None
+        )
+        identity_cell = f"`{identity}`" + (f" ({filters})" if filters else "")
         gvks = "<br>".join(f"`{api_kind.gvk}`" for api_kind in registry.api_kinds_for_family(family.name))
         lines.append(
-            f"| {family.name} | {selectors} | {gvks} | "
+            f"| {family.name} | {selectors} | {identity_cell} | {gvks} | "
             f"{_placement_cell(family, ResourcePlane.SOURCE)} | "
             f"{_placement_cell(family, ResourcePlane.DESIRED)} | "
             f"{_placement_cell(family, ResourcePlane.OBSERVED)} |"
@@ -89,7 +94,9 @@ def render_resource_model(registry: ResourceRegistry) -> str:
     lines.extend(
         [
             "",
-            "A placement names a logical collection. Its repository adapter—not the controller or presentation layer—",
+            "A family-local identity is composed with its placement scope to form a complete address. Most families use",
+            "one `name` segment. Artifact identity is `producer/name`, so two producers may publish the same logical output",
+            "name without collision. A placement names a logical collection. Its repository adapter—not the controller or presentation layer—",
             "owns physical path discovery. `default` selects the persisted representation used by the family's inspection",
             "view; it does not make that representation authoritative for another plane.",
             "",

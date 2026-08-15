@@ -21,20 +21,24 @@ from gitopsctr.operational import (
 )
 from gitopsctr.plane_repositories import PlaneRepositorySession, PlaneSnapshot
 from gitopsctr.resource_model import (
+    ArtifactDescriptionDefinition,
     ArtifactLink,
     ArtifactResolutionContext,
     CollectionReadContext,
     DiscoveredResource,
     EnvironmentInspectionSummary,
     InspectionRecord,
-    ObservationState,
+    LocalResourceIdentity,
+    ObservationDefinition,
     RelationshipResource,
+    ResourceAddress,
     ResourceFamilyDefinition,
     ResourceIdentity,
     ResourceModelError,
     ResourcePlacement,
     ResourcePlane,
     ResourceRegistry,
+    ResourceSelection,
     StackInspectionSummary,
 )
 from gitopsctr.resources import ResourceMetadata, StackResource, UnitResource, desired_unit_binding_digest
@@ -42,6 +46,10 @@ from gitopsctr.resources import ResourceMetadata, StackResource, UnitResource, d
 
 class InventoryError(OperationError):
     """A persisted resource or registered relationship cannot be inspected."""
+
+
+def _names_selection(names: frozenset[str]) -> ResourceSelection:
+    return ResourceSelection.segment("name", names)
 
 
 class InventoryObservationState(StrEnum):
@@ -69,7 +77,7 @@ class InventoryRecord:
     blob_id: str | None
     content_digest: str
     media_type: str | None
-    identity_qualifier: tuple[str, ...] = ()
+    local_identity: LocalResourceIdentity
     snapshot_root: Path | None = None
 
     @property
@@ -77,10 +85,19 @@ class InventoryRecord:
         return ResourceIdentity(self.gvk.api_version, self.gvk.kind, self.name)
 
     @property
-    def logical_identity(self) -> tuple[str, ...]:
+    def qualified_name(self) -> str:
+        return self.family.identity.render(self.local_identity)
+
+    @property
+    def address(self) -> ResourceAddress:
+        placement = InventorySession._placement(self.family, self.plane)
+        return ResourceAddress(self.family.name, placement.scope, self.environment, self.local_identity)
+
+    @property
+    def logical_identity(self) -> ResourceAddress:
         """Collection-owned identity used to detect duplicate persisted resources."""
 
-        return (self.family.name, self.name, *self.identity_qualifier)
+        return self.address
 
     def relationship_resource(self) -> RelationshipResource:
         return RelationshipResource(
@@ -149,9 +166,37 @@ class ReceiptOperationalState:
 
 
 @dataclass(frozen=True)
+class ArtifactOperationalState:
+    """Authentication state for one observed Artifact and its exact producer."""
+
+    artifact: InventoryRecord
+    authentication: InventoryObservationState
+    producer: InventoryRecord | None
+    receipt: InventoryRecord | None
+
+
+@dataclass(frozen=True)
+class ObservationOperationalState:
+    """Generic state for one side of a registry-defined observation relationship."""
+
+    resource: InventoryRecord
+    observation: InventoryObservationState
+    counterpart: InventoryRecord | None
+
+
+@dataclass(frozen=True)
+class ObservationRelationshipEvaluation:
+    """Generic subject and observer states for one exact observation definition."""
+
+    subjects: tuple[ObservationOperationalState, ...]
+    observers: tuple[ObservationOperationalState, ...]
+
+
+@dataclass(frozen=True)
 class RelationshipEvaluation:
     units: tuple[UnitOperationalState, ...]
     receipts: tuple[ReceiptOperationalState, ...]
+    artifacts: tuple[ArtifactOperationalState, ...] = ()
 
 
 class InventorySession:
@@ -196,8 +241,7 @@ class InventorySession:
         ref: str | None = None,
         revision: str | None = None,
         allow_missing_ref: bool = False,
-        names: frozenset[str] | None = None,
-        producer_names: frozenset[str] | None = None,
+        selection: ResourceSelection | None = None,
     ) -> tuple[InventoryRecord, ...]:
         family = self.registry.family(selector)
         placement = self._placement(family, plane)
@@ -214,7 +258,7 @@ class InventorySession:
                 snapshot = self.planes.snapshot(placement.plane, ref, revision, allow_missing=allow_missing_ref)
             except OperationError as exc:
                 raise InventoryError(str(exc)) from exc
-        return self._discover(family, placement, snapshot, environment, names, producer_names)
+        return self._discover(family, placement, snapshot, environment, selection)
 
     def _discover(
         self,
@@ -222,8 +266,7 @@ class InventorySession:
         placement: ResourcePlacement,
         snapshot: PlaneSnapshot,
         environment: str | None,
-        names: frozenset[str] | None,
-        producer_names: frozenset[str] | None,
+        selection: ResourceSelection | None,
     ) -> tuple[InventoryRecord, ...]:
         collection = self.registry.collection(placement.collection)
         context = CollectionReadContext(
@@ -236,8 +279,7 @@ class InventorySession:
             self.registry.api_kinds,
             self.registry.contracts_for(family.name, placement.contract_profile),
             snapshot.blob_ids,
-            names,
-            producer_names,
+            selection,
         )
         try:
             discovered = tuple(collection.provider.discover(context))
@@ -245,17 +287,20 @@ class InventorySession:
             location = f"environment {environment!r}, " if environment is not None else ""
             raise InventoryError(f"{location}{placement.plane} {family.plural}: {exc}") from exc
         records = tuple(self._record(item, family, snapshot, environment) for item in discovered)
-        identities: dict[tuple[str, ...], InventoryRecord] = {}
+        identities: dict[ResourceAddress, InventoryRecord] = {}
         for record in records:
             previous = identities.get(record.logical_identity)
             if previous is not None:
                 location = f"environment {environment!r}, " if environment is not None else ""
                 raise InventoryError(
-                    f"{location}{placement.plane}: duplicate logical {record.gvk} resource {record.name!r} "
+                    f"{location}{placement.plane}: duplicate logical {record.gvk} resource "
+                    f"{record.qualified_name!r} "
                     f"at {previous.path} and {record.path}"
                 )
             identities[record.logical_identity] = record
-        return tuple(sorted(records, key=lambda item: (item.environment or "", str(item.gvk), item.name, item.path)))
+        return tuple(
+            sorted(records, key=lambda item: (item.environment or "", str(item.gvk), item.qualified_name, item.path))
+        )
 
     @staticmethod
     def _record(
@@ -278,7 +323,7 @@ class InventorySession:
             item.blob_id,
             item.content_digest,
             item.media_type,
-            item.identity_qualifier,
+            item.local_identity,
             snapshot.root,
         )
 
@@ -346,16 +391,24 @@ class InventorySession:
         observed_revision: str | None = None,
         resolve_artifacts: bool = True,
     ) -> RelationshipEvaluation:
+        unit_view = self.registry.family("unit").inspection
+        if unit_view is None or unit_view.observation is None or unit_view.artifact_description is None:
+            raise InventoryError("resource family 'unit' has no registered inspection relationships")
+        units, receipts, artifacts = self.environment_inventory(
+            environment,
+            desired_ref=desired_ref,
+            desired_revision=desired_revision,
+            observed_ref=observed_ref,
+            observed_revision=observed_revision,
+        )
         return evaluate_relationships(
             self.registry,
-            *self.environment_inventory(
-                environment,
-                desired_ref=desired_ref,
-                desired_revision=desired_revision,
-                observed_ref=observed_ref,
-                observed_revision=observed_revision,
-            ),
+            units,
+            receipts,
+            artifacts if resolve_artifacts else (),
             resolve_artifacts=resolve_artifacts,
+            observation=self.registry.observation(unit_view.observation),
+            description=self.registry.artifact_description(unit_view.artifact_description),
         )
 
     def reconciliation_counts(self, environment: str) -> dict[ReconciliationState, int]:
@@ -590,7 +643,7 @@ class InventorySession:
                 plane=stack_template_relation.target_plane,
                 ref=desired_ref,
                 revision=desired_revision,
-                names=template_names,
+                selection=_names_selection(template_names),
             )
             unit_names = frozenset(
                 binding.name for stack in stacks for binding in self._active_projection_bindings(stack)
@@ -601,7 +654,7 @@ class InventorySession:
                 plane=stack_unit_relation.target_plane,
                 ref=desired_ref,
                 revision=desired_revision,
-                names=unit_names,
+                selection=_names_selection(unit_names),
             )
             templates_for_references = templates
         else:
@@ -613,7 +666,7 @@ class InventorySession:
                 plane=stack_template_relation.source_plane,
                 ref=desired_ref,
                 revision=desired_revision,
-                names=stack_names,
+                selection=_names_selection(stack_names),
             )
             units = ()
             templates_for_references = templates
@@ -653,7 +706,7 @@ class InventorySession:
             ref=observed_ref,
             revision=observed_revision,
             allow_missing_ref=allow_missing_observed_ref,
-            names=frozenset(active_names),
+            selection=_names_selection(frozenset(active_names)),
         )
 
         def record_child_state(stack: InventoryRecord, binding: StackProjectionUnitBinding) -> InventoryRecord | None:
@@ -717,12 +770,17 @@ class InventorySession:
                 child_observations=tuple(sorted(set(child_observations.get(stack.path, ())))) or ("N/A",),
             )
         if valid_units:
+            unit_view = self.registry.family("unit").inspection
+            if unit_view is None or unit_view.observation is None or unit_view.artifact_description is None:
+                raise InventoryError("resource family 'unit' has no registered inspection relationships")
             evaluation = evaluate_relationships(
                 self.registry,
                 tuple({unit.path: unit for unit in valid_units}.values()),
                 receipts,
                 (),
                 resolve_artifacts=False,
+                observation=self.registry.observation(unit_view.observation),
+                description=self.registry.artifact_description(unit_view.artifact_description),
             )
             unit_states = {value.unit.path: value for value in evaluation.units}
         for stack in stacks:
@@ -796,7 +854,7 @@ class InventorySession:
             plane=ResourcePlane.DESIRED,
             ref=record.ref,
             revision=record.revision,
-            names=frozenset((name,)),
+            selection=_names_selection(frozenset((name,))),
         )
         owners_by_identity = [
             candidate for candidate in candidates if candidate.gvk == owner_gvk and candidate.name == name
@@ -817,45 +875,53 @@ def evaluate_relationships(
     artifacts: tuple[InventoryRecord, ...],
     *,
     resolve_artifacts: bool = True,
+    strict_artifacts: bool = True,
+    observation: ObservationDefinition | None = None,
+    description: ArtifactDescriptionDefinition | None = None,
 ) -> RelationshipEvaluation:
     """Evaluate registered observations and artifact descriptions without joining documents."""
 
-    unit_families = {item.family.name for item in units}
-    if len(unit_families) == 1:
-        unit_family = registry.family(next(iter(unit_families)))
-        view = unit_family.inspection
-        if view is None or view.observation is None or view.artifact_description is None:
-            raise InventoryError(
-                f"resource family {unit_family.name!r} has no registered observation and artifact-description relationships"
-            )
-        observation = registry.observation(view.observation)
-        description = registry.artifact_description(view.artifact_description)
-    else:
-        observer_families = {item.family.name for item in receipts}
-        observations = tuple(
-            definition
-            for definition in registry.observations
-            if (not unit_families or definition.subject_family in unit_families)
-            and (not observer_families or definition.observer_family in observer_families)
-        )
-        if len(observations) != 1:
-            raise InventoryError("registered Unit observation relationship is not unambiguous")
-        observation = observations[0]
-        descriptions = tuple(
-            definition
-            for definition in registry.artifact_descriptions
-            if definition.producer_family == observation.subject_family
-            and definition.describer_family == observation.observer_family
-        )
-        if len(descriptions) != 1:
-            raise InventoryError("registered Unit artifact-description relationship is not unambiguous")
-        description = descriptions[0]
+    if observation is None or description is None:
+        unit_families = {item.family.name for item in units}
+        if len(unit_families) == 1:
+            unit_family = registry.family(next(iter(unit_families)))
+            view = unit_family.inspection
+            if view is None or view.observation is None or view.artifact_description is None:
+                raise InventoryError(
+                    f"resource family {unit_family.name!r} has no registered observation and "
+                    "artifact-description relationships"
+                )
+            observation = observation or registry.observation(view.observation)
+            description = description or registry.artifact_description(view.artifact_description)
+        else:
+            observer_families = {item.family.name for item in receipts}
+            if observation is None:
+                observations = tuple(
+                    definition
+                    for definition in registry.observations
+                    if (not unit_families or definition.subject_family in unit_families)
+                    and (not observer_families or definition.observer_family in observer_families)
+                )
+                if len(observations) != 1:
+                    raise InventoryError("registered Unit observation relationship is not unambiguous")
+                observation = observations[0]
+            if description is None:
+                descriptions = tuple(
+                    definition
+                    for definition in registry.artifact_descriptions
+                    if definition.producer_family == observation.subject_family
+                    and definition.describer_family == observation.observer_family
+                )
+                if len(descriptions) != 1:
+                    raise InventoryError("registered Unit artifact-description relationship is not unambiguous")
+                description = descriptions[0]
     units_by_identity = {item.identity: item for item in units}
     artifacts_by_path = {item.path: item.relationship_resource() for item in artifacts}
+    artifact_records_by_path = {item.path: item for item in artifacts}
     receipt_by_subject: dict[ResourceIdentity, InventoryRecord] = {}
     states_by_receipt: dict[PurePosixPath, ReceiptOperationalState] = {}
     linked_artifact_paths: set[PurePosixPath] = set()
-    described_producer_names: set[str] = set()
+    artifact_states_by_path: dict[PurePosixPath, ArtifactOperationalState] = {}
 
     for receipt in receipts:
         observer = receipt.relationship_resource()
@@ -879,7 +945,7 @@ def evaluate_relationships(
             )
             artifact_count = description.binding.descriptor_count(observer)
             links: tuple[ArtifactLink, ...] = ()
-            if resolve_artifacts and freshness is ObservationState.CURRENT and producer is not None:
+            if resolve_artifacts and freshness is not None and producer is not None:
                 links = description.binding.resolve(
                     observer,
                     ArtifactResolutionContext(
@@ -892,18 +958,31 @@ def evaluate_relationships(
         except (KeyError, ResourceModelError) as exc:
             raise InventoryError(f"environment {receipt.environment!r}, observed {receipt.path}: {exc}") from exc
         states_by_receipt[receipt.path] = ReceiptOperationalState(receipt, state, unit, links, artifact_count)
-        described_producer_names.add(subject_identity.name)
         linked_artifact_paths.update(link.artifact.path for link in links)
+        for link in links:
+            artifact = artifact_records_by_path[link.artifact.path]
+            artifact_states_by_path[artifact.path] = ArtifactOperationalState(
+                artifact,
+                state,
+                unit if state is InventoryObservationState.CURRENT else None,
+                receipt,
+            )
 
-    orphan_artifact_paths = {
-        path
-        for path in set(artifacts_by_path).difference(linked_artifact_paths)
-        if len(path.parts) < 2 or path.parts[-2] not in described_producer_names
-    }
-    if orphan_artifact_paths:
+    orphan_artifact_paths = set(artifacts_by_path).difference(linked_artifact_paths)
+    if strict_artifacts and orphan_artifact_paths:
         paths = ", ".join(str(path) for path in sorted(orphan_artifact_paths))
         environment = artifacts[0].environment if artifacts else None
         raise InventoryError(f"environment {environment!r}: observed Artifacts are not described by a Receipt: {paths}")
+
+    for artifact in artifacts:
+        if artifact.path in artifact_states_by_path:
+            continue
+        artifact_states_by_path[artifact.path] = ArtifactOperationalState(
+            artifact,
+            InventoryObservationState.ORPHAN,
+            None,
+            None,
+        )
 
     unit_states: list[UnitOperationalState] = []
     for unit in units:
@@ -943,11 +1022,67 @@ def evaluate_relationships(
                 status.reconciliation,
                 status.reason,
                 receipt,
-                receipt_state.artifacts if receipt_state is not None else (),
+                (
+                    receipt_state.artifacts
+                    if receipt_state is not None and receipt_state.observation is InventoryObservationState.CURRENT
+                    else ()
+                ),
             )
         )
 
     return RelationshipEvaluation(
         tuple(sorted(unit_states, key=lambda item: (item.unit.environment or "", item.unit.name, str(item.unit.gvk)))),
         tuple(sorted(states_by_receipt.values(), key=lambda item: (item.receipt.environment or "", item.receipt.name))),
+        tuple(
+            sorted(
+                artifact_states_by_path.values(),
+                key=lambda item: (item.artifact.environment or "", item.artifact.qualified_name),
+            )
+        ),
     )
+
+
+def evaluate_observation_relationship(
+    observation: ObservationDefinition,
+    subjects: tuple[InventoryRecord, ...],
+    observers: tuple[InventoryRecord, ...],
+) -> ObservationRelationshipEvaluation:
+    """Evaluate an observation without assuming Unit, Receipt, or Artifact semantics."""
+
+    subjects_by_identity = {item.identity: item for item in subjects}
+    observer_by_subject: dict[ResourceIdentity, InventoryRecord] = {}
+    observer_states: list[ObservationOperationalState] = []
+    for observer in observers:
+        relationship_observer = observer.relationship_resource()
+        try:
+            subject_identity = observation.binding.subject_identity(relationship_observer)
+        except ResourceModelError as exc:
+            raise InventoryError(f"environment {observer.environment!r}, observed {observer.path}: {exc}") from exc
+        if subject_identity in observer_by_subject:
+            previous = observer_by_subject[subject_identity]
+            raise InventoryError(
+                f"environment {observer.environment!r}: observers {previous.path} and {observer.path} both observe "
+                f"{subject_identity.gvk} {subject_identity.name!r}"
+            )
+        observer_by_subject[subject_identity] = observer
+        subject = subjects_by_identity.get(subject_identity)
+        if subject is None:
+            state = InventoryObservationState.ORPHAN
+        else:
+            try:
+                state = InventoryObservationState(
+                    observation.binding.evaluate(relationship_observer, subject.relationship_resource()).value
+                )
+            except ResourceModelError as exc:
+                raise InventoryError(f"environment {observer.environment!r}, observed {observer.path}: {exc}") from exc
+        observer_states.append(ObservationOperationalState(observer, state, subject))
+
+    observer_state_by_path = {item.resource.path: item for item in observer_states}
+    subject_states: list[ObservationOperationalState] = []
+    for subject in subjects:
+        observer = observer_by_subject.get(subject.identity)
+        state = (
+            InventoryObservationState.MISSING if observer is None else observer_state_by_path[observer.path].observation
+        )
+        subject_states.append(ObservationOperationalState(subject, state, observer))
+    return ObservationRelationshipEvaluation(tuple(subject_states), tuple(observer_states))

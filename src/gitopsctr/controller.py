@@ -127,7 +127,7 @@ from gitopsctr.formats import (
     write_document,
 )
 from gitopsctr.inspection import command_get as inspect_resources
-from gitopsctr.inspection import inspectable_selectors
+from gitopsctr.inspection import identity_filter_options, inspectable_selectors
 from gitopsctr.registry import (
     API_KINDS,
     DRIVER_GVKS,
@@ -12565,6 +12565,13 @@ def build_parser() -> argparse.ArgumentParser:
     get = commands.add_parser("get", help="inspect persisted resources")
     get.add_argument("selector", choices=inspectable_selectors(), help="singular or plural resource selector")
     get.add_argument("name", nargs="?", help="exact resource name; omit to list the selected family")
+    for identity_filter in identity_filter_options():
+        assert identity_filter.filter_option is not None
+        get.add_argument(
+            identity_filter.filter_option,
+            dest=identity_filter.option_destination,
+            help=f"filter by the {identity_filter.name} identity segment",
+        )
     get_scope = get.add_mutually_exclusive_group()
     get_scope.add_argument("--environment", help="environment namespace to inspect")
     get_scope.add_argument(

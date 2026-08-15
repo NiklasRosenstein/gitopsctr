@@ -30,6 +30,7 @@ from gitopsctr.registry import API_KINDS, RESOURCE_REGISTRY
 from gitopsctr.resource_model import (
     ArtifactResolutionContext,
     CollectionReadContext,
+    IdentityConstraint,
     ObservationCardinality,
     ObservationState,
     ProfiledApiMembership,
@@ -41,6 +42,7 @@ from gitopsctr.resource_model import (
     ResourcePlane,
     ResourceRegistry,
     ResourceScope,
+    ResourceSelection,
     UnitApiMembership,
 )
 from gitopsctr.resource_model_export import bundled_resource_registry, export_resource_model, render_resource_model
@@ -118,6 +120,27 @@ def test_builtin_registry_derives_core_driver_and_artifact_family_membership():
         "stack-selects-stacktemplate",
         "stack-owns-unit",
     }
+
+
+def test_family_local_identity_is_registry_defined_and_generically_selectable():
+    artifact = RESOURCE_REGISTRY.family("artifact")
+    unit = RESOURCE_REGISTRY.family("unit")
+
+    identity = artifact.identity.parse("application--image/containers")
+    assert artifact.identity.render(identity) == "application--image/containers"
+    assert artifact.identity.value(identity, "producer") == "application--image"
+    assert artifact.identity.value(identity, "name") == "containers"
+    assert artifact.identity.matches(
+        identity,
+        ResourceSelection(constraints=(IdentityConstraint("producer", frozenset(("application--image",))),)),
+    )
+    assert not artifact.identity.matches(
+        identity,
+        ResourceSelection(constraints=(IdentityConstraint("producer", frozenset(("other",))),)),
+    )
+    assert artifact.identity.segments[0].filter_option == "--producer"
+    with pytest.raises(ResourceModelError, match="requires 1 segments"):
+        unit.identity.parse("application--image/containers")
 
 
 def test_registered_stack_template_selection_binding_checks_uid_and_content_digest():

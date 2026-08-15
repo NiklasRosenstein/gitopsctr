@@ -28,12 +28,13 @@ from gitopsctr.inventory import (
     InventoryObservationState,
     InventorySession,
     ReconciliationState,
+    evaluate_observation_relationship,
     evaluate_relationships,
 )
 from gitopsctr.operational import materialization_tree_digest
 from gitopsctr.plane_repositories import PlaneRepositorySession
 from gitopsctr.registry import RESOURCE_REGISTRY
-from gitopsctr.resource_model import ObservationDefinition, ResourcePlane, ResourceRegistry
+from gitopsctr.resource_model import ObservationDefinition, ResourcePlane, ResourceRegistry, ResourceSelection
 from gitopsctr.resources import desired_unit_binding_digest
 from gitopsctr.state import GitRefSnapshot, GitStateStore
 
@@ -631,10 +632,23 @@ def test_relationship_evaluation_selects_applicable_registered_definition(reposi
     with InventorySession(repository, registry) as inventory:
         units, receipts, artifacts = inventory.environment_inventory("dev")
         evaluation = evaluate_relationships(registry, units, receipts, artifacts)
+        generic = evaluate_observation_relationship(base, units, receipts)
+        orphan = evaluate_relationships(
+            registry,
+            (),
+            (),
+            artifacts,
+            strict_artifacts=False,
+            observation=base,
+            description=registry.artifact_descriptions[0],
+        )
     assert (
         next(item for item in evaluation.units if item.unit.name == "application").reconciliation
         is ReconciliationState.CLEAN
     )
+    assert all(item.authentication is InventoryObservationState.ORPHAN for item in orphan.artifacts)
+    assert any(item.observation is InventoryObservationState.CURRENT for item in generic.subjects)
+    assert any(item.observation is InventoryObservationState.CURRENT for item in generic.observers)
 
 
 def test_relationship_evaluation_rejects_duplicate_and_malformed_receipts(repository: Path):
@@ -731,9 +745,16 @@ def test_inventory_validates_complete_receipt_artifact_relationship(repository: 
         "dev", desired_ref="gitopsctr/desired/artifacts", observed_ref="gitopsctr/observed/artifacts"
     )
     evaluation = evaluate_relationships(RESOURCE_REGISTRY, units, receipts, artifacts)
+    without_artifacts = inventory.evaluate_environment(
+        "dev",
+        desired_ref="gitopsctr/desired/artifacts",
+        observed_ref="gitopsctr/observed/artifacts",
+        resolve_artifacts=False,
+    )
     images = next(item for item in evaluation.units if item.unit.name == "images")
     assert images.observation is InventoryObservationState.CURRENT
     assert images.artifacts[0].name == "containers"
+    assert next(item for item in without_artifacts.units if item.unit.name == "images").artifacts == ()
 
     image_artifact = next(item for item in artifacts if item.name == "containers")
     mismatched_pin_document = json.loads(json.dumps(image_artifact.document))
@@ -760,6 +781,9 @@ def test_inventory_validates_complete_receipt_artifact_relationship(repository: 
     assert stale_images.artifacts == ()
     stale_receipt = next(item for item in stale.receipts if item.receipt.name == "images")
     assert stale_receipt.artifact_count == 1
+    stale_artifact = next(item for item in stale.artifacts if item.artifact.name == "containers")
+    assert stale_artifact.authentication is InventoryObservationState.STALE
+    assert stale_artifact.producer is None
 
     invalid_document = json.loads(json.dumps(next(item for item in receipts if item.name == "images").document))
     invalid_document["status"]["artifacts"]["containers"]["digest"] = "sha256:wrong"  # type: ignore[index]
@@ -851,7 +875,10 @@ def test_artifact_inventory_identity_is_qualified_by_producer(repository: Path):
     assert {(item.gvk, item.name) for item in artifacts} == {
         (artifacts[0].gvk, "containers"),
     }
-    assert {item.identity_qualifier[-1] for item in artifacts} == {"images-one", "images-two"}
+    assert {item.qualified_name for item in artifacts} == {
+        "images-one/containers",
+        "images-two/containers",
+    }
     assert len({item.logical_identity for item in artifacts}) == 2
 
 
@@ -948,7 +975,7 @@ def test_owned_unit_inherits_partition_from_uid_fenced_stack(repository: Path):
             "unit",
             environment="dev",
             ref="gitopsctr/desired/owned",
-            names=frozenset(("web--application",)),
+            selection=ResourceSelection.segment("name", frozenset(("web--application",))),
         )[0]
         assert inventory.resource_partition(record) == "application"
 

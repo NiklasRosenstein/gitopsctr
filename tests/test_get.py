@@ -88,6 +88,8 @@ def test_get_all_raw_output_is_always_one_provenance_list(repository: Path, caps
     assert {item["document"]["kind"] for item in result["items"]} >= {"Terraform", "Receipt"}
     assert {item["provenance"]["environment"] for item in result["items"]} == {"dev"}
     assert {item["provenance"]["plane"] for item in result["items"]} == {"desired", "observed"}
+    assert {item["address"]["scope"] for item in result["items"]} == {"environment"}
+    assert all(item["address"]["qualifiedName"] for item in result["items"])
 
 
 def test_stack_tables_are_compact_by_default_and_preserve_details_in_wide_output(
@@ -817,6 +819,142 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
         "json",
     )
     assert json.loads(all_output) == artifact
+
+    artifacts = run_get(repository, capsys, "artifacts", "--environment", "dev")
+    assert artifacts.splitlines()[0].split() == ["NAME", "KIND", "PARTITION", "AUTHENTICATION"]
+    assert artifacts.splitlines()[1].split() == [
+        "images/containers",
+        "ContainerImages",
+        "application",
+        "CURRENT",
+    ]
+
+    filtered = run_get(repository, capsys, "artifacts", "--environment", "dev", "--producer", "images")
+    assert filtered == artifacts
+
+    exact = run_get(
+        repository,
+        capsys,
+        "artifact",
+        "images/containers",
+        "--environment",
+        "dev",
+        "--desired-ref",
+        "gitopsctr/desired/dev",
+        "--desired-revision",
+        desired_revision,
+        "--observed-ref",
+        "gitopsctr/observed/dev",
+        "--observed-revision",
+        observed_revision,
+        "-o",
+        "json",
+    )
+    exact_result = json.loads(exact)
+    assert exact_result["kind"] == "ResourceList"
+    assert exact_result["items"][0]["address"]["qualifiedName"] == "images/containers"
+    assert exact_result["items"][0]["inspection"] == {"authentication": "CURRENT"}
+    assert exact_result["items"][0]["document"] == artifact
+
+    inventory_support.git(repository, "checkout", "observed")
+    orphan_artifact = json.loads(json.dumps(artifact))
+    orphan_artifact["producer"]["name"] = "orphan"
+    inventory_support.write_json(repository / "artifacts/orphan/containers.yaml", orphan_artifact)
+    orphan_revision = inventory_support.commit(repository, "orphan artifact")
+    inventory_support.git(
+        repository,
+        "push",
+        "origin",
+        f"{orphan_revision}:refs/heads/gitopsctr/observed/orphan-artifact",
+    )
+    inventory_support.git(repository, "checkout", "main")
+    orphan = run_get(
+        repository,
+        capsys,
+        "artifact",
+        "orphan/containers",
+        "--environment",
+        "dev",
+        "--observed-ref",
+        "gitopsctr/observed/orphan-artifact",
+    )
+    assert orphan.splitlines()[1].split() == ["orphan/containers", "ContainerImages", "-", "ORPHAN"]
+
+    inventory_support.git(repository, "checkout", "desired")
+    stale_producer = json.loads((repository / "units/images.yaml").read_text())
+    stale_producer["spec"]["source"]["inputHash"] = "sha256:changed"
+    inventory_support.write_json(repository / "units/images.yaml", stale_producer)
+    stale_desired_revision = inventory_support.commit(repository, "stale artifact producer")
+    inventory_support.git(
+        repository,
+        "push",
+        "origin",
+        f"{stale_desired_revision}:refs/heads/gitopsctr/desired/stale-artifact",
+    )
+    inventory_support.git(repository, "checkout", "main")
+    stale_output = json.loads(
+        run_get(
+            repository,
+            capsys,
+            "artifact",
+            "images/containers",
+            "--environment",
+            "dev",
+            "--desired-ref",
+            "gitopsctr/desired/stale-artifact",
+            "-o",
+            "json",
+        )
+    )
+    assert stale_output["items"][0]["inspection"] == {"authentication": "STALE"}
+    assert stale_output["items"][0]["address"]["qualifiedName"] == "images/containers"
+    stale_table = run_get(
+        repository,
+        capsys,
+        "artifact",
+        "images/containers",
+        "--environment",
+        "dev",
+        "--desired-ref",
+        "gitopsctr/desired/stale-artifact",
+    )
+    assert stale_table.splitlines()[1].split() == ["images/containers", "ContainerImages", "-", "STALE"]
+    inventory_support.git(repository, "checkout", "observed")
+    extra_artifact = json.loads(json.dumps(artifact))
+    extra_artifact["metadata"]["name"] = "other"
+    inventory_support.write_json(repository / "artifacts/images/other.yaml", extra_artifact)
+    stale_observed_revision = inventory_support.commit(repository, "undeclared stale artifact")
+    inventory_support.git(
+        repository,
+        "push",
+        "origin",
+        f"{stale_observed_revision}:refs/heads/gitopsctr/observed/stale-artifact",
+    )
+    inventory_support.git(repository, "checkout", "main")
+    with pytest.raises(OperationError, match="do not match its declared outputs"):
+        run_get(
+            repository,
+            capsys,
+            "artifacts",
+            "--environment",
+            "dev",
+            "--producer",
+            "images",
+            "--desired-ref",
+            "gitopsctr/desired/stale-artifact",
+            "--observed-ref",
+            "gitopsctr/observed/stale-artifact",
+        )
+
+    aggregate = run_get(repository, capsys, "all", "--environment", "dev")
+    assert "\n\nARTIFACTS\n" in aggregate
+    assert "images/containers" in aggregate
+
+    with pytest.raises(OperationError, match="--producer is not available for units"):
+        run_get(repository, capsys, "units", "--environment", "dev", "--producer", "images")
+
+    with pytest.raises(OperationError, match="expected PRODUCER/NAME"):
+        run_get(repository, capsys, "artifact", "containers", "--environment", "dev")
 
     with pytest.raises(OperationError, match="has no artifact named 'missing'"):
         run_get(

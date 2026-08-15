@@ -32,6 +32,125 @@ class ResourceScope(StrEnum):
     ENVIRONMENT = "environment"
 
 
+@dataclass(frozen=True)
+class IdentitySegmentDefinition:
+    """One named segment in a family-local resource identity."""
+
+    name: str
+    filter_option: str | None = None
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[a-z][a-z0-9-]*", self.name) is None:
+            raise ResourceModelError(f"invalid resource identity segment {self.name!r}")
+        if self.filter_option is not None and re.fullmatch(r"--[a-z][a-z0-9-]*", self.filter_option) is None:
+            raise ResourceModelError(f"invalid resource identity filter option {self.filter_option!r}")
+
+    @property
+    def option_destination(self) -> str | None:
+        return self.filter_option[2:].replace("-", "_") if self.filter_option is not None else None
+
+
+@dataclass(frozen=True)
+class LocalResourceIdentity:
+    """Validated family-local identity values in registry-declared segment order."""
+
+    values: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class IdentityConstraint:
+    """Allowed values for one named family-local identity segment."""
+
+    segment: str
+    values: frozenset[str]
+
+    def __post_init__(self) -> None:
+        if any(not value or "/" in value for value in self.values):
+            raise ResourceModelError(f"identity constraint {self.segment!r} requires safe values")
+
+
+@dataclass(frozen=True)
+class ResourceSelection:
+    """Generic exact or segment-constrained family-local resource selection."""
+
+    exact: LocalResourceIdentity | None = None
+    constraints: tuple[IdentityConstraint, ...] = ()
+
+    @classmethod
+    def segment(cls, name: str, values: frozenset[str]) -> ResourceSelection:
+        return cls(constraints=(IdentityConstraint(name, values),))
+
+    def values_for(self, segment: str) -> frozenset[str] | None:
+        values = tuple(item.values for item in self.constraints if item.segment == segment)
+        if len(values) > 1:
+            raise ResourceModelError(f"resource selection repeats identity segment {segment!r}")
+        return values[0] if values else None
+
+
+@dataclass(frozen=True)
+class ResourceIdentityDefinition:
+    """Parse, render, and match one resource family's local identities."""
+
+    segments: tuple[IdentitySegmentDefinition, ...] = (IdentitySegmentDefinition("name"),)
+    separator: str = "/"
+
+    def __post_init__(self) -> None:
+        names = tuple(segment.name for segment in self.segments)
+        if not names or len(set(names)) != len(names) or names[-1] != "name":
+            raise ResourceModelError("resource identity segments must be unique, non-empty, and end with 'name'")
+        if not self.separator:
+            raise ResourceModelError("resource identity separator must not be empty")
+
+    def build(self, values: tuple[str, ...]) -> LocalResourceIdentity:
+        if len(values) != len(self.segments):
+            raise ResourceModelError(
+                f"resource identity requires {len(self.segments)} segments, received {len(values)}"
+            )
+        if any(not value or self.separator in value for value in values):
+            raise ResourceModelError("resource identity values must be non-empty and must not contain the separator")
+        return LocalResourceIdentity(values)
+
+    def from_name(self, name: str, qualifiers: tuple[str, ...] = ()) -> LocalResourceIdentity:
+        return self.build((*qualifiers, name))
+
+    def parse(self, value: str) -> LocalResourceIdentity:
+        return self.build(tuple(value.split(self.separator)))
+
+    def render(self, identity: LocalResourceIdentity) -> str:
+        return self.separator.join(self.build(identity.values).values)
+
+    def value(self, identity: LocalResourceIdentity, segment: str) -> str:
+        try:
+            index = tuple(item.name for item in self.segments).index(segment)
+        except ValueError as exc:
+            raise ResourceModelError(f"resource identity has no segment {segment!r}") from exc
+        return self.build(identity.values).values[index]
+
+    def matches(self, identity: LocalResourceIdentity, selection: ResourceSelection | None) -> bool:
+        identity = self.build(identity.values)
+        if selection is None:
+            return True
+        if selection.exact is not None and identity != self.build(selection.exact.values):
+            return False
+        segment_names = {item.name for item in self.segments}
+        for constraint in selection.constraints:
+            if constraint.segment not in segment_names:
+                raise ResourceModelError(f"resource identity has no segment {constraint.segment!r}")
+            if self.value(identity, constraint.segment) not in constraint.values:
+                return False
+        return True
+
+
+@dataclass(frozen=True)
+class ResourceAddress:
+    """Complete inventory address: family, placement scope, and local identity."""
+
+    family: str
+    scope: ResourceScope
+    namespace: str | None
+    local_identity: LocalResourceIdentity
+
+
 @runtime_checkable
 class InspectionRecord(Protocol):
     """Persisted-record surface available to registry-owned presenters."""
@@ -44,6 +163,9 @@ class InspectionRecord(Protocol):
 
     @property
     def name(self) -> str: ...
+
+    @property
+    def qualified_name(self) -> str: ...
 
     @property
     def blob_id(self) -> str | None: ...
@@ -108,6 +230,14 @@ class WideInspectionPresenter(Protocol):
 
 class ObservationCardinality(StrEnum):
     ZERO_OR_ONE = "zero-or-one"
+
+
+class InspectionRelationshipRole(StrEnum):
+    """A family's role in its registry-owned inspection relationship traversal."""
+
+    SUBJECT = "subject"
+    OBSERVER = "observer"
+    DESCRIBED_RESOURCE = "described-resource"
 
 
 class ObservationState(StrEnum):
@@ -721,6 +851,28 @@ class ReceiptInspectionPresenter:
 
 
 @dataclass(frozen=True)
+class ArtifactInspectionPresenter:
+    """Present an Artifact with its authenticated producer lineage."""
+
+    def row(
+        self,
+        record: InspectionRecord,
+        relationship: object | None,
+        runtime: InspectionRuntime,
+    ) -> tuple[str, ...]:
+        if relationship is None:
+            raise ResourceModelError(f"Artifact {record.qualified_name!r} has no evaluated authentication state")
+        producer = getattr(relationship, "producer", None)
+        partition = runtime.resource_partition(producer) if isinstance(producer, InspectionRecord) else None
+        return (
+            record.qualified_name,
+            record.gvk.kind,
+            partition or "-",
+            _enum_value(getattr(relationship, "authentication", None), "authentication state"),
+        )
+
+
+@dataclass(frozen=True)
 class InspectionViewDefinition:
     """Presentation metadata kept separate from resource invariants."""
 
@@ -729,7 +881,9 @@ class InspectionViewDefinition:
     presenter: InspectionPresenter
     observation: str | None = None
     artifact_description: str | None = None
+    relationship_role: InspectionRelationshipRole | None = None
     wide_columns: tuple[str, ...] | None = None
+    include_in_all: bool = True
 
     def columns_for(self, *, wide: bool) -> tuple[str, ...]:
         return self.wide_columns if wide and self.wide_columns is not None else self.columns
@@ -747,6 +901,7 @@ class ResourceFamilyDefinition:
     aliases: tuple[str, ...] = ()
     inspection: InspectionViewDefinition | None = None
     namespace_boundary: bool = False
+    identity: ResourceIdentityDefinition = field(default_factory=ResourceIdentityDefinition)
 
     @property
     def selectors(self) -> tuple[str, ...]:
@@ -766,8 +921,7 @@ class CollectionReadContext:
     api_kinds: Mapping[GVK, ApiKind[object]]
     contracts: Mapping[GVK, TypedDocumentContract[Any]]
     blob_ids: Mapping[PurePosixPath, str] = field(default_factory=dict)
-    names: frozenset[str] | None = None
-    producer_names: frozenset[str] | None = None
+    selection: ResourceSelection | None = None
 
 
 @dataclass(frozen=True)
@@ -782,7 +936,7 @@ class DiscoveredResource:
     blob_id: str | None
     content_digest: str
     media_type: str | None
-    identity_qualifier: tuple[str, ...] = ()
+    local_identity: LocalResourceIdentity
 
 
 @runtime_checkable
@@ -797,6 +951,19 @@ class FilesystemCollectionProvider:
     layout: CollectionLayout
     media_typed: bool = False
 
+    @staticmethod
+    def _selected_values(context: CollectionReadContext, segment: str) -> frozenset[str] | None:
+        if segment not in {item.name for item in context.family.identity.segments}:
+            return None
+        if context.selection is None:
+            return None
+        constrained = context.selection.values_for(segment)
+        if constrained is not None:
+            return constrained
+        if context.selection.exact is None:
+            return None
+        return frozenset((context.family.identity.value(context.selection.exact, segment),))
+
     def _directories(self, context: CollectionReadContext) -> tuple[Path, ...]:
         if self.layout is CollectionLayout.PROJECT:
             return ()
@@ -809,7 +976,11 @@ class FilesystemCollectionProvider:
                     sorted(
                         path
                         for path in base.iterdir()
-                        if path.is_dir() and (context.names is None or path.name in context.names)
+                        if path.is_dir()
+                        and (
+                            self._selected_values(context, "name") is None
+                            or path.name in cast(frozenset[str], self._selected_values(context, "name"))
+                        )
                     )
                 )
                 if base.is_dir()
@@ -866,12 +1037,14 @@ class FilesystemCollectionProvider:
             for directory in self._directories(context)
             for path in self._document_files(directory, recursive=recursive)
         )
-        if self.layout is CollectionLayout.OBSERVED_ARTIFACTS and context.producer_names is not None:
+        producer_names = self._selected_values(context, "producer")
+        selected_names = self._selected_values(context, "name")
+        if self.layout is CollectionLayout.OBSERVED_ARTIFACTS and producer_names is not None:
             paths = tuple(
                 path
                 for path in paths
                 if len(path.relative_to(context.root).parts) == 3
-                and path.relative_to(context.root).parts[1] in context.producer_names
+                and path.relative_to(context.root).parts[1] in producer_names
             )
         elif (
             self.layout
@@ -880,9 +1053,9 @@ class FilesystemCollectionProvider:
                 CollectionLayout.ENVIRONMENTS,
                 CollectionLayout.DESIRED_PROMOTION,
             }
-            and context.names is not None
+            and selected_names is not None
         ):
-            paths = tuple(path for path in paths if path.stem in context.names)
+            paths = tuple(path for path in paths if path.stem in selected_names)
         return paths
 
     @staticmethod
@@ -921,6 +1094,9 @@ class FilesystemCollectionProvider:
                 raise ResourceModelError(f"invalid {context.placement.plane} resource {path}: {exc}") from exc
             relative = PurePosixPath(path.relative_to(context.root).as_posix())
             identity_qualifier = self._validate_canonical_identity(context, path, relative, document, name)
+            local_identity = context.family.identity.from_name(name, identity_qualifier)
+            if not context.family.identity.matches(local_identity, context.selection):
+                continue
             try:
                 raw = path.read_bytes()
             except OSError as exc:
@@ -944,7 +1120,7 @@ class FilesystemCollectionProvider:
                 context.blob_ids.get(relative),
                 "sha256:" + hashlib.sha256(raw).hexdigest(),
                 media_type,
-                identity_qualifier,
+                local_identity,
             )
 
     def _validate_canonical_identity(
@@ -1005,7 +1181,7 @@ class FilesystemCollectionProvider:
                 raise ResourceModelError(
                     f"Artifact producer name {values[2]!r} in {path} must match directory {producer_name!r}"
                 )
-            return cast(tuple[str, str, str], values)
+            return (producer_name,)
 
         # Project and Promotion have fixed collection-owned filenames; their
         # semantic identities are validated by their executable contracts.
@@ -1439,6 +1615,7 @@ class ArtifactDescriptionDefinition:
     producer_family: str
     producer_plane: ResourcePlane
     binding: ArtifactDescriptionBinding
+    producer_identity_segment: str
 
 
 @dataclass(frozen=True)
@@ -1667,6 +1844,10 @@ class ResourceRegistry:
             raise ResourceModelError(f"artifact description {definition.name!r} producer plane is not placed")
         if not isinstance(definition.binding, ArtifactDescriptionBinding):
             raise ResourceModelError(f"artifact description {definition.name!r} has no executable binding")
+        if definition.producer_identity_segment not in {segment.name for segment in artifact.identity.segments}:
+            raise ResourceModelError(
+                f"artifact description {definition.name!r} references an unknown Artifact identity segment"
+            )
 
     def _validate_graph_relationship(
         self, definition: ResourceGraphRelationship, families: Mapping[str, ResourceFamilyDefinition]
@@ -1711,12 +1892,33 @@ class ResourceRegistry:
                     f"resource family {family.name!r} inspection references unknown artifact description "
                     f"{view.artifact_description!r}"
                 )
-            if observation is not None and (family.name, view.default_plane) not in {
-                (observation.observer_family, observation.observer_plane),
-                (observation.subject_family, observation.subject_plane),
-            }:
+            if (observation is None) != (view.relationship_role is None):
                 raise ResourceModelError(
-                    f"resource family {family.name!r} inspection observation {observation.name!r} "
+                    f"resource family {family.name!r} inspection observation and relationship role must be paired"
+                )
+            expected_role_member = {
+                InspectionRelationshipRole.SUBJECT: (
+                    observation.subject_family,
+                    observation.subject_plane,
+                )
+                if observation is not None
+                else None,
+                InspectionRelationshipRole.OBSERVER: (
+                    observation.observer_family,
+                    observation.observer_plane,
+                )
+                if observation is not None
+                else None,
+                InspectionRelationshipRole.DESCRIBED_RESOURCE: (
+                    description.artifact_family,
+                    description.artifact_plane,
+                )
+                if description is not None
+                else None,
+            }.get(view.relationship_role)
+            if view.relationship_role is not None and expected_role_member != (family.name, view.default_plane):
+                raise ResourceModelError(
+                    f"resource family {family.name!r} inspection role {view.relationship_role!r} "
                     "does not include its default representation"
                 )
             if description is not None and (family.name, view.default_plane) not in {
@@ -1944,6 +2146,7 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
                 UnitInspectionPresenter(),
                 observation="receipt-observes-unit",
                 artifact_description="receipt-describes-artifacts",
+                relationship_role=InspectionRelationshipRole.SUBJECT,
             ),
         ),
         ResourceFamilyDefinition(
@@ -2049,14 +2252,29 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
                 ReceiptInspectionPresenter(),
                 observation="receipt-observes-unit",
                 artifact_description="receipt-describes-artifacts",
+                relationship_role=InspectionRelationshipRole.OBSERVER,
             ),
         ),
         ResourceFamilyDefinition(
             "artifact",
             "artifact",
             "artifacts",
-            (_placement(observed, environment, "observed-artifacts", "observed"),),
+            (_placement(observed, environment, "observed-artifacts", "observed", default=True),),
             (ArtifactApiMembership(ArtifactApi),),
+            inspection=InspectionViewDefinition(
+                observed,
+                ("NAME", "KIND", "PARTITION", "AUTHENTICATION"),
+                ArtifactInspectionPresenter(),
+                observation="receipt-observes-unit",
+                artifact_description="receipt-describes-artifacts",
+                relationship_role=InspectionRelationshipRole.DESCRIBED_RESOURCE,
+            ),
+            identity=ResourceIdentityDefinition(
+                (
+                    IdentitySegmentDefinition("producer", filter_option="--producer"),
+                    IdentitySegmentDefinition("name"),
+                )
+            ),
         ),
     )
     observations = (
@@ -2087,6 +2305,7 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             binding=ReceiptArtifactDescriptionBinding(
                 JsonFieldPath(("status", "artifacts")), JsonFieldPath(("producer",))
             ),
+            producer_identity_segment="producer",
         ),
     )
     graph_relationships = (
