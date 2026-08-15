@@ -160,6 +160,30 @@ def test_get_named_raw_document_and_collection_envelope(repository: Path, capsys
     assert raw["metadata"]["name"] == "application"
     assert "provenance" not in raw
 
+    named_list = json.loads(
+        run_get(
+            repository,
+            capsys,
+            "unit",
+            "application",
+            "--environment",
+            "dev",
+            "-o",
+            "json",
+            "--as-list",
+        )
+    )
+    assert named_list["kind"] == "ResourceList"
+    assert len(named_list["items"]) == 1
+    assert named_list["items"][0]["address"] == {
+        "family": "unit",
+        "scope": "environment",
+        "namespace": "dev",
+        "qualifiedName": "application",
+    }
+    assert named_list["items"][0]["provenance"]["environment"] == "dev"
+    assert named_list["items"][0]["document"] == raw
+
     collection = json.loads(run_get(repository, capsys, "units", "--environment", "staging", "-o", "json"))
     assert collection["apiVersion"] == "inspection.gitopsctr.io/v1"
     assert collection["kind"] == "ResourceList"
@@ -256,6 +280,8 @@ def test_get_validates_scope_overrides_and_named_misses(repository: Path, capsys
         run_get(repository, capsys, "all", "--environment", "dev", "--artifacts")
     with pytest.raises(OperationError, match="cannot be combined"):
         run_get(repository, capsys, "all", "-A", "--observed-revision", "a" * 40)
+    with pytest.raises(OperationError, match="requires --output yaml or json"):
+        run_get(repository, capsys, "unit", "application", "--environment", "dev", "--as-list")
 
 
 @pytest.mark.parametrize(
@@ -844,9 +870,7 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
     filtered = run_get(repository, capsys, "artifacts", "--environment", "dev", "--producer", "images")
     assert filtered == artifacts
 
-    exact = run_get(
-        repository,
-        capsys,
+    exact_arguments = (
         "artifact",
         "images/containers",
         "--environment",
@@ -862,8 +886,14 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
         "-o",
         "json",
     )
+    exact = run_get(repository, capsys, *exact_arguments)
     exact_result = json.loads(exact)
     assert exact_result == artifact
+
+    exact_list = json.loads(run_get(repository, capsys, *exact_arguments, "--as-list"))
+    assert exact_list["items"][0]["address"]["qualifiedName"] == "images/containers"
+    assert exact_list["items"][0]["document"] == artifact
+    assert exact_list["items"][0]["inspection"]["authentication"] == "CURRENT"
 
     inventory_support.git(repository, "checkout", "observed")
     orphan_artifact = json.loads(json.dumps(artifact))

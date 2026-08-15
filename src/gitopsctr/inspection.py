@@ -591,6 +591,9 @@ def _artifact_results(
 def command_get(repository_root: Path, args: argparse.Namespace) -> None:
     """Inspect persisted resources through registry-defined collections and relationships."""
 
+    if args.as_list and args.output in {"table", "wide"}:
+        raise OperationError("--as-list requires --output yaml or json")
+
     if args.selector == ALL_SELECTOR:
         _validate_all_options(args)
         with InventorySession(repository_root, RESOURCE_REGISTRY) as inventory:
@@ -665,5 +668,5 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
             _print_documents(
                 results,
                 "yaml" if table_output else args.output,
-                collection_result=args.name is None or args.artifacts,
+                collection_result=args.as_list or args.name is None or args.artifacts,
             )

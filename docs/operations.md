@@ -104,6 +104,7 @@ Use `-o yaml` or `-o json` for machine-readable output:
 
 ```console
 gitopsctr get unit application--deploy --environment dev -o yaml
+gitopsctr get unit application--deploy --environment dev -o yaml --as-list
 gitopsctr get receipts -A -o json
 ```
 
@@ -112,6 +113,8 @@ returns a schema-versioned inspection envelope, even when it contains zero or on
 uses the envelope when it matches multiple resources. Every item contains its generic family/scope/qualified-name
 address plus Environment, plane, ref, revision, and path provenance alongside the exact document. The envelope is the
 registered, typed `inspection.gitopsctr.io/v1 ResourceList` output API; it is not a persisted resource family.
+Use `--as-list` with `-o yaml` or `-o json` to force this envelope for a named lookup and retain its address and
+provenance metadata. The option is rejected for table output.
 
 An item's optional `inspection` object contains state derived while traversing registered relationships; it is never
 part of the persisted `document`. For Artifacts, `inspection.authentication` is `CURRENT` when the Receipt descriptor,
