@@ -48,6 +48,9 @@ gitopsctr get stacktemplates --environment dev
 gitopsctr get stacktemplate application --environment dev -o yaml
 ```
 
+The runner also prints `gitopsctr get all --environment <environment>` after every successful convergence so each
+workflow includes an aggregate desired-and-observed inventory snapshot.
+
 Run the unpartitioned preview workflow with:
 
 ```console

@@ -62,7 +62,41 @@ def test_docker_converge_reapplies_the_authoritative_partition(monkeypatch):
             "--source-revision",
             "HEAD",
             "--yes",
-        )
+        ),
+        ("get", "all", "--environment", "dev"),
+    ]
+
+
+def test_k8s_converge_prints_aggregate_inventory_after_success(monkeypatch):
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def fake_run_controller(_provider: str, *args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, "converged\n", "")
+
+    monkeypatch.setattr(k8s_demo, "run_controller", fake_run_controller)
+
+    k8s_demo.converge("kind", "dev", "argocd", remote="git://demo")
+
+    assert calls == [
+        (
+            ("converge", "--environment", "dev", "--yes"),
+            {
+                "delivery": "argocd",
+                "preview": False,
+                "remote": "git://demo",
+                "capture": True,
+                "check": False,
+            },
+        ),
+        (
+            ("get", "all", "--environment", "dev"),
+            {
+                "delivery": "argocd",
+                "preview": False,
+                "remote": "git://demo",
+            },
+        ),
     ]
 
 

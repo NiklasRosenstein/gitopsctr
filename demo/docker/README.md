@@ -33,7 +33,8 @@ GITOPSCTR_DEMO_REGISTRY_PORT=5001 GITOPSCTR_DEMO_APP_PORT=18081 mise run demo-do
 
 The acceptance flow starts empty, applies and deploys the Stack, proves a second application and convergence are
 no-ops, removes the Stack from the explicitly applied partition, and lets convergence tear down its generated Units
-child-first before removing the Stack root:
+child-first before removing the Stack root. After every successful convergence, the runner prints the aggregate
+`gitopsctr get all --environment dev` inventory:
 
 ```console
 mise run demo-docker acceptance

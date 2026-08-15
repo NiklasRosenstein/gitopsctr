@@ -319,6 +319,16 @@ def converge(
         if result.returncode == 0:
             if expect_clean and "no drivers ran" not in output:
                 raise RuntimeError(f"clean {environment} convergence ran a driver or moved a ref")
+            run_controller(
+                provider,
+                "get",
+                "all",
+                "--environment",
+                environment,
+                delivery=delivery,
+                preview=preview,
+                remote=remote,
+            )
             return
         if "convergence stalled with no ready unit" not in output:
             raise subprocess.CalledProcessError(
