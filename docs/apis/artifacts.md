@@ -21,11 +21,14 @@ it does not introduce a separate Unit namespace. The qualified name rendered by 
 address:
 
 ```console
-gitopsctr get artifacts --environment dev
-gitopsctr get artifacts --environment dev --producer application--image
-gitopsctr get artifact application--image/containers --environment dev
-gitopsctr get artifact application--image/containers --environment dev -o yaml --as-list
+$ gitopsctr get artifacts --environment dev --producer application--image
+NAME                           KIND             PARTITION    AUTHENTICATION
+application--image/containers  ContainerImages  application  CURRENT
 ```
+
+Copy the rendered name into `gitopsctr get artifact application--image/containers --environment dev`. Add
+`-o yaml --as-list` when the generic address, Git provenance, and derived authentication should accompany the exact
+Artifact document; the [tutorial](../tutorial.md#inspect-desired-and-observed-state) shows that output shape.
 
 `get all --environment dev` includes an `ARTIFACTS` section. Inspection authenticates each Artifact through its Receipt
 descriptor and the Receipt's exact desired producer before reporting it as `CURRENT`. The producer's authenticated

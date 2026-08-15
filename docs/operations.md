@@ -14,29 +14,19 @@ output uses color. Redirected output is plain. `NO_COLOR=1` disables color and
 environment-scoped resources require `--environment NAME`, while `-A` or `--all-environments` queries every authored
 environment.
 
+Representative queries are:
+
 ```console
 gitopsctr get environments
-gitopsctr get environment dev
 gitopsctr get all --environment dev
-gitopsctr get all -A
-gitopsctr get units --environment dev
-gitopsctr get units -A
 gitopsctr get unit application--deploy --environment dev
-gitopsctr get stacks --environment dev
-gitopsctr get stack application --environment dev
-gitopsctr get stacktemplates --environment dev
-gitopsctr get stacktemplate application --environment dev
-gitopsctr get promotions --environment staging
-gitopsctr get promotion dev --environment staging
-gitopsctr get receipts --environment dev
-gitopsctr get receipt application--image --environment dev
-gitopsctr get artifacts --environment dev
 gitopsctr get artifacts --environment dev --producer application--image
-gitopsctr get artifact application--image/containers --environment dev
 gitopsctr status --environment dev
-gitopsctr dependencies --environment dev --unit application
 gitopsctr validate
 ```
+
+The registry supplies the remaining selectors shown by `gitopsctr get --help`, including Stacks, StackTemplates,
+Promotions, and Receipts.
 
 Singular and plural selectors are equivalent apart from whether a name is supplied. A named lookup with `-A` returns
 every matching resource and includes its Environment, which is useful when names are reused across namespaces:
@@ -131,9 +121,9 @@ address in `NAME`, so it can be copied into a named lookup. `--producer` filters
 segment:
 
 ```console
-gitopsctr get artifacts --environment dev
-gitopsctr get artifacts --environment dev --producer application--image
-gitopsctr get artifact application--image/containers --environment dev
+$ gitopsctr get artifacts --environment dev --producer application--image
+NAME                           KIND             PARTITION    AUTHENTICATION
+application--image/containers  ContainerImages  application  CURRENT
 ```
 
 Artifact identity and authentication are separate. Inspection follows the registered Receipt-to-Artifact description
