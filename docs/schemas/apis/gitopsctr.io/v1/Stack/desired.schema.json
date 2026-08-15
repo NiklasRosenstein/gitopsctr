@@ -336,6 +336,14 @@
                         "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
                         "type": "string"
                       },
+                      "projectionContextDigest": {
+                        "pattern": "^sha256:[0-9a-f]{64}$",
+                        "type": "string"
+                      },
+                      "sourceProjectionDigest": {
+                        "pattern": "^sha256:[0-9a-f]{64}$",
+                        "type": "string"
+                      },
                       "uid": {
                         "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
                         "type": "string"
@@ -346,7 +354,9 @@
                       "kind",
                       "name",
                       "uid",
-                      "desiredDigest"
+                      "desiredDigest",
+                      "sourceProjectionDigest",
+                      "projectionContextDigest"
                     ],
                     "title": "StackProjectionUnitBinding",
                     "type": "object"

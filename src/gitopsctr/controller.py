@@ -730,6 +730,7 @@ def _validate_desired_projection_context_records(
         digests = {resource.spec.structuralProjection.identity.projectionContextDigest}
         if resource.spec.activeProjection is not None:
             digests.add(resource.spec.activeProjection.projectionContextDigest)
+            digests.update(binding.projectionContextDigest for binding in resource.spec.activeProjection.units.values())
         for digest in sorted(digests):
             load_projection_context(root, digest)
 
@@ -2992,28 +2993,53 @@ def _bind_active_stack_projections(
             else None
         )
         generated_names = {stack_generated_unit_name(stack.name, logical_name) for logical_name in structural.units}
-        waiting = bool(generated_names.intersection(blocked_transitions))
+        blocked_names = generated_names.intersection(blocked_transitions)
+        waiting = bool(blocked_names)
+        staged = False
         if waiting and previous_active is not None:
-            # A structural projection is an all-or-nothing transition.  The
-            # candidate may already contain newly resolved siblings, but none
-            # of them are active until every selected child resolves.
-            source_projection_digest = previous_active.sourceProjectionDigest
+            # A dependency producer must be able to advance before a consumer
+            # can resolve the producer's new receipt/artifact. Stage that
+            # producer while retaining only blocked bindings from the prior
+            # active projection. Each binding carries its own exact projection
+            # and context provenance, so the mixed transition remains fenced.
+            compatible = all(
+                logical_name in structural.units
+                and structural.units[logical_name].apiVersion == binding.apiVersion
+                and structural.units[logical_name].kind == binding.kind
+                and stack_generated_unit_name(stack.name, logical_name) == binding.name
+                and sorted(binding.dependsOn)
+                == sorted(
+                    stack_generated_unit_name(stack.name, dependency)
+                    for dependency in structural.units[logical_name].dependsOn
+                )
+                for logical_name, binding in previous_active.units.items()
+            )
+            staged = compatible
+            source_projection_digest = (
+                structural.identity.projectionDigest if staged else previous_active.sourceProjectionDigest
+            )
             active_names = {binding.name for binding in previous_active.units.values()}
             stack_owner = (stack.gvk.api_version, stack.gvk.kind, stack.name, stack.metadata.uid)
-            for resource in tuple(candidate_resources.values()):
-                if not isinstance(resource, UnitResource) or resource.name in active_names:
-                    continue
-                owner = resource_owner_reference(resource)
-                if owner is None or (owner.apiVersion, owner.kind, owner.name, owner.uid) != stack_owner:
-                    continue
-                for extra_path in document_candidates(candidate / "units", resource.name):
-                    extra_path.unlink()
-                materialization = getattr(resource.spec, "materialization", None)
-                if materialization is not None:
-                    materialized_path = candidate / materialization.path
-                    if materialized_path.is_dir():
-                        shutil.rmtree(materialized_path)
-            for binding in previous_active.units.values():
+            retained_bindings = (
+                tuple(binding for binding in previous_active.units.values() if binding.name in blocked_names)
+                if staged
+                else tuple(previous_active.units.values())
+            )
+            if not staged:
+                for resource in tuple(candidate_resources.values()):
+                    if not isinstance(resource, UnitResource) or resource.name in active_names:
+                        continue
+                    owner = resource_owner_reference(resource)
+                    if owner is None or (owner.apiVersion, owner.kind, owner.name, owner.uid) != stack_owner:
+                        continue
+                    for extra_path in document_candidates(candidate / "units", resource.name):
+                        extra_path.unlink()
+                    materialization = getattr(resource.spec, "materialization", None)
+                    if materialization is not None:
+                        materialized_path = candidate / materialization.path
+                        if materialized_path.is_dir():
+                            shutil.rmtree(materialized_path)
+            for binding in retained_bindings:
                 previous_name = binding.name
                 previous_path = unit_document_path(current_desired, previous_name)
                 if not previous_path.is_file():
@@ -3036,7 +3062,7 @@ def _bind_active_stack_projections(
             # blocked child remains absent/WAIT below.
         else:
             source_projection_digest = structural.identity.projectionDigest
-        if waiting and previous_active is not None:
+        if waiting and previous_active is not None and not staged:
             # Keep the previous binding map as well as its source digest.  A
             # blocked structural transition may add, remove, or rename
             # logical children; the old active set remains authoritative until
@@ -3069,8 +3095,14 @@ def _bind_active_stack_projections(
                     name=unit.name,
                     uid=unit.metadata.uid,
                     desiredDigest=desired_unit_binding_digest(unit),
+                    sourceProjectionDigest=structural.identity.projectionDigest,
+                    projectionContextDigest=structural.identity.projectionContextDigest,
                     dependsOn=[stack_generated_unit_name(stack.name, dependency) for dependency in projected.dependsOn],
                 )
+                if staged and unit_name in blocked_names and previous_active is not None:
+                    previous_binding = previous_active.units.get(logical_name)
+                    if previous_binding is not None:
+                        bindings[logical_name] = previous_binding
             # A first projection publishes only the dependency-closed active
             # subset.  A concrete descendant of an unavailable Unit is not
             # executable merely because its own dynamic fields resolved.
@@ -3082,7 +3114,7 @@ def _bind_active_stack_projections(
                     if any(dependency not in active_names for dependency in binding.dependsOn):
                         bindings.pop(logical_name)
                         changed = True
-            if waiting and previous_active is None:
+            if waiting and (previous_active is None or staged):
                 # A first projection has no prior active lineage to retain.
                 # Remove concrete descendants that were resolved locally but
                 # are not in the dependency-closed active subset; otherwise
@@ -3103,7 +3135,7 @@ def _bind_active_stack_projections(
                 source_projection_digest=source_projection_digest,
                 projection_context_digest=(
                     previous_active.projectionContextDigest
-                    if waiting and previous_active is not None
+                    if waiting and previous_active is not None and not staged
                     else structural.identity.projectionContextDigest
                 ),
                 units=bindings,
@@ -9713,6 +9745,7 @@ def _validate_durable_publication_policies(
             # projection is blocked, so their old context is part of the
             # publication policy fence as well.
             context_digests.add(active.projectionContextDigest)
+            context_digests.update(binding.projectionContextDigest for binding in active.units.values())
     if not context_digests:
         raise OperationError("durable Stack projection has no bound publication context")
 
@@ -9849,6 +9882,7 @@ def progress_durable_stack_projection(
                     digests = {resource.spec.structuralProjection.identity.projectionContextDigest}
                     if active is not None and active.units:
                         digests.add(active.projectionContextDigest)
+                        digests.update(binding.projectionContextDigest for binding in active.units.values())
                     for context_digest in sorted(digests):
                         if context_digest in context_sources:
                             continue
@@ -9920,11 +9954,15 @@ def progress_durable_stack_projection(
     raise OperationError(f"could not advance durable Stack projection on {desired_ref} after concurrent updates")
 
 
-def _stack_effect_context_digest(stack: StackResource) -> str:
+def _stack_effect_context_digest(stack: StackResource, unit_name: str | None = None) -> str:
     if not isinstance(stack.spec, DesiredStackSpec):
         raise OperationError(f"Stack {stack.name!r} has an invalid desired specification")
     structural = stack.spec.structuralProjection
     active = stack.spec.activeProjection
+    if active is not None and unit_name is not None:
+        binding = next((item for item in active.units.values() if item.name == unit_name), None)
+        if binding is not None:
+            return binding.projectionContextDigest
     if active is not None and active.sourceProjectionDigest != structural.identity.projectionDigest:
         return active.projectionContextDigest
     return structural.identity.projectionContextDigest
@@ -9999,7 +10037,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                         desired,
                         args.environment,
                         configuration_root,
-                        _stack_effect_context_digest(selected_stack),
+                        _stack_effect_context_digest(selected_stack, args.unit),
                     )
         if configuration_root != REPOSITORY_ROOT:
             load_environment(configuration_root, args.environment)
@@ -11513,17 +11551,17 @@ def _prune_omitted_partition_resources(
     if partition is None or not any(current.iterdir()):
         return
     current_resources = load_desired_resource_graph(current)
-    candidate_resources = load_desired_resource_graph(candidate, validate=False)
     for key, resource in current_resources.items():
         if resource_owner_reference(resource) is not None or resource.metadata.partition != partition or key in applied:
             continue
         for selected in _owned_resource_closure(current_resources, resource):
-            selected_target = candidate_resources.get(
-                (selected.gvk.api_version, selected.gvk.kind, selected.name), selected
-            )
             _write_desired_resource(
                 candidate / _desired_resource_path(current, selected).relative_to(current),
-                mark_resource_for_deletion(selected_target),
+                # Deletion intent fences the exact currently accepted
+                # resource. A template fan-out may have produced a newer
+                # candidate closure earlier in this build, but teardown must
+                # never silently switch the effect-bearing snapshot first.
+                mark_resource_for_deletion(selected),
             )
 
 

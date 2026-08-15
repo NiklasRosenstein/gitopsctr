@@ -136,6 +136,8 @@ def stack_tree(root: Path) -> tuple[str, str]:
                 name=unit.name,
                 uid=unit.metadata.uid or "",
                 desiredDigest=controller.desired_unit_binding_digest(unit),
+                sourceProjectionDigest=projection.identity.projectionDigest,
+                projectionContextDigest=projection.identity.projectionContextDigest,
             )
         },
     )

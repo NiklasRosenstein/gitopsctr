@@ -1075,6 +1075,8 @@ class StackProjectionUnitBinding(StrictModel):
     name: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
     uid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
     desiredDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+    sourceProjectionDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+    projectionContextDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
     dependsOn: list[Annotated[str, Pattern(DESIRED_UID_PATTERN)]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -1087,6 +1089,10 @@ class StackProjectionUnitBinding(StrictModel):
                 raise ValueError(f"Stack active projection Unit binding has an invalid {name}")
         if not re.fullmatch(CONTENT_DIGEST_PATTERN, self.desiredDigest):
             raise ValueError("Stack active projection Unit binding desiredDigest must be a SHA-256 digest")
+        if not re.fullmatch(CONTENT_DIGEST_PATTERN, self.sourceProjectionDigest):
+            raise ValueError("Stack active projection Unit binding sourceProjectionDigest must be a SHA-256 digest")
+        if not re.fullmatch(CONTENT_DIGEST_PATTERN, self.projectionContextDigest):
+            raise ValueError("Stack active projection Unit binding projectionContextDigest must be a SHA-256 digest")
         if any(re.fullmatch(DESIRED_UID_PATTERN, dependency) is None for dependency in self.dependsOn):
             raise ValueError("Stack active projection Unit binding dependencies must use desired resource names")
         if len(set(self.dependsOn)) != len(self.dependsOn):
@@ -1160,6 +1166,8 @@ class StackActiveProjection(StrictModel):
                     "name": unit.name,
                     "uid": unit.uid,
                     "desiredDigest": unit.desiredDigest,
+                    "sourceProjectionDigest": unit.sourceProjectionDigest,
+                    "projectionContextDigest": unit.projectionContextDigest,
                     "dependsOn": sorted(unit.dependsOn),
                 }
                 for name, unit in sorted(units.items())
@@ -1432,8 +1440,14 @@ class DesiredStackSpec(StrictModel):
         if self.templateRef.contentDigest != self.structuralProjection.identity.templateContentDigest:
             raise ValueError("Stack templateRef contentDigest must equal structural projection content digest")
         active = self.activeProjection
-        if active is not None and active.sourceProjectionDigest == self.structuralProjection.identity.projectionDigest:
+        if active is not None:
             for logical_name, binding in active.units.items():
+                if binding.sourceProjectionDigest != self.structuralProjection.identity.projectionDigest:
+                    continue
+                if binding.projectionContextDigest != self.structuralProjection.identity.projectionContextDigest:
+                    raise ValueError(
+                        f"Stack active projection Unit {logical_name!r} context does not match structural projection"
+                    )
                 structural = self.structuralProjection.units.get(logical_name)
                 if structural is None:
                     raise ValueError(f"Stack active projection has unknown structural Unit template: {logical_name!r}")

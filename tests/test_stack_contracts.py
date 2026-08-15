@@ -634,6 +634,8 @@ def _active_binding(name: str, depends_on: list[str] | None = None) -> StackProj
         name=name,
         uid=f"uid-{name}",
         desiredDigest="sha256:" + "b" * 64,
+        sourceProjectionDigest="sha256:" + "c" * 64,
+        projectionContextDigest=TEST_PROJECTION_CONTEXT_DIGEST,
         dependsOn=[] if depends_on is None else depends_on,
     )
 
@@ -667,7 +669,18 @@ def test_desired_stack_requires_exact_active_dependencies_for_current_structure(
     active = StackActiveProjection.build(
         source_projection_digest=structural.identity.projectionDigest,
         projection_context_digest=structural.identity.projectionContextDigest,
-        units={"db": _active_binding("web--db"), "app": _active_binding("web--app")},
+        units={
+            "db": replace(
+                _active_binding("web--db"),
+                sourceProjectionDigest=structural.identity.projectionDigest,
+                projectionContextDigest=structural.identity.projectionContextDigest,
+            ),
+            "app": replace(
+                _active_binding("web--app"),
+                sourceProjectionDigest=structural.identity.projectionDigest,
+                projectionContextDigest=structural.identity.projectionContextDigest,
+            ),
+        },
     )
     with pytest.raises(ValueError, match="dependencies do not match"):
         DesiredStackSpec(

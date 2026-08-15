@@ -370,6 +370,8 @@ def test_stack_summary_uses_exact_active_bindings_and_surfaces_mismatch(reposito
                 name="application",
                 uid="uid-application",
                 desiredDigest=application_digest,
+                sourceProjectionDigest=parsed_stack.spec.structuralProjection.identity.projectionDigest,
+                projectionContextDigest=parsed_stack.spec.structuralProjection.identity.projectionContextDigest,
             )
         },
     )

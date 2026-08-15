@@ -395,7 +395,7 @@ def _validate_stack_projection(
             owner_references = generated_resource.metadata.ownerReferences
             owner = owner_references[0] if owner_references is not None else None
             if (
-                generated_resource.metadata.deletion is not None
+                (generated_resource.metadata.deletion is not None and stack.metadata.deletion is None)
                 or generated_resource.metadata.uid != binding.uid
                 or owner is None
                 or (owner.apiVersion, owner.kind, owner.name, owner.uid)
@@ -475,6 +475,13 @@ def _validate_stack_projection(
         if binding.desiredDigest != actual_digest:
             raise ValueError(
                 f"Stack {stack.name!r} active projection binding does not authenticate Unit {generated.name!r}"
+            )
+        if (
+            binding.sourceProjectionDigest == stack.spec.structuralProjection.identity.projectionDigest
+            and binding.projectionContextDigest != stack.spec.structuralProjection.identity.projectionContextDigest
+        ):
+            raise ValueError(
+                f"Stack {stack.name!r} active projection binding context does not match Unit {generated.name!r}"
             )
         from gitopsctr.registry import RESOURCE_REGISTRY
 
@@ -607,7 +614,11 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
         if template is None:
             raise ValueError(f"Stack {stack.name!r} references missing StackTemplate {template_name!r} in this ref")
         _validate_stack_template_reference(stack, template)
-        projected = _resource_template_projection(stack, template)
+        projected = (
+            _resolved_stack_projection(stack)
+            if stack.metadata.deletion is not None
+            else _resource_template_projection(stack, template)
+        )
         _validate_stack_projection(stack, projected, identities)
 
 

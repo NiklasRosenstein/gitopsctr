@@ -153,11 +153,12 @@ StackTemplate UID and content digest, and its projection digest is derived from 
 and required `dependsOn` lists. The persisted topology is authoritative and is checked against the selected
 StackTemplate before publication.
 
-When Units are active, `activeProjection` records both the structural projection digest it was activated from and the
-`projectionContextDigest` used to resolve those Units. A blocked structural transition retains the prior active Unit
-set and context as one immutable lineage. Reconciliation of a retained active Unit therefore uses its active context;
-the structural context is used only after the active projection catches up. Both referenced context records must remain
-available in the desired snapshot.
+When Units are active, `activeProjection` authenticates every concrete Unit by UID and desired digest. Each Unit binding
+also records the exact structural projection and `projectionContextDigest` that produced it. This permits a changed
+dependency producer to advance while a consumer remains blocked on the producer's new receipt or artifact: the producer
+is bound to the new projection, while the retained consumer stays fenced to its previous projection and context until
+the evidence arrives. Reconciliation always uses the selected Unit binding's context. Every referenced context record
+must remain available in the desired snapshot.
 
 Generated Units use names such as `application--deploy` and carry an owner reference fenced by the exact Stack
 `apiVersion`, kind, name, and UID. Missing, stale, cyclic, or unknown dependencies and unsupported unresolved dynamic

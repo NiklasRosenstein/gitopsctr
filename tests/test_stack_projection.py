@@ -368,6 +368,48 @@ def write_receipt_template(path: Path, *, template_name: str, producer: str) -> 
     return path
 
 
+def write_internal_receipt_template(path: Path) -> Path:
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "StackTemplate",
+                "metadata": {"name": "preview"},
+                "spec": {
+                    "parameters": [],
+                    "unitTemplates": {
+                        "image": {
+                            "apiVersion": "unit.gitopsctr.io/v1",
+                            "kind": "Terraform",
+                            "spec": {"source": {"path": "image", "inputs": ["**/*"]}},
+                        },
+                        "deploy": {
+                            "apiVersion": "unit.gitopsctr.io/v1",
+                            "kind": "Terraform",
+                            "spec": {
+                                "source": {"path": "deploy", "inputs": ["**/*"]},
+                                "terraform": {
+                                    "variables": {
+                                        "image": {
+                                            "fromReceipt": {
+                                                "unit": "image",
+                                                "pointer": "/outputs/value",
+                                            }
+                                        }
+                                    }
+                                },
+                            },
+                            "dependsOn": ["image"],
+                        },
+                    },
+                },
+            },
+            sort_keys=False,
+        )
+    )
+    return path
+
+
 def write_topology_template(path: Path, *, version: str, blocked_b: bool, include_c: bool) -> Path:
     write_atomic_template(path, version=version, blocked_b=blocked_b)
     document = yaml.safe_load(path.read_text())
@@ -695,7 +737,7 @@ def test_unavailable_exact_stack_revision_fails_before_publication(tmp_path: Pat
     assert store.fetch("deploy/dev").revision == before
 
 
-def test_stack_projection_wait_retains_prior_active_set_then_durable_evidence_switches_both(
+def test_stack_projection_wait_stages_ready_units_then_durable_evidence_switches_blocked_units(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -721,9 +763,24 @@ def test_stack_projection_wait_retains_prior_active_set_then_durable_evidence_sw
     second_root, second_resources = desired_stack_resources(store, second_published, tmp_path / "atomic-second")
     second_stack = second_resources[("gitopsctr.io/v1", "Stack", "web")]
     assert isinstance(second_stack.spec, DesiredStackSpec)
-    assert second_stack.spec.activeProjection == first_stack.spec.activeProjection
-    assert controller.unit_document_path(second_root, "web--a").read_bytes() == first_a_bytes
+    assert second_stack.spec.activeProjection is not None
+    assert (
+        second_stack.spec.activeProjection.sourceProjectionDigest
+        == second_stack.spec.structuralProjection.identity.projectionDigest
+    )
+    assert (
+        second_stack.spec.activeProjection.units["a"].sourceProjectionDigest
+        == second_stack.spec.structuralProjection.identity.projectionDigest
+    )
+    assert (
+        second_stack.spec.activeProjection.units["b"].sourceProjectionDigest
+        == first_stack.spec.activeProjection.units["b"].sourceProjectionDigest
+    )
+    assert controller.unit_document_path(second_root, "web--a").read_bytes() != first_a_bytes
     assert controller.unit_document_path(second_root, "web--b").read_bytes() == first_b_bytes
+    assert controller.load_desired_unit(
+        controller.unit_document_path(second_root, "web--a"), "web--a"
+    ).spec.terraform.variables == {"version": "v2"}  # type: ignore[union-attr]
     assert controller.load_desired_transition_blocks(second_root)["web--b"]
 
     producer_path = controller.unit_document_path(second_root, "producer")
@@ -777,6 +834,68 @@ def test_stack_projection_wait_retains_prior_active_set_then_durable_evidence_sw
     assert controller.load_desired_unit(
         controller.unit_document_path(final_root, "web--b"), "web--b"
     ).spec.terraform.variables == {"producer": "evidence"}  # type: ignore[union-attr]
+
+
+def test_stack_source_update_stages_changed_producer_before_its_stale_receipt_consumer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source, store, _revision = _repository(tmp_path, monkeypatch)
+    template = write_internal_receipt_template(source / "template.yaml")
+    stack = write_inline_stack(source / "stack.yaml")
+    (source / "image").mkdir()
+    (source / "image/main.tf").write_text("image-v1\n")
+    (source / "deploy").mkdir()
+    (source / "deploy/main.tf").write_text("deploy-v1\n")
+    first_revision = commit(source, "publish receipt-dependent Stack")
+    first_published = _apply(source, first_revision, template, stack)
+    assert first_published is not None
+    first_root, first_resources = desired_stack_resources(store, first_published, tmp_path / "receipt-first")
+    first_stack = first_resources[("gitopsctr.io/v1", "Stack", "web")]
+    assert isinstance(first_stack.spec, DesiredStackSpec)
+    assert first_stack.spec.activeProjection is not None
+    assert set(first_stack.spec.activeProjection.units) == {"image"}
+
+    image_path = controller.unit_document_path(first_root, "web--image")
+    observed = tmp_path / "receipt-observed"
+    observed.mkdir()
+    receipt = receipt_resource(
+        "terraform",
+        "web--image",
+        {"revision": first_revision, "unitBlob": controller.file_blob(image_path)},
+        result={"applied": {"sourceRevision": first_revision}, "outputs": {"value": "image-v1"}},
+    )
+    controller.write_document(
+        observed / "units/web--image.json",
+        controller.RESOURCE_CATALOG.serialize_receipt(receipt),
+        format=controller.DocumentFormat.JSON,
+    )
+    store.publish("observed/dev", observed, None, "publish image receipt", expected_publication_head=None)
+    progressed = controller.progress_durable_stack_projection("dev", "deploy/dev", "observed/dev")
+    assert progressed is not None
+
+    (source / "image/main.tf").write_text("image-v2\n")
+    second_revision = commit(source, "change only the Stack producer inputs")
+    second_published = _apply(source, second_revision, template, stack)
+    assert second_published is not None
+    second_root, second_resources = desired_stack_resources(store, second_published, tmp_path / "receipt-second")
+    second_stack = second_resources[("gitopsctr.io/v1", "Stack", "web")]
+    assert isinstance(second_stack.spec, DesiredStackSpec)
+    assert second_stack.spec.activeProjection is not None
+    assert set(second_stack.spec.activeProjection.units) == {"deploy", "image"}
+    assert controller.load_desired_transition_blocks(second_root)["web--deploy"].startswith("receipt is stale")
+    image = controller.load_desired_unit(controller.unit_document_path(second_root, "web--image"), "web--image")
+    deploy = controller.load_desired_unit(controller.unit_document_path(second_root, "web--deploy"), "web--deploy")
+    assert image.spec.source.revision == second_revision  # type: ignore[union-attr]
+    assert deploy.spec.source.revision == first_revision  # type: ignore[union-attr]
+    assert (
+        second_stack.spec.activeProjection.units["image"].sourceProjectionDigest
+        == second_stack.spec.structuralProjection.identity.projectionDigest
+    )
+    assert (
+        second_stack.spec.activeProjection.units["deploy"].sourceProjectionDigest
+        != second_stack.spec.structuralProjection.identity.projectionDigest
+    )
 
 
 def test_durable_projection_evaluates_every_saved_context_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1175,7 +1294,8 @@ def test_template_only_partition_apply_prunes_stack_fanout_but_keeps_template_ac
     first_published = _apply(source, first_revision, template, stack, partition="application")
     assert first_published is not None
 
-    second_revision = first_revision
+    (source / "partition-removal.txt").write_text("advance the authoritative source snapshot\n")
+    second_revision = commit(source, "remove partitioned Stack at a later source revision")
     second_published = _apply(source, second_revision, template, partition="application")
     assert second_published is not None
     _root, resources = desired_stack_resources(store, second_published, tmp_path / "template-only")
