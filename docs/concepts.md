@@ -86,7 +86,9 @@ desired ref first.
 `apply` pins source inputs and resolves available references into an immutable desired Unit. A Unit is ready only when
 all required inputs are available. Materialization-capable drivers may also commit rendered payloads below
 `materialized/<unit>/`. Repository-backed Unit sources inherit the exact source context retained by their desired
-StackTemplate. The current authored Unit source contract has no independent per-Stack revision selector.
+StackTemplate unless an authored `source.revision` selects an exact 40-hex commit. StackTemplate parameters may supply
+that override from the same acquired-ref history; it is not a direct-Unit field. The effective revision is persisted
+in the structural projection and desired Unit.
 
 Successful reconciliation writes a **Receipt** to the observed ref. A Receipt is a separate observed resource, not a
 Unit's embedded `status`. Its subject identifies a desired Unit, and its desired-unit blob identifies the exact Unit

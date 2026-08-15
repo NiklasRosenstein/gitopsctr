@@ -38,6 +38,7 @@ from gitopsctr.api import GVK, ApiError
 from gitopsctr.artifacts import require_artifact_api
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
+    EXACT_REVISION_PATTERN,
     ArtifactDescriptor,
     ArtifactImport,
     AuthoredSource,
@@ -1044,6 +1045,20 @@ def unit_input_hash(specification: UnitResource[Any], source_root: Path) -> str 
         inputs = [source.path]
     else:
         source_path = source.path
+    specification_identity = specification.driver.unit_contract.dump(specification.spec)
+    # ``source.revision`` selects the checkout whose bytes are hashed; it is
+    # not itself an input identity.  Drop it from the structural portion so
+    # two exact revisions with identical selected bytes retain the same
+    # inputHash.  This also preserves the legacy hash for direct Units whose
+    # authored source omitted revision (the model default is not part of the
+    # historical identity).
+    if isinstance(specification_identity, dict):
+        source_identity = specification_identity.get("source")
+        if isinstance(source_identity, dict) and "revision" in source_identity:
+            source_identity = dict(source_identity)
+            source_identity.pop("revision", None)
+            specification_identity = dict(specification_identity)
+            specification_identity["source"] = source_identity
     return hash_source_inputs(
         source_root,
         source_path,
@@ -1052,7 +1067,7 @@ def unit_input_hash(specification: UnitResource[Any], source_root: Path) -> str 
             "kind": "unit",
             "driver": driver,
             "driverVersion": DRIVER_VERSIONS[driver],
-            "specification": specification.driver.unit_contract.dump(specification.spec),
+            "specification": specification_identity,
         },
     )
 
@@ -1764,21 +1779,23 @@ def resolved_unit_source(
     current_desired: Path,
     source_revision_policy: SourceRevisionPolicy | None = None,
     source_revision_operation: Literal["apply", "plan"] = "apply",
+    preserve_prior_revision: bool = True,
 ) -> ResolvedUnitSourceResult:
     source_revision_policy = source_revision_policy or SourceRevisionPolicy()
     driver, source = require_unit_specification(specification)
     if source is None:
         return ResolvedUnitSourceResult(source=None, disposition=SourceResolutionDisposition.UNCHANGED)
-    if source_revision is None:
+    requested_revision = source.revision or source_revision
+    if requested_revision is None:
         raise OperationError(
             f"Unit {specification.name!r} uses repository-backed source; apply it with --source-revision <commit>"
         )
     input_hash = unit_input_hash(specification, source_root)
-    revision = source_revision
+    revision = requested_revision
     prior = prior_unit_source(specification.name, current_desired)
     disposition = SourceResolutionDisposition.INPUTS_CHANGED if prior is None else SourceResolutionDisposition.UNCHANGED
     refresh_reason: str | None = None
-    if prior is not None:
+    if prior is not None and preserve_prior_revision and source.revision is None:
         prior_revision, prior_hash = prior
         previous_unit_path = unit_document_path(current_desired, specification.name)
         if (
@@ -1798,7 +1815,7 @@ def resolved_unit_source(
         if prior_hash == input_hash:
             in_candidate_history = prior_available and (
                 source_revision_policy.unavailable_when is SourceRevisionUnavailableWhen.MISSING
-                or commit_is_ancestor(prior_revision, source_revision)
+                or commit_is_ancestor(prior_revision, requested_revision)
             )
             if in_candidate_history:
                 revision = prior_revision
@@ -2327,9 +2344,58 @@ class StackProjection:
     owners: dict[str, DesiredOwnerReference]
     dependencies: dict[str, tuple[str, ...]]
     artifact_imports: dict[str, tuple[ArtifactImport, ...]] = field(default_factory=dict)
-    source_contexts: dict[str, tuple[Path, str | None]] = field(default_factory=dict)
+    source_contexts: dict[str, StackUnitSourceContext] = field(default_factory=dict)
     applied_stacks: frozenset[str] = frozenset()
     structural_projections: dict[str, StructuralStackProjection] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class StackUnitSourceContext:
+    """Materialized repository context for one projected Unit's effective source revision."""
+
+    root: Path
+    repository: str
+    revision: str | None
+
+
+@dataclass(frozen=True)
+class StackUnitSourceTransport:
+    """Process-only authenticated selector for an acquired Git template."""
+
+    repository: str
+    ref: str
+
+
+@dataclass(frozen=True)
+class AuthenticatedStackWorkloadRevision:
+    """Repository-scoped proof established by an exact controller pin."""
+
+    repository: str
+    revision: str
+
+
+@dataclass(frozen=True)
+class AuthenticatedStackTemplateContext:
+    """Repository-scoped proof established by materializing the acquired template commit."""
+
+    repository: str
+    revision: str
+
+
+@dataclass(frozen=True)
+class NormalizedStackUnitSource:
+    """Normalized Unit spec and the checkout selected for its effective source."""
+
+    spec: dict[str, Any]
+    source_context: StackUnitSourceContext | None
+
+
+@dataclass(frozen=True)
+class StackWorkloadPinRequirement:
+    """Exact controller alias used to hydrate one Stack-owned Unit source."""
+
+    name: str
+    revision: str
 
 
 @dataclass(frozen=True)
@@ -2473,6 +2539,150 @@ def _materialize_template_source_context(
     return checkout, context.revision
 
 
+def _materialize_stack_workload_revision(
+    repository: str,
+    revision: str,
+    inherited_root: Path,
+    inherited_revision: str,
+    candidate: Path,
+    cache: dict[tuple[str, str, str], Path],
+    retention_pin_name: str | None = None,
+    transport: StackUnitSourceTransport | None = None,
+    authenticated: bool = False,
+    authenticated_context: AuthenticatedStackTemplateContext | None = None,
+) -> Path:
+    """Resolve and materialize one exact workload revision in its template repository."""
+
+    if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+        raise OperationError("Stack Unit source revision must be an exact lowercase 40-hex Git commit")
+    if revision == inherited_revision:
+        # The template acquisition already proved and materialized this exact
+        # repository context. Reuse it without inventing another checkout.
+        return inherited_root
+    key = (repository, inherited_revision, revision)
+    existing = cache.get(key)
+    if existing is not None:
+        return existing
+    store = state_store()
+    if (
+        (authenticated or authenticated_context == AuthenticatedStackTemplateContext(repository, inherited_revision))
+        and commit_is_available(revision)
+        and commit_is_available(inherited_revision)
+        and commit_is_ancestor(revision, inherited_revision)
+    ):
+        checkout = (
+            candidate.parent
+            / f".stack-workload-source-{hashlib.sha256(f'{repository}\0{revision}'.encode()).hexdigest()[:16]}"
+        )
+        if checkout.exists() and not checkout.is_dir():
+            raise OperationError(f"workload source checkout {checkout.name!r} is not a directory")
+        if checkout.exists():
+            shutil.rmtree(checkout)
+        materialize_revision(revision, checkout)
+        cache[key] = checkout
+        return checkout
+    try:
+        source = (
+            store.resolve_source(transport.repository, transport.ref, revision=revision)
+            if transport is not None
+            else store.resolve_source(repository, revision)
+        )
+        source_key = hashlib.sha256(f"{repository}\0{source.revision}".encode()).hexdigest()[:16]
+        checkout = candidate.parent / f".stack-workload-source-{source_key}"
+        if checkout.exists():
+            if not checkout.is_dir():
+                raise OperationError(f"workload source checkout {checkout.name!r} is not a directory")
+        else:
+            materialize_source = getattr(store, "materialize_source", None)
+            if callable(materialize_source):
+                materialize_source(source, checkout)
+            else:
+                materialize_revision(source.revision, checkout)
+        cache[key] = checkout
+        return checkout
+    except (OperationError, OSError, subprocess.CalledProcessError) as exc:
+        hydrate = getattr(store, "hydrate_source_revision", None)
+        if retention_pin_name is not None and callable(hydrate):
+            checkout = (
+                candidate.parent
+                / f".stack-workload-source-{hashlib.sha256(f'{repository}\0{revision}'.encode()).hexdigest()[:16]}"
+            )
+            try:
+                hydrate(retention_pin_name, revision)
+                if not commit_is_available(inherited_revision) or not commit_is_ancestor(revision, inherited_revision):
+                    raise OperationError(
+                        f"Stack Unit source revision {revision!r} is outside the acquired template history"
+                    )
+                if checkout.exists() and not checkout.is_dir():
+                    raise OperationError(f"workload source checkout {checkout.name!r} is not a directory")
+                if checkout.exists():
+                    shutil.rmtree(checkout)
+                materialize_revision(revision, checkout)
+                cache[key] = checkout
+                return checkout
+            except (OperationError, OSError, subprocess.CalledProcessError) as hydration_error:
+                raise OperationError(
+                    f"Stack Unit source revision {revision!r} is unavailable in repository {repository!r}"
+                ) from hydration_error
+        raise OperationError(
+            f"Stack Unit source revision {revision!r} is unavailable in repository {repository!r}"
+        ) from exc
+
+
+def _normalize_stack_unit_source(
+    spec: object,
+    *,
+    repository: str,
+    inherited_revision: str,
+    inherited_root: Path,
+    candidate: Path,
+    checkout_cache: dict[tuple[str, str, str], Path],
+    retention_pin_prefix: str | None = None,
+    transport: StackUnitSourceTransport | None = None,
+    authenticated_revisions: frozenset[AuthenticatedStackWorkloadRevision] = frozenset(),
+    authenticated_context: AuthenticatedStackTemplateContext | None = None,
+) -> NormalizedStackUnitSource:
+    """Persist the effective exact source revision and select its checkout."""
+
+    raw = dump_template_value(cast(TemplateValue, spec))
+    if not isinstance(raw, dict):
+        raise OperationError("projected Unit spec must be an object")
+    source = raw.get("source")
+    if source is None:
+        return NormalizedStackUnitSource(spec=raw, source_context=None)
+    if not isinstance(source, dict):
+        return NormalizedStackUnitSource(spec=raw, source_context=None)
+    if not isinstance(source.get("path"), str):
+        return NormalizedStackUnitSource(spec=raw, source_context=None)
+    requested = source.get("revision")
+    if requested is None:
+        effective = inherited_revision
+        selected_root = inherited_root
+    else:
+        if not isinstance(requested, str):
+            raise OperationError("Stack Unit source revision must resolve to an exact Git commit")
+        effective = requested
+        selected_root = _materialize_stack_workload_revision(
+            repository,
+            requested,
+            inherited_root,
+            inherited_revision,
+            candidate,
+            checkout_cache,
+            f"{retention_pin_prefix}{requested}" if retention_pin_prefix is not None else None,
+            transport,
+            AuthenticatedStackWorkloadRevision(repository, requested) in authenticated_revisions,
+            authenticated_context,
+        )
+    source = dict(source)
+    source["revision"] = effective
+    raw["source"] = source
+    return NormalizedStackUnitSource(
+        spec=raw,
+        source_context=StackUnitSourceContext(root=selected_root, repository=repository, revision=effective),
+    )
+
+
 def _canonical_stack_template_git_request(request: Any, repository: str) -> Any:
     """Return a desired-state-safe Git request without transport credentials."""
 
@@ -2582,7 +2792,10 @@ def _acquire_promoted_stack_template(
     authored: StackResource,
     target_name: str,
     promotion: PromotionContext | None,
+    authenticated_revisions: set[AuthenticatedStackWorkloadRevision] | None = None,
 ) -> PromotedStackTemplateAcquisitionResult:
+    if authenticated_revisions is None:
+        authenticated_revisions = set()
     if promotion is None:
         raise OperationError("StackTemplate source.fromPromotion is legal only in an explicit promote transaction")
     if not isinstance(authored.spec, StackTemplatePromotionSpec):
@@ -2590,6 +2803,12 @@ def _acquire_promoted_stack_template(
     source_name = authored.spec.source.fromPromotion.stack
     try:
         source_resources = load_desired_resource_graph(promotion.desired_root)
+        authenticated_revisions.update(
+            _hydrate_required_stack_workload_pins(
+                promotion.source_environment,
+                promotion.desired_root,
+            )
+        )
     except (OperationError, TypeError, ValueError) as exc:
         raise OperationError(f"promotion source desired snapshot is corrupt: {exc}") from exc
     source_stack = source_resources.get((CORE_API_VERSION, "Stack", source_name))
@@ -2904,8 +3123,166 @@ def _stack_template_source_pin_name(environment: str, template_name: str, uid: s
     return f"{_stack_template_source_pin_prefix(environment, template_name, uid)}{revision}"
 
 
+def _stack_workload_source_pin_name(
+    environment: str,
+    template_name: str,
+    template_uid: str,
+    stack_name: str,
+    stack_uid: str,
+    revision: str,
+) -> str:
+    """Return a Stack/template-incarnation-exact workload source pin name."""
+
+    return (
+        f"{_stack_template_source_pin_prefix(environment, template_name, template_uid)}"
+        f"stacks/{stack_name}/{stack_uid}/{revision}"
+    )
+
+
+def _stack_workload_pin_for_unit(
+    desired_root: Path,
+    environment: str,
+    unit: UnitResource[Any],
+) -> StackWorkloadPinRequirement | None:
+    source = getattr(unit.spec, "source", None)
+    owner = resource_owner_reference(unit)
+    if not isinstance(source, DesiredSource) or source.revision is None or owner is None or owner.kind != "Stack":
+        return None
+    resources = load_desired_resource_graph(desired_root, validate=False)
+    stack = resources.get((CORE_API_VERSION, "Stack", owner.name))
+    if not isinstance(stack, StackResource) or not isinstance(stack.spec, DesiredStackSpec):
+        raise OperationError(f"Stack-owned Unit {unit.name!r} has no desired Stack owner")
+    if stack.metadata.uid != owner.uid:
+        raise OperationError(f"Stack-owned Unit {unit.name!r} has a stale Stack UID fence")
+    template = resources.get((CORE_API_VERSION, "StackTemplate", stack.spec.templateRef.name))
+    if not isinstance(template, StackResource) or template.metadata.uid != stack.spec.templateRef.uid:
+        raise OperationError(f"Stack {stack.name!r} has a stale StackTemplate identity fence")
+    if template.metadata.uid is None or stack.metadata.uid is None:
+        raise OperationError(f"Stack {stack.name!r} has no UID for workload source retention")
+    return StackWorkloadPinRequirement(
+        name=_stack_workload_source_pin_name(
+            environment,
+            template.name,
+            template.metadata.uid,
+            stack.name,
+            stack.metadata.uid,
+            source.revision,
+        ),
+        revision=source.revision,
+    )
+
+
+def _hydrate_stack_workload_pin_for_unit(
+    desired_root: Path,
+    environment: str,
+    unit: UnitResource[Any],
+) -> None:
+    """Hydrate a Stack Unit's exact workload object before using its source."""
+
+    pin = _stack_workload_pin_for_unit(desired_root, environment, unit)
+    if pin is None:
+        return
+    name, revision = pin.name, pin.revision
+    store = state_store()
+    hydrate = getattr(store, "hydrate_source_revision", None)
+    if not callable(hydrate):
+        hydrate = getattr(store, "hydrate_controller_pin", None)
+    if callable(hydrate):
+        try:
+            hydrate(name, revision)
+        except OperationError:
+            legacy_name = _legacy_stack_template_pin_for_workload(
+                desired_root,
+                environment,
+                name,
+                revision,
+            )
+            if legacy_name is not None:
+                try:
+                    hydrate(legacy_name, revision)
+                    return
+                except OperationError:
+                    pass
+            if not commit_is_available(revision):
+                raise
+
+
+def _legacy_stack_template_pin_for_workload(
+    desired_root: Path,
+    environment: str,
+    workload_pin_name: str,
+    revision: str,
+) -> str | None:
+    """Return the pre-workload-alias template pin for an inherited revision."""
+
+    parts = workload_pin_name.split("/")
+    if len(parts) != 8 or parts[:2] != ["stack-templates", environment]:
+        return None
+    template_name, template_uid = parts[2], parts[3]
+    resources = load_desired_resource_graph(desired_root, validate=False)
+    template = resources.get((CORE_API_VERSION, "StackTemplate", template_name))
+    if (
+        not isinstance(template, StackResource)
+        or not isinstance(template.spec, DesiredStackTemplateSpec)
+        or template.metadata.uid != template_uid
+        or template.spec.sourceContext is None
+        or template.spec.sourceContext.revision != revision
+    ):
+        return None
+    return _stack_template_source_pin_name(environment, template_name, template_uid, revision)
+
+
+def _hydrate_required_stack_workload_pins(
+    environment: str,
+    desired_root: Path,
+) -> frozenset[AuthenticatedStackWorkloadRevision]:
+    """Hydrate every retained structural/active Stack workload revision."""
+
+    store = state_store()
+    hydrate = getattr(store, "hydrate_source_revision", None)
+    if not callable(hydrate):
+        hydrate = getattr(store, "hydrate_controller_pin", None)
+    if not callable(hydrate):
+        return frozenset()
+    authenticated: set[AuthenticatedStackWorkloadRevision] = set()
+    resources = load_desired_resource_graph(desired_root, validate=False)
+    for name, revision in _required_stack_template_source_pins(environment, desired_root):
+        if not _is_stack_workload_pin_name(name, environment):
+            continue
+        parts = name.split("/")
+        template = resources.get((CORE_API_VERSION, "StackTemplate", parts[2]))
+        if (
+            not isinstance(template, StackResource)
+            or not isinstance(template.spec, DesiredStackTemplateSpec)
+            or template.metadata.uid != parts[3]
+            or template.spec.sourceContext is None
+        ):
+            raise OperationError(f"workload source pin {name!r} has no matching StackTemplate context")
+        proof = AuthenticatedStackWorkloadRevision(template.spec.sourceContext.repository, revision)
+        try:
+            hydrate(name, revision)
+            authenticated.add(proof)
+        except OperationError:
+            legacy_name = _legacy_stack_template_pin_for_workload(
+                desired_root,
+                environment,
+                name,
+                revision,
+            )
+            if legacy_name is not None:
+                try:
+                    hydrate(legacy_name, revision)
+                    authenticated.add(proof)
+                    continue
+                except OperationError:
+                    pass
+            if not commit_is_available(revision):
+                raise
+    return frozenset(authenticated)
+
+
 def _required_stack_template_source_pins(environment: str, desired_root: Path) -> tuple[tuple[str, str], ...]:
-    """Collect exact source contexts needed by desired StackTemplate incarnations."""
+    """Collect exact template and effective workload revisions needed by desired state."""
 
     required: set[tuple[str, str]] = set()
     resources = load_desired_resource_graph(desired_root, validate=False)
@@ -2920,6 +3297,87 @@ def _required_stack_template_source_pins(environment: str, desired_root: Path) -
         required.add(
             (_stack_template_source_pin_name(environment, resource.name, resource.metadata.uid, revision), revision)
         )
+    for resource in resources.values():
+        if (
+            not isinstance(resource, StackResource)
+            or resource.gvk.kind != "Stack"
+            or not isinstance(resource.spec, DesiredStackSpec)
+        ):
+            continue
+        if resource.metadata.uid is None:
+            raise OperationError(f"Stack {resource.name!r} has no UID")
+        template = resources.get((CORE_API_VERSION, "StackTemplate", resource.spec.templateRef.name))
+        if not isinstance(template, StackResource) or not isinstance(template.spec, DesiredStackTemplateSpec):
+            raise OperationError(f"Stack {resource.name!r} has no desired StackTemplate for source retention")
+        if template.metadata.uid != resource.spec.templateRef.uid:
+            raise OperationError(f"Stack {resource.name!r} has a stale StackTemplate UID fence")
+        template_name = resource.spec.templateRef.name
+        template_uid = template.metadata.uid
+        if template_uid is None:
+            raise OperationError(f"StackTemplate {template_name!r} has no UID for source retention")
+        stack_name = resource.name
+        stack_uid = resource.metadata.uid
+
+        def add_workload_revision(
+            revision: object,
+            *,
+            stack_name: str = stack_name,
+            stack_uid: str = stack_uid,
+            template_name: str = template_name,
+            template_uid: str = template_uid,
+        ) -> None:
+            if revision is None:
+                return
+            if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+                raise OperationError(f"Stack {stack_name!r} has an invalid workload source revision")
+            required.add(
+                (
+                    _stack_workload_source_pin_name(
+                        environment,
+                        template_name,
+                        template_uid,
+                        stack_name,
+                        stack_uid,
+                        revision,
+                    ),
+                    revision,
+                )
+            )
+
+        # Structural projection is the immutable selected Unit-template
+        # contract.  Do not re-expand the current template here: a carried
+        # blocked transition may intentionally retain a structural revision
+        # that differs from today's authored input.
+        for projected in resource.spec.structuralProjection.units.values():
+            source = projected.spec.get("source")
+            revision = source.get("revision") if isinstance(source, Mapping) else None
+            add_workload_revision(revision)
+
+        # During a blocked transition activeProjection may still authenticate
+        # concrete Units from the previous structural revision.  Retain those
+        # exact sources too, but only after binding API/kind/name/UID and the
+        # desired payload digest through the active projection.
+        active = resource.spec.activeProjection
+        if active is None:
+            continue
+        for binding in active.units.values():
+            unit = resources.get((binding.apiVersion, binding.kind, binding.name))
+            if not isinstance(unit, UnitResource):
+                raise OperationError(
+                    f"Stack {resource.name!r} active Unit {binding.name!r} is missing from desired state"
+                )
+            if unit.metadata.uid != binding.uid or desired_unit_binding_digest(unit) != binding.desiredDigest:
+                raise OperationError(f"Stack {resource.name!r} active Unit {binding.name!r} failed its binding fence")
+            owner = resource_owner_reference(unit)
+            if (
+                owner is None
+                or owner.kind != "Stack"
+                or owner.name != resource.name
+                or owner.uid != resource.metadata.uid
+            ):
+                raise OperationError(f"Stack {resource.name!r} active Unit {binding.name!r} has an invalid owner")
+            source = getattr(unit.spec, "source", None)
+            add_workload_revision(getattr(source, "revision", None))
     return tuple(sorted(required))
 
 
@@ -2978,6 +3436,56 @@ def _ensure_stack_template_source_pins(environment: str, desired_root: Path) -> 
     return store.create_controller_pins(dict(required))
 
 
+def _seed_missing_stack_workload_revisions(environment: str, desired_root: Path) -> None:
+    """Import historical workload objects before creating a new owner namespace."""
+
+    store = state_store()
+    hydrate = getattr(store, "hydrate_source_revision", None)
+    resolve_source = getattr(store, "resolve_source", None)
+    materialize_source = getattr(store, "materialize_source", None)
+    if not callable(resolve_source) or not callable(materialize_source):
+        return
+    resources = load_desired_resource_graph(desired_root, validate=False)
+    for name, revision in _required_stack_template_source_pins(environment, desired_root):
+        if not _is_stack_workload_pin_name(name, environment):
+            continue
+        if callable(hydrate):
+            try:
+                hydrate(name, revision)
+                continue
+            except OperationError:
+                legacy_name = _legacy_stack_template_pin_for_workload(
+                    desired_root,
+                    environment,
+                    name,
+                    revision,
+                )
+                if legacy_name is not None:
+                    try:
+                        hydrate(legacy_name, revision)
+                        continue
+                    except OperationError:
+                        pass
+        if commit_is_available(revision):
+            continue
+        parts = name.split("/")
+        template = resources.get((CORE_API_VERSION, "StackTemplate", parts[2]))
+        if (
+            not isinstance(template, StackResource)
+            or not isinstance(template.spec, DesiredStackTemplateSpec)
+            or template.metadata.uid != parts[3]
+            or template.spec.sourceContext is None
+        ):
+            raise OperationError(f"workload source pin {name!r} has no matching StackTemplate context")
+        context = template.spec.sourceContext
+        try:
+            source = resolve_source(context.repository, context.revision, revision=revision)
+        except (OperationError, OSError, subprocess.CalledProcessError):
+            source = resolve_source(context.repository, revision)
+        with tempfile.TemporaryDirectory(prefix="gitopsctr-workload-seed-") as directory:
+            materialize_source(source, Path(directory) / "source")
+
+
 @dataclass(frozen=True)
 class ControllerPinAcquisition:
     """Pins acquired by one publication attempt and safe to roll back."""
@@ -2991,6 +3499,7 @@ def _acquire_stack_template_source_pins(environment: str, desired_root: Path) ->
     required = _required_stack_template_source_pins(environment, desired_root)
     if not required:
         return ControllerPinAcquisition(pins=(), newly_created=())
+    _seed_missing_stack_workload_revisions(environment, desired_root)
     store = state_store()
     reap = getattr(store, "reap_expired_controller_pin_claims", None)
     if callable(reap):
@@ -3036,6 +3545,109 @@ def _release_new_stack_template_source_pins(acquisition: ControllerPinAcquisitio
         )
 
 
+def _is_stack_workload_pin_name(name: str, environment: str) -> bool:
+    parts = name.split("/")
+    safe_name = r"[a-z0-9][a-z0-9-]{0,62}"
+    return (
+        len(parts) == 8
+        and parts[0] == "stack-templates"
+        and re.fullmatch(safe_name, parts[1]) is not None
+        and parts[1] == environment
+        and re.fullmatch(safe_name, parts[2]) is not None
+        and re.fullmatch(safe_name, parts[3]) is not None
+        and parts[4] == "stacks"
+        and re.fullmatch(safe_name, parts[5]) is not None
+        and re.fullmatch(safe_name, parts[6]) is not None
+        and re.fullmatch(r"[0-9a-f]{40}", parts[7]) is not None
+    )
+
+
+def _gc_superseded_stack_workload_pins(
+    environment: str,
+    desired_root: Path,
+    accepted_target: AcceptedDesiredTarget,
+) -> None:
+    """Remove obsolete workload aliases after an accepted snapshot is fenced.
+
+    The desired snapshot is authoritative for structural and active source
+    requirements.  Publication owners are a second fence: an old alias is
+    removable only after every accepted or review publication retaining it is
+    no longer live.
+    """
+
+    store = state_store()
+    list_pins = getattr(store, "list_controller_pins", None)
+    list_owners = getattr(store, "list_controller_publication_owners", None)
+    release_pin = getattr(store, "release_controller_pin", None)
+    release_owner = getattr(store, "release_publication_owner", None)
+    owner_is_live = getattr(store, "publication_owner_is_live", None)
+    candidate_is_live = getattr(store, "publication_owner_is_live_candidate", None)
+    hydrate_source = getattr(store, "hydrate_source_revision", None)
+    create_pins = getattr(store, "create_controller_pins", None)
+    if not all(
+        callable(item)
+        for item in (list_pins, list_owners, release_pin, release_owner, owner_is_live, candidate_is_live)
+    ):
+        # Lightweight stores used by older callers do not expose the owner
+        # fence.  They cannot safely perform accepted-snapshot GC.
+        return
+
+    required = dict(_required_stack_template_source_pins(environment, desired_root))
+    list_pins_fn = cast(Callable[[], Sequence[ControllerPin]], list_pins)
+    list_owners_fn = cast(Callable[[], Sequence[Any]], list_owners)
+    release_pin_fn = cast(Callable[[str, str], Any], release_pin)
+    release_owner_fn = cast(Callable[..., Any], release_owner)
+    owner_is_live_fn = cast(Callable[[Any], bool], owner_is_live)
+    candidate_is_live_fn = cast(Callable[[Any, AcceptedDesiredTarget], bool], candidate_is_live)
+    pins_by_name = {pin.name: pin for pin in list_pins_fn() if _is_stack_workload_pin_name(pin.name, environment)}
+    owners_by_name: dict[str, list[Any]] = {}
+    for owner in list_owners_fn():
+        if _is_stack_workload_pin_name(owner.source_pin_name, environment):
+            owners_by_name.setdefault(owner.source_pin_name, []).append(owner)
+    for name in sorted(set(pins_by_name) | set(owners_by_name)):
+        if name in required:
+            continue
+        owners = tuple(owners_by_name.get(name, ()))
+        protected = False
+        for owner in owners:
+            if owner.publication_ref == accepted_target.ref:
+                if owner_is_live_fn(owner):
+                    protected = True
+                    break
+            elif candidate_is_live_fn(owner, accepted_target):
+                protected = True
+                break
+        if protected:
+            continue
+        pin = pins_by_name.get(name)
+        if pin is None and owners:
+            revisions = {owner.revision for owner in owners}
+            if len(revisions) != 1 or not callable(hydrate_source) or not callable(create_pins):
+                continue
+            revision = next(iter(revisions))
+            try:
+                hydrate_source(name, revision)
+                cast(Callable[[Mapping[str, str]], Any], create_pins)({name: revision})
+            except (OperationError, OSError, subprocess.CalledProcessError):
+                continue
+            pin = ControllerPin(name, f"refs/heads/gitopsctr/pins/{name}", revision)
+        for owner in owners:
+            release_owner_fn(owner, accepted_target=accepted_target)
+        remaining_owners = tuple(owner for owner in list_owners_fn() if owner.source_pin_name == name)
+        if any(
+            (owner.publication_ref == accepted_target.ref and owner_is_live_fn(owner))
+            or (owner.publication_ref != accepted_target.ref and candidate_is_live_fn(owner, accepted_target))
+            for owner in remaining_owners
+        ):
+            continue
+        if any(owner.source_pin_name == name for owner in remaining_owners):
+            # A stale owner that could not be released is an ownership fence;
+            # leave the alias for a later accepted-snapshot repair.
+            continue
+        if pin is not None:
+            release_pin_fn(pin.name, pin.revision)
+
+
 def _verify_published_stack_template_change(
     ref: str,
     candidate: Path,
@@ -3061,32 +3673,141 @@ def _promote_stack_template_source_pins(
     environment: str,
     desired_root: Path,
     acquisition: ControllerPinAcquisition | None,
+    accepted_target: AcceptedDesiredTarget | None = None,
 ) -> None:
     """Install canonical retention pins after a desired/candidate publication."""
 
-    if acquisition is None or not acquisition.claims:
-        return
-    store = state_store()
-    required = dict(_required_stack_template_source_pins(environment, desired_root))
-    promotion_error: BaseException | None = None
-    try:
-        store.create_controller_pins(required)
-    except BaseException as exc:
-        promotion_error = exc
-    # The publication-owner refs were created in the same atomic push as the
-    # publication. Claims are therefore released by exact name even when the
-    # later canonical alias promotion fails.
-    release_error: BaseException | None = None
-    for claim in acquisition.claims:
+    if acquisition is not None and acquisition.claims:
+        store = state_store()
+        required = dict(_required_stack_template_source_pins(environment, desired_root))
+        promotion_error: BaseException | None = None
         try:
-            store.release_controller_pin(claim.name, claim.revision)
+            store.create_controller_pins(required)
         except BaseException as exc:
-            if release_error is None:
-                release_error = exc
-    if promotion_error is not None:
-        raise promotion_error
-    if release_error is not None:
-        raise release_error
+            promotion_error = exc
+        # The publication-owner refs were created in the same atomic push as
+        # the publication. Claims are therefore released by exact name even
+        # when the later canonical alias promotion fails.
+        release_error: BaseException | None = None
+        for claim in acquisition.claims:
+            try:
+                store.release_controller_pin(claim.name, claim.revision)
+            except BaseException as exc:
+                if release_error is None:
+                    release_error = exc
+        if promotion_error is not None:
+            raise promotion_error
+        if release_error is not None:
+            raise release_error
+    if accepted_target is not None:
+        try:
+            _gc_superseded_stack_workload_pins(environment, desired_root, accepted_target)
+        except (OperationError, OSError, subprocess.CalledProcessError):
+            log_status("KEEP", "accepted Stack workload source cleanup remains retryable")
+
+
+def _stack_workload_pin_belongs_to_stack(name: str, environment: str, stack_name: str, stack_uid: str) -> bool:
+    parts = name.split("/")
+    safe_name = r"[a-z0-9][a-z0-9-]{0,62}"
+    return (
+        len(parts) == 8
+        and parts[0] == "stack-templates"
+        and re.fullmatch(safe_name, parts[1]) is not None
+        and parts[1] == environment
+        and re.fullmatch(safe_name, parts[2]) is not None
+        and re.fullmatch(safe_name, parts[3]) is not None
+        and parts[4] == "stacks"
+        and re.fullmatch(safe_name, parts[5]) is not None
+        and parts[5] == stack_name
+        and re.fullmatch(safe_name, parts[6]) is not None
+        and parts[6] == stack_uid
+        and re.fullmatch(r"[0-9a-f]{40}", parts[7]) is not None
+    )
+
+
+def _release_finalized_stack_workload_pins(
+    environment: str,
+    name: str,
+    uid: str,
+    deletion_generation: int,
+    desired_root: Path,
+    accepted_target: AcceptedDesiredTarget | None = None,
+) -> bool:
+    """Release only workload pins owned by one finalized Stack incarnation."""
+
+    tombstone = finalized_incarnation_evidence(
+        desired_root,
+        CORE_API_VERSION,
+        "Stack",
+        name,
+        uid,
+        deletion_generation,
+    )
+    if tombstone is None:
+        return False
+    resources = load_desired_resource_graph(desired_root, validate=False)
+    if any(
+        isinstance(item, StackResource) and item.gvk.kind == "Stack" and item.name == name and item.metadata.uid == uid
+        for item in resources.values()
+    ):
+        raise OperationError(f"Stack {name!r} is still present after finalization")
+    store = state_store()
+    owners = tuple(
+        owner
+        for owner in getattr(store, "list_controller_publication_owners", lambda: ())()
+        if _stack_workload_pin_belongs_to_stack(owner.source_pin_name, environment, name, uid)
+    )
+    canonical_pins = tuple(
+        pin
+        for pin in store.list_controller_pins()
+        if not pin.name.startswith("claims/") and _stack_workload_pin_belongs_to_stack(pin.name, environment, name, uid)
+    )
+    missing_owner_pins = {
+        owner.source_pin_name: owner.revision
+        for owner in owners
+        if not any(pin.name == owner.source_pin_name and pin.revision == owner.revision for pin in canonical_pins)
+    }
+    if missing_owner_pins:
+        hydrate = getattr(store, "hydrate_source_revision", None)
+        create_pins = getattr(store, "create_controller_pins", None)
+        if not callable(hydrate) or not callable(create_pins):
+            return False
+        for source_pin_name, revision in missing_owner_pins.items():
+            hydrate(source_pin_name, revision)
+        create_pins(missing_owner_pins)
+        canonical_pins = tuple(
+            pin
+            for pin in store.list_controller_pins()
+            if not pin.name.startswith("claims/")
+            and _stack_workload_pin_belongs_to_stack(pin.name, environment, name, uid)
+        )
+    for owner in owners:
+        if accepted_target is None:
+            if store.publication_owner_is_live(owner):
+                return False
+        elif owner.publication_ref == accepted_target.ref:
+            if store.publication_owner_is_live(owner):
+                return False
+        elif store.publication_owner_is_live_candidate(owner, accepted_target):
+            return False
+        if not any(pin.name == owner.source_pin_name and pin.revision == owner.revision for pin in canonical_pins):
+            return False
+    for owner in owners:
+        if accepted_target is None:
+            store.release_publication_owner(owner)
+        else:
+            store.release_publication_owner(owner, accepted_target=accepted_target)
+    if any(
+        _stack_workload_pin_belongs_to_stack(owner.source_pin_name, environment, name, uid)
+        for owner in getattr(store, "list_controller_publication_owners", lambda: ())()
+    ):
+        return False
+    for pin in canonical_pins:
+        current_owners = getattr(store, "list_controller_publication_owners", lambda: ())()
+        if any(owner.source_pin_name == pin.name for owner in current_owners):
+            continue
+        store.release_controller_pin(pin.name, pin.revision)
+    return bool(owners or canonical_pins)
 
 
 def _release_finalized_stack_template_pins(
@@ -3135,11 +3856,14 @@ def _release_finalized_stack_template_pins(
         owner
         for owner in getattr(store, "list_controller_publication_owners", lambda: ())()
         if owner.source_pin_name.startswith(prefix)
+        and re.fullmatch(r"[0-9a-f]{40}", owner.source_pin_name.removeprefix(prefix)) is not None
     )
     canonical_pins = tuple(
         pin
         for pin in store.list_controller_pins()
-        if pin.name.startswith(prefix) and not pin.name.startswith("claims/")
+        if pin.name.startswith(prefix)
+        and not pin.name.startswith("claims/")
+        and re.fullmatch(r"[0-9a-f]{40}", pin.name.removeprefix(prefix)) is not None
     )
     for owner in owners:
         if accepted_target is None:
@@ -3200,6 +3924,7 @@ def project_stack_resources(
     stack_template_document_digests: Mapping[str, str] | None = None,
     projection_context: JsonObject | None = None,
     stack_names: frozenset[str] | None = None,
+    authenticated_workload_revisions: frozenset[AuthenticatedStackWorkloadRevision] = frozenset(),
 ) -> StackProjection:
     """Build desired inline StackTemplate roots and project every Stack."""
 
@@ -3236,6 +3961,15 @@ def project_stack_resources(
     desired_templates: dict[str, StackResource] = dict(current_templates)
     explicit_template_names = set(authored_templates)
     template_source_roots: dict[str, Path] = {}
+    template_source_transports: dict[str, StackUnitSourceTransport] = {
+        template.name: StackUnitSourceTransport(
+            repository=template.spec.sourceContext.repository,
+            ref=template.spec.sourceContext.revision,
+        )
+        for template in desired_templates.values()
+        if isinstance(template.spec, DesiredStackTemplateSpec) and template.spec.sourceContext is not None
+    }
+    authenticated_revision_set = set(authenticated_workload_revisions)
     for name, authored in authored_templates.items():
         authored_path = authored_template_paths.get(name)
         if authored_path is None:
@@ -3278,17 +4012,30 @@ def project_stack_resources(
             acquisition = acquired.acquisition
             source_context = acquired.source_context
             template_source_roots[name] = acquired.source_root
+            template_source_transports[name] = StackUnitSourceTransport(
+                repository=authored.spec.source.fromGit.repository,
+                # The acquisition already resolved the authored selector. Fence
+                # workload overrides to that exact acquired history rather than
+                # re-reading a mutable branch or tag later in this transaction.
+                ref=acquired.source_context.revision,
+            )
         elif isinstance(authored.spec, StackTemplatePromotionSpec):
             acquired = _acquire_promoted_stack_template(
                 authored,
                 name,
                 promotion,
+                authenticated_revision_set,
             )
             inline_spec = acquired.inline_spec
             acquisition = acquired.acquisition
             source_context = acquired.source_context
         else:
             raise OperationError(f"StackTemplate {name!r} has an invalid authored specification")
+        if source_context is not None and not isinstance(authored.spec, StackTemplateGitSpec):
+            template_source_transports[name] = StackUnitSourceTransport(
+                repository=source_context.repository,
+                ref=source_context.revision,
+            )
         desired_templates[name] = StackResource(
             authored.gvk,
             _stack_root_metadata("StackTemplate", name, source_revision, current_desired, partition),
@@ -3340,8 +4087,9 @@ def project_stack_resources(
     owners: dict[str, DesiredOwnerReference] = {}
     dependencies: dict[str, tuple[str, ...]] = {}
     artifact_imports: dict[str, tuple[ArtifactImport, ...]] = {}
-    source_contexts: dict[str, tuple[Path, str | None]] = {}
+    source_contexts: dict[str, StackUnitSourceContext] = {}
     structural_projections: dict[str, StructuralStackProjection] = {}
+    workload_source_checkouts: dict[tuple[str, str, str], Path] = {}
 
     for name in sorted(reprojected_stack_names):
         stack = desired_stacks[name]
@@ -3382,11 +4130,52 @@ def project_stack_resources(
                     f"Stack {name!r} selects {resource.name!r} but omits dependencies: {', '.join(omitted)}"
                 )
         expanded = tuple(resource for resource in expanded if resource.name in selected_names)
+        inherited_root, inherited_revision = _materialize_template_source_context(
+            template,
+            template_source_roots.get(template.name, source_context_root or source_root),
+            source_revision,
+            candidate,
+            environment_name,
+        )
+        source_context = template.spec.sourceContext
+        authenticated_context = (
+            AuthenticatedStackTemplateContext(source_context.repository, source_context.revision)
+            if source_context is not None and inherited_revision == source_context.revision
+            else None
+        )
+        normalized_specs: dict[str, NormalizedStackUnitSource] = {}
+        if source_context is not None:
+            for resource in expanded:
+                normalized_specs[resource.name] = _normalize_stack_unit_source(
+                    resource.spec,
+                    repository=source_context.repository,
+                    inherited_revision=source_context.revision,
+                    inherited_root=inherited_root,
+                    candidate=candidate,
+                    checkout_cache=workload_source_checkouts,
+                    retention_pin_prefix=(
+                        f"{_stack_template_source_pin_prefix(environment_name, template.name, template.metadata.uid)}"
+                        f"stacks/{name}/{stack.metadata.uid}/"
+                        if template.metadata.uid is not None and stack.metadata.uid is not None
+                        else None
+                    ),
+                    transport=template_source_transports.get(template.name),
+                    authenticated_revisions=frozenset(authenticated_revision_set),
+                    authenticated_context=authenticated_context,
+                )
         projection_units = {
             resource.name: StackProjectionUnit(
                 apiVersion=resource.apiVersion,
                 kind=resource.kind,
-                spec=ProjectionObject(cast(dict[str, Any], dump_template_value(cast(TemplateValue, resource.spec)))),
+                spec=ProjectionObject(
+                    normalized_specs.get(
+                        resource.name,
+                        NormalizedStackUnitSource(
+                            spec=cast(dict[str, Any], dump_template_value(cast(TemplateValue, resource.spec))),
+                            source_context=None,
+                        ),
+                    ).spec
+                ),
                 dependsOn=list(resource.dependsOn),
             )
             for resource in expanded
@@ -3449,13 +4238,6 @@ def project_stack_resources(
         desired_stacks[name] = desired_stack
         _write_desired_stack_resource(candidate / "stacks" / f"{name}.json", desired_stack, project_root)
 
-        context_root, context_revision = _materialize_template_source_context(
-            template,
-            template_source_roots.get(template.name, source_context_root or source_root),
-            source_revision,
-            candidate,
-            environment_name,
-        )
         scoped_resources = scope_stack_template_resources(
             name,
             tuple(
@@ -3469,12 +4251,25 @@ def project_stack_resources(
                 for item in expanded
             ),
         )
-        for resource in scoped_resources:
+        for original_resource, resource in zip(expanded, scoped_resources, strict=True):
+            normalized = normalized_specs.get(
+                original_resource.name,
+                NormalizedStackUnitSource(
+                    spec=cast(dict[str, Any], dump_template_value(cast(TemplateValue, resource.spec))),
+                    source_context=None,
+                ),
+            )
+            normalized_spec = cast(dict[str, Any], dump_template_value(cast(TemplateValue, resource.spec)))
+            normalized_source = normalized.spec.get("source")
+            if normalized_source is not None:
+                normalized_spec = dict(normalized_spec)
+                normalized_spec["source"] = normalized_source
+            selected_source_context = normalized.source_context
             document: JsonObject = {
                 "apiVersion": resource.apiVersion,
                 "kind": resource.kind,
                 "metadata": {"name": resource.name},
-                "spec": cast(JsonObjectValue, dump_template_value(cast(TemplateValue, resource.spec))),
+                "spec": cast(JsonObjectValue, normalized_spec),
             }
             unit = RESOURCE_CATALOG.parse_unit(document, profile="authored", expected_name=resource.name)
             require_unit_specification(unit, resource.name)
@@ -3491,7 +4286,8 @@ def project_stack_resources(
                 name=stack.name,
                 uid=stack.metadata.uid,
             )
-            source_contexts[resource.name] = (context_root, context_revision)
+            if selected_source_context is not None:
+                source_contexts[resource.name] = selected_source_context
 
     return StackProjection(
         generated_units=generated,
@@ -5240,10 +6036,13 @@ def raw_document_source(payload: object) -> DesiredSource | None:
     source = specification.get("source") if isinstance(specification, dict) else None
     if not isinstance(source, dict) or not isinstance(source.get("path"), str):
         return None
+    revision = source.get("revision")
+    if not isinstance(revision, str) or re.fullmatch(EXACT_REVISION_PATTERN, revision) is None:
+        return None
     inputs = source.get("inputs")
     return DesiredSource(
         path=source["path"],
-        revision=source.get("revision") if isinstance(source.get("revision"), str) else None,
+        revision=revision,
         driverVersion=source.get("driverVersion") if isinstance(source.get("driverVersion"), int) else None,
         inputHash=source.get("inputHash") if isinstance(source.get("inputHash"), str) else None,
         inputs=inputs if isinstance(inputs, list) and all(isinstance(value, str) for value in inputs) else None,
@@ -5769,6 +6568,10 @@ def build_desired_candidate(
     projection_context: JsonObject | None = None,
     projection_stack_names: frozenset[str] | None = None,
 ) -> BuildDesiredResult:
+    authenticated_workload_revisions = _hydrate_required_stack_workload_pins(
+        environment_name,
+        current_desired,
+    )
     if verbose:
         log_heading(f"Resolve desired state for {style_environment(environment_name)}")
         log_status("SOURCE", f"candidate revision {describe_revision(source_revision)}")
@@ -5814,6 +6617,7 @@ def build_desired_candidate(
         stack_template_document_digests,
         projection_context,
         projection_stack_names,
+        authenticated_workload_revisions,
     )
     imported_artifact_fingerprints: dict[str, dict[str, str]] = {}
     imported_artifact_evidence: dict[str, dict[str, ResolvedArtifactImport]] = {}
@@ -5907,7 +6711,6 @@ def build_desired_candidate(
     blocked: dict[str, str] = {}
     cleanup_inputs: dict[str, DesiredCleanupInput] = {}
     refreshes: dict[str, str] = {}
-
     for unit_name, specification in specifications.items():
         if unit_name in opaque_transitions:
             blocked_transitions.setdefault(unit_name, "opaque cleanup root retained pending explicit adoption")
@@ -5952,16 +6755,37 @@ def build_desired_candidate(
                     f"{style_unit(unit_name)}: GVK/driver changed; retain previous desired cleanup root",
                 )
             continue
-        unit_source_root, unit_source_revision = stack_projection.source_contexts.get(
-            unit_name, (source_root, source_revision)
+        selected_source_context = stack_projection.source_contexts.get(unit_name)
+        unit_source_root = selected_source_context.root if selected_source_context is not None else source_root
+        unit_source_revision = (
+            selected_source_context.revision if selected_source_context is not None else source_revision
         )
-        source_resolution = resolved_unit_source(
-            specification,
-            unit_source_root,
-            unit_source_revision,
-            current_desired,
-            source_revision_policy,
-            source_revision_operation,
+        authored_source = getattr(specification.spec, "source", None)
+        if (
+            selected_source_context is None
+            and isinstance(authored_source, AuthoredSource)
+            and authored_source.revision is not None
+        ):
+            raise OperationError(f"Unit {unit_name!r}: source.revision is supported only in a StackTemplate projection")
+        source_resolution = (
+            resolved_unit_source(
+                specification,
+                unit_source_root,
+                unit_source_revision,
+                current_desired,
+                source_revision_policy,
+                source_revision_operation,
+                preserve_prior_revision=False,
+            )
+            if unit_name in stack_projection.owners
+            else resolved_unit_source(
+                specification,
+                unit_source_root,
+                unit_source_revision,
+                current_desired,
+                source_revision_policy,
+                source_revision_operation,
+            )
         )
         prepared[unit_name] = (specification, source_resolution)
         if source_resolution.refresh_reason is not None:
@@ -6846,6 +7670,11 @@ def command_promote(args: argparse.Namespace) -> None:
 
         if target_revision is not None and directory_files(current_target) == directory_files(candidate):
             _ensure_stack_template_source_pins(args.to_environment, candidate)
+            _gc_superseded_stack_workload_pins(
+                args.to_environment,
+                candidate,
+                AcceptedDesiredTarget(target_desired_ref, target_revision),
+            )
             log_status("KEEP", f"{style_branch(target_desired_ref)} already contains this promotion")
             print(target_revision)
             write_change_outputs(target_revision, target_desired_ref)
@@ -6948,14 +7777,42 @@ def command_promote(args: argparse.Namespace) -> None:
                     log_status("KEEP", "retained StackTemplate source claims after ambiguous publication inspection")
                     raise publication_error from None
                 if verified is not None:
+                    if gate == "pullRequest":
+                        if target_revision is None:
+                            raise OperationError("verified pull-request publication has no target revision") from None
+                        accepted_target = None
+                    else:
+                        accepted_target = (
+                            AcceptedDesiredTarget(target_desired_ref, target_revision)
+                            if target_revision is not None
+                            else None
+                        )
                     try:
-                        _promote_stack_template_source_pins(args.to_environment, candidate, pin_acquisition)
+                        _promote_stack_template_source_pins(
+                            args.to_environment,
+                            candidate,
+                            pin_acquisition,
+                            accepted_target,
+                        )
                     except BaseException:
                         log_status("KEEP", "retained StackTemplate source claims after ambiguous publication")
                 else:
                     _release_new_stack_template_source_pins(pin_acquisition)
             raise
-        _promote_stack_template_source_pins(args.to_environment, candidate, pin_acquisition)
+        if change_revision is None:
+            raise OperationError("publication returned no revision")
+        if gate == "pullRequest":
+            if target_revision is None:
+                raise OperationError("pull-request publication has no target revision")
+            accepted_revision = target_revision
+        else:
+            accepted_revision = change_revision
+        _promote_stack_template_source_pins(
+            args.to_environment,
+            candidate,
+            pin_acquisition,
+            None if gate == "pullRequest" else AcceptedDesiredTarget(target_desired_ref, accepted_revision),
+        )
         print(change_revision)
         write_change_outputs(
             change_revision,
@@ -7041,6 +7898,8 @@ def publish_desired_change(
         return target_revision or "", None
     if gate == "pullRequest" and target_revision is None:
         raise OperationError("pull-request publication requires an initialized desired ref")
+    if gate == "pullRequest":
+        assert target_revision is not None
     pin_acquisition = _acquire_stack_template_source_pins(environment, candidate)
     source_pins = dict(_required_stack_template_source_pins(environment, candidate))
     published = False
@@ -7066,7 +7925,14 @@ def publish_desired_change(
                 "CANDIDATE",
                 f"{style_branch(candidate_ref)} at {describe_revision(revision)} targets {style_branch(target_ref)}",
             )
-            _promote_stack_template_source_pins(environment, candidate, pin_acquisition)
+            if target_revision is None:
+                raise OperationError("pull-request publication has no target revision")
+            _promote_stack_template_source_pins(
+                environment,
+                candidate,
+                pin_acquisition,
+                None,
+            )
             return revision, outcome
         if source_pins:
             revision = publish_tree(
@@ -7087,7 +7953,12 @@ def publish_desired_change(
             )
         published = True
         log_status("UPDATE", f"{style_branch(target_ref)} advanced to {describe_revision(revision)}")
-        _promote_stack_template_source_pins(environment, candidate, pin_acquisition)
+        _promote_stack_template_source_pins(
+            environment,
+            candidate,
+            pin_acquisition,
+            AcceptedDesiredTarget(target_ref, revision),
+        )
         return revision, None
     except BaseException as publication_error:
         if not published:
@@ -7104,7 +7975,21 @@ def publish_desired_change(
                 # failed. Keep ownership, and make the canonical pin durable
                 # when possible; never release a claim for this state.
                 try:
-                    _promote_stack_template_source_pins(environment, candidate, pin_acquisition)
+                    if gate == "pullRequest" and target_revision is None:
+                        raise OperationError("verified pull-request publication has no target revision")
+                    accepted_target = (
+                        None
+                        if gate == "pullRequest"
+                        else AcceptedDesiredTarget(target_ref, target_revision)
+                        if target_revision is not None
+                        else None
+                    )
+                    _promote_stack_template_source_pins(
+                        environment,
+                        candidate,
+                        pin_acquisition,
+                        accepted_target,
+                    )
                 except BaseException:
                     log_status("KEEP", "retained StackTemplate source claims after ambiguous publication")
             else:
@@ -7828,6 +8713,15 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                     current,
                     AcceptedDesiredTarget(desired_ref, current_revision),
                 )
+            if category == "Stack" and not args.dry:
+                return _release_finalized_stack_workload_pins(
+                    args.environment,
+                    args.name,
+                    args.uid,
+                    args.deletion_generation,
+                    current,
+                    AcceptedDesiredTarget(desired_ref, current_revision),
+                )
             if category == "Unit" and not args.dry:
                 # Unit tombstones use the concrete driver kind (for example
                 # ``Terraform``), not the abstract resource category.
@@ -7855,6 +8749,19 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                         AcceptedDesiredTarget(desired_ref, current_revision),
                     )
                 return False
+        if category == "Stack" and matches[0].metadata.uid != args.uid:
+            tombstone = finalized_incarnation_evidence(
+                current, CORE_API_VERSION, category, args.name, args.uid, args.deletion_generation
+            )
+            if tombstone is not None and not args.dry:
+                return _release_finalized_stack_workload_pins(
+                    args.environment,
+                    args.name,
+                    args.uid,
+                    args.deletion_generation,
+                    current,
+                    AcceptedDesiredTarget(desired_ref, current_revision),
+                )
         if category == "Unit" and matches[0].metadata.uid != args.uid and not args.dry:
             return _release_finalized_unit_lease(
                 args.name,
@@ -7980,6 +8887,7 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
             source_root = None
             if source is not None and source.revision is not None:
                 source_root = temporary / "source"
+                _hydrate_stack_workload_pin_for_unit(current, args.environment, unit)
                 materialize_revision(source.revision, source_root)
 
             def assert_no_dependents(desired_root: Path) -> None:
@@ -8139,6 +9047,20 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                     and finalized_deletion is not None
                 ):
                     _release_finalized_stack_template_pins(
+                        args.environment,
+                        finalized_resource.name,
+                        finalized_resource.metadata.uid,
+                        finalized_deletion.generation,
+                        candidate,
+                        AcceptedDesiredTarget(desired_ref, revision),
+                    )
+                if (
+                    isinstance(finalized_resource, StackResource)
+                    and finalized_resource.gvk.kind == "Stack"
+                    and finalized_resource.metadata.uid is not None
+                    and finalized_deletion is not None
+                ):
+                    _release_finalized_stack_workload_pins(
                         args.environment,
                         finalized_resource.name,
                         finalized_resource.metadata.uid,
@@ -8333,6 +9255,7 @@ def command_verify(args: argparse.Namespace) -> None:
             if source is not None:
                 assert source.revision is not None
                 assert source_root is not None
+                _hydrate_stack_workload_pin_for_unit(desired, args.environment, unit)
                 materialize_revision(source.revision, source_root)
             result = VERIFICATION_DRIVERS[driver_name].verify(
                 VerificationContext(
@@ -8845,6 +9768,11 @@ def progress_durable_stack_projection(
                 ):
                     return current_revision
                 current_resources = load_desired_resource_graph(current, validate=False)
+                # A fresh runner may have the desired snapshot but not the
+                # source objects referenced by structural or stale-active
+                # Stack Units. Hydrate those exact per-Stack pins before any
+                # projection availability/materialization work.
+                _hydrate_required_stack_workload_pins(environment_name, current)
                 stack_contexts: dict[str, str] = {}
                 for resource in current_resources.values():
                     if not isinstance(resource, StackResource) or resource.gvk.kind != "Stack":
@@ -8942,6 +9870,12 @@ def progress_durable_stack_projection(
                     target_path = candidate / current_path.name
                     shutil.copy2(current_path, target_path)
                 if directory_files(current) == directory_files(candidate):
+                    _ensure_stack_template_source_pins(environment_name, current)
+                    _gc_superseded_stack_workload_pins(
+                        environment_name,
+                        current,
+                        AcceptedDesiredTarget(desired_ref, current_revision),
+                    )
                     return current_revision
                 candidate_id = candidate_identifier(
                     "apply",
@@ -9207,6 +10141,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         if source is not None:
             assert source.revision is not None
             assert source_root is not None
+            _hydrate_stack_workload_pin_for_unit(desired, args.environment, unit)
             materialize_revision(source.revision, source_root)
         plugin: ReconciliationCapability | None = None
         if not args.plan:
@@ -9763,7 +10698,8 @@ def _selected_finalized_cleanup(
     cleanup_capable = tuple(
         tombstone
         for tombstone in evidence
-        if tombstone.kind == "StackTemplate" or f"{tombstone.api_version}/{tombstone.kind}" in DRIVER_NAMES_BY_GVK
+        if tombstone.kind in {"Stack", "StackTemplate"}
+        or f"{tombstone.api_version}/{tombstone.kind}" in DRIVER_NAMES_BY_GVK
     )
     if partition is not None:
         return tuple(tombstone for tombstone in cleanup_capable if tombstone.partition == partition)
@@ -9802,6 +10738,15 @@ def _retry_finalized_cleanup(
 
     if tombstone.kind == "StackTemplate":
         return _release_finalized_stack_template_pins(
+            environment,
+            tombstone.name,
+            tombstone.uid,
+            tombstone.deletion_generation,
+            desired_root,
+            AcceptedDesiredTarget(desired_ref, current_revision),
+        )
+    if tombstone.kind == "Stack":
+        return _release_finalized_stack_workload_pins(
             environment,
             tombstone.name,
             tombstone.uid,
@@ -10759,6 +11704,11 @@ def command_apply(args: argparse.Namespace) -> str | None:
                         lease_ref=lease_ref,
                     )
                     _ensure_stack_template_source_pins(args.environment, candidate)
+                    _gc_superseded_stack_workload_pins(
+                        args.environment,
+                        candidate,
+                        AcceptedDesiredTarget(desired_ref, current_revision),
+                    )
                 except BaseException:
                     if acquisition is not None:
                         log_status("KEEP", "retained StackTemplate source claims for existing desired state")

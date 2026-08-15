@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from gitopsctr import controller
+from gitopsctr.contracts import StackActiveProjection
+from gitopsctr.contracts import StackProjection as DesiredStackProjection
 from gitopsctr.errors import OperationError
 from gitopsctr.state import AcceptedDesiredTarget, ControllerPin
 from tests.stack_deletion_support import stack_tree
@@ -62,7 +65,12 @@ def test_publish_pins_template_source_before_advancing_desired(tmp_path: Path, m
     )
 
     expected_name = f"stack-templates/dev/preview/{template_uid}/{source_revision}"
-    assert events == [("pin", expected_name, source_revision), ("publish",)]
+    workload_name = f"{expected_name.rsplit('/', 1)[0]}/stacks/preview/d1-stack-preview/{source_revision}"
+    assert events == [
+        ("pin", expected_name, source_revision),
+        ("pin", workload_name, source_revision),
+        ("publish",),
+    ]
     assert revision == "d" * 40
     assert outcome is None
 
@@ -376,7 +384,8 @@ def test_failed_desired_publication_retains_source_pins_for_race_safety(
     # writer after this attempt observed it as absent. Failed publication is
     # therefore monotonic: finalization, not the failed writer, owns cleanup.
     assert released == []
-    assert [pin.name for pin in live_pins] == [pin_name]
+    workload_name = f"{pin_name.rsplit('/', 1)[0]}/stacks/preview/d1-stack-preview/{source_revision}"
+    assert [pin.name for pin in live_pins] == [pin_name, workload_name]
 
 
 def test_failed_publication_does_not_release_a_preexisting_live_pin(
@@ -429,9 +438,90 @@ def test_template_pin_identity_is_independent_of_partition(tmp_path: Path):
     document["metadata"]["labels"] = {"gitopsctr.io/partition": "another-partition"}
     path.write_text(json.dumps(document))
 
+    template_pin = f"stack-templates/dev/preview/{template_uid}/{source_revision}"
+    workload_pin = f"{template_pin.rsplit('/', 1)[0]}/stacks/preview/d1-stack-preview/{source_revision}"
     assert controller._required_stack_template_source_pins("dev", path.parent.parent) == (
-        (f"stack-templates/dev/preview/{template_uid}/{source_revision}", source_revision),
+        (template_pin, source_revision),
+        (workload_pin, source_revision),
     )
+
+
+def test_required_pins_union_structural_and_stale_active_workload_revisions(tmp_path: Path):
+    candidate = tmp_path / "candidate"
+    template_uid, _unit_name, revision_a = _source_backed_tree(candidate)
+    revision_b = "b" * 40
+    stack_path = candidate / "stacks/preview.json"
+    stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(stack_path),
+        profile="desired",
+        expected_name="preview",
+    )
+    assert stack.spec.activeProjection is not None
+    structural = stack.spec.structuralProjection
+    old_unit = structural.units["preview-app"]
+    updated_projection = DesiredStackProjection.build(
+        stack_uid=structural.identity.stackUid,
+        template_uid=structural.identity.templateUid,
+        template_content_digest=structural.identity.templateContentDigest,
+        context_digest=structural.identity.projectionContextDigest,
+        units={
+            "preview-app": replace(
+                old_unit,
+                spec=controller.ProjectionObject({"source": {"path": ".", "revision": revision_b}}),
+            )
+        },
+    )
+    updated_active = StackActiveProjection.build(
+        source_projection_digest=updated_projection.identity.projectionDigest,
+        projection_context_digest=stack.spec.activeProjection.projectionContextDigest,
+        units=stack.spec.activeProjection.units,
+    )
+    stack = replace(
+        stack,
+        spec=replace(stack.spec, structuralProjection=updated_projection, activeProjection=updated_active),
+    )
+    stack_path.write_text(json.dumps(controller.RESOURCE_CATALOG.serialize_stack_resource(stack, profile="desired")))
+
+    template_prefix = f"stack-templates/dev/preview/{template_uid}/"
+    assert controller._required_stack_template_source_pins("dev", candidate) == (
+        (template_prefix + revision_a, revision_a),
+        (template_prefix + f"stacks/preview/d1-stack-preview/{revision_a}", revision_a),
+        (template_prefix + f"stacks/preview/d1-stack-preview/{revision_b}", revision_b),
+    )
+
+
+def test_finalized_stack_releases_all_nested_aliases_for_exact_uid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    candidate = tmp_path / "candidate"
+    template_uid, _unit_name, revision_a = _source_backed_tree(candidate)
+    stack_path = candidate / "stacks/preview.json"
+    stack_path.unlink()
+    (candidate / "units/preview--preview-app.json").unlink()
+    controller.write_resource_incarnation_tombstone(
+        candidate,
+        controller.ResourceIncarnationTombstone(
+            api_version=controller.CORE_API_VERSION,
+            kind="Stack",
+            name="preview",
+            uid="d1-stack-preview",
+            deletion_generation=1,
+        ),
+    )
+    template_prefix = f"stack-templates/dev/preview/{template_uid}/"
+    old_alias = _pin(template_prefix + f"stacks/preview/d1-stack-preview/{revision_a}", revision_a)
+    newer_alias = _pin(template_prefix + f"stacks/preview/d1-stack-preview/{'b' * 40}", "b" * 40)
+    other_stack_alias = _pin(template_prefix + f"stacks/preview/other-stack/{revision_a}", revision_a)
+    released: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        controller,
+        "state_store",
+        lambda: SimpleNamespace(
+            list_controller_pins=lambda: (old_alias, newer_alias, other_stack_alias),
+            release_controller_pin=lambda name, revision: released.append((name, revision)) or True,
+        ),
+    )
+
+    assert controller._release_finalized_stack_workload_pins("dev", "preview", "d1-stack-preview", 1, candidate) is True
+    assert released == [(old_alias.name, old_alias.revision), (newer_alias.name, newer_alias.revision)]
 
 
 def test_finalized_template_releases_all_incarnation_pins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -695,7 +785,20 @@ def test_noop_apply_repairs_a_missing_template_source_pin(tmp_path: Path, monkey
     assert template_resource.metadata.uid is not None
     pin_name = f"stack-templates/dev/preview/{template_resource.metadata.uid}/{source_revision}"
     assert store.release_controller_pin(pin_name, source_revision)
-    assert store.list_controller_pins() == ()
+    workload_pin_name = (
+        f"{pin_name.rsplit('/', 1)[0]}/stacks/web/"
+        + next(
+            resource.metadata.uid
+            for resource in controller.load_desired_resource_graph(desired).values()
+            if isinstance(resource, controller.StackResource)
+            and resource.gvk.kind == "Stack"
+            and resource.name == "web"
+        )
+        + f"/{source_revision}"
+    )
+    assert store.list_controller_pins() == (
+        ControllerPin(workload_pin_name, f"refs/heads/gitopsctr/pins/{workload_pin_name}", source_revision),
+    )
 
     template_file_index = arguments.index(str(template_path))
     stack_only_args = arguments[: template_file_index - 1] + arguments[template_file_index + 1 :]
@@ -708,4 +811,5 @@ def test_noop_apply_repairs_a_missing_template_source_pin(tmp_path: Path, monkey
     assert controller.command_apply(stack_only_namespace) == first_revision
     assert store.list_controller_pins() == (
         ControllerPin(pin_name, f"refs/heads/gitopsctr/pins/{pin_name}", source_revision),
+        ControllerPin(workload_pin_name, f"refs/heads/gitopsctr/pins/{workload_pin_name}", source_revision),
     )

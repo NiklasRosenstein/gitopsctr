@@ -168,10 +168,34 @@ or acquire a StackTemplate.
 
 ### Projection source propagation
 
-Repository-backed Unit paths inherit the desired StackTemplate's exact source context. Applying that StackTemplate
-requires `--source-revision <commit>`; a later Stack-only apply reads the retained context and does not need the source
-checkout. The current authored Unit source contract has no independent per-Stack revision selector. Updating the
-inline template's source context advances its referring Stacks together.
+Repository-backed Unit paths inherit the desired StackTemplate's exact source context when `source.revision` is omitted.
+Within a StackTemplate, an authored Unit source may instead set an exact lowercase 40-hex `revision`, including a
+`fromParameter` value. This field is legal only in a StackTemplate projection; direct authored Units continue to use
+the operation's `--source-revision`. The override is resolved and materialized in the template's repository context
+and must belong to the acquired template-ref history:
+
+```yaml
+spec:
+  parameters:
+    - name: workload-revision
+      type: string
+  unitTemplates:
+    deploy:
+      apiVersion: unit.gitopsctr.io/v1
+      kind: KubernetesManifests
+      spec:
+        source:
+          path: manifests
+          revision:
+            fromParameter:
+              name: workload-revision
+```
+
+The effective exact revision is recorded in both the structural projection and desired Unit source, so it changes the
+projection even when two selected commits contain byte-identical inputs. The driver `inputHash` covers those selected
+bytes and deliberately excludes the revision value itself. Updating the template source context advances inheriting
+Stacks atomically; an explicit Stack override advances only that Stack. Each effective revision is retained under the
+Stack/template incarnation that requires it, so later Stack-only apply and fresh runners do not need the origin checkout.
 
 Inspect desired representations with:
 

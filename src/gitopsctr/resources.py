@@ -30,6 +30,7 @@ from gitopsctr.contracts import (
     StackSpec,
     StackTemplateDocument,
     StackTemplateDocumentSpec,
+    StackTemplateResource,
     StrictModel,
     stack_generated_unit_name,
 )
@@ -257,13 +258,38 @@ def _resource_template_projection(
     if selected_names != expected_names:
         raise ValueError(f"Stack {stack.name!r} structuralProjection does not match selected Unit templates")
     expanded = tuple(resource for resource in expanded if resource.name in selected_names)
+    template_spec = template.spec
+    assert isinstance(template_spec, DesiredStackTemplateSpec)
+    recorded_by_name = {resource.logical_name: resource for resource in projected}
+
+    def normalized_spec(resource: StackTemplateResource) -> object:
+        raw = dump_template_value(cast(TemplateValue, resource.spec))
+        if not isinstance(raw, dict):
+            return raw
+        source = raw.get("source")
+        recorded_source = recorded_by_name[resource.name].spec
+        recorded_source = recorded_source.get("source") if isinstance(recorded_source, dict) else None
+        if (
+            isinstance(source, dict)
+            and isinstance(source.get("path"), str)
+            and source.get("revision") is None
+            and isinstance(recorded_source, dict)
+            and recorded_source.get("revision") is not None
+            and template_spec.sourceContext is not None
+        ):
+            source = dict(source)
+            source["revision"] = template_spec.sourceContext.revision
+            raw = dict(raw)
+            raw["source"] = source
+        return raw
+
     expected = tuple(
         _ProjectedStackUnit(
             logical_name=resource.name,
             api_version=resource.apiVersion,
             kind=resource.kind,
             name=stack_generated_unit_name(stack.name, resource.name),
-            spec=dump_template_value(cast(TemplateValue, resource.spec)),
+            spec=normalized_spec(resource),
             dependencies=tuple(stack_generated_unit_name(stack.name, dependency) for dependency in resource.dependsOn),
         )
         for resource in expanded

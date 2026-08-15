@@ -5,6 +5,7 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -81,6 +82,205 @@ def write_inline_stack(path: Path, *, template: str = "preview", name: str = "we
                 "kind": "Stack",
                 "metadata": {"name": name},
                 "spec": {"template": template},
+            },
+            sort_keys=False,
+        )
+    )
+    return path
+
+
+def write_revision_template(path: Path) -> Path:
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "StackTemplate",
+                "metadata": {"name": "preview"},
+                "spec": {
+                    "parameters": [{"name": "workload-revision", "type": "string"}],
+                    "unitTemplates": {
+                        "app": {
+                            "apiVersion": "unit.gitopsctr.io/v1",
+                            "kind": "Terraform",
+                            "spec": {
+                                "source": {
+                                    "path": ".",
+                                    "inputs": ["workload.txt"],
+                                    "revision": {"fromParameter": {"name": "workload-revision"}},
+                                }
+                            },
+                        }
+                    },
+                },
+            },
+            sort_keys=False,
+        )
+    )
+    return path
+
+
+def test_stack_workload_checkout_cache_is_fenced_to_acquired_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revision = "b" * 40
+    first_history = "c" * 40
+    second_history = "a" * 40
+    calls: list[tuple[str, str, str | None]] = []
+
+    class Store:
+        def resolve_source(self, repository: str, ref: str, revision: str | None = None) -> object:
+            calls.append((repository, ref, revision))
+            return SimpleNamespace(revision=revision)
+
+        def materialize_source(self, _source: object, output: Path) -> None:
+            output.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(controller, "state_store", lambda: Store())
+    monkeypatch.setattr(controller, "commit_is_available", lambda _revision: False)
+    inherited = tmp_path / "inherited"
+    inherited.mkdir()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    cache: dict[tuple[str, str, str], Path] = {}
+
+    controller._materialize_stack_workload_revision(
+        "https://example.invalid/repository.git",
+        revision,
+        inherited,
+        first_history,
+        candidate,
+        cache,
+        transport=controller.StackUnitSourceTransport("transport", first_history),
+    )
+    controller._materialize_stack_workload_revision(
+        "https://example.invalid/repository.git",
+        revision,
+        inherited,
+        second_history,
+        candidate,
+        cache,
+        transport=controller.StackUnitSourceTransport("transport", second_history),
+    )
+
+    assert calls == [
+        ("transport", first_history, revision),
+        ("transport", second_history, revision),
+    ]
+
+
+def test_stack_workload_local_object_requires_repository_authentication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revision = "b" * 40
+    inherited_revision = "c" * 40
+
+    class Store:
+        def resolve_source(self, _repository: str, _revision: str) -> object:
+            raise OperationError("repository does not contain revision")
+
+    monkeypatch.setattr(controller, "state_store", lambda: Store())
+    monkeypatch.setattr(controller, "commit_is_available", lambda _revision: True)
+    monkeypatch.setattr(controller, "commit_is_ancestor", lambda _revision, _inherited: True)
+    inherited = tmp_path / "inherited"
+    inherited.mkdir()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+
+    with pytest.raises(OperationError, match="is unavailable in repository"):
+        controller._materialize_stack_workload_revision(
+            "https://repository-a.invalid/source.git",
+            revision,
+            inherited,
+            inherited_revision,
+            candidate,
+            {},
+            authenticated=False,
+        )
+
+
+def test_acquired_template_context_authenticates_a_local_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = "https://private.example/repository.git"
+    revision = "b" * 40
+    inherited_revision = "c" * 40
+
+    class Store:
+        def resolve_source(self, _repository: str, _revision: str) -> object:
+            pytest.fail("authenticated local ancestor should not require origin access")
+
+    monkeypatch.setattr(controller, "state_store", lambda: Store())
+    monkeypatch.setattr(controller, "commit_is_available", lambda _revision: True)
+    monkeypatch.setattr(controller, "commit_is_ancestor", lambda _revision, _inherited: True)
+    monkeypatch.setattr(
+        controller,
+        "materialize_revision",
+        lambda _revision, output: output.mkdir(parents=True),
+    )
+    inherited = tmp_path / "inherited"
+    inherited.mkdir()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+
+    checkout = controller._materialize_stack_workload_revision(
+        repository,
+        revision,
+        inherited,
+        inherited_revision,
+        candidate,
+        {},
+        authenticated_context=controller.AuthenticatedStackTemplateContext(repository, inherited_revision),
+    )
+
+    assert checkout.is_dir()
+
+
+def test_stack_workload_pin_hydration_still_enforces_acquired_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revision = "b" * 40
+    inherited_revision = "a" * 40
+
+    class Store:
+        def resolve_source(self, _repository: str, _revision: str) -> object:
+            raise OperationError("origin unavailable")
+
+        def hydrate_source_revision(self, _name: str, _revision: str) -> None:
+            return None
+
+    monkeypatch.setattr(controller, "state_store", lambda: Store())
+    monkeypatch.setattr(controller, "commit_is_available", lambda _revision: True)
+    monkeypatch.setattr(controller, "commit_is_ancestor", lambda _revision, _inherited: False)
+    monkeypatch.setattr(
+        controller,
+        "materialize_revision",
+        lambda _revision, _output: pytest.fail("out-of-history workload revision was materialized"),
+    )
+    inherited = tmp_path / "inherited"
+    inherited.mkdir()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+
+    with pytest.raises(OperationError, match="is unavailable in repository"):
+        controller._materialize_stack_workload_revision(
+            "https://example.invalid/repository.git",
+            revision,
+            inherited,
+            inherited_revision,
+            candidate,
+            {},
+            retention_pin_name="stack-templates/dev/preview/template/stacks/web/stack/revision",
+        )
+
+
+def write_revision_stack(path: Path, *, name: str, revision: str) -> Path:
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "gitopsctr.io/v1",
+                "kind": "Stack",
+                "metadata": {"name": name},
+                "spec": {"template": "preview", "parameters": {"workload-revision": revision}},
             },
             sort_keys=False,
         )
@@ -370,6 +570,128 @@ def test_template_update_fans_out_to_two_stacks_atomically(tmp_path: Path, monke
     before = store.fetch("deploy/dev").revision
     with pytest.raises(OperationError, match="missing desired StackTemplate 'missing'"):
         _apply(source, invalid_revision, template, worker)
+    assert store.fetch("deploy/dev").revision == before
+
+
+def test_stacks_select_and_retain_exact_workload_revisions_independently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source, store, _revision = _repository(tmp_path, monkeypatch)
+    template = write_revision_template(source / "template.yaml")
+    (source / "workload.txt").write_text("identical workload bytes\n")
+    first_revision = commit(source, "publish revision-selecting template")
+    (source / "workload.txt").write_text("identical workload bytes\n")
+    (source / "revision-marker.txt").write_text("second revision\n")
+    second_revision = commit(source, "publish second workload revision")
+    web = write_revision_stack(source / "web.yaml", name="web", revision=first_revision)
+    worker = write_revision_stack(source / "worker.yaml", name="worker", revision=second_revision)
+    source_revision = commit(source, "select independent workload revisions")
+
+    published = _apply(source, source_revision, template, web, worker)
+    assert published is not None
+    root, resources = desired_stack_resources(store, published, tmp_path / "selected-revisions")
+    revisions = {}
+    input_hashes = {}
+    pins = {pin.name for pin in store.list_controller_pins()}
+    for name in ("web", "worker"):
+        unit = controller.load_desired_unit(controller.unit_document_path(root, f"{name}--app"), f"{name}--app")
+        revisions[name] = unit.spec.source.revision  # type: ignore[union-attr]
+        input_hashes[name] = unit.spec.source.inputHash  # type: ignore[union-attr]
+        stack = resources[("gitopsctr.io/v1", "Stack", name)]
+        assert isinstance(stack.spec, DesiredStackSpec)
+        assert stack.spec.structuralProjection.units["app"].spec["source"]["revision"] == revisions[name]
+        assert any(pin.endswith(f"/stacks/{name}/{stack.metadata.uid}/{revisions[name]}") for pin in pins)
+    assert revisions == {"web": first_revision, "worker": second_revision}
+    assert input_hashes["web"] == input_hashes["worker"]
+
+    (source / "workload.txt").write_text("revision-c\n")
+    third_revision = commit(source, "advance inherited template context")
+    # The explicit per-Stack revisions remain stable when the template context
+    # advances; an omitted revision is covered by the next assertion.
+    published = _apply(source, third_revision, template)
+    assert published is not None
+    root, _resources = desired_stack_resources(store, published, tmp_path / "retained-overrides")
+    for name, expected in (("web", first_revision), ("worker", second_revision)):
+        unit = controller.load_desired_unit(controller.unit_document_path(root, f"{name}--app"), f"{name}--app")
+        assert unit.spec.source.revision == expected  # type: ignore[union-attr]
+
+
+def test_source_revision_selection_is_not_part_of_unit_input_hash(tmp_path: Path):
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    (root_a / "workload.txt").write_text("same bytes\n")
+    (root_b / "workload.txt").write_text("same bytes\n")
+
+    def parse(revision: str | None):
+        source: dict[str, Any] = {"path": "."}
+        if revision is not None:
+            source["revision"] = revision
+        return controller.RESOURCE_CATALOG.parse_unit(
+            {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "Terraform",
+                "metadata": {"name": "app"},
+                "spec": {"source": source},
+            },
+            profile="authored",
+            expected_name="app",
+        )
+
+    revision_a = "a" * 40
+    revision_b = "b" * 40
+    hash_a = controller.unit_input_hash(parse(revision_a), root_a)
+    hash_b = controller.unit_input_hash(parse(revision_b), root_b)
+    legacy_hash = controller.unit_input_hash(parse(None), root_a)
+    assert hash_a == hash_b == legacy_hash
+
+
+def test_direct_authored_unit_rejects_stack_only_source_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source, _store, _initial = _repository(tmp_path, monkeypatch)
+    unit = _authored_unit(source / "direct.yaml", "direct")
+    document = yaml.safe_load(unit.read_text())
+    document["spec"]["source"]["revision"] = "a" * 40
+    unit.write_text(yaml.safe_dump(document, sort_keys=False))
+    source_revision = commit(source, "direct revision must remain unsupported")
+
+    with pytest.raises(OperationError, match="only in a StackTemplate projection"):
+        _apply(source, source_revision, unit)
+
+
+def test_inherited_workload_revision_advances_with_template_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source, store, _revision = _repository(tmp_path, monkeypatch)
+    template = write_inline_template(source / "template.yaml")
+    stack = write_inline_stack(source / "stack.yaml")
+    (source / "workload.txt").write_text("revision-a\n")
+    first_revision = commit(source, "publish inherited workload")
+    first_published = _apply(source, first_revision, template, stack)
+    assert first_published is not None
+    first_root, _resources = desired_stack_resources(store, first_published, tmp_path / "inherited-first")
+    first_unit = controller.load_desired_unit(controller.unit_document_path(first_root, "web--app"), "web--app")
+    assert first_unit.spec.source.revision == first_revision  # type: ignore[union-attr]
+
+    (source / "workload.txt").write_text("revision-b\n")
+    second_revision = commit(source, "advance inherited workload")
+    second_published = _apply(source, second_revision, template)
+    assert second_published is not None
+    second_root, _resources = desired_stack_resources(store, second_published, tmp_path / "inherited-second")
+    second_unit = controller.load_desired_unit(controller.unit_document_path(second_root, "web--app"), "web--app")
+    assert second_unit.spec.source.revision == second_revision  # type: ignore[union-attr]
+    assert second_unit.spec.source.inputHash != first_unit.spec.source.inputHash  # type: ignore[union-attr]
+
+
+def test_unavailable_exact_stack_revision_fails_before_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source, store, _revision = _repository(tmp_path, monkeypatch)
+    template = write_revision_template(source / "template.yaml")
+    stack = write_revision_stack(source / "stack.yaml", name="web", revision="f" * 40)
+    source_revision = commit(source, "publish invalid workload selection")
+    before = store.fetch("deploy/dev").revision
+    with pytest.raises(OperationError, match="unavailable in repository"):
+        _apply(source, source_revision, template, stack)
     assert store.fetch("deploy/dev").revision == before
 
 

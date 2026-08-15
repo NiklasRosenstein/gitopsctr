@@ -10,7 +10,7 @@ from jsonschema import Draft202012Validator, ValidationError
 from referencing import Registry, Resource
 
 from gitopsctr import controller, schemas
-from gitopsctr.contracts import CORE_CONTRACTS, ContractError, DesiredSource, MaterializationDocument
+from gitopsctr.contracts import CORE_CONTRACTS, AuthoredSource, ContractError, DesiredSource, MaterializationDocument
 from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import DriverError, MaterializationCapability, UnitResolutionContext
 from gitopsctr.errors import ReferenceUnavailable
@@ -117,6 +117,26 @@ def test_source_schema_describes_repository_relative_path_semantics():
     source = schema["properties"]["source"]
     assert "root of the selected source revision" in source["properties"]["path"]["description"]
     assert "relative to source.path" in source["properties"]["inputs"]["description"]
+
+
+def test_exact_source_revision_is_supported_by_runtime_and_json_schema():
+    contract = UNIT_DRIVERS["terraform"].unit_contract
+    valid = {"source": {"path": ".", "revision": REVISION}}
+    contract.validate(valid)
+    Draft202012Validator(contract.json_schema()).validate({**valid, "terraform": {}})
+
+    invalid = {"source": {"path": ".", "revision": "not-a-commit"}}
+    with pytest.raises(ContractError):
+        contract.validate(invalid)
+    with pytest.raises(ValidationError):
+        Draft202012Validator(contract.json_schema()).validate({**invalid, "terraform": {}})
+
+    with pytest.raises(ValueError, match="exact lowercase 40-hex"):
+        AuthoredSource(path=".", revision="main")
+    with pytest.raises(ValueError, match="exact lowercase 40-hex"):
+        DesiredSource(path=".", revision="main")
+    with pytest.raises(TypeError):
+        DesiredSource(path=".")  # type: ignore[call-arg]
 
 
 def test_template_schema_accepts_integer_values():

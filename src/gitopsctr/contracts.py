@@ -1686,10 +1686,23 @@ class AuthoredSource(StrictModel):
     path: str = field(
         metadata={"description": "Repository-relative path resolved from the root of the selected source revision."}
     )
+    revision: Annotated[str, Pattern(EXACT_REVISION_PATTERN)] | None = field(
+        default=None,
+        metadata={
+            "description": (
+                "Optional exact lowercase Git commit intent. Stack projections inherit the StackTemplate source "
+                "context when this is omitted."
+            )
+        },
+    )
     inputs: list[str] | None = field(
         default=None,
         metadata={"description": "Input paths or glob patterns resolved relative to source.path."},
     )
+
+    def __post_init__(self) -> None:
+        if self.revision is not None and re.fullmatch(EXACT_REVISION_PATTERN, self.revision) is None:
+            raise ValueError("source revision must be an exact lowercase 40-hex Git commit")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1697,13 +1710,17 @@ class DesiredSource(StrictModel):
     path: str = field(
         metadata={"description": "Repository-relative path resolved from the root of the selected source revision."}
     )
-    revision: str | None = None
+    revision: Annotated[str, Pattern(EXACT_REVISION_PATTERN)]
     driverVersion: int | None = None
     inputHash: str | None = None
     inputs: list[str] | None = field(
         default=None,
         metadata={"description": "Input paths or glob patterns resolved relative to source.path."},
     )
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(EXACT_REVISION_PATTERN, self.revision) is None:
+            raise ValueError("desired source revision must be an exact lowercase 40-hex Git commit")
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -216,9 +216,14 @@ desired revision. `fromGit` is resolved from its requested ref and can be used w
 Field-level `fromPromotion` values and `artifactImports[].fromPromotion` are resolved against the pinned source desired
 and observed revisions, with receipt, producer, artifact, and digest validation before publication.
 
-Repository-backed Unit paths inherit the exact source context retained by the desired StackTemplate. The current
-authored Unit source contract has no independent per-Stack revision selector. Updating the inline template's source
-context reprojects its referring Stacks.
+Repository-backed Unit paths inherit the exact source context retained by the desired StackTemplate unless
+`source.revision` selects an exact 40-hex commit. A StackTemplate parameter may provide that revision, allowing
+independent Stacks to use different commits from the same repository and acquired-ref history. Direct authored Units
+do not accept this field; they continue to use the operation's `--source-revision`. The effective revision
+is resolved before projection, contributes to the structural and desired identity, and is retained under the
+Stack/template incarnation. The driver `inputHash` reflects the selected bytes and deliberately excludes the revision
+value itself, so byte-identical commits have the same input hash while remaining distinct projections. Updating the
+template context reprojects inheritors; changing one Stack's override does not change another Stack.
 
 The target Environment decides whether promotion is published directly or through a pull-request candidate. After a
 gated candidate is merged, reconcile or converge the target without a source revision because its specification and
