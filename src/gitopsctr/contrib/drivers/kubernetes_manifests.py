@@ -690,7 +690,7 @@ class KubernetesManifestsDriver(
         context_name = delivery.kubeContext
         prune = delivery.prune
         waits = delivery.wait or []
-        manager = field_manager(context.environment, context.unit_name)
+        manager = field_manager(context.environment, context.qualified_name or context.unit_name)
         context.execution.run(
             *kubectl_prefix(context_name),
             "apply",
@@ -812,7 +812,7 @@ class KubernetesManifestsDriver(
             *kubectl_prefix(context_name),
             "diff",
             "--server-side",
-            f"--field-manager={field_manager(context.environment, context.unit_name)}",
+            f"--field-manager={field_manager(context.environment, context.qualified_name or context.unit_name)}",
             "--filename",
             str(context.desired_root / materialization.path),
             output=CommandOutput.CAPTURE,

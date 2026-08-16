@@ -133,7 +133,7 @@ def test_converge_tears_down_deleting_dependency_closure_consumer_before_produce
     consumer = _mark(consumer, "consumer")
     harness = _DeletionHarness(tmp_path, _unit_tree(tmp_path, producer, consumer))
     harness.install(monkeypatch)
-    calls: list[str] = []
+    calls: list[tuple[str, str | None]] = []
 
     def teardown(_driver, context):
         calls.append(context.unit_name)
@@ -181,16 +181,16 @@ def test_converge_partition_includes_deleting_units_in_scope(tmp_path, monkeypat
     document = _mark(_terraform_unit("application", "d1-application"))
     harness = _DeletionHarness(tmp_path, _unit_tree(tmp_path, document))
     harness.install(monkeypatch)
-    calls: list[str] = []
+    calls: list[tuple[str, str | None]] = []
     monkeypatch.setattr(
         type(controller.UNIT_DRIVERS["terraform"]),
         "teardown",
-        lambda _driver, context: calls.append(context.unit_name) or TeardownResult(),
+        lambda _driver, context: calls.append((context.unit_name, context.qualified_name)) or TeardownResult(),
     )
 
     controller.command_converge(harness.converge_args(partition="application"))
 
-    assert calls == ["application"]
+    assert calls == [("application", "application")]
 
 
 def test_converge_finalization_removes_a_completed_unit_materialization(tmp_path, monkeypatch):
@@ -251,16 +251,16 @@ def test_converge_stack_deletion_is_child_first_and_writes_one_progressive_clean
         harness.desired / f"units/{child_name}.json",
         controller.serialize_unit_document(controller.mark_resource_for_deletion(child), profile="desired"),
     )
-    calls: list[str] = []
+    calls: list[tuple[str, str | None]] = []
     monkeypatch.setattr(
         type(controller.UNIT_DRIVERS["terraform"]),
         "teardown",
-        lambda _driver, context: calls.append(context.unit_name) or TeardownResult(),
+        lambda _driver, context: calls.append((context.unit_name, context.qualified_name)) or TeardownResult(),
     )
 
     controller.command_converge(harness.converge_args(unit=["preview/preview-app"]))
 
-    assert calls == [child_name]
+    assert calls == [("preview-app", "preview/preview-app")]
     assert not (harness.desired / "units" / f"{child_name}.json").exists()
     assert not (harness.desired / "stacks/preview.json").exists()
     assert not (harness.desired / "stack-templates/preview.json").exists()
@@ -331,11 +331,11 @@ def test_converge_retries_template_pin_cleanup_after_desired_removal(tmp_path, m
             return True
 
     monkeypatch.setattr(controller, "state_store", FlakyPinStore)
-    teardown_calls: list[str] = []
+    teardown_calls: list[tuple[str, str | None]] = []
     monkeypatch.setattr(
         type(controller.UNIT_DRIVERS["terraform"]),
         "teardown",
-        lambda _driver, context: teardown_calls.append(context.unit_name) or TeardownResult(),
+        lambda _driver, context: teardown_calls.append((context.unit_name, context.qualified_name)) or TeardownResult(),
     )
 
     with pytest.raises(RuntimeError, match="temporary pin-store failure"):
@@ -346,7 +346,7 @@ def test_converge_retries_template_pin_cleanup_after_desired_removal(tmp_path, m
 
     assert attempts == 2
     assert pins == []
-    assert teardown_calls == [child_name]
+    assert teardown_calls == [("preview-app", "preview/preview-app")]
     assert harness.reconcile_outputs == [True]
 
 

@@ -142,6 +142,7 @@ class MaterializationContext[ResolvedT: StrictModel]:
     unit_name: str
     unit: ResolvedT
     output_root: Path
+    qualified_name: str | None = None
     execution: DriverExecution = field(default_factory=default_driver_execution)
 
 
@@ -180,6 +181,7 @@ class TeardownContext[DesiredT: StrictModel]:
     unit: DesiredT
     resource_uid: str
     deletion_generation: int
+    qualified_name: str | None = None
     previous_receipt: ReceiptResource[Any] | None = None
     report: Path | None = None
     execution: DriverExecution = field(default_factory=default_driver_execution)

@@ -4999,9 +4999,10 @@ def materialize_resolved_unit(
                 source_root=selected_source_root,
                 source_revision=selected_revision,
                 source_path=source_path,
-                unit_name=unit_name,
+                unit_name=resolved.name,
                 unit=resolved.spec,
                 output_root=output_root,
+                qualified_name=unit_name,
                 execution=DriverExecution.console(),
             )
         )
@@ -9245,10 +9246,11 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                             source_root=source_root,
                             source_revision=source.revision if source is not None else None,
                             source_path=source.path if source is not None else None,
-                            unit_name=args.name,
+                            unit_name=unit.name,
                             unit=unit.spec,
                             resource_uid=args.uid,
                             deletion_generation=deletion.generation,
+                            qualified_name=args.name,
                             previous_receipt=previous_receipt,
                             report=Path(args.report).resolve() if args.report else None,
                             execution=DriverExecution.console(),
@@ -9617,7 +9619,7 @@ def command_verify(args: argparse.Namespace) -> None:
                     source_root=source_root,
                     source_revision=source.revision if source is not None else None,
                     source_path=source.path if source is not None else None,
-                    unit_name=unit_name,
+                    unit_name=unit.name,
                     unit=unit.spec,
                     qualified_name=next(
                         qualified for qualified, concrete in addresses.items() if concrete == unit_name
@@ -10595,7 +10597,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 "source_root": source_root,
                 "source_revision": source.revision if source is not None else None,
                 "source_path": source.path if source is not None else None,
-                "unit_name": args.unit,
+                "unit_name": unit.name,
                 "unit": unit.spec,
                 "qualified_name": unit_qualified_name,
                 "report": report,
