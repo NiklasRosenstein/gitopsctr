@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
+
+import pytest
 
 from gitopsctr import controller
 from gitopsctr.resources import ResourceMetadata
+from gitopsctr.state import GitStateStore
 
 
 def project_repository(root: Path) -> Path:
@@ -132,3 +138,58 @@ def commit(root: Path, message: str) -> str:
     git(root, "add", "--all")
     git(root, "commit", "-m", message)
     return git(root, "rev-parse", "HEAD")
+
+
+@dataclass(frozen=True)
+class ProjectRepositorySeed:
+    """An immutable remote retained by its owning temporary directory."""
+
+    temporary_directory: TemporaryDirectory[str]
+    remote: Path
+
+
+def _build_project_repository_seed(root: Path) -> Path:
+    remote = root / "origin.git"
+    source = root / "source"
+    git(root, "init", "--bare", str(remote))
+    project_repository(source)
+    git(source, "init", "-b", "main")
+    git(source, "remote", "add", "origin", str(remote))
+    commit(source, "initialize source")
+    git(source, "push", "-u", "origin", "main")
+    baseline = root / "baseline"
+    baseline.mkdir()
+    (baseline / ".gitkeep").write_text("")
+    GitStateStore(source).publish(
+        "deploy/dev",
+        baseline,
+        None,
+        "initialize desired state",
+        expected_publication_head=None,
+    )
+    git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
+    return remote
+
+
+@cache
+def project_repository_seed() -> ProjectRepositorySeed:
+    """Build the common source/desired history once per test process."""
+    temporary_directory = TemporaryDirectory(prefix="gitopsctr-project-tests-")
+    remote = _build_project_repository_seed(Path(temporary_directory.name))
+    return ProjectRepositorySeed(temporary_directory, remote)
+
+
+def cloned_project_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, GitStateStore, str]:
+    """Clone an isolated project and desired-state remote from the shared seed."""
+    seed = project_repository_seed()
+    remote = tmp_path / "origin.git"
+    source = tmp_path / "source"
+    git(tmp_path, "clone", "--bare", "--local", str(seed.remote), str(remote))
+    git(tmp_path, "clone", "--local", str(remote), str(source))
+    revision = git(source, "rev-parse", "HEAD")
+    store = GitStateStore(source)
+    monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
+    return source, store, revision

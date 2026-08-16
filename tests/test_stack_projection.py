@@ -27,8 +27,9 @@ from gitopsctr.resources import ResourceMetadata, StackResource
 from gitopsctr.state import GitStateStore
 from gitopsctr.templates import TemplateObject
 from tests.conftest import receipt_resource
+from tests.stack_support import cloned_project_repository as _repository
 from tests.stack_support import commit, git, project_repository
-from tests.test_apply import _apply, _apply_worktree, _authored_source_less_unit, _authored_unit, _repository
+from tests.test_apply import _apply, _apply_worktree, _authored_source_less_unit, _authored_unit
 
 
 def write_inline_template(

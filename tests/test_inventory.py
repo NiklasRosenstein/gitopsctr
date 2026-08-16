@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -37,36 +36,12 @@ from gitopsctr.registry import RESOURCE_REGISTRY
 from gitopsctr.resource_model import ObservationDefinition, ResourcePlane, ResourceRegistry, ResourceSelection
 from gitopsctr.resources import desired_unit_binding_digest
 from gitopsctr.state import GitRefSnapshot, GitStateStore
-
-
-def git(root: Path, *args: str) -> str:
-    return subprocess.run(
-        (
-            "git",
-            "-c",
-            "user.name=test",
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "commit.gpgSign=false",
-            *args,
-        ),
-        cwd=root,
-        check=True,
-        text=True,
-        capture_output=True,
-    ).stdout.strip()
+from tests.stack_support import commit, git
 
 
 def write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2) + "\n")
-
-
-def commit(root: Path, message: str) -> str:
-    git(root, "add", ".")
-    git(root, "commit", "-m", message)
-    return git(root, "rev-parse", "HEAD")
 
 
 def project_document() -> dict[str, object]:
@@ -209,11 +184,11 @@ def receipt(name: str, unit_blob: str) -> dict[str, object]:
     }
 
 
-@pytest.fixture
-def repository(tmp_path: Path) -> Path:
-    remote = tmp_path / "remote.git"
-    working = tmp_path / "working"
-    git(tmp_path, "init", "--bare", str(remote))
+def build_repository(root: Path) -> Path:
+    """Build the shared inventory history and return its bare repository."""
+    remote = root / "remote.git"
+    working = root / "working"
+    git(root, "init", "--bare", str(remote))
     working.mkdir()
     git(working, "init", "-b", "main")
     git(working, "remote", "add", "origin", str(remote))
@@ -286,6 +261,7 @@ def repository(tmp_path: Path) -> Path:
         },
     )
     desired_revision = commit(working, "desired")
+    git(working, "push", "origin", f"{desired_revision}:refs/heads/desired")
     git(working, "push", "origin", f"{desired_revision}:refs/heads/gitopsctr/desired/dev")
     git(working, "push", "origin", f"{desired_revision}:refs/heads/gitopsctr/desired/staging")
     desired_blob = git(working, "rev-parse", f"{desired_revision}:units/application.yaml")
@@ -295,9 +271,25 @@ def repository(tmp_path: Path) -> Path:
         path.unlink()
     write_json(working / "units/application.yaml", receipt("application", desired_blob))
     observed_revision = commit(working, "observed")
+    git(working, "push", "origin", f"{observed_revision}:refs/heads/observed")
     git(working, "push", "origin", f"{observed_revision}:refs/heads/gitopsctr/observed/dev")
     git(working, "push", "origin", f"{observed_revision}:refs/heads/gitopsctr/observed/staging")
-    git(working, "checkout", "main")
+    git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
+    return remote
+
+
+@pytest.fixture(scope="session")
+def inventory_repository_seed(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return build_repository(tmp_path_factory.mktemp("inventory-repository"))
+
+
+@pytest.fixture
+def repository(tmp_path: Path, inventory_repository_seed: Path) -> Path:
+    """Clone an isolated repository from the shared immutable inventory history."""
+    remote = tmp_path / "remote.git"
+    working = tmp_path / "working"
+    git(tmp_path, "clone", "--bare", "--local", str(inventory_repository_seed), str(remote))
+    git(tmp_path, "clone", "--local", str(remote), str(working))
     return working
 
 

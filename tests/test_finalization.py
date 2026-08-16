@@ -466,11 +466,6 @@ def test_reconcile_blocks_owned_children_and_dependency_dependents(tmp_path, mon
     assert (desired / "units/parent.yaml").exists()
 
 
-def test_public_finalize_command_is_absent():
-    with pytest.raises(SystemExit):
-        controller.build_parser().parse_args(["finalize"])
-
-
 def test_reconcile_blocks_observation_dependents_before_teardown(tmp_path, monkeypatch):
     parent = _mark(_terraform_unit("parent", "d1-parent"), "parent")
     child = _terraform_unit("child", "d1-child")

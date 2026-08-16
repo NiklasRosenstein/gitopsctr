@@ -63,18 +63,6 @@ def _promotion_context(root: Path) -> deploy_release.PromotionContext:
     )
 
 
-def test_reconcile_parser_exposes_plan_without_a_dry_alias():
-    parser = deploy_release.build_parser()
-
-    args = parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--plan"])
-    assert args.plan is True
-    assert args.verbose is False
-    verbose_args = parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--verbose"])
-    assert verbose_args.verbose is True
-    with pytest.raises(SystemExit):
-        parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--dry"])
-
-
 def test_reconciliation_artifact_effects_distinguish_added_updated_and_unchanged(monkeypatch, tmp_path):
     previous = SimpleNamespace(
         status=SimpleNamespace(

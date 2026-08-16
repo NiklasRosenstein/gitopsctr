@@ -735,19 +735,6 @@ def test_documented_get_commands_execute_across_dev_and_staging(repository: Path
         assert run_get(repository, capsys, *command).strip()
 
 
-def test_retired_inspection_commands_have_no_parser_aliases():
-    parser = controller.build_parser()
-    for arguments in (
-        ("list", "environments"),
-        ("list", "units", "--environment", "dev"),
-        ("show", "desired", "--environment", "dev", "application"),
-        ("show", "desired-unit", "--environment", "dev", "application"),
-        ("show", "receipt", "--environment", "dev", "application"),
-    ):
-        with pytest.raises(SystemExit):
-            parser.parse_args(arguments)
-
-
 def test_get_receipt_artifact_returns_validated_persisted_resource(
     repository: Path, capsys: pytest.CaptureFixture[str]
 ):

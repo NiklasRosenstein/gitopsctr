@@ -138,7 +138,7 @@ def test_publish_tree_uses_caller_authorized_publication_head(
     assert capsys.readouterr().out == f"{'c' * 40}\n"
 
 
-def test_delete_is_public_but_finalize_is_not():
+def test_public_command_surface_and_retired_aliases():
     parser = deploy_release.build_parser()
 
     delete = parser.parse_args(
@@ -158,8 +158,81 @@ def test_delete_is_public_but_finalize_is_not():
     assert delete.name == "application"
     assert delete.uid == "d1-application"
 
-    with pytest.raises(SystemExit):
-        parser.parse_args(["finalize"])
+    promote = parser.parse_args(
+        [
+            "promote",
+            "--from-environment",
+            "dev",
+            "--to-environment",
+            "staging",
+            "--partition",
+            "application",
+            "-f",
+            "deployment/staging",
+        ]
+    )
+    assert promote.files == ["deployment/staging"]
+    assert promote.partition == "application"
+
+    rollback = parser.parse_args(
+        [
+            "rollback",
+            "--environment",
+            "prod",
+            "--to-desired-revision",
+            "a" * 40,
+            "--unit",
+            "application",
+            "--unit",
+            "frontend",
+            "--reason",
+            "Known-bad release",
+            "--dry",
+        ]
+    )
+    assert rollback.unit == ["application", "frontend"]
+    assert rollback.reason == "Known-bad release"
+    assert rollback.dry is True
+
+    verify = parser.parse_args(["verify", "--environment", "prod", "--unit", "api", "--unit", "database"])
+    reconcile = parser.parse_args(["reconcile", "--environment", "prod", "--unit", "api", "--reapply"])
+    plan = parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--plan"])
+    verbose = parser.parse_args(["reconcile", "--environment", "dev", "--unit", "app", "--verbose"])
+    assert verify.handler is deploy_release.command_verify
+    assert verify.unit == ["api", "database"]
+    assert reconcile.reapply is True
+    assert plan.plan is True and plan.verbose is False
+    assert verbose.verbose is True
+
+    status = parser.parse_args(["status"])
+    environment_status = parser.parse_args(["status", "--environment", "staging"])
+    unit_status = parser.parse_args(["status", "--environment", "staging", "--unit", "web"])
+    assert status.environment is None and status.unit is None
+    assert environment_status.environment == "staging" and environment_status.unit is None
+    assert environment_status.desired_ref is None and environment_status.observed_ref is None
+    assert environment_status.verbose is False
+    assert unit_status.environment == "staging" and unit_status.unit == "web"
+
+    retired = (
+        ["finalize"],
+        ["advance-desired", "--environment", "dev"],
+        ["instantiate-stack", "--environment", "dev"],
+        ["update-direct-stack", "--environment", "dev"],
+        ["apply", "unit", "--environment", "dev", "-f", "unit.yaml"],
+        ["delete", "unit", "--in=state", "--environment", "dev", "--name", "app", "--uid", "uid-app"],
+        ["create", "unit", "--in=source", "--environment", "dev", "--name", "app", "--driver", "terraform"],
+        ["audit-desired-compatibility", "--all"],
+        ["list", "environments"],
+        ["list", "units", "--environment", "dev"],
+        ["show", "desired", "--environment", "dev", "application"],
+        ["show", "desired-unit", "--environment", "dev", "application"],
+        ["show", "receipt", "--environment", "dev", "application"],
+        ["reconcile", "--environment", "dev", "--unit", "app", "--dry"],
+        ["promote", "--from-environment", "dev", "--to-environment", "staging"],
+    )
+    for arguments in retired:
+        with pytest.raises(SystemExit):
+            parser.parse_args(arguments)
 
 
 def test_candidate_publication_delegates_change_request_to_ci(tmp_path, monkeypatch):
@@ -1507,22 +1580,6 @@ def test_compact_approval_card_shows_driver_change_evidence_and_write_boundary(t
     assert "COMMIT   f4fa74b Consume extracted deployment action (+1 more)" in output
     assert "FILE     M\tinfra/deploy/README.md (+1 more)" in output
     assert "WRITES   driver effects; receipt to observed/dev on success" in output
-
-
-def test_status_allows_all_environment_and_single_unit_modes():
-    all_environments = deploy_release.build_parser().parse_args(["status"])
-    assert all_environments.environment is None
-    assert all_environments.unit is None
-    args = deploy_release.build_parser().parse_args(["status", "--environment", "staging"])
-    assert args.environment == "staging"
-    assert args.unit is None
-    assert args.desired_ref is None
-    assert args.observed_ref is None
-    assert args.verbose is False
-
-    unit = deploy_release.build_parser().parse_args(["status", "--environment", "staging", "--unit", "web"])
-    assert unit.environment == "staging"
-    assert unit.unit == "web"
 
 
 def test_status_without_environment_delegates_to_registry_inventory(monkeypatch):

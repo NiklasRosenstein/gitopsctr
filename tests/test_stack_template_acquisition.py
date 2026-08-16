@@ -13,8 +13,8 @@ from gitopsctr import controller
 from gitopsctr.contracts import DesiredStackTemplateSpec
 from gitopsctr.errors import OperationError
 from gitopsctr.state import GitStateStore
+from tests.stack_support import cloned_project_repository as _repository
 from tests.stack_support import commit, git, project_repository
-from tests.test_apply import _repository
 from tests.test_promote import _promotion_repository
 
 

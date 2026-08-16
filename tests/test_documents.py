@@ -66,6 +66,7 @@ def test_yaml_uses_language_server_schema_directive_while_json_keeps_schema_prop
         (project_document(name="Not_A_DNS_Name"), "does not match"),
         (project_document(name="invalid..name"), "does not match"),
         (project_document().replace("kind: Project", "kind: Configuration"), "Project"),
+        (project_document().replace("spec:\n  effectLease: null\n", "spec: {}\n"), "effectLease"),
     ],
 )
 def test_project_config_rejects_values_outside_its_published_schema(tmp_path: Path, contents: str, message: str):
@@ -75,68 +76,51 @@ def test_project_config_rejects_values_outside_its_published_schema(tmp_path: Pa
 
 
 @pytest.mark.parametrize(
-    "template",
+    ("field", "template", "valid"),
     [
-        "deploy/main",
-        "deploy/{env}",
-        "deploy/{environment",
-        "deploy/{environment}/{other}",
+        *(
+            ("desired", template, False)
+            for template in (
+                "deploy/main",
+                "deploy/{env}",
+                "deploy/{environment",
+                "deploy/{environment}/{other}",
+            )
+        ),
+        ("desired", "deployments/{environment}/{environment}", True),
+        *(
+            ("candidate", template, False)
+            for template in (
+                "gitopsctr/candidates/static",
+                "gitopsctr/candidates/{id}",
+                "gitopsctr/candidates/{environment}/{unknown}",
+                "gitopsctr/candidates/{environment",
+            )
+        ),
+        *(
+            ("candidate", template, True)
+            for template in (
+                "gitopsctr/candidates/{environment}",
+                "gitopsctr/candidates/{environment}/{id}",
+                "gitopsctr/candidates/{environment}/{operation}",
+                "gitopsctr/candidates/{environment}/{operation}/{id}",
+            )
+        ),
     ],
 )
-def test_project_environment_ref_templates_require_only_the_environment_placeholder(tmp_path: Path, template: str):
-    specification = {
-        "environmentDefaults": {"refs": {"desired": template}},
-    }
+def test_project_ref_template_contract(tmp_path: Path, field: str, template: str, valid: bool):
+    specification = {"environmentDefaults": {"refs": {field: template}}}
     (tmp_path / "gitopsctr.yaml").write_text(project_document(spec=json.dumps(specification)))
 
-    with pytest.raises(DocumentFormatError, match="environmentDefaults.refs.desired"):
-        load_project_config(tmp_path)
-
-
-def test_project_environment_ref_templates_can_be_configured_independently(tmp_path: Path):
-    specification = {
-        "environmentDefaults": {"refs": {"desired": "deployments/{environment}/{environment}"}},
-    }
-    (tmp_path / "gitopsctr.yaml").write_text(project_document(spec=json.dumps(specification)))
-
+    if not valid:
+        with pytest.raises(DocumentFormatError, match=f"environmentDefaults.refs.{field}"):
+            load_project_config(tmp_path)
+        return
     config = load_project_config(tmp_path)
-
-    assert config.environment_defaults.refs.desired == "deployments/{environment}/{environment}"
-    assert config.environment_defaults.refs.observed == "gitopsctr/observed/{environment}"
-    assert config.environment_defaults.refs.candidate == "gitopsctr/candidates/{environment}/{id}"
-
-
-@pytest.mark.parametrize(
-    "template",
-    [
-        "gitopsctr/candidates/static",
-        "gitopsctr/candidates/{id}",
-        "gitopsctr/candidates/{environment}/{unknown}",
-        "gitopsctr/candidates/{environment",
-    ],
-)
-def test_project_candidate_ref_template_requires_environment_and_known_placeholders(tmp_path: Path, template: str):
-    specification = {"environmentDefaults": {"refs": {"candidate": template}}}
-    (tmp_path / "gitopsctr.yaml").write_text(project_document(spec=json.dumps(specification)))
-
-    with pytest.raises(DocumentFormatError, match="environmentDefaults.refs.candidate"):
-        load_project_config(tmp_path)
-
-
-@pytest.mark.parametrize(
-    "template",
-    [
-        "gitopsctr/candidates/{environment}",
-        "gitopsctr/candidates/{environment}/{id}",
-        "gitopsctr/candidates/{environment}/{operation}",
-        "gitopsctr/candidates/{environment}/{operation}/{id}",
-    ],
-)
-def test_project_candidate_ref_template_accepts_supported_forms(tmp_path: Path, template: str):
-    specification = {"environmentDefaults": {"refs": {"candidate": template}}}
-    (tmp_path / "gitopsctr.yaml").write_text(project_document(spec=json.dumps(specification)))
-
-    assert load_project_config(tmp_path).environment_defaults.refs.candidate == template
+    assert getattr(config.environment_defaults.refs, field) == template
+    if field == "desired":
+        assert config.environment_defaults.refs.observed == "gitopsctr/observed/{environment}"
+        assert config.environment_defaults.refs.candidate == "gitopsctr/candidates/{environment}/{id}"
 
 
 def test_project_resource_schema_is_published_and_deterministic():

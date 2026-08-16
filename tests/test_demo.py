@@ -10,8 +10,8 @@ from demo.docker import run as docker_demo
 from demo.k8s import run as k8s_demo
 from demo.utils import RefHeads
 from gitopsctr import controller
+from tests.stack_support import cloned_project_repository as _repository
 from tests.stack_support import commit, write_stack_source
-from tests.test_apply import _repository
 
 
 def test_k8s_controller_preserves_terminal_color_when_capturing(monkeypatch, tmp_path):

@@ -12,25 +12,8 @@ import yaml
 from gitopsctr import controller
 from gitopsctr.errors import OperationError
 from gitopsctr.state import GitStateStore
-from tests.stack_support import commit, git, project_repository
-
-
-def _repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, GitStateStore, str]:
-    remote = tmp_path / "origin.git"
-    source = tmp_path / "source"
-    git(tmp_path, "init", "--bare", str(remote))
-    project_repository(source)
-    git(source, "init", "-b", "main")
-    git(source, "remote", "add", "origin", str(remote))
-    revision = commit(source, "initialize source")
-    git(source, "push", "-u", "origin", "main")
-    store = GitStateStore(source)
-    baseline = tmp_path / "baseline"
-    baseline.mkdir()
-    (baseline / ".gitkeep").write_text("")
-    store.publish("deploy/dev", baseline, None, "initialize desired state", expected_publication_head=None)
-    monkeypatch.setattr(controller, "REPOSITORY_ROOT", source)
-    return source, store, revision
+from tests.stack_support import cloned_project_repository as _repository
+from tests.stack_support import commit, git
 
 
 def _authored_unit(path: Path, name: str) -> Path:
@@ -191,51 +174,36 @@ def test_apply_rejects_candidate_ref_matching_observed(
         _apply(source, revision, authored, partition="application", candidate_ref=candidate_ref)
 
 
-def test_apply_without_source_revision_uses_worktree_for_source_less_input(
+def test_live_source_less_inputs_support_repository_relative_cwd_and_outside_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     source, store, _revision = _repository(tmp_path, monkeypatch)
     authored = _authored_source_less_unit(source / "frontend.yaml", "frontend")
 
     published = _apply_worktree(authored)
-
     assert published is not None
     desired = tmp_path / "source-less"
     store.materialize(published, desired)
     unit = controller.load_desired_unit(controller.unit_document_path(desired, "frontend"), "frontend")
     assert getattr(unit.spec, "source", None) is None
 
-
-def test_apply_without_source_revision_resolves_relative_input_from_cwd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    source, store, _revision = _repository(tmp_path, monkeypatch)
     caller = tmp_path / "caller"
-    authored = _authored_source_less_unit(caller / "inputs/frontend.yaml", "frontend")
+    authored = _authored_source_less_unit(caller / "inputs/relative.yaml", "relative")
     monkeypatch.chdir(caller)
-
-    published = _apply_worktree(Path("inputs/frontend.yaml"))
-
+    published = _apply_worktree(Path("inputs/relative.yaml"))
     assert published is not None
     desired = tmp_path / "cwd-relative"
     store.materialize(published, desired)
-    unit = controller.load_desired_unit(controller.unit_document_path(desired, "frontend"), "frontend")
+    unit = controller.load_desired_unit(controller.unit_document_path(desired, "relative"), "relative")
     assert getattr(unit.spec, "source", None) is None
     assert authored.is_file()
 
-
-def test_apply_without_source_revision_accepts_live_input_outside_repository(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    source, store, _revision = _repository(tmp_path, monkeypatch)
-    authored = _authored_source_less_unit(tmp_path / "outside/frontend.yaml", "frontend")
-
+    authored = _authored_source_less_unit(tmp_path / "outside/external.yaml", "external")
     published = _apply_worktree(authored)
-
     assert published is not None
     desired = tmp_path / "outside-desired"
     store.materialize(published, desired)
-    assert controller.unit_document_path(desired, "frontend").is_file()
+    assert controller.unit_document_path(desired, "external").is_file()
 
 
 def test_apply_with_source_revision_reads_snapshot_instead_of_dirty_worktree(
@@ -352,15 +320,6 @@ def test_apply_with_source_revision_rejects_outside_repository_input(tmp_path: P
 
     with pytest.raises(OperationError, match=r"outside the project repository.*--source-revision"):
         _apply(source, revision, outside)
-
-
-def test_apply_rejects_zero_document_input_without_partition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    _source, _store, _revision = _repository(tmp_path, monkeypatch)
-    empty = tmp_path / "empty"
-    empty.mkdir()
-
-    with pytest.raises(OperationError, match="zero documents"):
-        _apply_worktree(empty)
 
 
 def test_partitioned_empty_directory_marks_omitted_members_for_deletion(
@@ -610,50 +569,6 @@ def test_canonical_desired_input_is_preserved_but_controller_owns_identity(
     applied = _desired(store, tmp_path / "canonical-applied")
     assert applied["metadata"]["uid"] == initial_uid  # type: ignore[index]
     assert applied["spec"] == initial["spec"]
-
-
-def test_removed_state_construction_commands_are_rejected():
-    parser = controller.build_parser()
-    for arguments in (
-        ["advance-desired", "--environment", "dev"],
-        ["instantiate-stack", "--environment", "dev"],
-        ["update-direct-stack", "--environment", "dev"],
-        ["apply", "unit", "--environment", "dev", "-f", "unit.yaml"],
-        ["delete", "unit", "--in=state", "--environment", "dev", "--name", "app", "--uid", "uid-app"],
-        ["create", "unit", "--in=source", "--environment", "dev", "--name", "app", "--driver", "terraform"],
-        ["audit-desired-compatibility", "--all"],
-    ):
-        with pytest.raises(SystemExit):
-            parser.parse_args(arguments)
-
-
-def test_promote_requires_explicit_target_input():
-    parser = controller.build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(
-            [
-                "promote",
-                "--from-environment",
-                "dev",
-                "--to-environment",
-                "staging",
-            ]
-        )
-    args = parser.parse_args(
-        [
-            "promote",
-            "--from-environment",
-            "dev",
-            "--to-environment",
-            "staging",
-            "--partition",
-            "application",
-            "-f",
-            "deployment/staging",
-        ]
-    )
-    assert args.files == ["deployment/staging"]
-    assert args.partition == "application"
 
 
 def test_converge_defaults_to_all_units_and_partition_is_unit_selection(

@@ -298,31 +298,6 @@ def test_clean_rollback_target_returns_the_matching_observed_revision(tmp_path, 
     )
 
 
-def test_rollback_parser_supports_full_or_repeated_unit_scope():
-    args = deploy_release.build_parser().parse_args(
-        [
-            "rollback",
-            "--environment",
-            "prod",
-            "--to-desired-revision",
-            "a" * 40,
-            "--unit",
-            "application",
-            "--unit",
-            "frontend",
-            "--reason",
-            "Known-bad release",
-            "--dry",
-        ]
-    )
-
-    assert args.environment == "prod"
-    assert args.to_desired_revision == "a" * 40
-    assert args.unit == ["application", "frontend"]
-    assert args.reason == "Known-bad release"
-    assert args.dry is True
-
-
 def test_targeted_rollback_rejects_missing_persisted_dependency(tmp_path):
     desired = tmp_path / "desired"
     consumer = _desired_unit("consumer", "a" * 40, "current")

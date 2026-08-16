@@ -653,25 +653,6 @@ def _terraform_context(
     )
 
 
-def test_terraform_accepts_driver_neutral_backend_configuration(tmp_path, monkeypatch):
-    commands: list[tuple[str, ...]] = []
-
-    def fake_run(*args, **_kwargs):
-        commands.append(args)
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    state = tmp_path / "state/demo.tfstate"
-
-    reconciliation = replace(
-        _terraform_context(tmp_path, tmp_path / "report", {"path": str(state)}),
-        execution=execution_for(fake_run),
-    )
-    terraform.DRIVER.plan(_planning_context(reconciliation))
-
-    init = next(command for command in commands if command[1] == "init")
-    assert init == ("terraform", "init", f"-backend-config=path={state}")
-
-
 def test_terraform_rejects_structured_backend_values(tmp_path):
     with pytest.raises(ContractError):
         terraform.DRIVER.desired_unit_contract.parse(
@@ -688,6 +669,7 @@ def test_terraform_rejects_structured_backend_values(tmp_path):
 
 def test_terraform_plan_saves_binary_plan_and_rendered_report(tmp_path, monkeypatch):
     report = tmp_path / "report"
+    state = tmp_path / "state/demo.tfstate"
     commands: list[tuple[str, ...]] = []
     variable_file: Path | None = None
 
@@ -705,12 +687,17 @@ def test_terraform_plan_saves_binary_plan_and_rendered_report(tmp_path, monkeypa
             return subprocess.CompletedProcess(args, 0, "Plan: 1 to add, 0 to change, 0 to destroy.\n", "")
         return subprocess.CompletedProcess(args, 0, "initialized\n", "")
 
-    reconciliation = replace(_terraform_context(tmp_path, report), execution=execution_for(fake_run))
+    reconciliation = replace(
+        _terraform_context(tmp_path, report, {"path": str(state)}),
+        execution=execution_for(fake_run),
+    )
     result = terraform.DRIVER.plan(_planning_context(reconciliation))
 
     assert result is None
     assert (report / "plan.tfplan").read_bytes() == b"saved plan"
     assert (report / "plan.txt").read_text() == ("Plan: 1 to add, 0 to change, 0 to destroy.\n")
+    init = next(command for command in commands if command[1] == "init")
+    assert init == ("terraform", "init", f"-backend-config=path={state}")
     plan_command = next(command for command in commands if command[1] == "plan")
     assert variable_file is not None
     assert f"-var-file={variable_file}" in plan_command

@@ -321,14 +321,3 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
         )
     assert changed is bool(driver_runs)
     assert outputs == [(bool(driver_runs), "")]
-
-
-def test_parser_exposes_repeatable_verify_units_and_reapply():
-    parser = deploy_release.build_parser()
-
-    verify = parser.parse_args(["verify", "--environment", "prod", "--unit", "api", "--unit", "database"])
-    reconcile = parser.parse_args(["reconcile", "--environment", "prod", "--unit", "api", "--reapply"])
-
-    assert verify.handler is deploy_release.command_verify
-    assert verify.unit == ["api", "database"]
-    assert reconcile.reapply is True

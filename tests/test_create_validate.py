@@ -256,14 +256,6 @@ def test_project_effect_lease_store_supports_disabled_and_branch_modes(tmp_path:
     assert store.ref == "leases/{environment}"
 
 
-def test_project_requires_effect_lease_policy(tmp_path: Path):
-    document = project_document()
-    del document["spec"]["effectLease"]
-    write_yaml(tmp_path / "gitopsctr.yaml", document)
-    with pytest.raises(controller.DocumentFormatError, match="effectLease"):
-        controller.load_project_config(tmp_path)
-
-
 def test_create_project_rejects_ambiguous_configuration_even_with_force(tmp_path: Path):
     write_yaml(tmp_path / "gitopsctr.yaml", project_document())
     write_yaml(tmp_path / ".gitopsctr.yml", project_document())
