@@ -98,12 +98,14 @@ def _run_controller(*args: str, capture: bool = False) -> subprocess.CompletedPr
         str(WORKTREE),
         *args,
         cwd=WORKTREE,
+        check=False,
         capture=capture,
     )
     if capture:
         output = result.stdout + result.stderr
         if output:
             print(output, end="" if output.endswith("\n") else "\n")
+    result.check_returncode()
     return result
 
 

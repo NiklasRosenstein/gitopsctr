@@ -3318,6 +3318,10 @@ def _required_stack_template_source_pins(environment: str, desired_root: Path) -
 
     required: set[tuple[str, str]] = set()
     resources = load_desired_resource_graph(desired_root, validate=False)
+    finalized_identities = {
+        (tombstone.api_version, tombstone.kind, tombstone.name, tombstone.uid)
+        for tombstone in load_resource_incarnation_evidence(desired_root)
+    }
     for resource in resources.values():
         if not isinstance(resource, StackResource) or resource.gvk.kind != "StackTemplate":
             continue
@@ -3395,6 +3399,22 @@ def _required_stack_template_source_pins(environment: str, desired_root: Path) -
         for binding in active.units.values():
             unit = resources.get((binding.apiVersion, binding.kind, binding.name))
             if not isinstance(unit, UnitResource):
+                if (
+                    resource_deletion(resource) is not None
+                    and (
+                        binding.apiVersion,
+                        binding.kind,
+                        binding.name,
+                        binding.uid,
+                    )
+                    in finalized_identities
+                ):
+                    # During child-first deletion the Stack retains its active
+                    # projection until every child is finalized. An exact
+                    # incarnation tombstone replaces the removed child's
+                    # workload-retention requirement in that intermediate
+                    # accepted snapshot.
+                    continue
                 raise OperationError(
                     f"Stack {resource.name!r} active Unit {binding.name!r} is missing from desired state"
                 )

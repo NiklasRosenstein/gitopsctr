@@ -428,6 +428,38 @@ def test_converge_missing_stack_child_without_tombstone_fails_closed(tmp_path, m
     assert child.metadata.uid is not None
 
 
+def test_deleting_stack_source_retention_accepts_exact_finalized_child_tombstone(tmp_path):
+    initial = tmp_path / "initial"
+    _stack_uid, child_name = stack_tree(initial)
+    child = controller.load_desired_unit(initial / f"units/{child_name}.json", child_name)
+    stack_path = initial / "stacks/preview.json"
+    stack = controller.RESOURCE_CATALOG.parse_stack(
+        controller.RESOURCE_CATALOG.load_document(stack_path),
+        profile="desired",
+        expected_name="preview",
+    )
+    write_test_document(
+        stack_path,
+        controller.RESOURCE_CATALOG.serialize_stack_resource(
+            controller.mark_resource_for_deletion(stack), profile="desired"
+        ),
+    )
+    (initial / f"units/{child_name}.json").unlink()
+    assert child.metadata.uid is not None
+    controller.write_resource_incarnation_tombstone(
+        initial,
+        controller.ResourceIncarnationTombstone(
+            api_version=child.gvk.api_version,
+            kind=child.gvk.kind,
+            name=child.name,
+            uid=child.metadata.uid,
+            deletion_generation=1,
+        ),
+    )
+
+    assert controller._required_stack_template_source_pins("dev", initial) == ()
+
+
 def test_gated_deletion_candidate_cannot_teardown_before_live_ref(tmp_path, monkeypatch):
     active = _terraform_unit("application", "d1-application")
     harness = _DeletionHarness(tmp_path, _unit_tree(tmp_path, active))
