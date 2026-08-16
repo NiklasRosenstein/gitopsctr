@@ -96,6 +96,7 @@ from gitopsctr.driver import (
     TeardownCapability,
     TeardownContext,
     TeardownResult,
+    TeardownUnsupported,
     UnitResolutionContext,
     VerificationContext,
     VerificationStatus,
@@ -8989,6 +8990,18 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                             execution=DriverExecution.console(),
                         )
                     )
+                except TeardownUnsupported as exc:
+                    if lease_acquisition is not None:
+                        release_effect_lease(
+                            desired_ref,
+                            resource.name,
+                            lease_acquisition.lease.token,
+                            args.uid,
+                            verify_snapshot=False,
+                            lease_ref=lease_ref,
+                        )
+                    log_status("WAIT", f"{style_unit(unit.name)}: {exc}")
+                    return False
                 except (DriverError, subprocess.CalledProcessError):
                     # A reported driver failure proves this invocation has
                     # stopped. Release its exact token so the idempotent
@@ -11189,6 +11202,11 @@ def _resolve_checked_apply_path(path: Path, *, source_root: Path | None, value: 
     """Resolve an input path and, for snapshots, prove it remains inside the snapshot."""
 
     try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError:
+        # Preserve the caller's ordinary "input does not exist" diagnostic.
+        # Strict resolution is needed because Python 3.13+ no longer raises
+        # for symlink loops in the default non-strict mode.
         resolved = path.resolve()
     except (OSError, RuntimeError) as exc:
         raise OperationError(f"{value!r} contains an invalid or looping symbolic link: {exc}") from exc

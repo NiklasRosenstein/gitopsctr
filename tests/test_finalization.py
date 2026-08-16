@@ -11,7 +11,7 @@ import pytest
 from gitopsctr import controller
 from gitopsctr.contracts import DesiredOwnerReference
 from gitopsctr.contrib.drivers.terraform import AppliedTerraformModel, TerraformResultModel
-from gitopsctr.driver import DriverError, ReconciliationOutput, TeardownResult
+from gitopsctr.driver import DriverError, ReconciliationOutput, TeardownResult, TeardownUnsupported
 from gitopsctr.errors import OperationError
 from tests.conftest import write_test_document
 
@@ -489,6 +489,19 @@ def test_reconcile_unsupported_teardown_remains_wait_with_desired_intact(tmp_pat
         pass
 
     monkeypatch.setattr(controller, "TeardownCapability", NoTeardownCapability)
+    assert controller.command_reconcile(_reconcile_args()) is False
+    assert (desired / "units/application.yaml").exists()
+
+
+def test_reconcile_delivery_without_teardown_remains_wait_with_desired_intact(tmp_path, monkeypatch):
+    document = _mark(_terraform_unit("application", "d1-application"))
+    desired, _observed, _publications, _teardown_publications = _prepare_finalization(tmp_path, monkeypatch, document)
+
+    def teardown(_driver, _context):
+        raise TeardownUnsupported("delivery mode has no controller-owned teardown")
+
+    monkeypatch.setattr(type(controller.UNIT_DRIVERS["terraform"]), "teardown", teardown)
+
     assert controller.command_reconcile(_reconcile_args()) is False
     assert (desired / "units/application.yaml").exists()
 

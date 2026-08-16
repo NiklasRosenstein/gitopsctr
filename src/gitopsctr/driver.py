@@ -30,6 +30,10 @@ class DriverError(RuntimeError):
     pass
 
 
+class TeardownUnsupported(DriverError):
+    """The selected Unit delivery mode has no controller-owned teardown."""
+
+
 @dataclass(frozen=True)
 class ReconciliationOutput[ResultT: StrictModel]:
     """Validated observation facts and artifact resources returned by reconciliation."""

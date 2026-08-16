@@ -39,6 +39,7 @@ from gitopsctr.driver import (
     TeardownCapability,
     TeardownContext,
     TeardownResult,
+    TeardownUnsupported,
     UnitDriver,
     UnitResolution,
     UnitResolutionContext,
@@ -725,7 +726,7 @@ class KubernetesManifestsDriver(
         delivery = delivery_configuration(context.unit)
         observer = argo_observer(delivery)
         if observer is None:
-            raise DriverError(
+            raise TeardownUnsupported(
                 "direct Kubernetes delivery has no controller-owned teardown; use provider cleanup before finalization"
             )
         deadline = time.monotonic() + observer.timeoutSeconds
