@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 
 import pytest
@@ -777,6 +777,63 @@ def test_inventory_validates_complete_receipt_artifact_relationship(repository: 
     assert images.observation is InventoryObservationState.CURRENT
     assert images.artifacts[0].name == "containers"
     assert next(item for item in without_artifacts.units if item.unit.name == "images").artifacts == ()
+
+    base_unit = images.unit
+    base_receipt = next(item for item in receipts if item.name == "images")
+    base_artifact = next(item for item in artifacts if item.name == "containers")
+
+    def scoped_relationship(stack_name: str):
+        qualified_name = f"{stack_name}/image"
+        unit_document = json.loads(json.dumps(base_unit.document))
+        unit_document["metadata"]["name"] = "image"
+        receipt_document = json.loads(json.dumps(base_receipt.document))
+        receipt_document["metadata"]["name"] = "image"
+        receipt_document["spec"]["subject"]["name"] = "image"
+        receipt_document["spec"]["subject"]["qualifiedName"] = qualified_name
+        receipt_document["status"]["artifacts"]["containers"]["path"] = f"artifacts/{qualified_name}/containers.yaml"
+        artifact_document = json.loads(json.dumps(base_artifact.document))
+        artifact_document["producer"]["name"] = "image"
+        artifact_document["producer"]["qualifiedName"] = qualified_name
+        return (
+            replace(
+                base_unit,
+                path=PurePosixPath(f"units/{qualified_name}.yaml"),
+                document=unit_document,
+                name="image",
+                local_identity=base_unit.family.identity.from_name("image"),
+                storage_qualified_name=qualified_name,
+            ),
+            replace(
+                base_receipt,
+                path=PurePosixPath(f"units/{qualified_name}.yaml"),
+                document=receipt_document,
+                name="image",
+                local_identity=base_receipt.family.identity.from_name("image"),
+                storage_qualified_name=qualified_name,
+            ),
+            replace(
+                base_artifact,
+                path=PurePosixPath(f"artifacts/{qualified_name}/containers.yaml"),
+                document=artifact_document,
+                local_identity=base_artifact.family.identity.from_name("containers", (qualified_name,)),
+                storage_qualified_name=f"{qualified_name}/containers",
+            ),
+        )
+
+    application = scoped_relationship("application")
+    backend = scoped_relationship("backend")
+    scoped = evaluate_relationships(
+        RESOURCE_REGISTRY,
+        (application[0], backend[0]),
+        (application[1], backend[1]),
+        (application[2], backend[2]),
+    )
+    assert {item.unit.qualified_name for item in scoped.units} == {"application/image", "backend/image"}
+    assert all(item.observation is InventoryObservationState.CURRENT for item in scoped.units)
+    assert {item.artifact.qualified_name for item in scoped.artifacts} == {
+        "application/image/containers",
+        "backend/image/containers",
+    }
 
     image_artifact = next(item for item in artifacts if item.name == "containers")
     mismatched_pin_document = json.loads(json.dumps(image_artifact.document))

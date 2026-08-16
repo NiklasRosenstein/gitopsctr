@@ -339,59 +339,26 @@ def _relationship_states(
             selection=selection,
         )
 
-    selected_artifact_producers: frozenset[str] | None = None
     if view.relationship_role is InspectionRelationshipRole.SUBJECT:
         units = records
-        subject_identities = {record.identity for record in records}
-        candidate_receipts = related_resources(
+        receipts = related_resources(
             observation.observer_family,
             observation.observer_plane,
         )
-        try:
-            receipts = tuple(
-                receipt
-                for receipt in candidate_receipts
-                if observation.binding.subject_identity(receipt.relationship_resource()) in subject_identities
-            )
-        except ResourceModelError as exc:
-            raise OperationError(f"environment {environment!r}: invalid observation relationship: {exc}") from exc
     elif view.relationship_role is InspectionRelationshipRole.OBSERVER:
         receipts = records
-        subject_names = set()
-        for receipt in receipts:
-            try:
-                subject_names.add(observation.binding.subject_identity(receipt.relationship_resource()).name)
-            except ResourceModelError as exc:
-                raise OperationError(f"environment {environment!r}, observed {receipt.path}: {exc}") from exc
         units = related_resources(
             observation.subject_family,
             observation.subject_plane,
-            _names_selection(frozenset(subject_names)),
         )
     elif view.relationship_role is InspectionRelationshipRole.DESCRIBED_RESOURCE and description is not None:
-        selected_artifact_producers = frozenset(
-            family.identity.value(record.local_identity, description.producer_identity_segment) for record in records
-        )
-        candidate_receipts = related_resources(
+        receipts = related_resources(
             description.describer_family,
             description.describer_plane,
         )
-        try:
-            receipts = tuple(
-                receipt
-                for receipt in candidate_receipts
-                if observation.binding.subject_identity(receipt.relationship_resource()).name
-                in selected_artifact_producers
-            )
-            subject_names = {
-                observation.binding.subject_identity(receipt.relationship_resource()).name for receipt in receipts
-            }
-        except ResourceModelError as exc:
-            raise OperationError(f"environment {environment!r}: invalid observation relationship: {exc}") from exc
         units = related_resources(
             description.producer_family,
             description.producer_plane,
-            _names_selection(frozenset(subject_names)),
         )
     else:
         raise OperationError(
@@ -402,11 +369,9 @@ def _relationship_states(
     if description is not None and (
         resolve_artifacts or view.relationship_role is InspectionRelationshipRole.DESCRIBED_RESOURCE
     ):
-        producer_names = selected_artifact_producers or frozenset(unit.name for unit in units)
         artifacts = related_resources(
             description.artifact_family,
             description.artifact_plane,
-            ResourceSelection.segment(description.producer_identity_segment, producer_names),
         )
     if description is None:
         evaluation = evaluate_observation_relationship(observation, units, receipts)

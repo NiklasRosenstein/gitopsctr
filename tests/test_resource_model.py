@@ -514,6 +514,7 @@ def test_receipt_artifact_binding_executes_identity_digest_media_and_producer_in
     )
     context = ArtifactResolutionContext(
         producer,
+        "application",
         {artifact_path: artifact},
         {"containers": GVK("artifact.gitopsctr.io/v1", "ContainerImages")},
         ObservationState.CURRENT,

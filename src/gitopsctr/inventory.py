@@ -966,10 +966,10 @@ def evaluate_relationships(
                 if len(descriptions) != 1:
                     raise InventoryError("registered Unit artifact-description relationship is not unambiguous")
                 description = descriptions[0]
-    units_by_identity = {item.identity: item for item in units}
+    units_by_qualified_name = {item.qualified_name: item for item in units}
     artifacts_by_path = {item.path: item.relationship_resource() for item in artifacts}
     artifact_records_by_path = {item.path: item for item in artifacts}
-    receipt_by_subject: dict[ResourceIdentity, InventoryRecord] = {}
+    receipt_by_subject: dict[str, InventoryRecord] = {}
     states_by_receipt: dict[PurePosixPath, ReceiptOperationalState] = {}
     linked_artifact_paths: set[PurePosixPath] = set()
     artifact_states_by_path: dict[PurePosixPath, ArtifactOperationalState] = {}
@@ -980,14 +980,20 @@ def evaluate_relationships(
             subject_identity = observation.binding.subject_identity(observer)
         except ResourceModelError as exc:
             raise InventoryError(f"environment {receipt.environment!r}, observed {receipt.path}: {exc}") from exc
-        if subject_identity in receipt_by_subject:
-            previous = receipt_by_subject[subject_identity]
+        subject_qualified_name = receipt.qualified_name
+        if subject_qualified_name in receipt_by_subject:
+            previous = receipt_by_subject[subject_qualified_name]
             raise InventoryError(
                 f"environment {receipt.environment!r}: Receipts {previous.path} and {receipt.path} both observe "
-                f"{subject_identity.gvk} {subject_identity.name!r}"
+                f"{subject_identity.gvk} {subject_qualified_name!r}"
             )
-        receipt_by_subject[subject_identity] = receipt
-        unit = units_by_identity.get(subject_identity)
+        receipt_by_subject[subject_qualified_name] = receipt
+        unit = units_by_qualified_name.get(subject_qualified_name)
+        if unit is not None and unit.identity != subject_identity:
+            raise InventoryError(
+                f"environment {receipt.environment!r}, observed {receipt.path}: Receipt subject identity "
+                f"does not authenticate desired Unit {subject_qualified_name!r}"
+            )
         if unit is not None and address_runtime is not None:
             specification = receipt.document.get("spec")
             subject = specification.get("subject") if isinstance(specification, dict) else None
@@ -1011,6 +1017,7 @@ def evaluate_relationships(
                     observer,
                     ArtifactResolutionContext(
                         producer,
+                        subject_qualified_name,
                         artifacts_by_path,
                         registry.artifact_outputs_for(subject_identity.gvk),
                         freshness,
@@ -1056,7 +1063,7 @@ def evaluate_relationships(
 
     unit_states: list[UnitOperationalState] = []
     for unit in units:
-        receipt = receipt_by_subject.get(unit.identity)
+        receipt = receipt_by_subject.get(unit.qualified_name)
         observation_state = (
             InventoryObservationState.MISSING if receipt is None else states_by_receipt[receipt.path].observation
         )

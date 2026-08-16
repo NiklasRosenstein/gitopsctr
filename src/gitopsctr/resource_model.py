@@ -1754,6 +1754,7 @@ class ArtifactBindingDocumentation:
 @dataclass(frozen=True)
 class ArtifactResolutionContext:
     producer: RelationshipResource
+    producer_qualified_name: str
     artifacts_by_path: Mapping[PurePosixPath, RelationshipResource]
     declared_artifacts: Mapping[str, GVK]
     producer_observation: ObservationState | None
@@ -1819,7 +1820,7 @@ class ReceiptArtifactDescriptionBinding:
                 suffix = "yaml"
             else:
                 raise ResourceModelError(f"Receipt artifact descriptor {name!r} has an unsupported media type")
-            expected_path = PurePosixPath("artifacts", context.producer.identity.name, f"{name}.{suffix}")
+            expected_path = PurePosixPath("artifacts", context.producer_qualified_name, f"{name}.{suffix}")
             if path != expected_path:
                 raise ResourceModelError(
                     f"Receipt artifact descriptor {name!r} must use canonical path {expected_path}"
@@ -1845,7 +1846,7 @@ class ReceiptArtifactDescriptionBinding:
             if context.producer_observation is ObservationState.CURRENT:
                 self._validate_producer_pin(name, artifact, context.producer)
             links.append(ArtifactLink(name, artifact))
-        producer_root = PurePosixPath("artifacts", context.producer.identity.name)
+        producer_root = PurePosixPath("artifacts", context.producer_qualified_name)
         actual_paths = {path for path in context.artifacts_by_path if path.parent == producer_root}
         expected_paths = {link.artifact.path for link in links}
         if actual_paths != expected_paths:
