@@ -73,8 +73,8 @@ def render_resource_model(registry: ResourceRegistry) -> str:
         "",
         "## Families and placements",
         "",
-        "| Family | Selectors | Local identity | Installed API kinds | Source | Desired | Observed |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| Family | Selectors | Storage identity | Operator address | Installed API kinds | Source | Desired | Observed |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for family in sorted(registry.families, key=lambda item: item.name):
         selectors = ", ".join(f"`{selector}`" for selector in family.selectors)
@@ -85,7 +85,7 @@ def render_resource_model(registry: ResourceRegistry) -> str:
         identity_cell = f"`{identity}`" + (f" ({filters})" if filters else "")
         gvks = "<br>".join(f"`{api_kind.gvk}`" for api_kind in registry.api_kinds_for_family(family.name))
         lines.append(
-            f"| {family.name} | {selectors} | {identity_cell} | {gvks} | "
+            f"| {family.name} | {selectors} | {identity_cell} | {family.addressing.documentation()} | {gvks} | "
             f"{_placement_cell(family, ResourcePlane.SOURCE)} | "
             f"{_placement_cell(family, ResourcePlane.DESIRED)} | "
             f"{_placement_cell(family, ResourcePlane.OBSERVED)} |"
@@ -94,10 +94,11 @@ def render_resource_model(registry: ResourceRegistry) -> str:
     lines.extend(
         [
             "",
-            "A family-local identity is composed with its placement scope to form a complete address. Most families use",
-            "one `name` segment. Artifact identity is `producer/name`, so two producers may publish the same logical output",
-            "name without collision. A placement names a logical collection. Its repository adapter—not the controller or presentation layer—",
-            "owns physical path discovery. `default` selects the persisted representation used by the family's inspection",
+            "Local identity plus placement drives collection discovery and duplicate detection. Each family's root, child, or",
+            "mirror rule defines the qualified address that the CLI renders and accepts; the collection adapter encodes that",
+            "same address into its canonical path while the document retains its local metadata.name. Environment and family",
+            "remain separate command context. The repository adapter—not the controller or presentation layer—owns physical",
+            "path discovery and encoding. `default` selects the persisted representation used by the family's inspection",
             "view; it does not make that representation authoritative for another plane.",
             "",
             "## Observation relationships",

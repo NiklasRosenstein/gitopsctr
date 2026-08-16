@@ -796,7 +796,7 @@ def test_observation_publication_rebases_after_unrelated_lease_renewal(tmp_path,
         lease_snapshot=application_lease.snapshot,
     )
     evidence = json.loads(
-        observed_publication[f".gitopsctr/teardowns/units/application.{units['application'].metadata.uid}.1.json"]
+        observed_publication[f".gitopsctr/teardowns/units/application/{units['application'].metadata.uid}.1.json"]
     )
     assert evidence["desiredRevision"] == "c" * 40
 

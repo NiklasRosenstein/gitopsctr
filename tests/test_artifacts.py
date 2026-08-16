@@ -56,6 +56,7 @@ def container_images() -> dict[str, object]:
             "apiVersion": "unit.gitopsctr.io/v1",
             "kind": "OciImages",
             "name": "images",
+            "qualifiedName": "images",
             "driverVersion": 1,
             "sourceRevision": "a" * 40,
             "inputHashVersion": 1,

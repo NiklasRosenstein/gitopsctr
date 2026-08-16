@@ -202,7 +202,7 @@ def test_k8s_promotion_passes_explicit_target_input(monkeypatch):
 def test_preview_application_targets_unpartitioned_stack_projection():
     application = k8s_demo.argo_application_document("preview", preview=True)
     assert application["spec"]["source"]["targetRevision"] == "gitopsctr/desired/preview"
-    assert application["spec"]["source"]["path"] == "materialized/preview--deploy"
+    assert application["spec"]["source"]["path"] == "materialized/preview/deploy"
 
 
 def test_existing_preview_at_current_source_only_converges(monkeypatch, tmp_path):
@@ -214,7 +214,7 @@ def test_existing_preview_at_current_source_only_converges(monkeypatch, tmp_path
         "converge",
         lambda *args, **kwargs: events.append(("converge", args, kwargs)),
     )
-    monkeypatch.setattr(k8s_demo, "verify_workload", lambda *_args, **_kwargs: "application--image:r1")
+    monkeypatch.setattr(k8s_demo, "verify_workload", lambda *_args, **_kwargs: "application/image:r1")
     monkeypatch.setattr(
         k8s_demo,
         "deployment_heads",
@@ -224,7 +224,7 @@ def test_existing_preview_at_current_source_only_converges(monkeypatch, tmp_path
     heads, image = k8s_demo.run_preview_story("kind", "direct")
 
     assert heads == RefHeads("desired", "observed")
-    assert image == "application--image:r1"
+    assert image == "application/image:r1"
     assert len(events) == 1
     assert events[0][0] == "converge"
     assert events[0][2]["files"] == (
@@ -324,6 +324,6 @@ def test_demo_stack_templates_project_real_driver_contracts(
     stack = resources[("gitopsctr.io/v1", "Stack", "application")]
     assert stack.spec.structuralProjection.units["deploy"].kind == expected_kind  # type: ignore[union-attr]
     assert stack.spec.structuralProjection.units["image"].kind == "OciImages"  # type: ignore[union-attr]
-    assert result.blocked == {"application--deploy": "receipt does not exist: application--image"}
+    assert result.blocked == {"application/deploy": "receipt does not exist: application/image"}
     assert stack.spec.activeProjection is not None  # type: ignore[union-attr]
     assert set(stack.spec.activeProjection.units) == {"image"}  # type: ignore[union-attr]

@@ -258,17 +258,20 @@ def test_converge_stack_deletion_is_child_first_and_writes_one_progressive_clean
         lambda _driver, context: calls.append(context.unit_name) or TeardownResult(),
     )
 
-    controller.command_converge(harness.converge_args(unit=[child_name]))
+    controller.command_converge(harness.converge_args(unit=["preview/preview-app"]))
 
     assert calls == [child_name]
     assert not (harness.desired / "units" / f"{child_name}.json").exists()
     assert not (harness.desired / "stacks/preview.json").exists()
     assert not (harness.desired / "stack-templates/preview.json").exists()
     tombstones = controller.load_resource_incarnation_evidence(harness.desired)
-    assert {(tombstone.api_version, tombstone.kind, tombstone.name, tombstone.uid) for tombstone in tombstones} == {
-        (controller.CORE_API_VERSION, "Stack", "preview", "d1-stack-preview"),
-        (controller.CORE_API_VERSION, "StackTemplate", "preview", "d1-template"),
-        (controller.UNIT_API_VERSION, "Terraform", child_name, "d1-preview-app"),
+    assert {
+        (tombstone.api_version, tombstone.kind, tombstone.name, tombstone.qualified_name, tombstone.uid)
+        for tombstone in tombstones
+    } == {
+        (controller.CORE_API_VERSION, "Stack", "preview", "preview", "d1-stack-preview"),
+        (controller.CORE_API_VERSION, "StackTemplate", "preview", "preview", "d1-template"),
+        (controller.UNIT_API_VERSION, "Terraform", "preview-app", child_name, "d1-preview-app"),
     }
     assert len(harness.desired_publications) == 1
     assert harness.reconcile_outputs == [True]
@@ -336,10 +339,10 @@ def test_converge_retries_template_pin_cleanup_after_desired_removal(tmp_path, m
     )
 
     with pytest.raises(RuntimeError, match="temporary pin-store failure"):
-        controller.command_converge(harness.converge_args(unit=[child_name]))
+        controller.command_converge(harness.converge_args(unit=["preview/preview-app"]))
     assert not (harness.desired / "stack-templates/preview.json").exists()
 
-    controller.command_converge(harness.converge_args(unit=[child_name]))
+    controller.command_converge(harness.converge_args(unit=["preview/preview-app"]))
 
     assert attempts == 2
     assert pins == []
@@ -351,7 +354,7 @@ def test_converge_finalizes_a_standalone_deleting_stacktemplate(tmp_path, monkey
     initial = tmp_path / "initial"
     stack_tree(initial)
     (initial / "stacks/preview.json").unlink()
-    (initial / "units/preview--preview-app.json").unlink()
+    (initial / "units/preview/preview-app.json").unlink()
     template = controller.RESOURCE_CATALOG.parse_stack_template(
         controller.RESOURCE_CATALOG.load_document(initial / "stack-templates/preview.json"),
         profile="desired",
@@ -415,6 +418,7 @@ def test_converge_missing_stack_child_without_tombstone_fails_closed(tmp_path, m
             api_version=child.gvk.api_version,
             kind=child.gvk.kind,
             name=child.name,
+            qualified_name=child_name,
             uid="d1-old-preview-app",
             deletion_generation=1,
         ),
@@ -452,6 +456,7 @@ def test_deleting_stack_source_retention_accepts_exact_finalized_child_tombstone
             api_version=child.gvk.api_version,
             kind=child.gvk.kind,
             name=child.name,
+            qualified_name=child_name,
             uid=child.metadata.uid,
             deletion_generation=1,
         ),

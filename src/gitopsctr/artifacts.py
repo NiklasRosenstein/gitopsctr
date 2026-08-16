@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 from gitopsctr.api import GVK, ApiError, ApiKind, require_api_spec
-from gitopsctr.contracts import SCHEMA_ROOT, MashumaroContract, SchemaDocument, StrictModel
+from gitopsctr.contracts import SCHEMA_ROOT, MashumaroContract, QualifiedResourceName, SchemaDocument, StrictModel
 from gitopsctr.document import JsonObject, TypedDocumentContract
 
 ARTIFACT_API_VERSION = "artifact.gitopsctr.io/v1"
@@ -63,6 +63,7 @@ class ArtifactProducer(StrictModel):
     apiVersion: Literal["unit.gitopsctr.io/v1"]
     kind: str
     name: str
+    qualifiedName: QualifiedResourceName
     driverVersion: int
     sourceRevision: str
     inputHashVersion: Literal[1]

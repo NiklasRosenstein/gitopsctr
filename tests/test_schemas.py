@@ -248,7 +248,12 @@ def test_result_contracts_and_receipt_resource_schemas(driver):
         "kind": "Receipt",
         "metadata": {"name": "example"},
         "spec": {
-            "subject": {"apiVersion": plugin.api_version, "kind": plugin.kind, "name": "example"},
+            "subject": {
+                "apiVersion": plugin.api_version,
+                "kind": plugin.kind,
+                "name": "example",
+                "qualifiedName": "example",
+            },
             "desired": {"revision": REVISION, "unitBlob": "f" * 40},
             "resolvedInputs": {},
         },

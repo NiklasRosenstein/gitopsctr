@@ -161,6 +161,7 @@ class UnitExecutionContext[DesiredT: StrictModel]:
     source_path: str | None
     unit_name: str
     unit: DesiredT
+    qualified_name: str | None = None
     report: Path | None = None
     execution: DriverExecution = field(default_factory=default_driver_execution)
 
@@ -217,6 +218,7 @@ class VerificationContext[DesiredT: StrictModel]:
     source_path: str | None
     unit_name: str
     unit: DesiredT
+    qualified_name: str | None = None
     report: Path | None = None
     execution: DriverExecution = field(default_factory=default_driver_execution)
 

@@ -150,7 +150,7 @@ def clean(provider: Provider, delivery: Delivery = "direct") -> None:
     elif provider == "minikube" and shutil.which("minikube") is not None:
         run("minikube", "delete", "--profile", name, check=False)
     if shutil.which("docker") is not None:
-        remove_docker_images("application--image:*", "preview--image:*")
+        remove_docker_images("application/image:*", "preview/image:*")
     state_root = STATE_ROOT / delivery / provider
     if state_root.exists():
         shutil.rmtree(state_root)
@@ -272,7 +272,7 @@ def verify_workload(
         "--environment",
         environment,
         "--unit",
-        f"{stack_name}--deploy",
+        f"{stack_name}/deploy",
         delivery=delivery,
         preview=preview,
         remote=remote,
@@ -530,7 +530,7 @@ def argo_application_document(environment: str, preview: bool = False) -> dict[s
             "source": {
                 "repoURL": f"git://{ARGO_GIT_SERVICE}.{ARGO_NAMESPACE}.svc.cluster.local:9418/origin.git",
                 "targetRevision": f"gitopsctr/desired/{environment}",
-                "path": f"materialized/{stack_name}--deploy",
+                "path": f"materialized/{stack_name}/deploy",
             },
             "destination": {"server": "https://kubernetes.default.svc", "namespace": "default"},
             "syncPolicy": {"automated": {}},

@@ -424,13 +424,14 @@ def test_reconcile_rejects_changed_retained_resource_digest(tmp_path, monkeypatc
 def test_teardown_evidence_requires_uid_and_generation_in_filename(tmp_path):
     evidence = controller.TeardownEvidence(
         unit_name="application",
+        qualified_name="application",
         uid="d1-application",
         deletion_generation=1,
         desired_revision="a" * 40,
         effect_lease_ref=None,
         details={},
     )
-    _write(tmp_path / ".gitopsctr/teardowns/units/application.json", evidence.document())
+    _write(tmp_path / ".gitopsctr/teardowns/units/application/wrong.json", evidence.document())
 
     with pytest.raises(OperationError, match="filename does not match its fence"):
         controller.load_teardown_evidence(tmp_path, "application", "d1-application", 1)
@@ -439,6 +440,7 @@ def test_teardown_evidence_requires_uid_and_generation_in_filename(tmp_path):
 def test_teardown_evidence_requires_explicit_nullable_effect_lease_ref():
     evidence = controller.TeardownEvidence(
         unit_name="application",
+        qualified_name="application",
         uid="d1-application",
         deletion_generation=1,
         desired_revision="a" * 40,

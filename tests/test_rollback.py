@@ -132,7 +132,7 @@ def _promotion_document(revision: str) -> dict:
 def _template_only(root: Path) -> None:
     stack_tree(root)
     (root / "stacks/preview.json").unlink()
-    (root / "units/preview--preview-app.json").unlink()
+    (root / "units/preview/preview-app.json").unlink()
 
 
 def test_full_stack_rollback_rejects_recreated_root_identity(tmp_path: Path):
@@ -181,8 +181,8 @@ def test_full_stack_rollback_rejects_resurrection_of_finalized_root(tmp_path: Pa
 def test_targeted_rollback_rejects_stack_owned_unit_before_publication(tmp_path: Path, monkeypatch):
     current = tmp_path / "current"
     stack_tree(current)
-    unit_name = "preview--preview-app"
-    owned = deploy_release.load_desired_unit(current / "units/preview--preview-app.json", unit_name)
+    unit_name = "preview/preview-app"
+    owned = deploy_release.load_desired_unit(current / "units/preview/preview-app.json", unit_name)
     inventory = deploy_release.RollbackDesiredInventory({unit_name: owned}, {unit_name: ()})
     published = False
 
@@ -213,7 +213,7 @@ def test_targeted_rollback_rejects_stack_owned_unit_before_publication(tmp_path:
             "--to-desired-revision",
             "a" * 40,
             "--unit",
-            unit_name,
+            "preview/preview-app",
             "--reason",
             "avoid historical Stack child",
         ]
@@ -660,6 +660,7 @@ def test_rollback_restores_historical_payload_with_new_uid_after_finalization(tm
     deploy_release.canonicalize_rollback_unit(
         historical_path,
         current / "units/application.json",
+        "application",
         tuple(
             tombstone
             for tombstone in deploy_release.load_resource_incarnation_evidence(candidate)
@@ -789,14 +790,14 @@ def test_full_rollback_stack_owned_block_overlay_keeps_target_payload_and_blocks
     target = tmp_path / "target"
     stack_tree(current)
     stack_tree(target)
-    current_unit_path = current / "units/preview--preview-app.json"
+    current_unit_path = current / "units/preview/preview-app.json"
     if different_payload:
         current_document = json.loads(current_unit_path.read_text())
         current_document["spec"]["terraform"] = {"backend": {}, "variables": {"value": "current"}}
         current_unit_path.write_text(json.dumps(current_document))
     deploy_release.write_desired_transition_blocks(
         current,
-        {"preview--preview-app": "current Stack-owned transition is blocked"},
+        {"preview/preview-app": "current Stack-owned transition is blocked"},
     )
     candidate = tmp_path / "candidate"
     shutil.copytree(target, candidate)
@@ -807,10 +808,10 @@ def test_full_rollback_stack_owned_block_overlay_keeps_target_payload_and_blocks
         preserve_target_stack_semantics=True,
     )
 
-    target_unit = deploy_release.load_desired_unit(target / "units/preview--preview-app.json", "preview--preview-app")
+    target_unit = deploy_release.load_desired_unit(target / "units/preview/preview-app.json", "preview/preview-app")
     candidate_unit = deploy_release.load_desired_unit(
-        candidate / "units/preview--preview-app.json",
-        "preview--preview-app",
+        candidate / "units/preview/preview-app.json",
+        "preview/preview-app",
     )
     assert candidate_unit.spec == target_unit.spec
     assert deploy_release.load_desired_transition_blocks(candidate) == {}

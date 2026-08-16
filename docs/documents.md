@@ -47,6 +47,14 @@ singular and plural selectors, and each placement defines one allowed representa
 observed plane. A family can have multiple representations: an authored Unit and its resolved desired Unit are the
 same API family in different planes, not unrelated kinds.
 
+A family's local identity, placement, and address rule belong to the registry. Its collection adapter encodes the
+resulting `qualifiedName` into a canonical path while the document retains its local `metadata.name`. Root, child, and
+mirror rules compose hierarchy from validated relationships without teaching the CLI a fixed number of identity
+levels. Installed plugins can add a
+`ResourceModelContribution` through the `gitopsctr.resource-models` entry-point group; contributions may contain
+collections, families, observations, artifact descriptions, graph relationships, presenters, and address rules.
+Selectors and filter options are derived only after the combined registry validates successfully.
+
 Relationship definitions connect otherwise independent resources. In particular, a Receipt observes a desired Unit
 by subject identity and desired-unit blob, while its artifact descriptors refer to separately stored Artifact
 resources. Those definitions are invariants; each YAML or JSON document is a concrete instance. See the generated

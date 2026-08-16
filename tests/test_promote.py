@@ -238,11 +238,11 @@ def test_command_promote_resolves_unit_and_direct_inline_stack_inputs(tmp_path: 
     store.materialize(target_revision, target)
     promoted = controller.load_desired_unit(controller.unit_document_path(target, "promoted"), "promoted")
     projected = controller.load_desired_unit(
-        controller.unit_document_path(target, "application--app"), "application--app"
+        controller.unit_document_path(target, "application/app"), "application/app"
     )
     assert promoted.spec.terraform.variables == {"value": "source"}  # type: ignore[union-attr]
     assert projected.spec.terraform.variables == {"value": "source"}  # type: ignore[union-attr]
-    assert not controller.unit_document_path(target, "application--wait").exists()
+    assert not controller.unit_document_path(target, "application/wait").exists()
     promotion_path = controller.document_candidates(target, "promotion")[0]
     promotion = controller.RESOURCE_CATALOG.load_document(promotion_path)
     assert promotion["spec"]["source"]["desiredRevision"] == source_desired_revision
@@ -280,10 +280,10 @@ def test_command_promote_resolves_unit_and_direct_inline_stack_inputs(tmp_path: 
     assert progressed_revision is not None
     store.materialize(progressed_revision, progressed_root)
     promoted_after_progress = controller.load_desired_unit(
-        controller.unit_document_path(progressed_root, "application--app"), "application--app"
+        controller.unit_document_path(progressed_root, "application/app"), "application/app"
     )
     waiting_after_progress = controller.load_desired_unit(
-        controller.unit_document_path(progressed_root, "application--wait"), "application--wait"
+        controller.unit_document_path(progressed_root, "application/wait"), "application/wait"
     )
     assert promoted_after_progress.spec.terraform.variables == {"value": "source"}  # type: ignore[union-attr]
     assert waiting_after_progress.spec.terraform.variables == {"value": "evidence"}  # type: ignore[union-attr]

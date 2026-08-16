@@ -46,6 +46,9 @@ from gitopsctr.templates import (
     validate_parameter_values,
 )
 
+QUALIFIED_RESOURCE_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$"
+QualifiedResourceName = Annotated[str, Pattern(QUALIFIED_RESOURCE_NAME_PATTERN)]
+
 SCHEMA_ROOT = "https://niklasrosenstein.github.io/gitopsctr/schemas"
 
 
@@ -97,7 +100,7 @@ def _reference_target_schema(reference_type: str, value_ref: str = "#/$defs/Temp
     properties: JsonObject = {
         "unit": {
             "type": "string",
-            "pattern": "^[a-z0-9][a-z0-9-]*$",
+            "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
             "description": unit_description,
         },
         "pointer": {
@@ -516,13 +519,11 @@ PARTITION_LABEL = "gitopsctr.io/partition"
 
 
 def stack_generated_unit_name(stack_name: str, resource_name: str) -> str:
-    """Return the deterministic desired Unit name for one Stack-local resource."""
+    """Return the canonical qualified name for one Stack-local Unit."""
 
-    raw = f"{stack_name}--{resource_name}"
-    if len(raw) <= 63:
-        return raw
-    digest = hashlib.sha256(f"gitopsctr/stack-unit-name/v1\0{stack_name}\0{resource_name}".encode()).hexdigest()[:10]
-    return f"{raw[:52].rstrip('-')}-{digest}"
+    if not re.fullmatch(DESIRED_UID_PATTERN, stack_name) or not re.fullmatch(DESIRED_UID_PATTERN, resource_name):
+        raise ValueError("Stack and Unit names must be canonical local resource names")
+    return f"{stack_name}/{resource_name}"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -698,9 +699,11 @@ def scope_stack_template_resources(
         StackTemplateResource(
             apiVersion=resource.apiVersion,
             kind=resource.kind,
-            name=names[resource.name],
+            # Persisted identity is local to the Stack scope. Only references
+            # crossing a document boundary use the qualified resource name.
+            name=resource.name,
             spec=ParameterTemplateObject(cast(Any, _scope_stack_template_value(resource.spec, names))),
-            dependsOn=[names[dependency] for dependency in resource.dependsOn],
+            dependsOn=list(resource.dependsOn),
         )
         for resource in resources
     )
@@ -1815,6 +1818,7 @@ class ReceiptSubjectDocument(StrictModel):
     apiVersion: str
     kind: str
     name: str
+    qualifiedName: QualifiedResourceName
 
 
 @dataclass(frozen=True, kw_only=True)

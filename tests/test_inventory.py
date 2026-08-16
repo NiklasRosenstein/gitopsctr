@@ -33,7 +33,7 @@ from gitopsctr.inventory import (
 from gitopsctr.operational import materialization_tree_digest
 from gitopsctr.plane_repositories import PlaneRepositorySession
 from gitopsctr.registry import RESOURCE_REGISTRY
-from gitopsctr.resource_model import ObservationDefinition, ResourcePlane, ResourceRegistry, ResourceSelection
+from gitopsctr.resource_model import ObservationDefinition, ResourcePlane, ResourceRegistry
 from gitopsctr.resources import desired_unit_binding_digest
 from gitopsctr.state import GitRefSnapshot, GitStateStore
 from tests.stack_support import commit, git
@@ -174,7 +174,12 @@ def receipt(name: str, unit_blob: str) -> dict[str, object]:
         "kind": "Receipt",
         "metadata": {"name": name},
         "spec": {
-            "subject": {"apiVersion": "unit.gitopsctr.io/v1", "kind": "Terraform", "name": name},
+            "subject": {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "Terraform",
+                "name": name,
+                "qualifiedName": name,
+            },
             "desired": {"unitBlob": unit_blob},
         },
         "status": {
@@ -368,11 +373,19 @@ def test_stack_summary_uses_exact_active_bindings_and_surfaces_mismatch(reposito
         },
     )
     active_stack = replace(parsed_stack, spec=replace(parsed_stack.spec, activeProjection=active))
-    write_json(repository / "units/application.yaml", application)
-    write_json(repository / "units/unrelated.yaml", unrelated)
+    (repository / "units/application.yaml").unlink()
+    write_json(repository / "units/web/application.yaml", application)
+    write_json(repository / "units/web/unrelated.yaml", unrelated)
     write_json(repository / "stacks/web.yaml", CORE_CONTRACTS["stack-desired"].dump(active_stack))
     exact_revision = commit(repository, "active Stack child bindings")
     git(repository, "push", "origin", f"{exact_revision}:refs/heads/gitopsctr/desired/active-bindings")
+    git(repository, "checkout", "observed")
+    receipt_document = json.loads((repository / "units/application.yaml").read_text())
+    (repository / "units/application.yaml").unlink()
+    receipt_document["spec"]["subject"]["qualifiedName"] = "web/application"
+    write_json(repository / "units/web/application.yaml", receipt_document)
+    observed_revision = commit(repository, "qualify Stack-owned Receipt subject")
+    git(repository, "push", "--force", "origin", f"{observed_revision}:refs/heads/gitopsctr/observed/dev")
     git(repository, "checkout", "main")
 
     with InventorySession(repository, RESOURCE_REGISTRY) as inventory:
@@ -381,6 +394,14 @@ def test_stack_summary_uses_exact_active_bindings_and_surfaces_mismatch(reposito
             environment="dev",
             ref="gitopsctr/desired/active-bindings",
         )[0]
+        unit_record = next(
+            record
+            for record in inventory.resources("unit", environment="dev", ref="gitopsctr/desired/active-bindings")
+            if record.name == "application"
+        )
+        receipt_record = inventory.resources("receipt", environment="dev", ref="gitopsctr/observed/dev")[0]
+        assert inventory.resource_qualified_name(unit_record) == "web/application"
+        assert inventory.resource_qualified_name(receipt_record) == "web/application"
         summary = inventory.stack_inspection_summary(stack_record)
     assert summary.child_observations == ("STALE",)
 
@@ -622,6 +643,7 @@ def test_relationship_evaluation_selects_applicable_registered_definition(reposi
         RESOURCE_REGISTRY.families,
         (*RESOURCE_REGISTRY.observations, additional),
         RESOURCE_REGISTRY.artifact_descriptions,
+        RESOURCE_REGISTRY.graph_relationships,
     )
     with InventorySession(repository, registry) as inventory:
         units, receipts, artifacts = inventory.environment_inventory("dev")
@@ -698,6 +720,7 @@ def test_inventory_validates_complete_receipt_artifact_relationship(repository: 
                 "apiVersion": "unit.gitopsctr.io/v1",
                 "kind": "OciImages",
                 "name": "images",
+                "qualifiedName": "images",
                 "driverVersion": 1,
                 "sourceRevision": "a" * 40,
                 "inputHashVersion": 1,
@@ -712,7 +735,12 @@ def test_inventory_validates_complete_receipt_artifact_relationship(repository: 
         "kind": "Receipt",
         "metadata": {"name": "images"},
         "spec": {
-            "subject": {"apiVersion": "unit.gitopsctr.io/v1", "kind": "OciImages", "name": "images"},
+            "subject": {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "OciImages",
+                "name": "images",
+                "qualifiedName": "images",
+            },
             "desired": {"unitBlob": unit_blob},
         },
         "status": {
@@ -845,6 +873,7 @@ def test_artifact_inventory_identity_is_qualified_by_producer(repository: Path):
                     "apiVersion": "unit.gitopsctr.io/v1",
                     "kind": "OciImages",
                     "name": producer,
+                    "qualifiedName": producer,
                     "driverVersion": 1,
                     "sourceRevision": "a" * 40,
                     "inputHashVersion": 1,
@@ -949,7 +978,7 @@ def test_collection_rejects_same_stem_with_different_unit_gvks(repository: Path)
 
 def test_owned_unit_inherits_partition_from_uid_fenced_stack(repository: Path):
     git(repository, "checkout", "desired")
-    unit = desired_terraform("web--application")
+    unit = desired_terraform("application")
     unit["metadata"].pop("labels")  # type: ignore[union-attr]
     unit["metadata"]["ownerReferences"] = [  # type: ignore[index]
         {
@@ -959,18 +988,22 @@ def test_owned_unit_inherits_partition_from_uid_fenced_stack(repository: Path):
             "uid": "uid-web",
         }
     ]
-    write_json(repository / "units/web--application.yaml", unit)
+    write_json(repository / "units/web/application.yaml", unit)
     revision = commit(repository, "owned desired Unit")
     git(repository, "push", "origin", f"{revision}:refs/heads/gitopsctr/desired/owned")
     git(repository, "checkout", "main")
 
     with InventorySession(repository, RESOURCE_REGISTRY) as inventory:
-        record = inventory.resources(
-            "unit",
-            environment="dev",
-            ref="gitopsctr/desired/owned",
-            selection=ResourceSelection.segment("name", frozenset(("web--application",))),
-        )[0]
+        record = next(
+            item
+            for item in inventory.resources(
+                "unit",
+                environment="dev",
+                ref="gitopsctr/desired/owned",
+            )
+            if item.qualified_name == "web/application"
+        )
+        assert record.qualified_name == "web/application"
         assert inventory.resource_partition(record) == "application"
 
 

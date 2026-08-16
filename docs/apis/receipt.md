@@ -1,7 +1,7 @@
 # Receipt
 
 `gitopsctr.io/v1` `Receipt` records the result of reconciling one exact desired unit. The controller and unit driver
-write it to `units/<unit>.yaml|json` on the observed ref; users do not author receipts.
+write it to `units/<unit-qualified-name>.yaml|json` on the observed ref; users do not author receipts.
 
 ```yaml
 apiVersion: gitopsctr.io/v1
@@ -13,6 +13,7 @@ spec:
     apiVersion: unit.gitopsctr.io/v1
     kind: Terraform
     name: infrastructure
+    qualifiedName: infrastructure
   desired:
     unitBlob: 0123456789abcdef0123456789abcdef01234567
   resolvedInputs: {}
@@ -28,6 +29,10 @@ status:
 `spec.subject` identifies the unit kind, `spec.desired.unitBlob` binds the receipt to the serialized desired unit, and
 `spec.resolvedInputs` records the reference fingerprints used by that unit. `status.result` follows the subject
 driver's typed result contract. Drivers that publish artifacts also add descriptors under `status.artifacts`.
+`spec.subject.qualifiedName` persists the operator address that was authenticated when the Receipt was written. It is
+`stack/unit` for a Stack-owned Unit and the Unit name for a direct Unit; inspection re-authenticates it against the
+selected desired snapshot. The Receipt mirrors the Unit's hierarchical path in the observed collection while retaining
+the Unit's local name in `metadata.name`.
 
 ## Receipt and Unit state
 

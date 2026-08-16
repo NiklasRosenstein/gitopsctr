@@ -260,6 +260,7 @@ def test_receipt_result_cannot_override_envelope_identity():
                         "apiVersion": "unit.gitopsctr.io/v1",
                         "kind": "Terraform",
                         "name": "terraform",
+                        "qualifiedName": "terraform",
                     },
                     "desired": {"unitBlob": "f" * 40},
                 },
