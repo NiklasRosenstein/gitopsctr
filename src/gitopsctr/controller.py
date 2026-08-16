@@ -4953,12 +4953,13 @@ def log_convergence_action(
 def materialize_resolved_unit(
     environment_name: str,
     resolved: UnitResource[Any],
+    qualified_name: str,
     source_root: Path,
     source_revision: str | None,
     current_desired: Path,
     candidate: Path,
 ) -> UnitResource[Any]:
-    unit_name = resolved.name
+    unit_name = qualified_name
     plugin_name = resolved.driver_name
     plugin = MATERIALIZATION_DRIVERS.get(plugin_name)
     if plugin is None:
@@ -7143,6 +7144,7 @@ def build_desired_candidate(
             resolved = materialize_resolved_unit(
                 environment_name,
                 resolved,
+                unit_name,
                 unit_source_root,
                 unit_source_revision,
                 current_desired,

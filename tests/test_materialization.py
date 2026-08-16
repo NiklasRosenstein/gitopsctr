@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import controller
+from gitopsctr.api import GVK
 from gitopsctr.contracts import (
     AuthoredSource,
     DesiredSource,
@@ -22,6 +23,7 @@ from gitopsctr.driver import (
     UnitResolutionContext,
 )
 from gitopsctr.errors import ReferenceUnavailable
+from gitopsctr.resources import ResourceMetadata, UnitResource
 from tests.conftest import write_test_document
 
 
@@ -184,6 +186,42 @@ def test_advancement_materializes_and_reuses_an_unchanged_payload(tmp_path, monk
         controller.load_desired_unit(second / "units/rendered.json", "rendered").spec.materialization
         == first_unit.spec.materialization
     )
+
+
+def test_stack_owned_materialization_uses_the_qualified_storage_path(tmp_path, monkeypatch):
+    plugin = install_render_only(monkeypatch)
+    source = tmp_path / "source"
+    source.mkdir()
+    current = tmp_path / "current"
+    current.mkdir()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    resolved = UnitResource(
+        GVK(plugin.api_version, plugin.kind),
+        ResourceMetadata(name="rendered"),
+        plugin,
+        RenderOnlyResolvedUnit(
+            source=DesiredSource(
+                path=".",
+                revision="a" * 40,
+                inputHash="sha256:test",
+                driverVersion=plugin.version,
+            )
+        ),
+    )
+
+    desired = controller.materialize_resolved_unit(
+        "dev",
+        resolved,
+        "application/rendered",
+        source,
+        "a" * 40,
+        current,
+        candidate,
+    )
+
+    assert desired.spec.materialization.path == "materialized/application/rendered"
+    assert (candidate / "materialized/application/rendered/rendered.yaml").is_file()
 
 
 def test_revision_refresh_carries_valid_materialization_when_dependency_is_stale(tmp_path, monkeypatch):

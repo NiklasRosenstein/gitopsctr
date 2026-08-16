@@ -2105,6 +2105,22 @@ def test_dependencies_parser_defaults_to_head_and_accepts_repeated_units():
         deploy_release.convergence_scope({"frontend": _unit_resource("frontend")}, ["frontend"], max_depth=-1)
 
 
+def test_persisted_dependencies_accept_hierarchical_unit_addresses():
+    unit = deploy_release.RESOURCE_CATALOG.parse_unit(
+        _terraform_desired_document(
+            "deploy",
+            resolved_inputs={
+                "receipts": {"application/image": "receipt-blob"},
+                "artifacts": {"application/image/containers": "artifact-blob"},
+            },
+        ),
+        profile="desired",
+        expected_name="deploy",
+    )
+
+    assert deploy_release.desired_observation_reference_units(unit) == {"application/image"}
+
+
 def test_dependencies_command_prints_the_resolved_tree(monkeypatch, capsys):
     monkeypatch.setattr(
         deploy_release,
