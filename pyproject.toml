@@ -48,6 +48,7 @@ gitopsctr = "gitopsctr.cli:main"
 dev = [
   "mkdocs-material>=9.7.1",
   "pytest>=8",
+  "pytest-cov>=6",
   "ruff>=0.12",
   "ty>=0.0.1a16",
 ]
@@ -61,6 +62,15 @@ packages = ["src/gitopsctr"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["gitopsctr"]
+
+[tool.coverage.report]
+fail_under = 79
+show_missing = true
+skip_covered = true
 
 [tool.ruff]
 line-length = 120

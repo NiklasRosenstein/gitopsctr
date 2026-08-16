@@ -15,6 +15,10 @@ run = "uv sync --all-groups"
 [tasks.test]
 run = "uv run pytest -q"
 
+[tasks.coverage]
+description = "Run the test suite with branch coverage and enforce the baseline"
+run = "uv run pytest -q --cov=gitopsctr --cov-branch --cov-report=term-missing"
+
 [tasks.lint]
 run = "uv run ruff check ."
 
@@ -47,7 +51,7 @@ description = "Serve the documentation with live reload"
 run = "uv run mkdocs serve"
 
 [tasks.check]
-depends = ["actionlint", "docs", "lint", "resource-model-check", "schemas-check", "typecheck", "test"]
+depends = ["actionlint", "coverage", "docs", "lint", "resource-model-check", "schemas-check", "typecheck"]
 
 [tasks.build]
 run = "uv build"
