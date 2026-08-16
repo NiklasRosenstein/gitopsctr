@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -133,6 +134,12 @@ def receipt_resource(
 
 
 @pytest.fixture(autouse=True)
-def repository_root(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep controller tests independent from the gitopsctr source checkout."""
+def isolated_test_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests independent from the source checkout and host Git configuration."""
     monkeypatch.setattr(controller_module, "REPOSITORY_ROOT", FIXTURE_REPOSITORY)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "gitopsctr tests")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "gitopsctr-tests@example.invalid")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "gitopsctr tests")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "gitopsctr-tests@example.invalid")
