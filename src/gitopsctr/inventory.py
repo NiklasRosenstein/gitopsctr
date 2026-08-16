@@ -1072,10 +1072,10 @@ def evaluate_relationships(
         if not isinstance(unit.parsed, UnitResource):
             raise InventoryError(f"desired Unit {unit.name!r} has no typed Unit representation")
         try:
-            transition_reason = load_desired_transition_blocks(unit.snapshot_root).get(unit.name)
+            transition_reason = load_desired_transition_blocks(unit.snapshot_root).get(unit.qualified_name)
             status = classify_before_observation(
                 unit.snapshot_root,
-                unit.name,
+                unit.qualified_name,
                 unit.document,
                 unit.parsed,
                 transition_reason,

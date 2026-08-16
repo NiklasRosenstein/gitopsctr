@@ -27,6 +27,7 @@ class _DeletionHarness:
         self.desired_revision = "c" * 40
         self.observed_revision: str | None = None
         self.desired_publications: list[Path] = []
+        self.removed_unit_sets: list[frozenset[str]] = []
         self.observed_publications: list[Path] = []
         self.reconcile_outputs: list[bool] = []
 
@@ -59,6 +60,10 @@ class _DeletionHarness:
             return self.observed_revision
 
         def publish_desired(_environment: str, candidate: Path, *_args: object, **_kwargs: object):
+            if len(_args) > 8:
+                removed_units = _args[8]
+                assert isinstance(removed_units, frozenset)
+                self.removed_unit_sets.append(removed_units)
             snapshot = self.desired.parent / f"desired-{len(self.desired_publications)}"
             shutil.copytree(candidate, snapshot)
             self.desired_publications.append(snapshot)
@@ -274,6 +279,7 @@ def test_converge_stack_deletion_is_child_first_and_writes_one_progressive_clean
         (controller.UNIT_API_VERSION, "Terraform", "preview-app", child_name, "d1-preview-app"),
     }
     assert len(harness.desired_publications) == 1
+    assert harness.removed_unit_sets == [frozenset({"preview/preview-app"})]
     assert harness.reconcile_outputs == [True]
     cleanup = harness.desired_publications[0]
     assert not (cleanup / "units" / f"{child_name}.json").exists()

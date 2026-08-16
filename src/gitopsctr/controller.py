@@ -9363,7 +9363,11 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
             f"Remove the finalized resource {category} {args.name}.",
             args.dry,
             current,
-            frozenset(item.name for item in finalized if isinstance(item, UnitResource)),
+            frozenset(
+                fence.name
+                for item, fence in zip(finalized, finalized_fences, strict=True)
+                if isinstance(item, UnitResource)
+            ),
             request_change=False,
             finalized_resources=frozenset(finalized_fences),
             configuration_root=configuration_root,

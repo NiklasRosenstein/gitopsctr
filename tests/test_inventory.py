@@ -8,6 +8,7 @@ from typing import cast
 
 import pytest
 
+import gitopsctr.inventory as inventory_module
 from gitopsctr.api import GVK
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
@@ -682,7 +683,7 @@ def test_relationship_evaluation_rejects_duplicate_and_malformed_receipts(reposi
             )
 
 
-def test_inventory_validates_complete_receipt_artifact_relationship(repository: Path):
+def test_inventory_validates_complete_receipt_artifact_relationship(repository: Path, monkeypatch: pytest.MonkeyPatch):
     git(repository, "checkout", "desired")
     write_json(
         repository / "units/images.yaml",
@@ -834,6 +835,25 @@ def test_inventory_validates_complete_receipt_artifact_relationship(repository: 
         "application/image/containers",
         "backend/image/containers",
     }
+
+    classified_names: list[str] = []
+    classify_before_observation = inventory_module.classify_before_observation
+
+    def record_classified_name(*args: object, **kwargs: object):
+        unit_name = args[1]
+        assert isinstance(unit_name, str)
+        classified_names.append(unit_name)
+        return classify_before_observation(*args, **kwargs)
+
+    monkeypatch.setattr(inventory_module, "classify_before_observation", record_classified_name)
+    evaluate_relationships(
+        RESOURCE_REGISTRY,
+        (application[0], backend[0]),
+        (application[1], backend[1]),
+        (),
+        resolve_artifacts=False,
+    )
+    assert classified_names == ["application/image", "backend/image"]
 
     image_artifact = next(item for item in artifacts if item.name == "containers")
     mismatched_pin_document = json.loads(json.dumps(image_artifact.document))
