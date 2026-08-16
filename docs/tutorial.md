@@ -62,24 +62,63 @@ curl http://127.0.0.1:18080
 
 ## Inspect desired and observed state
 
-Change into the demo's isolated repository:
+Change into the demo's isolated repository and start with the namespace overview. The excerpt below omits the Stack and
+StackTemplate sections, but the important relationship is already visible: both Units are current and the image Unit's
+Artifact is authenticated.
 
 ```console
-cd .docker-demo-state/repository
-uv run gitopsctr status --environment dev
-uv run gitopsctr get environments
-uv run gitopsctr get units --environment dev
-uv run gitopsctr get stacks --environment dev
-uv run gitopsctr get unit application--deploy --environment dev -o yaml
-uv run gitopsctr get receipt application--image --environment dev -o yaml
-uv run gitopsctr get receipt application--image --environment dev --artifact containers
-git log --all --oneline --decorate
+$ cd .docker-demo-state/repository
+$ uv run gitopsctr get all --environment dev
+UNITS
+NAME                 KIND       PARTITION    DESIRED       OBSERVATION  RECONCILIATION  REASON
+application--deploy  Terraform  application  <blob>        CURRENT      CLEAN           observation matches desired state
+application--image   OciImages  application  <blob>        CURRENT      CLEAN           observation matches desired state
+
+...
+
+ARTIFACTS
+NAME                           KIND             PARTITION    AUTHENTICATION
+application--image/containers  ContainerImages  application  CURRENT
 ```
 
 The source commit contains authored resources. `gitopsctr/desired/dev` contains resolved desired Units, Stacks, and
 StackTemplates; `gitopsctr/observed/dev` contains Receipts and Artifacts proving what was applied. The default Unit
-table combines those planes into an operational summary, but `-o yaml` returns the exact desired Unit and exact
-Receipt as separate resources. See [Concepts](concepts.md) for the full state model.
+table combines those planes into an operational summary.
+
+Use the copyable `producer/name` address from the Artifact table for an exact lookup. `--as-list` keeps the exact
+Artifact document inside the generic inspection envelope so that its address, Git provenance, and derived
+authentication state remain available:
+
+```console
+$ uv run gitopsctr get artifact application--image/containers --environment dev -o yaml --as-list
+apiVersion: inspection.gitopsctr.io/v1
+kind: ResourceList
+metadata: {}
+items:
+- provenance:
+    environment: dev
+    plane: observed
+    ref: gitopsctr/observed/dev
+    revision: <observed-commit>
+    path: artifacts/application--image/containers.yaml
+  address:
+    family: artifact
+    scope: environment
+    namespace: dev
+    qualifiedName: application--image/containers
+  document:
+    apiVersion: artifact.gitopsctr.io/v1
+    kind: ContainerImages
+    metadata:
+      name: containers
+    # producer and images omitted here
+  inspection:
+    authentication: CURRENT
+```
+
+Without `--as-list`, that named query returns only the persisted `ContainerImages` document. A collection query such
+as `get artifacts` always returns a `ResourceList` for YAML/JSON output, even when it contains one item. See
+[Concepts](concepts.md) for the full state model and [Operations](operations.md) for ref/revision overrides.
 
 ## Partitions and independent resources
 
@@ -89,13 +128,15 @@ partition, gitopsctr begins deletion of the Stack and its generated Units:
 ```console
 gitopsctr apply --environment dev \
   --partition application \
-  --file deployment/environments/dev/stacks \
+  --file deployment/stack-templates/application.yaml \
   --source-revision HEAD
 ```
 
 Applying without `--partition` updates only explicitly supplied roots. Existing resources keep their partition; new
-resources remain unpartitioned. See [Preview environments](preview-environments.md) for the unpartitioned preview
-workflow and deletion/finalization.
+resources remain unpartitioned. Run `converge --environment dev --yes` after recording deletion intent to let the
+controller tear down generated Units child-first and remove the Stack when safe. See
+[Preview environments](preview-environments.md) for the unpartitioned preview workflow and automatic deletion
+progression.
 
 ## Prove clean convergence
 

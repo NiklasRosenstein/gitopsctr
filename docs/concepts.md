@@ -3,6 +3,10 @@
 gitopsctr separates authored intent, desired state, and observed evidence. Git
 records each transition. Unit drivers perform external work.
 
+> Authored input is a recipe. A desired Unit is an execution snapshot. Desired
+> StackTemplates and Stacks are durable projection inputs. Receipts and
+> Artifacts are separate observed evidence, not embedded status.
+
 ```mermaid
 flowchart LR
   source["Explicit input<br/>authored intent"] -->|apply| desired["Desired ref<br/>gitopsctr/desired/&lt;environment&gt;"]
@@ -50,11 +54,41 @@ An environment may override the desired and observed ref names, but they must re
 desired state to advance independently while receipts continue to describe the exact desired revision a driver
 observed.
 
+## Operations across the planes
+
+| Operation | Reads | Publishes | External effects |
+| --- | --- | --- | --- |
+| `apply` | Explicit source recipes or canonical desired input | Desired Units, StackTemplates, Stacks, and projections | None |
+| `promote` | Target specification plus pinned source desired and observed revisions | Target desired state and a Promotion record | None |
+| `rollback` | A historical desired revision | A new forward desired commit | None |
+| `delete` | A UID-fenced desired root | Deletion intent in desired state | None |
+| `reconcile` | One live desired Unit and observed evidence | Receipts, Artifacts, and deletion cleanup commits | Driver effects or idempotent teardown |
+| `converge` | Desired state, observed evidence, and optional explicit input | The desired/observed commits needed to become clean | Dependency-ordered driver effects and teardown |
+| `get` / `status` / `validate` | Source, desired, or observed resources | Nothing | None |
+
+The normal state flow is chronological:
+
+1. A user or CI job authors a recipe in the Source plane.
+2. `apply` resolves it into Desired state. Desired StackTemplates and Stacks retain projection intent; desired Units
+   contain resolved execution snapshots.
+3. `reconcile` or `converge` processes desired Units in dependency order. Drivers perform external work and publish
+   Receipts and immutable Artifacts in the Observed plane.
+4. New observed evidence can unlock a later projection. `converge` re-evaluates durable StackTemplate/Stack inputs
+   and atomically advances the affected active projection without rereading unrelated authored input.
+5. Deletion follows the same flow: `apply` partition omission or `delete` records intent, then reconciliation tears
+   down children first and publishes the fenced cleanup commit automatically.
+
+No candidate or non-live desired ref starts reconciliation or teardown. A change-gated candidate must reach the live
+desired ref first.
+
 ## Desired state, receipts, and artifacts
 
-`apply` pins source inputs and resolves available references into an immutable desired unit. A unit is ready
-only when all required inputs are available. Materialization-capable drivers may also commit rendered payloads below
-`materialized/<unit>/`.
+`apply` pins source inputs and resolves available references into an immutable desired Unit. A Unit is ready only when
+all required inputs are available. Materialization-capable drivers may also commit rendered payloads below
+`materialized/<unit>/`. Repository-backed Unit sources inherit the exact source context retained by their desired
+StackTemplate unless an authored `source.revision` selects an exact 40-hex commit. StackTemplate parameters may supply
+that override from the same acquired-ref history; it is not a direct-Unit field. The effective revision is persisted
+in the structural projection and desired Unit.
 
 Successful reconciliation writes a **Receipt** to the observed ref. A Receipt is a separate observed resource, not a
 Unit's embedded `status`. Its subject identifies a desired Unit, and its desired-unit blob identifies the exact Unit
@@ -76,7 +110,9 @@ follow the desired and observed trees.
 - **Verify** checks supported units for external drift without writing receipts.
 
 Because observations can unlock downstream desired inputs, convergence with explicit input may produce several
-desired and observed commits before it becomes clean. Convergence without input cannot reconstruct authored intent.
+desired and observed commits before it becomes clean. Convergence without input re-projects the durable
+StackTemplate/Stack intent after evidence changes, while ordinary standalone authored input still requires an
+explicit apply when it changes.
 
 ## Promotion and rollback
 
@@ -86,7 +122,7 @@ desired, source observed, and target specification revisions.
 
 ```mermaid
 flowchart LR
-  specification["Pinned specification revision<br/>target Environment, Stack, and StackTemplate"] --> promotion["Promotion record<br/>pins three revisions"]
+  specification["Pinned specification revision<br/>target config and explicit input bytes"] --> promotion["Promotion record<br/>pins three revisions"]
   desired["Pinned source desired revision<br/>resolved source Units and Stacks"] --> promotion
   observed["Pinned source observed revision<br/>fresh receipts and artifacts"] --> promotion
   promotion --> resolution["Resolve target desired state"]
@@ -103,13 +139,12 @@ target desired state = target specification at specificationRevision
                      + selected inputs from source desiredRevision and observedRevision
 ```
 
-For example, a target Stack may expand a local StackTemplate from the pinned specification revision while importing
-an exact image artifact evidenced by the pinned source desired and observed revisions. Alternatively,
-`template.source.fromPromotion` follows the source Stack's recorded StackTemplate commit, path, and digest, then
-expands that parameterized template with the target Stack's parameters. It does not copy the source Stack's expanded
-Units, and it is not the switch that makes an operation a promotion. See [Stacks and
-StackTemplates](apis/stacks.md#promotion-and-template-selection) for the source-mode matrix and
-[Promotion](apis/promotion.md) for the complete lineage record.
+For example, a target Stack may reuse a StackTemplate already in target desired state, or promotion may supply that
+StackTemplate inline, from Git, or with an explicit `source.fromPromotion` selector. The latter resolves only against
+the pinned source desired revision; acquisition is never implicit. A StackTemplate's desired acquisition record keeps
+the requested and resolved source lineage, while `documentDigest` checks the serialized selected document and
+`contentDigest` identifies its semantic inline content. See [Stacks and StackTemplates](apis/stacks.md) for
+source-context propagation and [Promotion](apis/promotion.md) for the lineage record.
 
 `changeGate: pullRequest` publishes promotion and rollback candidates for review; `changeGate: none` publishes them
 directly. Promotion normally requires every source unit to have a current receipt. Environments that contain only

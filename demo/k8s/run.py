@@ -291,6 +291,7 @@ def converge(
     source_revision: str | None = None,
     expect_clean: bool = False,
     allow_stall: bool = False,
+    verbose: bool = False,
     files: tuple[str, ...] = (),
     partition: str | None = None,
 ) -> None:
@@ -299,6 +300,8 @@ def converge(
         arguments.extend(("--source-revision", source_revision))
     if partition is not None:
         arguments.extend(("--partition", partition))
+    if verbose:
+        arguments.append("--verbose")
     for path in files:
         arguments.extend(("--file", path))
     for attempt in range(4):
@@ -316,6 +319,16 @@ def converge(
         if result.returncode == 0:
             if expect_clean and "no drivers ran" not in output:
                 raise RuntimeError(f"clean {environment} convergence ran a driver or moved a ref")
+            run_controller(
+                provider,
+                "get",
+                "all",
+                "--environment",
+                environment,
+                delivery=delivery,
+                preview=preview,
+                remote=remote,
+            )
             return
         if "convergence stalled with no ready unit" not in output:
             raise subprocess.CalledProcessError(
@@ -566,7 +579,10 @@ def run_promotion_story(
         delivery,
         remote=remote,
         source_revision="HEAD",
-        files=("deployment/environments/dev/stacks/application.yaml",),
+        files=(
+            "deployment/stack-templates/application.yaml",
+            "deployment/environments/dev/stacks/application.yaml",
+        ),
         partition="application",
         expect_clean=expect_clean,
     )
@@ -581,6 +597,8 @@ def run_promotion_story(
             "staging",
             "--file",
             "deployment/environments/staging/stacks/application.yaml",
+            "--file",
+            "deployment/stack-templates/application.yaml",
             "--partition",
             "application",
             delivery=delivery,
@@ -614,9 +632,26 @@ def desired_stack(worktree: Path) -> tuple[str, str, str]:
         )
         if stack.metadata.uid is None or stack.metadata.partition is not None:
             raise RuntimeError("preview Stack is not an unpartitioned root")
-        if not isinstance(stack.spec, controller_module.DesiredStackSpec) or stack.spec.resolvedSource is None:
-            raise RuntimeError("preview Stack has no resolved template source")
-        return revision, stack.metadata.uid, stack.spec.resolvedSource.fromGit.commit
+        if not isinstance(stack.spec, controller_module.DesiredStackSpec):
+            raise RuntimeError("preview Stack has no desired template reference")
+        template_paths = controller_module.document_candidates(root / "stack-templates", stack.spec.templateRef.name)
+        if len(template_paths) != 1:
+            raise RuntimeError("preview StackTemplate is missing")
+        template = controller_module.RESOURCE_CATALOG.parse_stack_template(
+            controller_module.RESOURCE_CATALOG.load_document(template_paths[0]),
+            profile="desired",
+            expected_name=stack.spec.templateRef.name,
+        )
+        if not isinstance(template.spec, controller_module.DesiredStackTemplateSpec):
+            raise RuntimeError("preview StackTemplate is not desired")
+        if template.metadata.uid != stack.spec.templateRef.uid:
+            raise RuntimeError("preview StackTemplate UID fence does not match")
+        if template.spec.contentDigest != stack.spec.templateRef.contentDigest:
+            raise RuntimeError("preview StackTemplate content digest fence does not match")
+        template_revision = (
+            template.spec.sourceContext.revision if template.spec.sourceContext is not None else revision
+        )
+        return revision, stack.metadata.uid, template_revision
 
 
 def run_preview_story(
@@ -635,7 +670,10 @@ def run_preview_story(
         preview=True,
         remote=remote,
         source_revision=revision,
-        files=("deployment/environments/preview/stacks/preview.yaml",),
+        files=(
+            "deployment/stack-templates/application.yaml",
+            "deployment/environments/preview/stacks/preview.yaml",
+        ),
         expect_clean=expect_clean,
     )
     image = verify_workload(provider, "preview", delivery, preview=True, remote=remote)
@@ -679,6 +717,24 @@ def request_preview_deletion(
     )
 
 
+def progress_preview_deletion(
+    provider: Provider,
+    delivery: Delivery,
+    *,
+    remote: str | None = None,
+) -> None:
+    """Let convergence progress preview teardown after deletion intent is live."""
+    converge(
+        provider,
+        "preview",
+        delivery,
+        preview=True,
+        remote=remote,
+        allow_stall=delivery == "direct",
+        verbose=delivery == "direct",
+    )
+
+
 def execute_story(
     provider: Provider,
     delivery: Delivery,
@@ -705,7 +761,10 @@ def execute_story(
                 preview=True,
                 remote=remote,
                 source_revision=revision,
-                files=("deployment/environments/preview/stacks/preview.yaml",),
+                files=(
+                    "deployment/stack-templates/application.yaml",
+                    "deployment/environments/preview/stacks/preview.yaml",
+                ),
                 allow_stall=True,
             )
             converge(
@@ -715,13 +774,23 @@ def execute_story(
                 preview=True,
                 remote=remote,
                 source_revision=revision,
-                files=("deployment/environments/preview/stacks/preview.yaml",),
+                files=(
+                    "deployment/stack-templates/application.yaml",
+                    "deployment/environments/preview/stacks/preview.yaml",
+                ),
             )
             second_image = verify_workload(provider, "preview", delivery, preview=True, remote=remote)
             if second_image == first_image:
                 raise RuntimeError("preview application did not publish a new image")
             request_preview_deletion(provider, delivery, remote=remote)
-            print("Acceptance passed: unpartitioned preview applied, converged, updated, and entered deletion.")
+            progress_preview_deletion(provider, delivery, remote=remote)
+            if delivery == "direct":
+                print(
+                    "Acceptance passed: unpartitioned preview applied, converged, updated, and "
+                    "left unsupported teardown visibly waiting."
+                )
+            else:
+                print("Acceptance passed: unpartitioned preview applied, converged, updated, and deleted child-first.")
         return
 
     first_heads = run_promotion_story(provider, delivery, remote=remote)

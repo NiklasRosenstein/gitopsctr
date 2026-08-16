@@ -10,7 +10,14 @@ from jsonschema import Draft202012Validator, ValidationError
 from referencing import Registry, Resource
 
 from gitopsctr import controller, schemas
-from gitopsctr.contracts import CORE_CONTRACTS, ContractError, DesiredSource, MaterializationDocument
+from gitopsctr.contracts import (
+    CORE_CONTRACTS,
+    INSPECTION_RESOURCE_LIST_CONTRACT,
+    AuthoredSource,
+    ContractError,
+    DesiredSource,
+    MaterializationDocument,
+)
 from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import DriverError, MaterializationCapability, UnitResolutionContext
 from gitopsctr.errors import ReferenceUnavailable
@@ -119,6 +126,26 @@ def test_source_schema_describes_repository_relative_path_semantics():
     assert "relative to source.path" in source["properties"]["inputs"]["description"]
 
 
+def test_exact_source_revision_is_supported_by_runtime_and_json_schema():
+    contract = UNIT_DRIVERS["terraform"].unit_contract
+    valid = {"source": {"path": ".", "revision": REVISION}}
+    contract.validate(valid)
+    Draft202012Validator(contract.json_schema()).validate({**valid, "terraform": {}})
+
+    invalid = {"source": {"path": ".", "revision": "not-a-commit"}}
+    with pytest.raises(ContractError):
+        contract.validate(invalid)
+    with pytest.raises(ValidationError):
+        Draft202012Validator(contract.json_schema()).validate({**invalid, "terraform": {}})
+
+    with pytest.raises(ValueError, match="exact lowercase 40-hex"):
+        AuthoredSource(path=".", revision="main")
+    with pytest.raises(ValueError, match="exact lowercase 40-hex"):
+        DesiredSource(path=".", revision="main")
+    with pytest.raises(TypeError):
+        DesiredSource(path=".")  # type: ignore[call-arg]
+
+
 def test_template_schema_accepts_integer_values():
     document = {
         "source": {"path": "."},
@@ -157,6 +184,41 @@ def test_resource_contracts_use_api_version_instead_of_envelope_schema_field():
             assert "schema" not in contract.json_schema().get("properties", {})
     for contract in CORE_CONTRACTS.values():
         assert "schema" not in contract.json_schema().get("properties", {})
+
+
+def test_inspection_resource_list_has_a_strict_generated_contract():
+    document = {
+        "apiVersion": "inspection.gitopsctr.io/v1",
+        "kind": "ResourceList",
+        "metadata": {},
+        "items": [
+            {
+                "provenance": {
+                    "environment": "dev",
+                    "plane": "observed",
+                    "ref": "gitopsctr/observed/dev",
+                    "revision": REVISION,
+                    "path": "artifacts/images/containers.yaml",
+                },
+                "address": {
+                    "family": "artifact",
+                    "scope": "environment",
+                    "namespace": "dev",
+                    "qualifiedName": "images/containers",
+                },
+                "document": {"apiVersion": "artifact.gitopsctr.io/v1", "kind": "ContainerImages"},
+                "inspection": {"authentication": "CURRENT"},
+            }
+        ],
+    }
+    assert INSPECTION_RESOURCE_LIST_CONTRACT.validate(document) == document
+    with pytest.raises(ContractError):
+        INSPECTION_RESOURCE_LIST_CONTRACT.validate(
+            {
+                **document,
+                "items": [{**document["items"][0], "inspection": {"authentication": "UNKNOWN"}}],
+            }
+        )
 
 
 RESULTS = {
@@ -252,37 +314,213 @@ def test_generated_desired_schema_rejects_explicit_null_metadata(field):
         Draft202012Validator(schema).validate(document)
 
 
-def test_generated_desired_schema_rejects_lifecycle_and_invalid_partition_metadata():
+def test_generated_desired_schema_rejects_invalid_partition_metadata():
     authored = authored_examples()[0]
     desired = desired_example(authored)
     document = controller.serialize_unit_document(desired, profile="desired")
     schema = next(schema for schema in schemas.schema_documents().values() if schema.get("$id") == document["$schema"])
 
-    document["metadata"]["lifecycle"] = {"management": {"mode": "sourceTracked"}}
-    with pytest.raises(ValidationError):
-        Draft202012Validator(schema).validate(document)
-
-    document["metadata"].pop("lifecycle")
     document["metadata"]["labels"] = {"gitopsctr.io/partition": "Not Valid"}
     with pytest.raises(ValidationError):
         Draft202012Validator(schema).validate(document)
 
 
-def test_desired_stack_template_schema_exposes_resolved_source_fields():
+def test_desired_stack_template_schema_exposes_direct_input_contract():
     schema = schemas.core_resource_schema("StackTemplate", "desired")
     spec = schema["properties"]["spec"]
 
-    assert "requestedSource" in spec["properties"]
-    assert "resolvedSource" in spec["properties"]
+    assert "contentDigest" in spec["properties"]
+    assert "acquisition" in spec["properties"]
+    assert "sourceContext" in spec["properties"]
+    assert "requestedSource" not in spec["properties"]
+    assert "resolvedSource" not in spec["properties"]
     assert "unitTemplates" in spec["properties"]
     assert "resources" not in spec["properties"]
+    assert set(spec["required"]) >= {"parameters", "unitTemplates", "contentDigest", "acquisition"}
+    acquisition = spec["properties"]["acquisition"]
+    assert set(acquisition["required"]) == {"documentDigest", "requestedSource", "resolvedSource"}
+    assert "fromInput" not in acquisition["properties"]
+
+
+def test_desired_stack_template_schema_requires_non_null_git_source_context():
+    schema = schemas.core_resource_schema("StackTemplate", "desired")
+    document = {
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "StackTemplate",
+        "metadata": {"name": "application", "uid": "template-uid"},
+        "spec": {
+            "parameters": [],
+            "unitTemplates": {
+                "app": {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "spec": {},
+                }
+            },
+            "contentDigest": DIGEST,
+            "acquisition": {
+                "documentDigest": DIGEST,
+                "requestedSource": {
+                    "fromGit": {
+                        "repository": "https://example.invalid/templates.git",
+                        "revision": "main",
+                        "path": "templates/application.yaml",
+                    }
+                },
+                "resolvedSource": {
+                    "fromGit": {
+                        "repository": "https://example.invalid/templates.git",
+                        "revision": "a" * 40,
+                        "path": "templates/application.yaml",
+                    }
+                },
+            },
+            "sourceContext": None,
+        },
+    }
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
+
+
+@pytest.mark.parametrize(
+    ("kind", "source", "parameters", "requires_context"),
+    [
+        ("Terraform", None, [], False),
+        ("FrontendS3Cloudfront", None, [], False),
+        ("Terraform", {"path": "."}, [], True),
+        ("Terraform", {"fromParameter": {"name": "source"}}, [{"name": "source", "type": "object"}], True),
+        (
+            "Terraform",
+            {"path": {"fromParameter": {"name": "source"}}},
+            [{"name": "source", "type": "string"}],
+            True,
+        ),
+    ],
+)
+def test_desired_stack_template_schema_source_context_matrix(
+    kind: str, source: object, parameters: list[dict[str, str]], requires_context: bool
+):
+    schema = schemas.core_resource_schema("StackTemplate", "desired")
+    document = {
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "StackTemplate",
+        "metadata": {"name": "application", "uid": "template-uid"},
+        "spec": {
+            "parameters": parameters,
+            "unitTemplates": {
+                "app": {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": kind,
+                    "spec": {"source": source},
+                }
+            },
+            "contentDigest": DIGEST,
+            "acquisition": {
+                "documentDigest": DIGEST,
+                "requestedSource": {"fromInput": {}},
+                "resolvedSource": {"fromInput": {}},
+            },
+        },
+    }
+
+    validator = Draft202012Validator(schema)
+    if requires_context:
+        with pytest.raises(ValidationError):
+            validator.validate(document)
+        document["spec"]["sourceContext"] = {"repository": ".", "revision": "a" * 40}
+    Draft202012Validator(schema).validate(document)
 
 
 def test_authored_stack_template_schema_exposes_only_canonical_unit_templates():
     spec = schemas.core_resource_schema("StackTemplate", "authored")["properties"]["spec"]
+    inline = next(variant for variant in spec["anyOf"] if "unitTemplates" in variant.get("properties", {}))
 
-    assert "unitTemplates" in spec["properties"]
-    assert "resources" not in spec["properties"]
+    assert "unitTemplates" in inline["properties"]
+    assert "resources" not in inline["properties"]
+
+
+@pytest.mark.parametrize(
+    ("schema_kind", "profile", "mutation"),
+    [
+        ("StackTemplate", "desired", lambda spec: spec.update(requestedSource={"fromGit": {"path": "."}})),
+        ("Stack", "authored", lambda spec: spec.update(template={"fromResource": {"name": "application"}})),
+        ("Stack", "authored", lambda spec: spec.update(template={"fromGit": {"path": "."}})),
+        ("StackTemplate", "authored", lambda spec: spec.update(fromPromotion={"name": "application"})),
+    ],
+)
+def test_stack_schemas_reject_unsupported_acquisition_shapes(schema_kind, profile, mutation):
+    if schema_kind == "StackTemplate":
+        spec = {
+            "parameters": [],
+            "unitTemplates": {
+                "app": {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "spec": {},
+                }
+            },
+        }
+        if profile == "desired":
+            spec.update(
+                contentDigest=DIGEST,
+                acquisition={
+                    "documentDigest": DIGEST,
+                    "requestedSource": {"fromInput": {}},
+                    "resolvedSource": {"fromInput": {}},
+                },
+            )
+        document = {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "StackTemplate",
+            "metadata": {"name": "application", **({"uid": "template-uid"} if profile == "desired" else {})},
+            "spec": spec,
+        }
+    else:
+        document = {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Stack",
+            "metadata": {"name": "application"},
+            "spec": {"template": "application"},
+        }
+    mutation(document["spec"])
+    schema = schemas.core_resource_schema(schema_kind, profile)
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
+
+
+def test_desired_stack_template_schema_rejects_mismatched_acquisition_modes():
+    document = {
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "StackTemplate",
+        "metadata": {"name": "preview", "uid": "template-uid"},
+        "spec": {
+            "parameters": [],
+            "unitTemplates": {
+                "app": {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "spec": {},
+                }
+            },
+            "contentDigest": DIGEST,
+            "acquisition": {
+                "documentDigest": DIGEST,
+                "requestedSource": {"fromInput": {}},
+                "resolvedSource": {"fromInput": {}},
+            },
+        },
+    }
+    document["spec"]["acquisition"]["resolvedSource"] = {
+        "fromGit": {
+            "repository": "https://example.invalid/templates.git",
+            "revision": "a" * 40,
+            "path": "templates/web.yaml",
+        }
+    }
+    schema = schemas.core_resource_schema("StackTemplate", "desired")
+
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
 
 
 def test_schema_catalog_is_deterministic_checkable_and_prunes_obsolete_schemas(tmp_path):

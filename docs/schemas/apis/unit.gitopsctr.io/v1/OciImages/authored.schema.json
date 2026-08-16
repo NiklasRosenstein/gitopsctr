@@ -185,6 +185,19 @@
             "path": {
               "description": "Repository-relative path resolved from the root of the selected source revision.",
               "type": "string"
+            },
+            "revision": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{40}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Optional exact lowercase Git commit intent. Stack projections inherit the StackTemplate source context when this is omitted."
             }
           },
           "required": [

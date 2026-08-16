@@ -10,6 +10,7 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Protocol, cast, runtime_checkable
+from urllib.parse import urlsplit, urlunsplit
 
 from gitopsctr.api import GVK, ApiKind
 from gitopsctr.document import ContractError, JsonObject, JsonValue, TypedDocumentContract, require_json_value
@@ -31,6 +32,125 @@ class ResourceScope(StrEnum):
     ENVIRONMENT = "environment"
 
 
+@dataclass(frozen=True)
+class IdentitySegmentDefinition:
+    """One named segment in a family-local resource identity."""
+
+    name: str
+    filter_option: str | None = None
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[a-z][a-z0-9-]*", self.name) is None:
+            raise ResourceModelError(f"invalid resource identity segment {self.name!r}")
+        if self.filter_option is not None and re.fullmatch(r"--[a-z][a-z0-9-]*", self.filter_option) is None:
+            raise ResourceModelError(f"invalid resource identity filter option {self.filter_option!r}")
+
+    @property
+    def option_destination(self) -> str | None:
+        return self.filter_option[2:].replace("-", "_") if self.filter_option is not None else None
+
+
+@dataclass(frozen=True)
+class LocalResourceIdentity:
+    """Validated family-local identity values in registry-declared segment order."""
+
+    values: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class IdentityConstraint:
+    """Allowed values for one named family-local identity segment."""
+
+    segment: str
+    values: frozenset[str]
+
+    def __post_init__(self) -> None:
+        if any(not value or "/" in value for value in self.values):
+            raise ResourceModelError(f"identity constraint {self.segment!r} requires safe values")
+
+
+@dataclass(frozen=True)
+class ResourceSelection:
+    """Generic exact or segment-constrained family-local resource selection."""
+
+    exact: LocalResourceIdentity | None = None
+    constraints: tuple[IdentityConstraint, ...] = ()
+
+    @classmethod
+    def segment(cls, name: str, values: frozenset[str]) -> ResourceSelection:
+        return cls(constraints=(IdentityConstraint(name, values),))
+
+    def values_for(self, segment: str) -> frozenset[str] | None:
+        values = tuple(item.values for item in self.constraints if item.segment == segment)
+        if len(values) > 1:
+            raise ResourceModelError(f"resource selection repeats identity segment {segment!r}")
+        return values[0] if values else None
+
+
+@dataclass(frozen=True)
+class ResourceIdentityDefinition:
+    """Parse, render, and match one resource family's local identities."""
+
+    segments: tuple[IdentitySegmentDefinition, ...] = (IdentitySegmentDefinition("name"),)
+    separator: str = "/"
+
+    def __post_init__(self) -> None:
+        names = tuple(segment.name for segment in self.segments)
+        if not names or len(set(names)) != len(names) or names[-1] != "name":
+            raise ResourceModelError("resource identity segments must be unique, non-empty, and end with 'name'")
+        if not self.separator:
+            raise ResourceModelError("resource identity separator must not be empty")
+
+    def build(self, values: tuple[str, ...]) -> LocalResourceIdentity:
+        if len(values) != len(self.segments):
+            raise ResourceModelError(
+                f"resource identity requires {len(self.segments)} segments, received {len(values)}"
+            )
+        if any(not value or self.separator in value for value in values):
+            raise ResourceModelError("resource identity values must be non-empty and must not contain the separator")
+        return LocalResourceIdentity(values)
+
+    def from_name(self, name: str, qualifiers: tuple[str, ...] = ()) -> LocalResourceIdentity:
+        return self.build((*qualifiers, name))
+
+    def parse(self, value: str) -> LocalResourceIdentity:
+        return self.build(tuple(value.split(self.separator)))
+
+    def render(self, identity: LocalResourceIdentity) -> str:
+        return self.separator.join(self.build(identity.values).values)
+
+    def value(self, identity: LocalResourceIdentity, segment: str) -> str:
+        try:
+            index = tuple(item.name for item in self.segments).index(segment)
+        except ValueError as exc:
+            raise ResourceModelError(f"resource identity has no segment {segment!r}") from exc
+        return self.build(identity.values).values[index]
+
+    def matches(self, identity: LocalResourceIdentity, selection: ResourceSelection | None) -> bool:
+        identity = self.build(identity.values)
+        if selection is None:
+            return True
+        if selection.exact is not None and identity != self.build(selection.exact.values):
+            return False
+        segment_names = {item.name for item in self.segments}
+        for constraint in selection.constraints:
+            if constraint.segment not in segment_names:
+                raise ResourceModelError(f"resource identity has no segment {constraint.segment!r}")
+            if self.value(identity, constraint.segment) not in constraint.values:
+                return False
+        return True
+
+
+@dataclass(frozen=True)
+class ResourceAddress:
+    """Complete inventory address: family, placement scope, and local identity."""
+
+    family: str
+    scope: ResourceScope
+    namespace: str | None
+    local_identity: LocalResourceIdentity
+
+
 @runtime_checkable
 class InspectionRecord(Protocol):
     """Persisted-record surface available to registry-owned presenters."""
@@ -45,16 +165,43 @@ class InspectionRecord(Protocol):
     def name(self) -> str: ...
 
     @property
+    def qualified_name(self) -> str: ...
+
+    @property
     def blob_id(self) -> str | None: ...
+
+
+@dataclass(frozen=True)
+class EnvironmentInspectionSummary:
+    """Named registry-presenter inputs for one environment namespace."""
+
+    desired_ref: str
+    desired_revision: str | None
+    observed_ref: str
+    observed_revision: str | None
+    reconciliation: str
+
+
+@dataclass(frozen=True)
+class StackInspectionSummary:
+    """Relationship-derived facts for one Stack or StackTemplate table row."""
+
+    template_name: str | None = None
+    template_uid: str | None = None
+    template_digest: str | None = None
+    references: tuple[str, ...] = ()
+    child_observations: tuple[str, ...] = ()
 
 
 @runtime_checkable
 class InspectionRuntime(Protocol):
     """Inventory services available to registry-owned presenters."""
 
-    def environment_summary(self, environment: str) -> tuple[str, str | None, str, str | None, str]: ...
+    def environment_summary(self, environment: str) -> EnvironmentInspectionSummary: ...
 
     def resource_partition(self, record: InspectionRecord) -> str | None: ...
+
+    def stack_inspection_summary(self, record: InspectionRecord) -> StackInspectionSummary: ...
 
 
 @runtime_checkable
@@ -69,8 +216,28 @@ class InspectionPresenter(Protocol):
     ) -> tuple[str, ...]: ...
 
 
+@runtime_checkable
+class WideInspectionPresenter(Protocol):
+    """Optional expanded table presenter for one inspectable resource family."""
+
+    def wide_row(
+        self,
+        record: InspectionRecord,
+        relationship: object | None,
+        runtime: InspectionRuntime,
+    ) -> tuple[str, ...]: ...
+
+
 class ObservationCardinality(StrEnum):
     ZERO_OR_ONE = "zero-or-one"
+
+
+class InspectionRelationshipRole(StrEnum):
+    """A family's role in its registry-owned inspection relationship traversal."""
+
+    SUBJECT = "subject"
+    OBSERVER = "observer"
+    DESCRIBED_RESOURCE = "described-resource"
 
 
 class ObservationState(StrEnum):
@@ -329,6 +496,149 @@ def _short_revision(value: object) -> str:
     return value[:12] if isinstance(value, str) and value else "-"
 
 
+def _short_digest(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return "-"
+    return value if len(value) <= 19 else f"{value[:19]}..."
+
+
+def _digest(value: object) -> str:
+    return value if isinstance(value, str) and value else "-"
+
+
+def _credential_free_repository(value: object) -> str:
+    """Return a repository identifier without URL userinfo or credentials."""
+
+    if not isinstance(value, str) or not value:
+        return "-"
+    try:
+        parsed = urlsplit(value)
+        if parsed.netloc:
+            hostname = parsed.hostname or ""
+            if ":" in hostname and not hostname.startswith("["):
+                hostname = f"[{hostname}]"
+            netloc = hostname
+            if parsed.port is not None:
+                netloc = f"{netloc}:{parsed.port}"
+            return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    except ValueError:
+        pass
+    # Also cover scp-like repository identifiers such as user@host:path.
+    return value.rsplit("@", 1)[-1]
+
+
+def _deletion_state(metadata: Mapping[str, JsonValue]) -> str:
+    deletion = _mapping_field(metadata, "deletion")
+    if not deletion:
+        return "ACTIVE"
+    generation = deletion.get("generation")
+    return f"DELETING(generation={generation})" if generation is not None else "DELETING"
+
+
+def _acquisition(specification: Mapping[str, JsonValue]) -> str:
+    acquisition = _mapping_field(specification, "acquisition")
+    requested = _mapping_field(acquisition, "requestedSource")
+    resolved = _mapping_field(acquisition, "resolvedSource")
+    document_digest = _digest(acquisition.get("documentDigest"))
+
+    requested_mode = next(iter(requested), None)
+    resolved_mode = next(iter(resolved), None)
+    mode_names = {"fromInput": "input", "fromGit": "git", "fromPromotion": "promotion"}
+    mode = mode_names.get(requested_mode, requested_mode or mode_names.get(resolved_mode, resolved_mode or "-"))
+    if mode == "input":
+        return f"input(document={document_digest})"
+
+    if mode == "git":
+        requested_git = _mapping_field(requested, "fromGit")
+        resolved_git = _mapping_field(resolved, "fromGit")
+        repository = _credential_free_repository(resolved_git.get("repository", requested_git.get("repository")))
+        requested_revision = requested_git.get("revision", "-")
+        resolved_revision = resolved_git.get("revision", "-")
+        path = resolved_git.get("path", requested_git.get("path", "-"))
+        return (
+            f"git(repository={repository};requested={requested_revision};resolved={resolved_revision};"
+            f"path={path};document={document_digest})"
+        )
+
+    if mode == "promotion":
+        requested_promotion = _mapping_field(requested, "fromPromotion")
+        resolved_promotion = _mapping_field(resolved, "fromPromotion")
+        requested_stack = requested_promotion.get("stack", "-")
+        resolved_source = "/".join(
+            str(value)
+            for value in (
+                resolved_promotion.get("environment", "-"),
+                resolved_promotion.get("desiredRef", "-"),
+            )
+        )
+        resolved_revision = resolved_promotion.get("desiredRevision", "-")
+        template = resolved_promotion.get("template", "-")
+        template_uid = resolved_promotion.get("templateUid", "-")
+        return (
+            f"promotion(requested={requested_stack};resolved={resolved_source}@{resolved_revision};"
+            f"template={template}@{template_uid};document={document_digest})"
+        )
+
+    return f"{mode}(document={document_digest})"
+
+
+def _source_context(specification: Mapping[str, JsonValue], *, short_revision: bool = False) -> str:
+    context = _mapping_field(specification, "sourceContext")
+    if not context:
+        return "-"
+    repository = _credential_free_repository(context.get("repository"))
+    revision = context.get("revision", "-")
+    if short_revision:
+        revision = _short_revision(revision)
+    return f"{repository}@{revision}"
+
+
+def _projection_topology(projection: Mapping[str, JsonValue]) -> str:
+    units = projection.get("units")
+    if not isinstance(units, dict):
+        return "-"
+    topology: list[str] = []
+    for logical_name, value in sorted(units.items()):
+        unit = value if isinstance(value, dict) else {}
+        dependencies = unit.get("dependsOn")
+        dependency_names = (
+            ",".join(str(item) for item in dependencies) if isinstance(dependencies, list) and dependencies else "-"
+        )
+        topology.append(f"{logical_name}<-{dependency_names}")
+    return ";".join(topology) or "-"
+
+
+def _projection_summary(projection: object, *, active: bool) -> str:
+    value = projection if isinstance(projection, dict) else {}
+    if not value:
+        return "-"
+    identity = value if active else _mapping_field(value, "identity")
+    digest = identity.get("projectionDigest")
+    context_digest = identity.get("projectionContextDigest")
+    if active:
+        prefix = f"projection={_short_digest(digest)} source={_short_digest(identity.get('sourceProjectionDigest'))}"
+    else:
+        prefix = f"projection={_short_digest(digest)}"
+    units = value.get("units")
+    rendered_units: list[str] = []
+    if isinstance(units, dict):
+        for logical_name, item in sorted(units.items()):
+            unit = item if isinstance(item, dict) else {}
+            if active:
+                rendered_units.append(
+                    f"{logical_name}:{unit.get('name', '-')}@{_short_digest(unit.get('desiredDigest'))}"
+                )
+            else:
+                rendered_units.append(f"{logical_name}:{unit.get('kind', '-')}")
+    return f"{prefix} context={_short_digest(context_digest)} units={','.join(rendered_units) or '-'}"
+
+
+def _projection_unit_readiness(specification: Mapping[str, JsonValue]) -> str:
+    structural = _mapping_field(_mapping_field(specification, "structuralProjection"), "units")
+    active = _mapping_field(_mapping_field(specification, "activeProjection"), "units")
+    return f"{len(active)}/{len(structural)}"
+
+
 def _enum_value(value: object, description: str) -> str:
     candidate = getattr(value, "value", None)
     if not isinstance(candidate, str):
@@ -346,9 +656,12 @@ class EnvironmentInspectionPresenter:
         relationship: object | None,
         runtime: InspectionRuntime,
     ) -> tuple[str, ...]:
-        desired_ref, desired_revision, observed_ref, observed_revision, reconciliation = runtime.environment_summary(
-            record.name
-        )
+        summary = runtime.environment_summary(record.name)
+        desired_ref = summary.desired_ref
+        desired_revision = summary.desired_revision
+        observed_ref = summary.observed_ref
+        observed_revision = summary.observed_revision
+        reconciliation = summary.reconciliation
         desired = f"{desired_ref}@{_short_revision(desired_revision)}" if desired_revision else f"{desired_ref}@missing"
         observed = (
             f"{observed_ref}@{_short_revision(observed_revision)}" if observed_revision else f"{observed_ref}@missing"
@@ -373,12 +686,20 @@ class UnitInspectionPresenter:
         reason = getattr(relationship, "reason", None)
         if not isinstance(reason, str):
             raise ResourceModelError(f"Unit {record.name!r} has no reconciliation reason")
-        return record.name, record.gvk.kind, _short_revision(record.blob_id), observation, reconciliation, reason
+        return (
+            record.name,
+            record.gvk.kind,
+            runtime.resource_partition(record) or "-",
+            _short_revision(record.blob_id),
+            observation,
+            reconciliation,
+            reason,
+        )
 
 
 @dataclass(frozen=True)
 class StackInspectionPresenter:
-    """Present desired Stack selection, partition, and projection size."""
+    """Present desired Stack identity fences, projections, and child observation."""
 
     def row(
         self,
@@ -388,30 +709,47 @@ class StackInspectionPresenter:
     ) -> tuple[str, ...]:
         metadata = _mapping_field(record.document, "metadata")
         specification = _mapping_field(record.document, "spec")
-        template = specification.get("template")
-        if isinstance(template, str):
-            template_name = template
-        elif isinstance(template, dict) and isinstance(template.get("name"), str):
-            template_name = cast(str, template["name"])
-        else:
-            template_name = "-"
-        projection = specification.get("resolvedProjection")
-        units = projection.get("units") if isinstance(projection, dict) else None
-        if not isinstance(units, (dict, list)):
-            units = specification.get("units")
-        unit_count = len(units) if isinstance(units, (dict, list)) else 0
+        summary = runtime.stack_inspection_summary(record)
         return (
             record.name,
-            template_name,
+            summary.template_name or "-",
+            _short_digest(summary.template_digest),
             runtime.resource_partition(record) or "-",
-            str(unit_count),
-            "DELETING" if metadata.get("deletion") is not None else "ACTIVE",
+            _projection_unit_readiness(specification),
+            ",".join(summary.child_observations) or "N/A",
+            _deletion_state(metadata),
+        )
+
+    def wide_row(
+        self,
+        record: InspectionRecord,
+        relationship: object | None,
+        runtime: InspectionRuntime,
+    ) -> tuple[str, ...]:
+        metadata = _mapping_field(record.document, "metadata")
+        specification = _mapping_field(record.document, "spec")
+        structural_projection = specification.get("structuralProjection")
+        if not isinstance(structural_projection, dict):
+            structural_projection = {}
+        summary = runtime.stack_inspection_summary(record)
+        return (
+            record.name,
+            str(metadata.get("uid", "-")),
+            summary.template_name or "-",
+            summary.template_uid or "-",
+            _digest(summary.template_digest),
+            runtime.resource_partition(record) or "-",
+            _projection_summary(structural_projection, active=False),
+            _projection_summary(specification.get("activeProjection"), active=True),
+            _projection_topology(structural_projection),
+            ",".join(summary.child_observations) or "N/A",
+            _deletion_state(metadata),
         )
 
 
 @dataclass(frozen=True)
 class StackTemplateInspectionPresenter:
-    """Present desired StackTemplate parameter and Unit counts."""
+    """Present desired StackTemplate provenance, partition, and references."""
 
     def row(
         self,
@@ -419,16 +757,44 @@ class StackTemplateInspectionPresenter:
         relationship: object | None,
         runtime: InspectionRuntime,
     ) -> tuple[str, ...]:
+        metadata = _mapping_field(record.document, "metadata")
         specification = _mapping_field(record.document, "spec")
         parameters = specification.get("parameters")
-        projection = specification.get("resolvedProjection")
-        units = specification.get("unitTemplates") or specification.get("resources")
-        if isinstance(projection, dict):
-            units = projection.get("units", units)
+        units = specification.get("unitTemplates")
+        summary = runtime.stack_inspection_summary(record)
         return (
             record.name,
+            _short_digest(specification.get("contentDigest")),
+            _source_context(specification, short_revision=True),
             str(len(parameters)) if isinstance(parameters, list) else "0",
             str(len(units)) if isinstance(units, (list, dict)) else "0",
+            runtime.resource_partition(record) or "-",
+            ",".join(summary.references) or "-",
+            _deletion_state(metadata),
+        )
+
+    def wide_row(
+        self,
+        record: InspectionRecord,
+        relationship: object | None,
+        runtime: InspectionRuntime,
+    ) -> tuple[str, ...]:
+        metadata = _mapping_field(record.document, "metadata")
+        specification = _mapping_field(record.document, "spec")
+        parameters = specification.get("parameters")
+        units = specification.get("unitTemplates")
+        summary = runtime.stack_inspection_summary(record)
+        return (
+            record.name,
+            str(metadata.get("uid", "-")),
+            _digest(specification.get("contentDigest")),
+            _acquisition(specification),
+            _source_context(specification),
+            str(len(parameters)) if isinstance(parameters, list) else "0",
+            str(len(units)) if isinstance(units, (list, dict)) else "0",
+            runtime.resource_partition(record) or "-",
+            ",".join(summary.references) or "-",
+            _deletion_state(metadata),
         )
 
 
@@ -448,6 +814,7 @@ class PromotionInspectionPresenter:
         return (
             record.name,
             environment if isinstance(environment, str) else "-",
+            runtime.resource_partition(record) or "-",
             _short_revision(source.get("desiredRevision")),
             _short_revision(source.get("observedRevision")),
             _short_revision(specification.get("specificationRevision")),
@@ -472,11 +839,36 @@ class ReceiptInspectionPresenter:
         artifact_count = getattr(relationship, "artifact_count", None)
         if not isinstance(artifact_count, int):
             raise ResourceModelError(f"Receipt {record.name!r} has no artifact descriptor count")
+        unit = getattr(relationship, "unit", None)
+        partition = runtime.resource_partition(unit) if isinstance(unit, InspectionRecord) else None
         return (
             record.name,
             kind if isinstance(kind, str) else "-",
+            partition or "-",
             _enum_value(getattr(relationship, "observation", None), "observation state"),
             str(artifact_count),
+        )
+
+
+@dataclass(frozen=True)
+class ArtifactInspectionPresenter:
+    """Present an Artifact with its authenticated producer lineage."""
+
+    def row(
+        self,
+        record: InspectionRecord,
+        relationship: object | None,
+        runtime: InspectionRuntime,
+    ) -> tuple[str, ...]:
+        if relationship is None:
+            raise ResourceModelError(f"Artifact {record.qualified_name!r} has no evaluated authentication state")
+        producer = getattr(relationship, "producer", None)
+        partition = runtime.resource_partition(producer) if isinstance(producer, InspectionRecord) else None
+        return (
+            record.qualified_name,
+            record.gvk.kind,
+            partition or "-",
+            _enum_value(getattr(relationship, "authentication", None), "authentication state"),
         )
 
 
@@ -489,6 +881,12 @@ class InspectionViewDefinition:
     presenter: InspectionPresenter
     observation: str | None = None
     artifact_description: str | None = None
+    relationship_role: InspectionRelationshipRole | None = None
+    wide_columns: tuple[str, ...] | None = None
+    include_in_all: bool = True
+
+    def columns_for(self, *, wide: bool) -> tuple[str, ...]:
+        return self.wide_columns if wide and self.wide_columns is not None else self.columns
 
 
 @dataclass(frozen=True)
@@ -503,6 +901,7 @@ class ResourceFamilyDefinition:
     aliases: tuple[str, ...] = ()
     inspection: InspectionViewDefinition | None = None
     namespace_boundary: bool = False
+    identity: ResourceIdentityDefinition = field(default_factory=ResourceIdentityDefinition)
 
     @property
     def selectors(self) -> tuple[str, ...]:
@@ -522,8 +921,7 @@ class CollectionReadContext:
     api_kinds: Mapping[GVK, ApiKind[object]]
     contracts: Mapping[GVK, TypedDocumentContract[Any]]
     blob_ids: Mapping[PurePosixPath, str] = field(default_factory=dict)
-    names: frozenset[str] | None = None
-    producer_names: frozenset[str] | None = None
+    selection: ResourceSelection | None = None
 
 
 @dataclass(frozen=True)
@@ -538,7 +936,7 @@ class DiscoveredResource:
     blob_id: str | None
     content_digest: str
     media_type: str | None
-    identity_qualifier: tuple[str, ...] = ()
+    local_identity: LocalResourceIdentity
 
 
 @runtime_checkable
@@ -553,6 +951,19 @@ class FilesystemCollectionProvider:
     layout: CollectionLayout
     media_typed: bool = False
 
+    @staticmethod
+    def _selected_values(context: CollectionReadContext, segment: str) -> frozenset[str] | None:
+        if segment not in {item.name for item in context.family.identity.segments}:
+            return None
+        if context.selection is None:
+            return None
+        constrained = context.selection.values_for(segment)
+        if constrained is not None:
+            return constrained
+        if context.selection.exact is None:
+            return None
+        return frozenset((context.family.identity.value(context.selection.exact, segment),))
+
     def _directories(self, context: CollectionReadContext) -> tuple[Path, ...]:
         if self.layout is CollectionLayout.PROJECT:
             return ()
@@ -565,7 +976,11 @@ class FilesystemCollectionProvider:
                     sorted(
                         path
                         for path in base.iterdir()
-                        if path.is_dir() and (context.names is None or path.name in context.names)
+                        if path.is_dir()
+                        and (
+                            self._selected_values(context, "name") is None
+                            or path.name in cast(frozenset[str], self._selected_values(context, "name"))
+                        )
                     )
                 )
                 if base.is_dir()
@@ -622,12 +1037,14 @@ class FilesystemCollectionProvider:
             for directory in self._directories(context)
             for path in self._document_files(directory, recursive=recursive)
         )
-        if self.layout is CollectionLayout.OBSERVED_ARTIFACTS and context.producer_names is not None:
+        producer_names = self._selected_values(context, "producer")
+        selected_names = self._selected_values(context, "name")
+        if self.layout is CollectionLayout.OBSERVED_ARTIFACTS and producer_names is not None:
             paths = tuple(
                 path
                 for path in paths
                 if len(path.relative_to(context.root).parts) == 3
-                and path.relative_to(context.root).parts[1] in context.producer_names
+                and path.relative_to(context.root).parts[1] in producer_names
             )
         elif (
             self.layout
@@ -636,9 +1053,9 @@ class FilesystemCollectionProvider:
                 CollectionLayout.ENVIRONMENTS,
                 CollectionLayout.DESIRED_PROMOTION,
             }
-            and context.names is not None
+            and selected_names is not None
         ):
-            paths = tuple(path for path in paths if path.stem in context.names)
+            paths = tuple(path for path in paths if path.stem in selected_names)
         return paths
 
     @staticmethod
@@ -677,6 +1094,9 @@ class FilesystemCollectionProvider:
                 raise ResourceModelError(f"invalid {context.placement.plane} resource {path}: {exc}") from exc
             relative = PurePosixPath(path.relative_to(context.root).as_posix())
             identity_qualifier = self._validate_canonical_identity(context, path, relative, document, name)
+            local_identity = context.family.identity.from_name(name, identity_qualifier)
+            if not context.family.identity.matches(local_identity, context.selection):
+                continue
             try:
                 raw = path.read_bytes()
             except OSError as exc:
@@ -700,7 +1120,7 @@ class FilesystemCollectionProvider:
                 context.blob_ids.get(relative),
                 "sha256:" + hashlib.sha256(raw).hexdigest(),
                 media_type,
-                identity_qualifier,
+                local_identity,
             )
 
     def _validate_canonical_identity(
@@ -761,7 +1181,7 @@ class FilesystemCollectionProvider:
                 raise ResourceModelError(
                     f"Artifact producer name {values[2]!r} in {path} must match directory {producer_name!r}"
                 )
-            return cast(tuple[str, str, str], values)
+            return (producer_name,)
 
         # Project and Promotion have fixed collection-owned filenames; their
         # semantic identities are validated by their executable contracts.
@@ -801,6 +1221,120 @@ class RelationshipResource:
     blob_id: str | None = None
     content_digest: str | None = None
     media_type: str | None = None
+
+
+@runtime_checkable
+class ResourceGraphBinding(Protocol):
+    """Executable identity fence for a desired resource relationship."""
+
+    def validate(self, source: object, target: object) -> None: ...
+
+    def documentation(self) -> tuple[str, ...]: ...
+
+
+@dataclass(frozen=True)
+class StackTemplateSelectionBinding:
+    """Fence a Stack's selected StackTemplate by name, UID, and content digest."""
+
+    def validate(self, source: object, target: object) -> None:
+        from gitopsctr.contracts import DesiredStackSpec, DesiredStackTemplateSpec
+        from gitopsctr.resources import StackResource
+
+        if not isinstance(source, StackResource) or not isinstance(target, StackResource):
+            raise ResourceModelError("StackTemplate selection binding requires Stack resources")
+        if target.gvk != GVK("gitopsctr.io/v1", "StackTemplate") or source.gvk != GVK("gitopsctr.io/v1", "Stack"):
+            raise ResourceModelError("StackTemplate selection binding has the wrong resource kinds")
+        if not isinstance(source.spec, DesiredStackSpec):
+            raise ResourceModelError(f"Stack {source.name!r} has an invalid specification")
+        reference = source.spec.templateRef
+        if reference.name != target.name:
+            raise ResourceModelError(f"Stack {source.name!r} references a different StackTemplate name")
+        if target.metadata.uid != reference.uid:
+            raise ResourceModelError(f"Stack {source.name!r} StackTemplate reference has a different UID")
+        if not isinstance(target.spec, DesiredStackTemplateSpec):
+            raise ResourceModelError(f"StackTemplate {target.name!r} is not a desired StackTemplate")
+        actual_digest = target.spec.contentDigest
+        if actual_digest != reference.contentDigest:
+            raise ResourceModelError(f"Stack {source.name!r} StackTemplate reference has a different content digest")
+        identity = source.spec.structuralProjection.identity
+        if source.metadata.uid != identity.stackUid:
+            raise ResourceModelError(f"Stack {source.name!r} projection is fenced to a different Stack UID")
+        if target.metadata.uid != identity.templateUid:
+            raise ResourceModelError(f"Stack {source.name!r} projection is fenced to a different StackTemplate UID")
+        if actual_digest != identity.templateContentDigest:
+            raise ResourceModelError(
+                f"Stack {source.name!r} projection is fenced to a different StackTemplate content digest"
+            )
+
+    def documentation(self) -> tuple[str, ...]:
+        return (
+            "Stack.apiVersion",
+            "Stack.kind",
+            "Stack.metadata.name",
+            "Stack.metadata.uid",
+            "Stack.spec.templateRef.name",
+            "Stack.spec.templateRef.uid",
+            "Stack.spec.templateRef.contentDigest",
+            "Stack.spec.structuralProjection.identity.stackUid",
+            "Stack.spec.structuralProjection.identity.templateUid",
+            "Stack.spec.structuralProjection.identity.templateContentDigest",
+            "StackTemplate.apiVersion",
+            "StackTemplate.kind",
+            "StackTemplate.metadata.name",
+            "StackTemplate.metadata.uid",
+            "StackTemplate.spec.contentDigest",
+        )
+
+
+@dataclass(frozen=True)
+class StackOwnedUnitBinding:
+    """Validate that a desired Unit is owned by the exact desired Stack UID."""
+
+    def validate(self, source: object, target: object) -> None:
+        from gitopsctr.resources import StackResource, UnitResource
+
+        if not isinstance(source, StackResource) or source.gvk != GVK("gitopsctr.io/v1", "Stack"):
+            raise ResourceModelError("Stack ownership binding requires a Stack source")
+        if not isinstance(target, UnitResource):
+            raise ResourceModelError("Stack ownership binding requires a Unit target")
+        references = target.metadata.ownerReferences
+        if references is None or len(references) != 1:
+            raise ResourceModelError(f"Unit {target.name!r} is not owned by a Stack")
+        owner = references[0]
+        if source.metadata.uid is None:
+            raise ResourceModelError(f"Stack {source.name!r} has no UID for ownership binding")
+        expected = (source.gvk.api_version, source.gvk.kind, source.name, source.metadata.uid)
+        if (owner.apiVersion, owner.kind, owner.name, owner.uid) != expected:
+            raise ResourceModelError(f"Unit {target.name!r} is owned by a different Stack UID")
+
+    def documentation(self) -> tuple[str, ...]:
+        return (
+            "Stack.apiVersion",
+            "Stack.kind",
+            "Stack.metadata.name",
+            "Stack.metadata.uid",
+            "Unit.apiVersion",
+            "Unit.kind",
+            "Unit.metadata.name",
+            "Unit.metadata.ownerReferences[0].apiVersion",
+            "Unit.metadata.ownerReferences[0].kind",
+            "Unit.metadata.ownerReferences[0].name",
+            "Unit.metadata.ownerReferences[0].uid",
+        )
+
+
+@dataclass(frozen=True)
+class ResourceGraphRelationship:
+    """A registry-owned relationship between independently stored resources."""
+
+    name: str
+    source_family: str
+    source_plane: ResourcePlane
+    target_family: str
+    target_plane: ResourcePlane
+    source_gvk: GVK | None
+    target_gvk: GVK | None
+    binding: ResourceGraphBinding
 
 
 @dataclass(frozen=True)
@@ -1081,6 +1615,7 @@ class ArtifactDescriptionDefinition:
     producer_family: str
     producer_plane: ResourcePlane
     binding: ArtifactDescriptionBinding
+    producer_identity_segment: str
 
 
 @dataclass(frozen=True)
@@ -1092,6 +1627,7 @@ class ResourceRegistry:
     families: tuple[ResourceFamilyDefinition, ...]
     observations: tuple[ObservationDefinition, ...] = ()
     artifact_descriptions: tuple[ArtifactDescriptionDefinition, ...] = ()
+    graph_relationships: tuple[ResourceGraphRelationship, ...] = ()
     _collections_by_name: Mapping[str, ResourceCollection] = field(init=False, repr=False)
     _families_by_name: Mapping[str, ResourceFamilyDefinition] = field(init=False, repr=False)
     _families_by_selector: Mapping[str, ResourceFamilyDefinition] = field(init=False, repr=False)
@@ -1133,6 +1669,9 @@ class ResourceRegistry:
         for description in self.artifact_descriptions:
             self._claim_relationship_name(description.name, relationship_names)
             self._validate_artifact_description(description, families)
+        for relationship in self.graph_relationships:
+            self._claim_relationship_name(relationship.name, relationship_names)
+            self._validate_graph_relationship(relationship, families)
         self._validate_inspection_relationships(families)
         artifact_outputs = self._validate_driver_artifact_outputs(family_by_gvk)
 
@@ -1221,6 +1760,17 @@ class ResourceRegistry:
                 raise ResourceModelError(f"resource family {family.name!r} inspection columns must be headings")
             if not isinstance(family.inspection.presenter, InspectionPresenter):
                 raise ResourceModelError(f"resource family {family.name!r} inspection has no executable presenter")
+            if family.inspection.wide_columns is not None:
+                if (
+                    not family.inspection.wide_columns
+                    or len(set(family.inspection.wide_columns)) != len(family.inspection.wide_columns)
+                    or any(not column or column.upper() != column for column in family.inspection.wide_columns)
+                ):
+                    raise ResourceModelError(f"resource family {family.name!r} has invalid wide inspection columns")
+                if not isinstance(family.inspection.presenter, WideInspectionPresenter):
+                    raise ResourceModelError(
+                        f"resource family {family.name!r} wide inspection has no executable presenter"
+                    )
             default = next(placement for placement in family.placements if placement.default_for_inspection)
             if family.inspection.default_plane is not default.plane:
                 raise ResourceModelError(
@@ -1294,6 +1844,35 @@ class ResourceRegistry:
             raise ResourceModelError(f"artifact description {definition.name!r} producer plane is not placed")
         if not isinstance(definition.binding, ArtifactDescriptionBinding):
             raise ResourceModelError(f"artifact description {definition.name!r} has no executable binding")
+        if definition.producer_identity_segment not in {segment.name for segment in artifact.identity.segments}:
+            raise ResourceModelError(
+                f"artifact description {definition.name!r} references an unknown Artifact identity segment"
+            )
+
+    def _validate_graph_relationship(
+        self, definition: ResourceGraphRelationship, families: Mapping[str, ResourceFamilyDefinition]
+    ) -> None:
+        source = families.get(definition.source_family)
+        target = families.get(definition.target_family)
+        if source is None or target is None:
+            raise ResourceModelError(f"graph relationship {definition.name!r} references an unknown family")
+        if not self._has_placement(source, definition.source_plane):
+            raise ResourceModelError(f"graph relationship {definition.name!r} source plane is not placed")
+        if not self._has_placement(target, definition.target_plane):
+            raise ResourceModelError(f"graph relationship {definition.name!r} target plane is not placed")
+        source_kind = self.api_kinds.get(definition.source_gvk) if definition.source_gvk is not None else None
+        target_kind = self.api_kinds.get(definition.target_gvk) if definition.target_gvk is not None else None
+        if definition.source_gvk is not None and source_kind is None:
+            raise ResourceModelError(f"graph relationship {definition.name!r} references an unknown source GVK")
+        if definition.target_gvk is not None and target_kind is None:
+            raise ResourceModelError(f"graph relationship {definition.name!r} references an unknown target GVK")
+        family_by_gvk, _ = self._resolve_api_membership(families)
+        if definition.source_gvk is not None and family_by_gvk.get(definition.source_gvk) is not source:
+            raise ResourceModelError(f"graph relationship {definition.name!r} source GVK is outside its family")
+        if definition.target_gvk is not None and family_by_gvk.get(definition.target_gvk) is not target:
+            raise ResourceModelError(f"graph relationship {definition.name!r} target GVK is outside its family")
+        if not isinstance(definition.binding, ResourceGraphBinding):
+            raise ResourceModelError(f"graph relationship {definition.name!r} has no executable binding")
 
     def _validate_inspection_relationships(self, families: Mapping[str, ResourceFamilyDefinition]) -> None:
         observations = {definition.name: definition for definition in self.observations}
@@ -1313,12 +1892,33 @@ class ResourceRegistry:
                     f"resource family {family.name!r} inspection references unknown artifact description "
                     f"{view.artifact_description!r}"
                 )
-            if observation is not None and (family.name, view.default_plane) not in {
-                (observation.observer_family, observation.observer_plane),
-                (observation.subject_family, observation.subject_plane),
-            }:
+            if (observation is None) != (view.relationship_role is None):
                 raise ResourceModelError(
-                    f"resource family {family.name!r} inspection observation {observation.name!r} "
+                    f"resource family {family.name!r} inspection observation and relationship role must be paired"
+                )
+            expected_role_member = {
+                InspectionRelationshipRole.SUBJECT: (
+                    observation.subject_family,
+                    observation.subject_plane,
+                )
+                if observation is not None
+                else None,
+                InspectionRelationshipRole.OBSERVER: (
+                    observation.observer_family,
+                    observation.observer_plane,
+                )
+                if observation is not None
+                else None,
+                InspectionRelationshipRole.DESCRIBED_RESOURCE: (
+                    description.artifact_family,
+                    description.artifact_plane,
+                )
+                if description is not None
+                else None,
+            }.get(view.relationship_role)
+            if view.relationship_role is not None and expected_role_member != (family.name, view.default_plane):
+                raise ResourceModelError(
+                    f"resource family {family.name!r} inspection role {view.relationship_role!r} "
                     "does not include its default representation"
                 )
             if description is not None and (family.name, view.default_plane) not in {
@@ -1436,6 +2036,12 @@ class ResourceRegistry:
         except StopIteration as exc:
             raise KeyError(f"unknown artifact-description relationship: {name!r}") from exc
 
+    def graph_relationship(self, name: str) -> ResourceGraphRelationship:
+        try:
+            return next(definition for definition in self.graph_relationships if definition.name == name)
+        except StopIteration as exc:
+            raise KeyError(f"unknown graph relationship: {name!r}") from exc
+
     def api_kinds_for_family(self, family: str) -> tuple[ApiKind[object], ...]:
         definition = self.family(family)
         return tuple(
@@ -1536,10 +2142,11 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             (UnitApiMembership(UnitDriver),),
             inspection=InspectionViewDefinition(
                 desired,
-                ("NAME", "KIND", "DESIRED", "OBSERVATION", "RECONCILIATION", "REASON"),
+                ("NAME", "KIND", "PARTITION", "DESIRED", "OBSERVATION", "RECONCILIATION", "REASON"),
                 UnitInspectionPresenter(),
                 observation="receipt-observes-unit",
                 artifact_description="receipt-describes-artifacts",
+                relationship_role=InspectionRelationshipRole.SUBJECT,
             ),
         ),
         ResourceFamilyDefinition(
@@ -1553,8 +2160,29 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             core("Stack"),
             inspection=InspectionViewDefinition(
                 desired,
-                ("NAME", "TEMPLATE", "PARTITION", "UNITS", "STATE"),
+                (
+                    "NAME",
+                    "TEMPLATE",
+                    "TEMPLATE-DIGEST",
+                    "PARTITION",
+                    "UNITS",
+                    "OBSERVATION",
+                    "STATE",
+                ),
                 StackInspectionPresenter(),
+                wide_columns=(
+                    "NAME",
+                    "UID",
+                    "TEMPLATE",
+                    "TEMPLATE-UID",
+                    "TEMPLATE-DIGEST",
+                    "PARTITION",
+                    "STRUCTURAL",
+                    "ACTIVE",
+                    "TOPOLOGY",
+                    "OBSERVATION",
+                    "STATE",
+                ),
             ),
         ),
         ResourceFamilyDefinition(
@@ -1568,8 +2196,29 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             core("StackTemplate"),
             inspection=InspectionViewDefinition(
                 desired,
-                ("NAME", "PARAMETERS", "UNITS"),
+                (
+                    "NAME",
+                    "CONTENT-DIGEST",
+                    "SOURCE",
+                    "PARAMETERS",
+                    "UNITS",
+                    "PARTITION",
+                    "REFERENCES",
+                    "STATE",
+                ),
                 StackTemplateInspectionPresenter(),
+                wide_columns=(
+                    "NAME",
+                    "UID",
+                    "CONTENT-DIGEST",
+                    "ACQUISITION",
+                    "SOURCE",
+                    "PARAMETERS",
+                    "UNITS",
+                    "PARTITION",
+                    "REFERENCES",
+                    "STATE",
+                ),
             ),
         ),
         ResourceFamilyDefinition(
@@ -1580,7 +2229,14 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             core("Promotion"),
             inspection=InspectionViewDefinition(
                 desired,
-                ("NAME", "SOURCE", "DESIRED-REVISION", "OBSERVED-REVISION", "SPECIFICATION-REVISION"),
+                (
+                    "NAME",
+                    "SOURCE",
+                    "PARTITION",
+                    "DESIRED-REVISION",
+                    "OBSERVED-REVISION",
+                    "SPECIFICATION-REVISION",
+                ),
                 PromotionInspectionPresenter(),
             ),
         ),
@@ -1592,18 +2248,33 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             (ReceiptApiMembership(GVK(CORE_API_VERSION, "Receipt"), CoreResourceApi, api_kinds),),
             inspection=InspectionViewDefinition(
                 observed,
-                ("NAME", "KIND", "OBSERVATION", "ARTIFACTS"),
+                ("NAME", "KIND", "PARTITION", "OBSERVATION", "ARTIFACTS"),
                 ReceiptInspectionPresenter(),
                 observation="receipt-observes-unit",
                 artifact_description="receipt-describes-artifacts",
+                relationship_role=InspectionRelationshipRole.OBSERVER,
             ),
         ),
         ResourceFamilyDefinition(
             "artifact",
             "artifact",
             "artifacts",
-            (_placement(observed, environment, "observed-artifacts", "observed"),),
+            (_placement(observed, environment, "observed-artifacts", "observed", default=True),),
             (ArtifactApiMembership(ArtifactApi),),
+            inspection=InspectionViewDefinition(
+                observed,
+                ("NAME", "KIND", "PARTITION", "AUTHENTICATION"),
+                ArtifactInspectionPresenter(),
+                observation="receipt-observes-unit",
+                artifact_description="receipt-describes-artifacts",
+                relationship_role=InspectionRelationshipRole.DESCRIBED_RESOURCE,
+            ),
+            identity=ResourceIdentityDefinition(
+                (
+                    IdentitySegmentDefinition("producer", filter_option="--producer"),
+                    IdentitySegmentDefinition("name"),
+                )
+            ),
         ),
     )
     observations = (
@@ -1634,6 +2305,29 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             binding=ReceiptArtifactDescriptionBinding(
                 JsonFieldPath(("status", "artifacts")), JsonFieldPath(("producer",))
             ),
+            producer_identity_segment="producer",
         ),
     )
-    return ResourceRegistry(api_kinds, collections, families, observations, artifact_descriptions)
+    graph_relationships = (
+        ResourceGraphRelationship(
+            "stack-selects-stacktemplate",
+            source_family="stack",
+            source_plane=desired,
+            target_family="stacktemplate",
+            target_plane=desired,
+            source_gvk=GVK(CORE_API_VERSION, "Stack"),
+            target_gvk=GVK(CORE_API_VERSION, "StackTemplate"),
+            binding=StackTemplateSelectionBinding(),
+        ),
+        ResourceGraphRelationship(
+            "stack-owns-unit",
+            source_family="stack",
+            source_plane=desired,
+            target_family="unit",
+            target_plane=desired,
+            source_gvk=GVK(CORE_API_VERSION, "Stack"),
+            target_gvk=None,
+            binding=StackOwnedUnitBinding(),
+        ),
+    )
+    return ResourceRegistry(api_kinds, collections, families, observations, artifact_descriptions, graph_relationships)

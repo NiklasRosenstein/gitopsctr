@@ -458,7 +458,7 @@ def test_observation_publication_writes_receipt_and_artifact_atomically(
     def observed_tree(_ref: str, output: Path) -> None:
         output.mkdir(parents=True)
 
-    def publish_tree(_ref: str, tree: Path, _expected: str | None, _message: str) -> str:
+    def publish_tree(_ref: str, tree: Path, _expected: str | None, _message: str, **_kwargs: object) -> str:
         for path in tree.rglob("*"):
             if path.is_file():
                 captured[path.relative_to(tree).as_posix()] = path.read_bytes()
@@ -503,7 +503,7 @@ def test_observation_publication_retries_without_losing_concurrent_state(
             concurrent.write_text('{"concurrent":true}\n')
         return ("a" if attempts == 1 else "b") * 40
 
-    def publish_tree(_ref: str, tree: Path, expected: str | None, _message: str) -> str:
+    def publish_tree(_ref: str, tree: Path, expected: str | None, _message: str, **_kwargs: object) -> str:
         if expected == "a" * 40:
             raise subprocess.CalledProcessError(
                 1,

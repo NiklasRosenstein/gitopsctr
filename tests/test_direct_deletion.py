@@ -60,7 +60,12 @@ def _args(**overrides: object) -> Namespace:
     return Namespace(**values)
 
 
-def _prepare(tmp_path: Path, monkeypatch, document: dict[str, object]):
+def _prepare(
+    tmp_path: Path,
+    monkeypatch,
+    document: dict[str, object],
+    resolved_candidate_ref: str = "candidate/dev",
+):
     current = tmp_path / "current"
     name = str(document["metadata"]["name"])  # type: ignore[index]
     _write(current / f"units/{name}.yaml", document)
@@ -79,7 +84,7 @@ def _prepare(tmp_path: Path, monkeypatch, document: dict[str, object]):
     monkeypatch.setattr(controller, "fetch_ref", lambda _ref: "b" * 40)
     monkeypatch.setattr(controller, "materialize_revision", materialize)
     monkeypatch.setattr(controller, "publish_desired_change", publish)
-    monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: "candidate/dev")
+    monkeypatch.setattr(controller, "resolve_candidate_ref", lambda *_args, **_kwargs: resolved_candidate_ref)
     return current, published
 
 
@@ -113,6 +118,14 @@ def test_generic_delete_marks_retained_unit_with_generation_and_digest(tmp_path,
     assert retained.metadata.uid == "d1-application"
     assert retained.metadata.partition == "application"
     assert not any("deletion" in path.name for path in published[0].rglob("*"))
+
+
+@pytest.mark.parametrize("candidate_ref", ["observed/dev", "refs/heads/observed/dev"])
+def test_generic_delete_rejects_candidate_ref_matching_observed(tmp_path, monkeypatch, candidate_ref):
+    _current, _published = _prepare(tmp_path, monkeypatch, _unit_document(), candidate_ref)
+
+    with pytest.raises(OperationError, match="conflicts with deployment state"):
+        controller.command_delete_resource(_args(candidate_ref=candidate_ref))
 
 
 def test_generic_delete_marks_uid_owned_descendants(tmp_path, monkeypatch):

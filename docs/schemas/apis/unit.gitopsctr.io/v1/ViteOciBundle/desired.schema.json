@@ -386,19 +386,13 @@
               "type": "string"
             },
             "revision": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null
+              "pattern": "^[0-9a-f]{40}$",
+              "type": "string"
             }
           },
           "required": [
-            "path"
+            "path",
+            "revision"
           ],
           "title": "DesiredSource",
           "type": "object"

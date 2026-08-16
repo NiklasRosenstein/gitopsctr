@@ -71,7 +71,6 @@ def test_unit_parsers_require_canonical_resource_envelopes(profile: str) -> None
     [
         {"name": "infra", "uid": "uid-1"},
         {"name": "infra", "labels": {PARTITION_LABEL: "application"}},
-        {"name": "infra", "uid": "uid-1", "lifecycle": {"management": {"mode": "sourceTracked"}}},
     ],
 )
 def test_authored_metadata_rejects_controller_owned_fields(metadata: dict[str, object]) -> None:

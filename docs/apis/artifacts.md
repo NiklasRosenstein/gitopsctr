@@ -14,6 +14,36 @@ The current bundled artifact kinds are:
 Plugins can register additional `artifact.gitopsctr.io` kinds. The table describes the bundled set, not a complete
 ecosystem.
 
+## Inspect artifacts
+
+Artifact local identity has two registry-declared segments: `producer/name`. It composes with the Environment scope;
+it does not introduce a separate Unit namespace. The qualified name rendered by the table is also the exact lookup
+address:
+
+```console
+$ gitopsctr get artifacts --environment dev --producer application--image
+NAME                           KIND             PARTITION    AUTHENTICATION
+application--image/containers  ContainerImages  application  CURRENT
+```
+
+Copy the rendered name into `gitopsctr get artifact application--image/containers --environment dev`. Add
+`-o yaml --as-list` when the generic address, Git provenance, and derived authentication should accompany the exact
+Artifact document; the [tutorial](../tutorial.md#inspect-desired-and-observed-state) shows that output shape.
+
+`get all --environment dev` includes an `ARTIFACTS` section. Inspection authenticates each Artifact through its Receipt
+descriptor and the Receipt's exact desired producer before reporting it as `CURRENT`. The producer's authenticated
+desired resource supplies the Artifact's partition. The existing Receipt shortcuts remain useful for relationship-first
+navigation: `gitopsctr get receipt PRODUCER --environment dev --artifact NAME` or `--artifacts`.
+
+A named query with one result returns the exact Artifact document, matching other `get` selectors. Collection and
+aggregate machine queries always use the typed `inspection.gitopsctr.io/v1 ResourceList` contract, even when the
+collection contains zero or one item. A named all-Environment query uses the list only if it matches multiple
+resources. The list's optional per-item
+`inspection.authentication` field is derived inspection state, not part of the persisted Artifact: `CURRENT` means the
+Receipt descriptor and exact current desired producer authenticate the Artifact; `STALE` means the descriptor is valid
+for an older desired producer; and `ORPHAN` means no matching Receipt/current producer relationship can authenticate it.
+Historical inspection may set both the desired and observed ref/revision overrides.
+
 ## How `fromArtifact` resolves
 
 ```mermaid

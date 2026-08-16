@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal, cast
 
 from jsonschema import Draft202012Validator
@@ -35,10 +35,13 @@ from gitopsctr.templates import (
     ArtifactReference,
     EnvironmentReference,
     ParameterTemplateObject,
+    ProjectionObject,
     PromotionReference,
     ReceiptReference,
     TemplateError,
     TemplateObject,
+    contains_parameter_expression,
+    dump_template_value,
     resolve_parameter_value,
     validate_parameter_values,
 )
@@ -57,6 +60,8 @@ class _ContractSchemaPlugin(BasePlugin):
     ) -> JSONSchema | None:
         if instance.type is TemplateObject:
             return JSONSchema(title="__gitopsctr_template_object__")
+        if instance.type is ProjectionObject:
+            return JSONSchema(title="__gitopsctr_projection_object__")
         if instance.type is ParameterTemplateObject:
             return JSONSchema(title="__gitopsctr_parameter_template_object__")
         reference_type = {
@@ -74,7 +79,7 @@ class _ContractSchemaPlugin(BasePlugin):
         return None
 
 
-def _reference_target_schema(reference_type: str) -> JsonObject:
+def _reference_target_schema(reference_type: str, value_ref: str = "#/$defs/TemplateValue") -> JsonObject:
     unit_description = (
         "Promoted source unit name; omit it to use the target unit name."
         if reference_type == "fromPromotion"
@@ -100,13 +105,14 @@ def _reference_target_schema(reference_type: str) -> JsonObject:
             "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
             "description": pointer_descriptions[reference_type],
         },
-        "dryFallback": {
-            "$ref": "#/$defs/TemplateValue",
+    }
+    if reference_type != "fromEnvironment":
+        properties["dryFallback"] = {
+            "$ref": value_ref,
             "description": (
                 "Type-correct speculative value used only during dry resolution when the reference is unavailable."
             ),
-        },
-    }
+        }
     required = [] if reference_type in {"fromPromotion", "fromEnvironment"} else ["unit"]
     if reference_type not in {"fromPromotion", "fromEnvironment"}:
         properties["pointer"]["default"] = ""
@@ -130,10 +136,13 @@ def _reference_target_schema(reference_type: str) -> JsonObject:
     )
 
 
-def _reference_expression_schema(reference_type: str) -> JsonObject:
+def _reference_expression_schema(
+    reference_type: str,
+    value_ref: str = "#/$defs/TemplateValue",
+) -> JsonObject:
     return {
         "type": "object",
-        "properties": {reference_type: _reference_target_schema(reference_type)},
+        "properties": {reference_type: _reference_target_schema(reference_type, value_ref)},
         "required": [reference_type],
         "additionalProperties": False,
     }
@@ -220,11 +229,13 @@ def _parameter_template_definitions() -> JsonObject:
 
 def _expand_special_schemas(schema: JsonObject) -> JsonObject:
     used_template = False
+    used_projection = False
     used_parameter_template = False
     used_resolved_json = False
 
     def visit(value: JsonValue) -> JsonValue:
         nonlocal used_template
+        nonlocal used_projection
         nonlocal used_parameter_template
         nonlocal used_resolved_json
         if isinstance(value, list):
@@ -239,6 +250,16 @@ def _expand_special_schemas(schema: JsonObject) -> JsonObject:
                     "type": "object",
                     "propertyNames": {"not": {"enum": sorted((*REFERENCE_KEYS, "fromParameter"))}},
                     "additionalProperties": {"$ref": "#/$defs/TemplateValue"},
+                },
+            )
+        if value.get("title") == "__gitopsctr_projection_object__":
+            used_projection = True
+            return cast(
+                JsonObject,
+                {
+                    "type": "object",
+                    "propertyNames": {"not": {"enum": sorted((*REFERENCE_KEYS, "fromParameter"))}},
+                    "additionalProperties": {"$ref": "#/$defs/ProjectionValue"},
                 },
             )
         if value.get("title") == "__gitopsctr_parameter_template_object__":
@@ -272,6 +293,32 @@ def _expand_special_schemas(schema: JsonObject) -> JsonObject:
     if used_template:
         definitions = cast(JsonObject, expanded.setdefault("$defs", {}))
         definitions.update(_template_definitions())
+    if used_projection:
+        definitions = cast(JsonObject, expanded.setdefault("$defs", {}))
+        projection_variants: list[JsonObject] = [
+            _reference_expression_schema(key, "#/$defs/ProjectionValue") for key in sorted(REFERENCE_KEYS)
+        ]
+        projection_variants.extend(
+            cast(
+                list[JsonObject],
+                [
+                    {"type": "null"},
+                    {"type": "boolean"},
+                    {"type": "number"},
+                    {"type": "string"},
+                    {"type": "array", "items": {"$ref": "#/$defs/ProjectionValue"}},
+                    {
+                        "type": "object",
+                        "propertyNames": {"not": {"enum": sorted((*REFERENCE_KEYS, "fromParameter"))}},
+                        "additionalProperties": {"$ref": "#/$defs/ProjectionValue"},
+                    },
+                ],
+            )
+        )
+        definitions["ProjectionValue"] = cast(
+            JsonValue,
+            {"oneOf": projection_variants},
+        )
     if used_parameter_template:
         definitions = cast(JsonObject, expanded.setdefault("$defs", {}))
         definitions.update(_parameter_template_definitions())
@@ -295,6 +342,161 @@ def _expand_special_schemas(schema: JsonObject) -> JsonObject:
             },
         )
     return expanded
+
+
+def _pair_stack_template_acquisition_schema(schema: JsonObject) -> JsonObject:
+    """Make the public acquisition schema preserve request/resolution pairing."""
+
+    def visit(value: JsonValue) -> JsonValue:
+        if isinstance(value, list):
+            return [visit(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        properties = value.get("properties")
+        if isinstance(properties, dict):
+            properties = cast(dict[str, Any], properties)
+            acquisition = properties.get("acquisition")
+            if isinstance(acquisition, dict) and isinstance(acquisition.get("properties"), dict):
+                acquisition = cast(dict[str, Any], acquisition)
+                acquisition_properties = cast(dict[str, Any], acquisition["properties"])
+                requested = acquisition_properties.get("requestedSource")
+                resolved = acquisition_properties.get("resolvedSource")
+                if isinstance(requested, dict) and isinstance(resolved, dict):
+                    requested = cast(dict[str, Any], requested)
+                    resolved = cast(dict[str, Any], resolved)
+                    requested_variants = requested.get("anyOf")
+                    resolved_variants = resolved.get("anyOf")
+                    if isinstance(requested_variants, list) and isinstance(resolved_variants, list):
+                        requested_variants = cast(list[dict[str, Any]], requested_variants)
+                        resolved_variants = cast(list[dict[str, Any]], resolved_variants)
+                        requested_by_mode = {
+                            str(variant.get("title", "")).removeprefix("StackTemplateRequestedFrom"): variant
+                            for variant in requested_variants
+                            if isinstance(variant, dict)
+                        }
+                        resolved_by_mode = {
+                            str(variant.get("title", ""))
+                            .removeprefix("StackTemplateResolvedFrom")
+                            .removesuffix("Source"): variant
+                            for variant in resolved_variants
+                            if isinstance(variant, dict)
+                        }
+                        variants: list[JsonObject] = []
+                        for mode, requested_variant in requested_by_mode.items():
+                            resolved_variant = resolved_by_mode.get(mode)
+                            if resolved_variant is None:
+                                continue
+                            variants.append(
+                                {
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "documentDigest": deepcopy(acquisition_properties["documentDigest"]),
+                                        "requestedSource": deepcopy(requested_variant),
+                                        "resolvedSource": deepcopy(resolved_variant),
+                                    },
+                                    "required": ["documentDigest", "requestedSource", "resolvedSource"],
+                                    "title": f"StackTemplate{mode}Acquisition",
+                                    "type": "object",
+                                }
+                            )
+                        if variants:
+                            paired = deepcopy(acquisition)
+                            paired["anyOf"] = cast(JsonValue, variants)
+                            properties["acquisition"] = paired
+        return {name: visit(item) for name, item in value.items()}
+
+    return cast(JsonObject, visit(schema))
+
+
+def _harden_stack_template_desired_schema(schema: JsonObject) -> JsonObject:
+    """Keep desired StackTemplate source-context requirements visible in JSON Schema."""
+
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return schema
+    if {"unitTemplates", "contentDigest", "acquisition"} <= set(properties):
+        spec = schema
+        spec_properties = properties
+    else:
+        spec = properties.get("spec")
+        if not isinstance(spec, dict):
+            return schema
+        spec_properties = spec.get("properties")
+    if not isinstance(spec_properties, dict) or not {"unitTemplates", "contentDigest", "acquisition"} <= set(
+        spec_properties
+    ):
+        return schema
+
+    # Runtime validation permits sourceContext to be omitted only when no Unit
+    # template has an actual repository source descriptor. JSON Schema cannot
+    # express an existential condition over object values directly, so the
+    # equivalent is an anyOf: a non-null sourceContext, or unitTemplates whose
+    # specs do not contain a source object with a string path or a direct or
+    # path-nested fromParameter expression.
+    spec["anyOf"] = [
+        {
+            "required": ["sourceContext"],
+            "properties": {"sourceContext": {"not": {"type": "null"}}},
+        },
+        {
+            "properties": {
+                "unitTemplates": {
+                    "additionalProperties": {
+                        "properties": {
+                            "spec": {
+                                "not": {
+                                    "required": ["source"],
+                                    "properties": {
+                                        "source": {
+                                            "type": "object",
+                                            "anyOf": [
+                                                {
+                                                    "required": ["path"],
+                                                    "properties": {"path": {"type": "string"}},
+                                                },
+                                                {"required": ["fromParameter"]},
+                                                {
+                                                    "required": ["path"],
+                                                    "properties": {
+                                                        "path": {
+                                                            "type": "object",
+                                                            "required": ["fromParameter"],
+                                                        }
+                                                    },
+                                                },
+                                            ],
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    ]
+
+    # A Git acquisition carries repository context even for a source-less
+    # resolved template. Keep this explicit so the schema mirrors the
+    # constructor invariant instead of relying on the content conditional.
+    spec["allOf"] = [
+        {
+            "if": {
+                "required": ["acquisition"],
+                "properties": {
+                    "acquisition": {
+                        "required": ["resolvedSource"],
+                        "properties": {"resolvedSource": {"required": ["fromGit"]}},
+                    }
+                },
+            },
+            "then": {
+                "required": ["sourceContext"],
+                "properties": {"sourceContext": {"not": {"type": "null"}}},
+            },
+        }
+    ]
+    return schema
 
 
 class StrictModel(DataClassDictMixin):
@@ -338,6 +540,11 @@ class DesiredOwnerReference(StrictModel):
 
 
 DELETION_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
+CONTENT_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
+EXACT_REVISION_PATTERN = r"^[0-9a-f]{40}$"
+GIT_REF_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+REPOSITORY_PATTERN = r"^[^\s\x00]+$"
+SAFE_RELATIVE_POSIX_PATH_PATTERN = r"^(?!/)(?!.*\\)(?!.*(?:^|/)(?:\.{1,2})(?:/|$))[^/]+(?:/[^/]+)*$"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -416,6 +623,12 @@ class StackTemplateUnitTemplate(StrictModel):
     dependsOn: list[Annotated[str, Pattern(DESIRED_UID_PATTERN)]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if re.fullmatch(r"^[^/]+/[^/]+$", self.apiVersion) is None:
+            raise ValueError(f"invalid Unit template apiVersion: {self.apiVersion!r}")
+        if re.fullmatch(r"^[A-Z][A-Za-z0-9]*$", self.kind) is None:
+            raise ValueError(f"invalid Unit template kind: {self.kind!r}")
+        if any(re.fullmatch(DESIRED_UID_PATTERN, dependency) is None for dependency in self.dependsOn):
+            raise ValueError("Unit template dependencies must use desired resource names")
         if len(set(self.dependsOn)) != len(self.dependsOn):
             raise ValueError("Unit template has duplicate dependencies")
 
@@ -431,8 +644,14 @@ class StackTemplateResource(StrictModel):
     dependsOn: list[Annotated[str, Pattern(DESIRED_UID_PATTERN)]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if re.fullmatch(r"^[^/]+/[^/]+$", self.apiVersion) is None:
+            raise ValueError(f"invalid template resource apiVersion: {self.apiVersion!r}")
+        if re.fullmatch(r"^[A-Z][A-Za-z0-9]*$", self.kind) is None:
+            raise ValueError(f"invalid template resource kind: {self.kind!r}")
         if not re.fullmatch(DESIRED_UID_PATTERN, self.name):
             raise ValueError(f"invalid template resource name: {self.name!r}")
+        if any(re.fullmatch(DESIRED_UID_PATTERN, dependency) is None for dependency in self.dependsOn):
+            raise ValueError(f"template resource {self.name!r} dependencies must use desired resource names")
         if len(set(self.dependsOn)) != len(self.dependsOn):
             raise ValueError(f"template resource {self.name!r} has duplicate dependencies")
         if self.name in self.dependsOn:
@@ -487,12 +706,69 @@ def scope_stack_template_resources(
     )
 
 
+def _validate_repository(repository: str, field_name: str) -> None:
+    if re.fullmatch(REPOSITORY_PATTERN, repository) is None:
+        raise ValueError(f"{field_name} must be a non-empty repository identifier without whitespace")
+
+
+def _validate_revision(revision: str, field_name: str, *, exact: bool = False) -> None:
+    pattern = EXACT_REVISION_PATTERN if exact else GIT_REF_PATTERN
+    if re.fullmatch(pattern, revision) is None:
+        detail = "an exact lowercase Git commit" if exact else "a valid Git revision"
+        raise ValueError(f"{field_name} must be {detail}")
+
+
+def _validate_safe_relative_posix_path(path: str, field_name: str) -> None:
+    if re.fullmatch(SAFE_RELATIVE_POSIX_PATH_PATTERN, path) is None:
+        raise ValueError(
+            f"{field_name} must be a safe relative POSIX path without absolute, dot, dotdot, empty, or backslash segments"
+        )
+
+
 @dataclass(frozen=True, kw_only=True)
-class StackTemplateSpec(StrictModel):
-    parameters: list[ParameterDeclaration] = field(default_factory=list)
-    unitTemplates: dict[Annotated[str, Pattern(DESIRED_UID_PATTERN)], StackTemplateUnitTemplate] = field(
-        default_factory=dict
-    )
+class StackTemplateGitRequest(StrictModel):
+    """A requested repository-backed StackTemplate source."""
+
+    repository: Annotated[str, Pattern(REPOSITORY_PATTERN)]
+    revision: Annotated[str, Pattern(GIT_REF_PATTERN)]
+    path: Annotated[str, Pattern(SAFE_RELATIVE_POSIX_PATH_PATTERN)]
+    documentDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)] | None = None
+
+    def __post_init__(self) -> None:
+        _validate_repository(self.repository, "StackTemplate Git repository")
+        _validate_revision(self.revision, "StackTemplate Git revision")
+        _validate_safe_relative_posix_path(self.path, "StackTemplate Git path")
+        if self.documentDigest is not None and not re.fullmatch(CONTENT_DIGEST_PATTERN, self.documentDigest):
+            raise ValueError("StackTemplate Git documentDigest must be a SHA-256 digest")
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplatePromotionRequest(StrictModel):
+    """A requested promoted StackTemplate source."""
+
+    stack: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(DESIRED_UID_PATTERN, self.stack) is None:
+            raise ValueError("StackTemplate promotion stack must be a valid identifier")
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateSourceFromGit(StrictModel):
+    fromGit: StackTemplateGitRequest
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateSourceFromPromotion(StrictModel):
+    fromPromotion: StackTemplatePromotionRequest
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateInlineSpec(StrictModel):
+    """Authored inline StackTemplate content."""
+
+    parameters: list[ParameterDeclaration]
+    unitTemplates: dict[Annotated[str, Pattern(DESIRED_UID_PATTERN)], StackTemplateUnitTemplate]
 
     def __post_init__(self) -> None:
         if not self.unitTemplates:
@@ -563,148 +839,536 @@ class StackTemplateSpec(StrictModel):
                 )
         return tuple(resource.resolved(values) for resource in self.resources)
 
+    def normalized_content(self) -> JsonObject:
+        """Return the semantic StackTemplate content, excluding acquisition metadata."""
 
-def _validate_repository_path(value: str, field_name: str) -> None:
-    path = PurePosixPath(value)
-    if not value or path.is_absolute() or ".." in path.parts:
-        raise ValueError(f"{field_name} must be repository-relative")
+        def serialize_template(template: StackTemplateUnitTemplate) -> JsonObject:
+            spec = (
+                template.spec if isinstance(template.spec, TemplateObject) else TemplateObject(cast(Any, template.spec))
+            )
+            return StackTemplateUnitTemplate(
+                apiVersion=template.apiVersion,
+                kind=template.kind,
+                spec=spec,
+                dependsOn=sorted(template.dependsOn),
+            ).to_dict()
 
+        return {
+            "parameters": [parameter.to_dict() for parameter in sorted(self.parameters, key=lambda item: item.name)],
+            "unitTemplates": {
+                name: serialize_template(template) for name, template in sorted(self.unitTemplates.items())
+            },
+        }
 
-def _normalize_git_ref(value: str) -> str:
-    if not value or any(char.isspace() or ord(char) < 32 for char in value):
-        raise ValueError("Git ref must not contain whitespace or control characters")
-    if any(token in value for token in ("..", "~", "^")):
-        raise ValueError("Git ref must name a ref, not a revision expression")
-    if value.startswith("/") or value.endswith("/") or "//" in value:
-        raise ValueError("Git ref has an invalid path")
-    return value if value.startswith("refs/") else f"refs/heads/{value}"
+    def semantic_content_digest(self) -> str:
+        """Return the digest of the canonical parameter and Unit-template content."""
 
-
-def _validate_git_remote(value: str) -> None:
-    from urllib.parse import urlsplit
-
-    parsed = urlsplit(value)
-    if parsed.scheme not in {"https", "ssh", "git"} or not parsed.hostname:
-        raise ValueError("remote must use an https, ssh, or git URL")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("remote must not contain credentials")
+        encoded = json.dumps(self.normalized_content(), separators=(",", ":"), sort_keys=True).encode()
+        return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 @dataclass(frozen=True, kw_only=True)
-class GitSourceRequest(StrictModel):
-    """A requested repository location for a StackTemplate."""
+class StackTemplateGitSpec(StrictModel):
+    source: StackTemplateSourceFromGit
 
-    path: str | None = None
-    remote: str | None = None
-    commit: Annotated[str, Pattern(r"^[0-9a-f]{40}$")] | None = None
-    ref: str | None = None
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplatePromotionSpec(StrictModel):
+    source: StackTemplateSourceFromPromotion
+
+
+StackTemplateDocumentSpec = StackTemplateInlineSpec | StackTemplateGitSpec | StackTemplatePromotionSpec
+# ``StackTemplateSpec`` remains the concrete inline content model used by
+# internal constructors. Authored documents use ``StackTemplateDocumentSpec``
+# so their public contract admits Git and promotion acquisition selectors.
+StackTemplateSpec = StackTemplateInlineSpec
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateFromInput(StrictModel):
+    """Empty marker for a StackTemplate acquired directly from input."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateRequestedFromGit(StrictModel):
+    fromGit: StackTemplateGitRequest
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateRequestedFromPromotion(StrictModel):
+    fromPromotion: StackTemplatePromotionRequest
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateRequestedFromInput(StrictModel):
+    fromInput: StackTemplateFromInput
+
+
+StackTemplateRequestedSource = (
+    StackTemplateRequestedFromInput | StackTemplateRequestedFromGit | StackTemplateRequestedFromPromotion
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateResolvedFromGit(StrictModel):
+    repository: Annotated[str, Pattern(REPOSITORY_PATTERN)]
+    revision: Annotated[str, Pattern(EXACT_REVISION_PATTERN)]
+    path: Annotated[str, Pattern(SAFE_RELATIVE_POSIX_PATH_PATTERN)]
 
     def __post_init__(self) -> None:
-        if (self.path is None) == (self.remote is None):
-            raise ValueError("Git source requires exactly one of path or remote")
-        if self.commit is not None and self.ref is not None:
-            raise ValueError("Git source accepts at most one of commit or ref")
-        if self.commit is not None and not re.fullmatch(r"[0-9a-f]{40}", self.commit):
-            raise ValueError("commit must be a full lowercase Git commit")
-        if self.path is not None:
-            _validate_repository_path(self.path, "path")
-            if self.path == "." and self.commit is not None:
-                raise ValueError("path '.' cannot be combined with an explicit commit")
-            if self.path != "." and self.commit is None and self.ref is None:
-                raise ValueError("a non-root path requires commit or ref")
-        if self.remote is not None:
-            _validate_git_remote(self.remote)
-            if self.commit is None and self.ref is None:
-                raise ValueError("remote source requires commit or ref")
-        if self.ref is not None:
-            object.__setattr__(self, "ref", _normalize_git_ref(self.ref))
+        _validate_repository(self.repository, "resolved StackTemplate Git repository")
+        _validate_revision(self.revision, "resolved StackTemplate Git revision", exact=True)
+        _validate_safe_relative_posix_path(self.path, "resolved StackTemplate Git path")
 
 
 @dataclass(frozen=True, kw_only=True)
-class ResolvedGitSource(StrictModel):
-    """An immutable Git source selected while applying desired state."""
-
-    path: str | None = None
-    remote: str | None = None
-    commit: Annotated[str, Pattern(r"^[0-9a-f]{40}$")]
-    resourcePath: str
-    digest: Annotated[str, Pattern(r"^[0-9a-f]{64}$")]
-    ref: str | None = None
+class StackTemplateResolvedFromPromotion(StrictModel):
+    environment: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    desiredRef: Annotated[str, Pattern(GIT_REF_PATTERN)]
+    desiredRevision: Annotated[str, Pattern(EXACT_REVISION_PATTERN)]
+    stack: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    stackUid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    template: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    templateUid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    templateContentDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
 
     def __post_init__(self) -> None:
-        if (self.path is None) == (self.remote is None):
-            raise ValueError("resolved Git source requires exactly one of path or remote")
-        if self.path is not None:
-            _validate_repository_path(self.path, "path")
-        if self.remote is not None:
-            _validate_git_remote(self.remote)
-        if not re.fullmatch(r"[0-9a-f]{40}", self.commit):
-            raise ValueError("commit must be a full lowercase Git commit")
-        _validate_repository_path(self.resourcePath, "resourcePath")
-        if not re.fullmatch(r"[0-9a-f]{64}", self.digest):
-            raise ValueError("digest must be a SHA-256 digest")
-        if self.ref is not None:
-            object.__setattr__(self, "ref", _normalize_git_ref(self.ref))
+        for name, value in (
+            ("environment", self.environment),
+            ("stack", self.stack),
+            ("stackUid", self.stackUid),
+            ("template", self.template),
+            ("templateUid", self.templateUid),
+        ):
+            if re.fullmatch(DESIRED_UID_PATTERN, value) is None:
+                raise ValueError(f"resolved StackTemplate promotion {name} must be a valid identifier")
+        _validate_revision(self.desiredRef, "resolved StackTemplate promotion desiredRef")
+        _validate_revision(self.desiredRevision, "resolved StackTemplate promotion desiredRevision", exact=True)
+        if re.fullmatch(CONTENT_DIGEST_PATTERN, self.templateContentDigest) is None:
+            raise ValueError("resolved StackTemplate promotion templateContentDigest must be a SHA-256 digest")
 
 
 @dataclass(frozen=True, kw_only=True)
-class StackTemplateResourceReference(StrictModel):
-    name: Annotated[str, Pattern(DESIRED_UID_PATTERN)] | None = None
-    uid: Annotated[str, Pattern(DESIRED_UID_PATTERN)] | None = None
+class StackTemplateResolvedFromInput(StrictModel):
+    fromInput: StackTemplateFromInput
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateResolvedFromGitSource(StrictModel):
+    fromGit: StackTemplateResolvedFromGit
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateResolvedFromPromotionSource(StrictModel):
+    fromPromotion: StackTemplateResolvedFromPromotion
+
+
+StackTemplateResolvedSource = (
+    StackTemplateResolvedFromInput | StackTemplateResolvedFromGitSource | StackTemplateResolvedFromPromotionSource
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackTemplateAcquisition(StrictModel):
+    """Immutable request and resolution lineage for one desired StackTemplate."""
+
+    documentDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+    requestedSource: StackTemplateRequestedSource
+    resolvedSource: StackTemplateResolvedSource
 
     def __post_init__(self) -> None:
-        if self.name is not None and not re.fullmatch(DESIRED_UID_PATTERN, self.name):
-            raise ValueError(f"invalid StackTemplate name: {self.name!r}")
-        if self.uid is not None and self.name is None:
-            raise ValueError("StackTemplate resource UID requires name")
+        if not re.fullmatch(CONTENT_DIGEST_PATTERN, self.documentDigest):
+            raise ValueError("StackTemplate acquisition documentDigest must be a SHA-256 digest")
+        requested = self.requestedSource
+        resolved = self.resolvedSource
+        if isinstance(requested, StackTemplateRequestedFromInput):
+            if not isinstance(resolved, StackTemplateResolvedFromInput):
+                raise ValueError("StackTemplate acquisition request and resolution modes must match")
+        elif isinstance(requested, StackTemplateRequestedFromGit):
+            if not isinstance(resolved, StackTemplateResolvedFromGitSource):
+                raise ValueError("StackTemplate acquisition request and resolution modes must match")
+            request = requested.fromGit
+            source = resolved.fromGit
+            if request.repository != source.repository or request.path != source.path:
+                raise ValueError("StackTemplate Git acquisition repository and path must remain fenced")
+            if re.fullmatch(EXACT_REVISION_PATTERN, request.revision) and request.revision != source.revision:
+                raise ValueError("StackTemplate Git exact requested SHA must match resolved SHA")
+            if request.documentDigest is not None and request.documentDigest != self.documentDigest:
+                raise ValueError("StackTemplate Git request documentDigest must match acquisition documentDigest")
+        elif isinstance(requested, StackTemplateRequestedFromPromotion):
+            if not isinstance(resolved, StackTemplateResolvedFromPromotionSource):
+                raise ValueError("StackTemplate acquisition request and resolution modes must match")
+            if requested.fromPromotion.stack != resolved.fromPromotion.stack:
+                raise ValueError("StackTemplate promotion acquisition stack must remain fenced")
+        else:
+            raise ValueError("StackTemplate acquisition has an unsupported request mode")
 
 
 @dataclass(frozen=True, kw_only=True)
-class StackTemplatePromotionReference(StrictModel):
+class StackTemplateSourceContext(StrictModel):
+    """Exact repository context retained for later projection of inline Unit sources."""
+
+    repository: Annotated[str, Pattern(REPOSITORY_PATTERN)]
+    revision: Annotated[str, Pattern(EXACT_REVISION_PATTERN)]
+
+    def __post_init__(self) -> None:
+        _validate_repository(self.repository, "StackTemplate sourceContext repository")
+        _validate_revision(self.revision, "StackTemplate sourceContext revision", exact=True)
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackProjectionIdentity(StrictModel):
+    """Identity fence for one Stack's structural Unit projection."""
+
+    stackUid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    templateUid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    templateContentDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+    projectionContextDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+    projectionDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(DESIRED_UID_PATTERN, self.stackUid):
+            raise ValueError("Stack projection identity requires a valid Stack UID")
+        if not re.fullmatch(DESIRED_UID_PATTERN, self.templateUid):
+            raise ValueError("Stack projection identity requires a valid StackTemplate UID")
+        for name, value in (
+            ("templateContentDigest", self.templateContentDigest),
+            ("projectionContextDigest", self.projectionContextDigest),
+            ("projectionDigest", self.projectionDigest),
+        ):
+            if not re.fullmatch(CONTENT_DIGEST_PATTERN, value):
+                raise ValueError(f"Stack projection identity {name} must be a SHA-256 digest")
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackProjectionUnit(StrictModel):
+    """One typed Unit declaration in a Stack projection."""
+
+    apiVersion: Annotated[str, Pattern(r"^[^/]+/[^/]+$")]
+    kind: Annotated[str, Pattern(r"^[A-Z][A-Za-z0-9]*$")]
+    spec: ProjectionObject
+    dependsOn: list[Annotated[str, Pattern(DESIRED_UID_PATTERN)]]
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"^[^/]+/[^/]+$", self.apiVersion) is None:
+            raise ValueError(f"invalid Stack projection Unit apiVersion: {self.apiVersion!r}")
+        if re.fullmatch(r"^[A-Z][A-Za-z0-9]*$", self.kind) is None:
+            raise ValueError(f"invalid Stack projection Unit kind: {self.kind!r}")
+        if any(re.fullmatch(DESIRED_UID_PATTERN, dependency) is None for dependency in self.dependsOn):
+            raise ValueError("Stack projection Unit dependencies must use desired resource names")
+        if len(set(self.dependsOn)) != len(self.dependsOn):
+            raise ValueError("Stack projection Unit has duplicate dependencies")
+        if _contains_unresolved_projection_expression(self.spec):
+            raise ValueError("Stack projection Unit spec contains an unresolved fromParameter expression")
+
+
+def _contains_unresolved_projection_expression(value: object) -> bool:
+    return contains_parameter_expression(value)
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackProjectionUnitBinding(StrictModel):
+    """The concrete desired Unit authenticated by an active Stack projection."""
+
+    apiVersion: Annotated[str, Pattern(r"^[^/]+/[^/]+$")]
+    kind: Annotated[str, Pattern(r"^[A-Z][A-Za-z0-9]*$")]
+    name: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    uid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    desiredDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+    sourceProjectionDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+    projectionContextDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+    dependsOn: list[Annotated[str, Pattern(DESIRED_UID_PATTERN)]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"^[^/]+/[^/]+$", self.apiVersion) is None:
+            raise ValueError("Stack active projection Unit binding has an invalid apiVersion")
+        if re.fullmatch(r"^[A-Z][A-Za-z0-9]*$", self.kind) is None:
+            raise ValueError("Stack active projection Unit binding has an invalid kind")
+        for name, value in (("name", self.name), ("uid", self.uid)):
+            if not re.fullmatch(DESIRED_UID_PATTERN, value):
+                raise ValueError(f"Stack active projection Unit binding has an invalid {name}")
+        if not re.fullmatch(CONTENT_DIGEST_PATTERN, self.desiredDigest):
+            raise ValueError("Stack active projection Unit binding desiredDigest must be a SHA-256 digest")
+        if not re.fullmatch(CONTENT_DIGEST_PATTERN, self.sourceProjectionDigest):
+            raise ValueError("Stack active projection Unit binding sourceProjectionDigest must be a SHA-256 digest")
+        if not re.fullmatch(CONTENT_DIGEST_PATTERN, self.projectionContextDigest):
+            raise ValueError("Stack active projection Unit binding projectionContextDigest must be a SHA-256 digest")
+        if any(re.fullmatch(DESIRED_UID_PATTERN, dependency) is None for dependency in self.dependsOn):
+            raise ValueError("Stack active projection Unit binding dependencies must use desired resource names")
+        if len(set(self.dependsOn)) != len(self.dependsOn):
+            raise ValueError("Stack active projection Unit binding has duplicate dependencies")
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackActiveProjection(StrictModel):
+    """Concrete desired Units currently executable for one structural projection."""
+
+    sourceProjectionDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+    projectionContextDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+    units: dict[Annotated[str, Pattern(DESIRED_UID_PATTERN)], StackProjectionUnitBinding]
+    projectionDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(CONTENT_DIGEST_PATTERN, self.sourceProjectionDigest):
+            raise ValueError("Stack active projection sourceProjectionDigest must be a SHA-256 digest")
+        if not re.fullmatch(CONTENT_DIGEST_PATTERN, self.projectionContextDigest):
+            raise ValueError("Stack active projection projectionContextDigest must be a SHA-256 digest")
+        concrete_names = [binding.name for binding in self.units.values()]
+        if len(set(concrete_names)) != len(concrete_names):
+            raise ValueError("Stack active projection has duplicate concrete Unit names")
+        concrete_set = set(concrete_names)
+        by_name = {binding.name: binding for binding in self.units.values()}
+        for binding in self.units.values():
+            if binding.name in binding.dependsOn:
+                raise ValueError(f"Stack active projection Unit {binding.name!r} cannot depend on itself")
+            missing = sorted(set(binding.dependsOn) - concrete_set)
+            if missing:
+                raise ValueError(
+                    f"Stack active projection Unit {binding.name!r} has unknown dependencies: {', '.join(missing)}"
+                )
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(name: str) -> None:
+            if name in visiting:
+                raise ValueError("Stack active projection dependencies must be acyclic")
+            if name in visited:
+                return
+            visiting.add(name)
+            for dependency in by_name[name].dependsOn:
+                visit(dependency)
+            visiting.remove(name)
+            visited.add(name)
+
+        for name in concrete_names:
+            visit(name)
+        expected = self.compute_projection_digest(
+            self.sourceProjectionDigest,
+            self.projectionContextDigest,
+            self.units,
+        )
+        if self.projectionDigest != expected:
+            raise ValueError("Stack active projection projectionDigest does not match concrete Unit bindings")
+
+    @staticmethod
+    def compute_projection_digest(
+        source_projection_digest: str,
+        projection_context_digest: str,
+        units: Mapping[str, StackProjectionUnitBinding],
+    ) -> str:
+        payload = {
+            "sourceProjectionDigest": source_projection_digest,
+            "projectionContextDigest": projection_context_digest,
+            "units": {
+                name: {
+                    "apiVersion": unit.apiVersion,
+                    "kind": unit.kind,
+                    "name": unit.name,
+                    "uid": unit.uid,
+                    "desiredDigest": unit.desiredDigest,
+                    "sourceProjectionDigest": unit.sourceProjectionDigest,
+                    "projectionContextDigest": unit.projectionContextDigest,
+                    "dependsOn": sorted(unit.dependsOn),
+                }
+                for name, unit in sorted(units.items())
+            },
+        }
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        source_projection_digest: str,
+        projection_context_digest: str,
+        units: Mapping[str, StackProjectionUnitBinding],
+    ) -> StackActiveProjection:
+        return cls(
+            sourceProjectionDigest=source_projection_digest,
+            projectionContextDigest=projection_context_digest,
+            units=dict(units),
+            projectionDigest=cls.compute_projection_digest(
+                source_projection_digest,
+                projection_context_digest,
+                units,
+            ),
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class StackProjection(StrictModel):
+    """The required, fully validated structural projection for one desired Stack."""
+
+    identity: StackProjectionIdentity
+    units: dict[Annotated[str, Pattern(DESIRED_UID_PATTERN)], StackProjectionUnit]
+
+    def __post_init__(self) -> None:
+        names = set(self.units)
+        for name, unit in self.units.items():
+            if name in unit.dependsOn:
+                raise ValueError(f"Stack projection Unit {name!r} cannot depend on itself")
+            missing = sorted(set(unit.dependsOn) - names)
+            if missing:
+                raise ValueError(f"Stack projection Unit {name!r} has unknown dependencies: {', '.join(missing)}")
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(name: str) -> None:
+            if name in visiting:
+                raise ValueError("Stack projection dependencies must be acyclic")
+            if name in visited:
+                return
+            visiting.add(name)
+            for dependency in self.units[name].dependsOn:
+                visit(dependency)
+            visiting.remove(name)
+            visited.add(name)
+
+        for name in self.units:
+            visit(name)
+        if self.identity.projectionDigest != self.compute_projection_digest(
+            self.identity.stackUid,
+            self.identity.templateUid,
+            self.identity.templateContentDigest,
+            self.identity.projectionContextDigest,
+            self.units,
+        ):
+            raise ValueError("Stack projection identity projectionDigest does not match canonical units")
+
+    @staticmethod
+    def compute_projection_digest(
+        stack_uid: str,
+        template_uid: str,
+        template_content_digest: str,
+        projection_context_digest: str,
+        units: Mapping[str, StackProjectionUnit],
+    ) -> str:
+        canonical_units = {
+            name: {
+                "apiVersion": unit.apiVersion,
+                "kind": unit.kind,
+                "spec": dump_template_value(unit.spec),
+                "dependsOn": sorted(unit.dependsOn),
+            }
+            for name, unit in sorted(units.items())
+        }
+        payload = {
+            "stackUid": stack_uid,
+            "templateUid": template_uid,
+            "templateContentDigest": template_content_digest,
+            "projectionContextDigest": projection_context_digest,
+            "units": canonical_units,
+        }
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        stack_uid: str,
+        template_uid: str,
+        template_content_digest: str,
+        units: Mapping[str, StackProjectionUnit],
+        context_digest: str,
+    ) -> StackProjection:
+        projection_digest = cls.compute_projection_digest(
+            stack_uid,
+            template_uid,
+            template_content_digest,
+            context_digest,
+            units,
+        )
+        return cls(
+            identity=StackProjectionIdentity(
+                stackUid=stack_uid,
+                templateUid=template_uid,
+                templateContentDigest=template_content_digest,
+                projectionContextDigest=context_digest,
+                projectionDigest=projection_digest,
+            ),
+            units=dict(units),
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class PromotionStackReference(StrictModel):
     stack: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
 
 
-@dataclass(frozen=True, kw_only=True)
-class StackTemplateFromResource(StrictModel):
-    fromResource: StackTemplateResourceReference = field(default_factory=StackTemplateResourceReference)
+def _has_repository_source(spec: TemplateObject) -> bool:
+    """Return whether a Unit template has the source shape used by the controller."""
+
+    def visit_source(value: object) -> bool:
+        if getattr(value, "fromParameter", None) is not None:
+            return True
+        if isinstance(value, Mapping):
+            if isinstance(value.get("path"), str) or "fromParameter" in value:
+                return True
+            return any(visit_source(item) for item in value.values())
+        if isinstance(value, list):
+            return any(visit_source(item) for item in value)
+        return False
+
+    def visit(value: object) -> bool:
+        if isinstance(value, Mapping):
+            source = value.get("source")
+            if source is not None and visit_source(source):
+                return True
+            return any(visit(item) for name, item in value.items() if name != "source")
+        if isinstance(value, list):
+            return any(visit(item) for item in value)
+        return False
+
+    return visit(spec)
 
 
 @dataclass(frozen=True, kw_only=True)
-class StackTemplateFromGit(StrictModel):
-    fromGit: GitSourceRequest
+class DesiredStackTemplateSpec(StackTemplateInlineSpec):
+    """Desired inline StackTemplate content and its direct-input acquisition record."""
 
+    contentDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
+    acquisition: StackTemplateAcquisition
+    sourceContext: StackTemplateSourceContext | None = None
 
-@dataclass(frozen=True, kw_only=True)
-class StackTemplateFromPromotion(StrictModel):
-    fromPromotion: StackTemplatePromotionReference
-
-
-type StackTemplateSource = StackTemplateFromResource | StackTemplateFromGit | StackTemplateFromPromotion
-
-
-@dataclass(frozen=True, kw_only=True)
-class ResolvedStackTemplateSource(StrictModel):
-    """The exact parameterized StackTemplate source pin selected for a Stack."""
-
-    fromGit: ResolvedGitSource
-
-
-@dataclass(frozen=True, kw_only=True)
-class DesiredStackTemplateSpec(StackTemplateSpec):
-    """Desired StackTemplate content plus its immutable source record."""
-
-    requestedSource: StackTemplateSource | None = None
-    resolvedSource: ResolvedStackTemplateSource | None = None
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.contentDigest != self.semantic_content_digest():
+            raise ValueError(
+                f"StackTemplate contentDigest {self.contentDigest!r} does not match "
+                f"content {self.semantic_content_digest()!r}"
+            )
+        resolved = self.acquisition.resolvedSource
+        if isinstance(resolved, StackTemplateResolvedFromGitSource):
+            if self.sourceContext is None:
+                raise ValueError("Git-resolved StackTemplate requires sourceContext")
+            source = resolved.fromGit
+            if (self.sourceContext.repository, self.sourceContext.revision) != (source.repository, source.revision):
+                raise ValueError("StackTemplate sourceContext must match the resolved Git repository and revision")
+        if (
+            any(_has_repository_source(template.spec) for template in self.unitTemplates.values())
+            and self.sourceContext is None
+        ):
+            raise ValueError("repository-backed Unit sources require StackTemplate sourceContext")
+        if isinstance(resolved, StackTemplateResolvedFromPromotionSource):
+            if resolved.fromPromotion.templateContentDigest != self.contentDigest:
+                raise ValueError("promoted StackTemplate templateContentDigest must match contentDigest")
 
 
 @dataclass(frozen=True, kw_only=True)
 class StackTemplateReference(StrictModel):
     name: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
-    source: StackTemplateSource = field(default_factory=StackTemplateFromResource)
+    uid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
+    contentDigest: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
 
     def __post_init__(self) -> None:
         if not re.fullmatch(DESIRED_UID_PATTERN, self.name):
             raise ValueError(f"invalid Stack template name: {self.name!r}")
+        if not re.fullmatch(DESIRED_UID_PATTERN, self.uid):
+            raise ValueError("StackTemplate reference UID must be supplied")
+        if not re.fullmatch(CONTENT_DIGEST_PATTERN, self.contentDigest):
+            raise ValueError("StackTemplate reference contentDigest must be a SHA-256 digest")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -713,7 +1377,7 @@ class ArtifactImport(StrictModel):
     name: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
     apiVersion: Annotated[str, Pattern(r"^[^/]+/[^/]+$")]
     kind: Annotated[str, Pattern(r"^[A-Z][A-Za-z0-9]*$")]
-    fromPromotion: StackTemplatePromotionReference
+    fromPromotion: PromotionStackReference
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -739,18 +1403,14 @@ class ResolvedArtifactImport(StrictModel):
 class StackSpec(StrictModel):
     """Source-authored Stack template selection and parameter values."""
 
-    template: StackTemplateReference | str
+    template: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
     parameters: JsonObjectValue = field(default_factory=JsonObjectValue)
     units: list[Annotated[str, Pattern(DESIRED_UID_PATTERN)]] | None = None
     artifactImports: list[ArtifactImport] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if isinstance(self.template, str):
-            object.__setattr__(
-                self,
-                "template",
-                StackTemplateReference(name=self.template),
-            )
+        if not re.fullmatch(DESIRED_UID_PATTERN, self.template):
+            raise ValueError(f"invalid Stack template name: {self.template!r}")
         if self.units is not None:
             if not self.units or len(set(self.units)) != len(self.units):
                 raise ValueError("Stack units must be non-empty and unique")
@@ -760,27 +1420,50 @@ class StackSpec(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class DesiredStackSpec(StrictModel):
-    """Self-contained desired Stack selection and immutable source record."""
+    """Self-contained desired Stack selection and structural projection."""
 
-    template: StackTemplateReference | str
+    templateRef: StackTemplateReference
     parameters: JsonObjectValue = field(default_factory=JsonObjectValue)
     units: list[Annotated[str, Pattern(DESIRED_UID_PATTERN)]] | None = None
     artifactImports: list[ArtifactImport] = field(default_factory=list)
-    requestedSource: StackTemplateSource | None = None
-    resolvedSource: ResolvedStackTemplateSource | None = None
-    resolvedProjection: JsonObjectValue | None = None
     resolvedArtifactImports: dict[str, ResolvedArtifactImport] | None = None
+    structuralProjection: StackProjection
+    activeProjection: StackActiveProjection | None = None
 
     def __post_init__(self) -> None:
-        if isinstance(self.template, str):
-            object.__setattr__(self, "template", StackTemplateReference(name=self.template))
-        assert isinstance(self.template, StackTemplateReference)
-        if self.requestedSource is None:
-            object.__setattr__(self, "requestedSource", self.template.source)
         if self.units is not None and (not self.units or len(set(self.units)) != len(self.units)):
             raise ValueError("Stack units must be non-empty and unique")
         if len({(item.unit, item.name) for item in self.artifactImports}) != len(self.artifactImports):
             raise ValueError("Stack artifactImports must be unique")
+        if self.templateRef.uid != self.structuralProjection.identity.templateUid:
+            raise ValueError("Stack templateRef UID must equal structural projection template UID")
+        if self.templateRef.contentDigest != self.structuralProjection.identity.templateContentDigest:
+            raise ValueError("Stack templateRef contentDigest must equal structural projection content digest")
+        active = self.activeProjection
+        if active is not None:
+            for logical_name, binding in active.units.items():
+                if binding.sourceProjectionDigest != self.structuralProjection.identity.projectionDigest:
+                    continue
+                if binding.projectionContextDigest != self.structuralProjection.identity.projectionContextDigest:
+                    raise ValueError(
+                        f"Stack active projection Unit {logical_name!r} context does not match structural projection"
+                    )
+                structural = self.structuralProjection.units.get(logical_name)
+                if structural is None:
+                    raise ValueError(f"Stack active projection has unknown structural Unit template: {logical_name!r}")
+                expected_dependencies: list[str] = []
+                for dependency in structural.dependsOn:
+                    dependency_binding = active.units.get(dependency)
+                    if dependency_binding is None:
+                        raise ValueError(
+                            f"Stack active projection Unit {logical_name!r} is missing structural dependency "
+                            f"{dependency!r}"
+                        )
+                    expected_dependencies.append(dependency_binding.name)
+                if sorted(binding.dependsOn) != sorted(expected_dependencies):
+                    raise ValueError(
+                        f"Stack active projection dependencies do not match structural topology for {logical_name!r}"
+                    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -788,7 +1471,11 @@ class StackTemplateDocument(SchemaDocument):
     apiVersion: Literal["gitopsctr.io/v1"]
     kind: Literal["StackTemplate"]
     metadata: AuthoredResourceMetadata
-    spec: StackTemplateSpec
+    spec: StackTemplateDocumentSpec
+
+    def __post_init__(self) -> None:
+        if self.apiVersion != "gitopsctr.io/v1" or self.kind != "StackTemplate":
+            raise ValueError("StackTemplate document has an invalid apiVersion/kind")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -798,6 +1485,14 @@ class DesiredStackTemplateDocument(SchemaDocument):
     metadata: DesiredResourceMetadata
     spec: DesiredStackTemplateSpec
 
+    def __post_init__(self) -> None:
+        if self.apiVersion != "gitopsctr.io/v1" or self.kind != "StackTemplate":
+            raise ValueError("desired StackTemplate document has an invalid apiVersion/kind")
+        resolved = self.spec.acquisition.resolvedSource
+        if isinstance(resolved, StackTemplateResolvedFromPromotionSource):
+            if resolved.fromPromotion.template != self.metadata.name:
+                raise ValueError("promoted StackTemplate template name must match metadata.name")
+
 
 @dataclass(frozen=True, kw_only=True)
 class StackDocument(SchemaDocument):
@@ -806,6 +1501,10 @@ class StackDocument(SchemaDocument):
     metadata: AuthoredResourceMetadata
     spec: StackSpec
 
+    def __post_init__(self) -> None:
+        if self.apiVersion != "gitopsctr.io/v1" or self.kind != "Stack":
+            raise ValueError("Stack document has an invalid apiVersion/kind")
+
 
 @dataclass(frozen=True, kw_only=True)
 class DesiredStackDocument(SchemaDocument):
@@ -813,6 +1512,77 @@ class DesiredStackDocument(SchemaDocument):
     kind: Literal["Stack"]
     metadata: DesiredResourceMetadata
     spec: DesiredStackSpec
+
+    def __post_init__(self) -> None:
+        if self.apiVersion != "gitopsctr.io/v1" or self.kind != "Stack":
+            raise ValueError("desired Stack document has an invalid apiVersion/kind")
+        if metadata_uid := self.metadata.uid:
+            if metadata_uid != self.spec.structuralProjection.identity.stackUid:
+                raise ValueError("desired Stack metadata.uid must equal structural projection stackUid")
+        else:
+            raise ValueError("desired Stack metadata.uid is required")
+
+
+type InspectionPlane = Literal["source", "desired", "observed"]
+type InspectionScope = Literal["project", "environment"]
+type InspectionAuthentication = Literal["CURRENT", "STALE", "ORPHAN"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class InspectionResourceListMetadata(StrictModel):
+    """Reserved metadata for an inspection result list."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class InspectionProvenance(StrictModel):
+    """Exact persisted snapshot that supplied one inspection result."""
+
+    environment: str | None
+    plane: InspectionPlane
+    ref: str | None
+    revision: str | None
+    path: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class InspectionAddress(StrictModel):
+    """Registry-owned logical address for one inspection result."""
+
+    family: str
+    scope: InspectionScope
+    namespace: str | None
+    qualifiedName: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class InspectionDetails(StrictModel):
+    """Derived relationship state authenticated during inspection."""
+
+    authentication: InspectionAuthentication
+
+
+@dataclass(frozen=True, kw_only=True)
+class InspectionResourceItem(StrictModel):
+    """One persisted resource plus its address, provenance, and optional derived state."""
+
+    provenance: InspectionProvenance
+    address: InspectionAddress
+    document: JsonObjectValue
+    inspection: InspectionDetails | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class InspectionResourceListDocument(SchemaDocument):
+    """Typed machine-output envelope for zero, one, or many inspected resources."""
+
+    apiVersion: Literal["inspection.gitopsctr.io/v1"]
+    kind: Literal["ResourceList"]
+    metadata: InspectionResourceListMetadata
+    items: list[InspectionResourceItem]
+
+    def __post_init__(self) -> None:
+        if self.apiVersion != "inspection.gitopsctr.io/v1" or self.kind != "ResourceList":
+            raise ValueError("inspection ResourceList has an invalid apiVersion/kind")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -835,6 +1605,8 @@ class MashumaroContract[ModelT: StrictModel](TypedDocumentContract[ModelT]):
             ).to_dict(),
         )
         schema = _expand_special_schemas(schema)
+        schema = _pair_stack_template_acquisition_schema(schema)
+        schema = _harden_stack_template_desired_schema(schema)
         schema["$id"] = self.schema_id
         return schema
 
@@ -990,10 +1762,23 @@ class AuthoredSource(StrictModel):
     path: str = field(
         metadata={"description": "Repository-relative path resolved from the root of the selected source revision."}
     )
+    revision: Annotated[str, Pattern(EXACT_REVISION_PATTERN)] | None = field(
+        default=None,
+        metadata={
+            "description": (
+                "Optional exact lowercase Git commit intent. Stack projections inherit the StackTemplate source "
+                "context when this is omitted."
+            )
+        },
+    )
     inputs: list[str] | None = field(
         default=None,
         metadata={"description": "Input paths or glob patterns resolved relative to source.path."},
     )
+
+    def __post_init__(self) -> None:
+        if self.revision is not None and re.fullmatch(EXACT_REVISION_PATTERN, self.revision) is None:
+            raise ValueError("source revision must be an exact lowercase 40-hex Git commit")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1001,13 +1786,17 @@ class DesiredSource(StrictModel):
     path: str = field(
         metadata={"description": "Repository-relative path resolved from the root of the selected source revision."}
     )
-    revision: str | None = None
+    revision: Annotated[str, Pattern(EXACT_REVISION_PATTERN)]
     driverVersion: int | None = None
     inputHash: str | None = None
     inputs: list[str] | None = field(
         default=None,
         metadata={"description": "Input paths or glob patterns resolved relative to source.path."},
     )
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(EXACT_REVISION_PATTERN, self.revision) is None:
+            raise ValueError("desired source revision must be an exact lowercase 40-hex Git commit")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1093,6 +1882,11 @@ CORE_CONTRACTS: dict[str, DocumentContract] = {
         f"{SCHEMA_ROOT}/core/v1/stack-desired.schema.json",
     ),
 }
+
+INSPECTION_RESOURCE_LIST_CONTRACT = MashumaroContract(
+    InspectionResourceListDocument,
+    f"{SCHEMA_ROOT}/apis/inspection.gitopsctr.io/v1/ResourceList.schema.json",
+)
 
 
 def schema_url(scope: str, version: int, kind: str) -> str:

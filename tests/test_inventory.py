@@ -5,21 +5,37 @@ import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from gitopsctr.api import GVK
+from gitopsctr.contracts import (
+    CORE_CONTRACTS,
+    DesiredResourceMetadata,
+    DesiredStackDocument,
+    DesiredStackSpec,
+    StackActiveProjection,
+    StackProjection,
+    StackProjectionUnit,
+    StackProjectionUnitBinding,
+    StackTemplateReference,
+)
+from gitopsctr.document import JsonObjectValue
 from gitopsctr.errors import OperationError
 from gitopsctr.inventory import (
     InventoryError,
     InventoryObservationState,
     InventorySession,
     ReconciliationState,
+    evaluate_observation_relationship,
     evaluate_relationships,
 )
 from gitopsctr.operational import materialization_tree_digest
 from gitopsctr.plane_repositories import PlaneRepositorySession
 from gitopsctr.registry import RESOURCE_REGISTRY
-from gitopsctr.resource_model import ObservationDefinition, ResourcePlane, ResourceRegistry
+from gitopsctr.resource_model import ObservationDefinition, ResourcePlane, ResourceRegistry, ResourceSelection
+from gitopsctr.resources import desired_unit_binding_digest
 from gitopsctr.state import GitRefSnapshot, GitStateStore
 
 
@@ -86,40 +102,89 @@ def desired_terraform(name: str) -> dict[str, object]:
 
 def stack_template(name: str, *, desired: bool) -> dict[str, object]:
     metadata: dict[str, object] = {"name": name}
-    if desired:
-        metadata.update({"uid": f"uid-{name}", "labels": {"gitopsctr.io/partition": "application"}})
-    return {
+    authored = {
         "apiVersion": "gitopsctr.io/v1",
         "kind": "StackTemplate",
         "metadata": metadata,
         "spec": {
+            "parameters": [],
             "unitTemplates": {
                 "application": {
                     "apiVersion": "unit.gitopsctr.io/v1",
                     "kind": "Terraform",
                     "spec": {"source": {"path": "."}},
                 }
-            }
+            },
         },
     }
+    if not desired:
+        return authored
+    parsed = CORE_CONTRACTS["stack-template-authored"].parse(authored)
+    metadata.update({"uid": f"uid-{name}", "labels": {"gitopsctr.io/partition": "application"}})
+    specification = cast(dict[str, object], authored["spec"])
+    specification.update(
+        {
+            "contentDigest": parsed.spec.semantic_content_digest(),
+            "acquisition": {
+                "documentDigest": "sha256:" + "b" * 64,
+                "requestedSource": {"fromInput": {}},
+                "resolvedSource": {"fromInput": {}},
+            },
+            "sourceContext": {"repository": ".", "revision": "a" * 40},
+        }
+    )
+    return authored
 
 
-def stack(name: str, template: str, *, desired: bool) -> dict[str, object]:
+def stack(
+    name: str,
+    template: str,
+    *,
+    desired: bool,
+    template_document: dict[str, object] | None = None,
+) -> dict[str, object]:
     metadata: dict[str, object] = {"name": name}
     if desired:
         metadata.update({"uid": f"uid-{name}", "labels": {"gitopsctr.io/partition": "application"}})
     specification: dict[str, object] = {"template": template, "parameters": {}}
     if desired:
-        specification["resolvedProjection"] = {
-            "units": {
-                "application": {
-                    "apiVersion": "unit.gitopsctr.io/v1",
-                    "kind": "Terraform",
-                    "spec": {"source": {"path": "."}},
-                    "dependsOn": [],
-                }
-            }
-        }
+        assert template_document is not None
+        template_metadata = cast(dict[str, object], template_document["metadata"])
+        template_spec = cast(dict[str, object], template_document["spec"])
+        template_uid = cast(str, template_metadata["uid"])
+        content_digest = cast(str, template_spec["contentDigest"])
+        projection = StackProjection.build(
+            stack_uid=cast(str, metadata["uid"]),
+            template_uid=template_uid,
+            template_content_digest=content_digest,
+            context_digest="sha256:" + "c" * 64,
+            units={
+                "application": StackProjectionUnit(
+                    apiVersion="unit.gitopsctr.io/v1",
+                    kind="Terraform",
+                    spec=JsonObjectValue({"source": {"path": "."}}),
+                    dependsOn=[],
+                )
+            },
+        )
+        desired = DesiredStackDocument(
+            apiVersion="gitopsctr.io/v1",
+            kind="Stack",
+            metadata=DesiredResourceMetadata(
+                name=name,
+                uid=cast(str, metadata["uid"]),
+                labels={"gitopsctr.io/partition": "application"},
+            ),
+            spec=DesiredStackSpec(
+                templateRef=StackTemplateReference(
+                    name=template,
+                    uid=template_uid,
+                    contentDigest=content_digest,
+                ),
+                structuralProjection=projection,
+            ),
+        )
+        return CORE_CONTRACTS["stack-desired"].dump(desired)
     return {
         "apiVersion": "gitopsctr.io/v1",
         "kind": "Stack",
@@ -199,8 +264,9 @@ def repository(tmp_path: Path) -> Path:
             },
         },
     )
-    write_json(working / "stack-templates/web.yaml", stack_template("web", desired=True))
-    write_json(working / "stacks/web.yaml", stack("web", "web", desired=True))
+    desired_template = stack_template("web", desired=True)
+    write_json(working / "stack-templates/web.yaml", desired_template)
+    write_json(working / "stacks/web.yaml", stack("web", "web", desired=True, template_document=desired_template))
     write_json(
         working / "promotion.yaml",
         {
@@ -271,6 +337,82 @@ def test_inventory_discovers_every_registered_initial_placement(repository: Path
     assert [item.name for item in promotions] == ["dev"]
     assert [item.name for item in receipts] == ["application"]
     assert artifacts == ()
+
+
+def test_stack_summary_uses_exact_active_bindings_and_surfaces_mismatch(repository: Path):
+    git(repository, "checkout", "desired")
+    stack_document = json.loads((repository / "stacks/web.yaml").read_text())
+    application = desired_terraform("application")
+    application["metadata"]["ownerReferences"] = [  # type: ignore[index]
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Stack",
+            "name": "web",
+            "uid": "uid-web",
+        }
+    ]
+    application["metadata"].pop("labels")  # type: ignore[union-attr]
+    unrelated = desired_terraform("unrelated")
+    unrelated["metadata"]["ownerReferences"] = application["metadata"]["ownerReferences"]  # type: ignore[index]
+    unrelated["metadata"].pop("labels")  # type: ignore[union-attr]
+    application_resource = RESOURCE_REGISTRY.contract(GVK("unit.gitopsctr.io/v1", "Terraform"), "desired").parse(
+        application
+    )
+    application_digest = desired_unit_binding_digest(application_resource)
+    parsed_stack = CORE_CONTRACTS["stack-desired"].parse(stack_document)
+    active = StackActiveProjection.build(
+        source_projection_digest=parsed_stack.spec.structuralProjection.identity.projectionDigest,
+        projection_context_digest=parsed_stack.spec.structuralProjection.identity.projectionContextDigest,
+        units={
+            "application": StackProjectionUnitBinding(
+                apiVersion="unit.gitopsctr.io/v1",
+                kind="Terraform",
+                name="application",
+                uid="uid-application",
+                desiredDigest=application_digest,
+                sourceProjectionDigest=parsed_stack.spec.structuralProjection.identity.projectionDigest,
+                projectionContextDigest=parsed_stack.spec.structuralProjection.identity.projectionContextDigest,
+            )
+        },
+    )
+    active_stack = replace(parsed_stack, spec=replace(parsed_stack.spec, activeProjection=active))
+    write_json(repository / "units/application.yaml", application)
+    write_json(repository / "units/unrelated.yaml", unrelated)
+    write_json(repository / "stacks/web.yaml", CORE_CONTRACTS["stack-desired"].dump(active_stack))
+    exact_revision = commit(repository, "active Stack child bindings")
+    git(repository, "push", "origin", f"{exact_revision}:refs/heads/gitopsctr/desired/active-bindings")
+    git(repository, "checkout", "main")
+
+    with InventorySession(repository, RESOURCE_REGISTRY) as inventory:
+        stack_record = inventory.resources(
+            "stack",
+            environment="dev",
+            ref="gitopsctr/desired/active-bindings",
+        )[0]
+        summary = inventory.stack_inspection_summary(stack_record)
+    assert summary.child_observations == ("STALE",)
+
+    git(repository, "checkout", "desired")
+    broken_binding = replace(active.units["application"], desiredDigest="sha256:" + "d" * 64)
+    broken_active = StackActiveProjection.build(
+        source_projection_digest=active.sourceProjectionDigest,
+        projection_context_digest=active.projectionContextDigest,
+        units={"application": broken_binding},
+    )
+    broken_stack = replace(parsed_stack, spec=replace(parsed_stack.spec, activeProjection=broken_active))
+    write_json(repository / "stacks/web.yaml", CORE_CONTRACTS["stack-desired"].dump(broken_stack))
+    broken_revision = commit(repository, "broken active Stack child binding")
+    git(repository, "push", "origin", f"{broken_revision}:refs/heads/gitopsctr/desired/broken-bindings")
+    git(repository, "checkout", "main")
+
+    with InventorySession(repository, RESOURCE_REGISTRY) as inventory:
+        stack_record = inventory.resources(
+            "stack",
+            environment="dev",
+            ref="gitopsctr/desired/broken-bindings",
+        )[0]
+        summary = inventory.stack_inspection_summary(stack_record)
+    assert summary.child_observations == ("BROKEN(application:mismatch)",)
 
 
 def test_environment_local_stacktemplate_is_not_a_registered_source_representation(repository: Path):
@@ -492,10 +634,23 @@ def test_relationship_evaluation_selects_applicable_registered_definition(reposi
     with InventorySession(repository, registry) as inventory:
         units, receipts, artifacts = inventory.environment_inventory("dev")
         evaluation = evaluate_relationships(registry, units, receipts, artifacts)
+        generic = evaluate_observation_relationship(base, units, receipts)
+        orphan = evaluate_relationships(
+            registry,
+            (),
+            (),
+            artifacts,
+            strict_artifacts=False,
+            observation=base,
+            description=registry.artifact_descriptions[0],
+        )
     assert (
         next(item for item in evaluation.units if item.unit.name == "application").reconciliation
         is ReconciliationState.CLEAN
     )
+    assert all(item.authentication is InventoryObservationState.ORPHAN for item in orphan.artifacts)
+    assert any(item.observation is InventoryObservationState.CURRENT for item in generic.subjects)
+    assert any(item.observation is InventoryObservationState.CURRENT for item in generic.observers)
 
 
 def test_relationship_evaluation_rejects_duplicate_and_malformed_receipts(repository: Path):
@@ -592,9 +747,16 @@ def test_inventory_validates_complete_receipt_artifact_relationship(repository: 
         "dev", desired_ref="gitopsctr/desired/artifacts", observed_ref="gitopsctr/observed/artifacts"
     )
     evaluation = evaluate_relationships(RESOURCE_REGISTRY, units, receipts, artifacts)
+    without_artifacts = inventory.evaluate_environment(
+        "dev",
+        desired_ref="gitopsctr/desired/artifacts",
+        observed_ref="gitopsctr/observed/artifacts",
+        resolve_artifacts=False,
+    )
     images = next(item for item in evaluation.units if item.unit.name == "images")
     assert images.observation is InventoryObservationState.CURRENT
     assert images.artifacts[0].name == "containers"
+    assert next(item for item in without_artifacts.units if item.unit.name == "images").artifacts == ()
 
     image_artifact = next(item for item in artifacts if item.name == "containers")
     mismatched_pin_document = json.loads(json.dumps(image_artifact.document))
@@ -621,6 +783,9 @@ def test_inventory_validates_complete_receipt_artifact_relationship(repository: 
     assert stale_images.artifacts == ()
     stale_receipt = next(item for item in stale.receipts if item.receipt.name == "images")
     assert stale_receipt.artifact_count == 1
+    stale_artifact = next(item for item in stale.artifacts if item.artifact.name == "containers")
+    assert stale_artifact.authentication is InventoryObservationState.STALE
+    assert stale_artifact.producer is None
 
     invalid_document = json.loads(json.dumps(next(item for item in receipts if item.name == "images").document))
     invalid_document["status"]["artifacts"]["containers"]["digest"] = "sha256:wrong"  # type: ignore[index]
@@ -712,7 +877,10 @@ def test_artifact_inventory_identity_is_qualified_by_producer(repository: Path):
     assert {(item.gvk, item.name) for item in artifacts} == {
         (artifacts[0].gvk, "containers"),
     }
-    assert {item.identity_qualifier[-1] for item in artifacts} == {"images-one", "images-two"}
+    assert {item.qualified_name for item in artifacts} == {
+        "images-one/containers",
+        "images-two/containers",
+    }
     assert len({item.logical_identity for item in artifacts}) == 2
 
 
@@ -809,7 +977,7 @@ def test_owned_unit_inherits_partition_from_uid_fenced_stack(repository: Path):
             "unit",
             environment="dev",
             ref="gitopsctr/desired/owned",
-            names=frozenset(("web--application",)),
+            selection=ResourceSelection.segment("name", frozenset(("web--application",))),
         )[0]
         assert inventory.resource_partition(record) == "application"
 

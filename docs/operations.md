@@ -14,24 +14,19 @@ output uses color. Redirected output is plain. `NO_COLOR=1` disables color and
 environment-scoped resources require `--environment NAME`, while `-A` or `--all-environments` queries every authored
 environment.
 
+Representative queries are:
+
 ```console
 gitopsctr get environments
-gitopsctr get environment dev
-gitopsctr get units --environment dev
-gitopsctr get units -A
+gitopsctr get all --environment dev
 gitopsctr get unit application--deploy --environment dev
-gitopsctr get stacks --environment dev
-gitopsctr get stack application --environment dev
-gitopsctr get stacktemplates --environment dev
-gitopsctr get stacktemplate application --environment dev
-gitopsctr get promotions --environment staging
-gitopsctr get promotion dev --environment staging
-gitopsctr get receipts --environment dev
-gitopsctr get receipt application--image --environment dev
+gitopsctr get artifacts --environment dev --producer application--image
 gitopsctr status --environment dev
-gitopsctr dependencies --environment dev --unit application
 gitopsctr validate
 ```
+
+The registry supplies the remaining selectors shown by `gitopsctr get --help`, including Stacks, StackTemplates,
+Promotions, and Receipts.
 
 Singular and plural selectors are equivalent apart from whether a name is supplied. A named lookup with `-A` returns
 every matching resource and includes its Environment, which is useful when names are reused across namespaces:
@@ -40,58 +35,110 @@ every matching resource and includes its Environment, which is useful when names
 gitopsctr get unit application--deploy -A
 ```
 
+`get all` is the namespace overview, analogous to `kubectl get all`. It queries every registry-defined,
+environment-scoped inspection family and prints one table section per family that has results. This includes Units,
+Stacks, StackTemplates, Promotions, Receipts, and Artifacts; project-scoped Environments keep their
+dedicated selector. With `-o yaml` or `-o json`, the aggregate is always one provenance-bearing `ResourceList`, even
+when it contains zero or one resource.
+
 `--environment` and `-A/--all-environments` are mutually exclusive. Project-scoped Environment queries need neither.
 A collection with no matches succeeds with an empty table; a named lookup with no matches fails and identifies the
 resource and Environment.
 
 ### Tables and raw resources
 
-`-o table` is the default. Tables are operational views rather than stored API documents. In particular, the Units
-table joins desired Units with their separately stored Receipts to show `OBSERVATION` (`CURRENT`, `STALE`, `MISSING`,
-or `N/A`) and `RECONCILIATION` (`CLEAN`, `READY`, `WAIT`, or `MATERIALIZED`). The Receipts table reports `CURRENT`,
-`STALE`, or `ORPHAN` relative to the selected desired snapshot. These relationships are derived at read time; a
-Receipt is not embedded into Unit `status`.
+`-o table` is the default. Tables are operational views rather than stored API documents. `-o wide` adds identity
+fences, complete digests, acquisition lineage, and projection details where a resource family defines an expanded
+view. The Units table joins desired Units with their separately stored Receipts to show `OBSERVATION` (`CURRENT`,
+`STALE`, `MISSING`, or `N/A`) and `RECONCILIATION` (`CLEAN`, `READY`, `WAIT`, or `MATERIALIZED`). The Receipts table
+reports `CURRENT`, `STALE`, or `ORPHAN` relative to the selected desired snapshot. These relationships are derived at
+read time; a Receipt is not embedded into Unit `status`.
 
 The built-in views use these columns, with `ENVIRONMENT` added for `-A`:
 
 | Resource | Default columns |
 | --- | --- |
 | Environments | `NAME`, `DESIRED`, `OBSERVED`, reconciliation counts |
-| Units | `NAME`, `KIND`, `DESIRED`, `OBSERVATION`, `RECONCILIATION`, `REASON` |
-| Stacks | `NAME`, `TEMPLATE`, `PARTITION`, `UNITS`, `STATE` |
-| StackTemplates | `NAME`, `PARAMETERS`, `UNITS` |
-| Promotions | `NAME`, `SOURCE`, pinned desired, observed, and specification revisions |
-| Receipts | `NAME`, subject `KIND`, `OBSERVATION`, `ARTIFACTS` |
+| Units | `NAME`, `KIND`, `PARTITION`, `DESIRED`, `OBSERVATION`, `RECONCILIATION`, `REASON` |
+| Stacks | `NAME`, `TEMPLATE`, short `TEMPLATE-DIGEST`, `PARTITION`, active/structural `UNITS`, `OBSERVATION`, `STATE` |
+| StackTemplates | `NAME`, short `CONTENT-DIGEST`, short `SOURCE`, `PARAMETERS`, `UNITS`, `PARTITION`, `REFERENCES`, `STATE` |
+| Promotions | `NAME`, `SOURCE`, `PARTITION`, pinned desired, observed, and specification revisions |
+| Receipts | `NAME`, subject `KIND`, subject `PARTITION`, `OBSERVATION`, `ARTIFACTS` |
+| Artifacts | qualified `NAME` (`producer/name`), `KIND`, producer `PARTITION`, `AUTHENTICATION` |
+
+The default Stack view keeps `TEMPLATE` and a short `TEMPLATE-DIGEST` for quick identification; `UNITS` is the
+active/structural projection count. In `-o wide`, Stack `TEMPLATE`, `TEMPLATE-UID`, and `TEMPLATE-DIGEST` are the
+name/UID/content fences for its selected desired StackTemplate. `STRUCTURAL` shows the intended projection identity,
+context, generated Unit kinds, and topology;
+`ACTIVE` shows the concrete activated projection and its source projection. `TOPOLOGY` shows each logical Unit and its
+dependencies. `OBSERVATION` is derived from UID-fenced child Units and their separate receipts, so it reports child
+observation states rather than embedded Stack status. `STATE` reports the Stack's deletion state.
+
+The default StackTemplate view shortens its content digest and source revision. In `-o wide`, `ACQUISITION` reports
+`input`, `git`, or `promotion` distinctly. It includes the document digest and,
+for Git and promotion, the requested selector plus the resolved exact revision/lineage. Repository values are shown
+without credentials. `SOURCE` reports retained repository and exact revision context, and `REFERENCES` lists Stacks
+whose name/UID/content-digest binding selects that template. `PARTITION` follows the resource's authoritative apply
+membership; `PARAMETERS` and `UNITS` are counts. These relationship and child observation facts are evaluated against
+the selected desired and observed snapshots at read time.
 
 For Units, `DESIRED` is the short Git blob identity of that exact persisted Unit document—the same identity used by a
 Receipt's freshness binding. It is intentionally per-resource rather than repeating the desired snapshot commit on
 every row.
 
+Every environment-scoped table includes `PARTITION`. Desired resources resolve it through their UID-fenced ownership
+chain; Receipts and Artifacts inherit it from the exact desired Unit authenticated by their registered relationships.
+Unpartitioned and orphaned resources render `-`.
+
 Use `-o yaml` or `-o json` for machine-readable output:
 
 ```console
 gitopsctr get unit application--deploy --environment dev -o yaml
+gitopsctr get unit application--deploy --environment dev -o yaml --as-list
 gitopsctr get receipts -A -o json
 ```
 
-A single result is the exact persisted resource document. Multi-result output is a schema-versioned inspection
-envelope: every item contains its Environment, plane, ref, revision, and path provenance alongside the exact document.
-The envelope does not synthesize a joined API resource.
+A named lookup with one match returns the exact persisted resource document. A collection query or `get all` always
+returns a schema-versioned inspection envelope, even when it contains zero or one item; a named all-Environment query
+uses the envelope when it matches multiple resources. Every item contains its generic family/scope/qualified-name
+address plus Environment, plane, ref, revision, and path provenance alongside the exact document. The envelope is the
+registered, typed `inspection.gitopsctr.io/v1 ResourceList` output API; it is not a persisted resource family.
+Use `--as-list` with `-o yaml` or `-o json` to force this envelope for a named lookup and retain its address and
+provenance metadata. The option is rejected for table output.
 
-Desired resource queries accept `--desired-ref` and `--desired-revision`; Receipt queries accept `--observed-ref` and
-`--observed-revision`. Explicit ref or revision overrides cannot be combined with `-A`, because each Environment may
-resolve different deployment refs.
+An item's optional `inspection` object contains state derived while traversing registered relationships; it is never
+part of the persisted `document`. For Artifacts, `inspection.authentication` is `CURRENT` when the Receipt descriptor,
+Artifact identity/content bindings, and exact current desired producer all match; `STALE` when the descriptor is valid
+for an older desired producer; and `ORPHAN` when no matching Receipt/current producer relationship authenticates the
+Artifact. These values do not assert that an external image, bundle, or deployment is reachable or healthy.
 
-Receipt artifacts remain explicitly subordinate to their producing Receipt. `--artifact NAME` prints one typed
-Artifact resource and `--artifacts` prints every artifact described by the Receipt:
+Queries accept ref/revision overrides for every plane used by their registry-defined inspection relationships. Artifact
+and Receipt authentication can therefore select both historical desired and observed snapshots. Explicit ref or
+revision overrides cannot be combined with `-A`, because each Environment may resolve different deployment refs.
+
+Artifacts are first-class inspectable resources with a producer-qualified local identity. The table renders this exact
+address in `NAME`, so it can be copied into a named lookup. `--producer` filters a collection by its first identity
+segment:
+
+```console
+$ gitopsctr get artifacts --environment dev --producer application--image
+NAME                           KIND             PARTITION    AUTHENTICATION
+application--image/containers  ContainerImages  application  CURRENT
+```
+
+Artifact identity and authentication are separate. Inspection follows the registered Receipt-to-Artifact description
+and Receipt-to-desired-Unit observation before reporting `CURRENT`; the authenticated Unit supplies `PARTITION`.
+The generic resource model declares identity segments per family rather than hardcoding a three-level Artifact address.
+
+The Receipt relationship shortcuts remain available. `--artifact NAME` prints one typed Artifact resource and
+`--artifacts` prints every artifact described by the Receipt:
 
 ```console
 gitopsctr get receipt application--image --environment dev --artifact containers
 gitopsctr get receipt application--image --environment dev --artifacts
 ```
 
-There is no standalone Artifact selector in this release because Artifact identity is producer-qualified. `status`
-remains the higher-level diagnostic view and includes authored resources that have not yet resolved into persisted
+`status` remains the higher-level diagnostic view and includes authored resources that have not yet resolved into persisted
 desired Units; `get units` lists persisted desired Units only.
 
 ## Apply and reconcile
@@ -102,6 +149,7 @@ authored inputs, and atomically publishes the resulting desired snapshot:
 ```console
 gitopsctr apply --environment dev \
   --partition application \
+  --file deployment/stack-templates/application.yaml \
   --file deployment/environments/dev/stacks/application.yaml \
   --source-revision HEAD
 gitopsctr reconcile --environment dev --unit application --plan
@@ -113,19 +161,32 @@ roots are its complete membership: members omitted from that application begin d
 unpartitioned roots are untouched. Without `--partition`, apply updates only the named inputs; an existing root keeps
 its partition, while a new root is unpartitioned. Owned resources inherit selection through `ownerReferences`.
 
+Deletion is a two-phase lifecycle. `delete` and partition omission publish UID-/digest-fenced deletion intent only;
+they do not run external teardown. Reconcile a deleting Unit or run `converge` to let the controller process deleting
+resources child/dependent-first, perform idempotent teardown, record observed evidence, and publish the cleanup
+commit automatically. A resource whose driver cannot prove teardown remains in the desired tree and is shown as
+`RECONCILIATION: WAIT` rather than being removed.
+
+Persisted desired state supplies teardown inputs and Stack projection context. The controller's live Project and
+Environment configuration remains the trust anchor that identifies the accepted desired ref; desired or candidate
+documents never authorize their own cleanup effects.
+
 `--dry` previews the controller-owned Git changes. A no-op application creates no commit. An Environment change gate
 decides whether a changed candidate is published to the desired ref or offered for review. A reconciliation plan lets
 the driver inspect its work without applying changes or publishing a receipt; normal reconciliation publishes a
 receipt only after the driver succeeds.
 
 Without `--source-revision`, apply reads its explicit documents and source-less configuration from the current
-worktree. It does not silently substitute `HEAD` or create a hidden commit. If an authored Unit uses
-repository-backed `spec.source`, or a Stack selects a repository-local StackTemplate without its own exact Git
-commit, apply fails and asks for `--source-revision <commit>`.
+worktree. It does not silently substitute `HEAD` or create a hidden commit. If an inline StackTemplate or authored
+Unit uses repository-backed `spec.source`, apply fails and asks for `--source-revision <commit>`; the selected
+revision is persisted as the desired template's `sourceContext`.
 
 `--source-revision` selects the exact committed snapshot used for repository-backed paths and pins. In that mode,
-working-tree changes are excluded and apply reports that exclusion. Commit the intended content and select that
-commit explicitly.
+working-tree changes are excluded and apply reports that exclusion. Every `-f/--file` spelling is first resolved
+relative to the caller's current working directory; revision-backed apply then maps that path into the selected
+repository snapshot and rejects stdin or paths outside the repository. Without a source revision, live filesystem
+input is read as spelled and no hidden `HEAD` commit is created. Commit the intended content and select that commit
+explicitly when reproducibility is required.
 
 For local orchestration, converge a unit and its dependencies until clean:
 
@@ -140,13 +201,17 @@ converge retain those exact inputs for the invocation and alternate apply with d
 ```console
 gitopsctr converge --environment dev \
   --partition application \
+  --file deployment/stack-templates/application.yaml \
   --file deployment/environments/dev/stacks/application.yaml \
   --source-revision HEAD \
   --yes
 ```
 
-Without `--file`, converge only reconciles current desired state; it cannot reconstruct authored input. If an
-observation unlocks another dynamic reference, invoke apply again with the explicit input or use `converge --file`.
+Without `--file`, converge reconciles current desired state and can re-project persisted StackTemplate/Stack
+inputs when new observation evidence unlocks a dynamic reference. No re-application of the original source files is
+required; provide `--file` only when intentionally changing authored input. It also progresses deleting resources until
+the environment is clean, waiting, or failed. A change-gated candidate is not live desired state: it cannot start
+reconciliation, teardown, or cleanup until it is approved and reaches the environment's desired ref.
 
 ## Promote and verify
 
@@ -157,6 +222,7 @@ selected values or artifacts from the reviewed source state:
 gitopsctr promote \
   --from-environment dev \
   --to-environment staging \
+  --file deployment/stack-templates/application.yaml \
   --file deployment/environments/staging/stacks/application.yaml \
   --partition application \
   --specification-revision SOURCE_SHA
@@ -164,18 +230,34 @@ gitopsctr verify --environment staging
 ```
 
 Promotion applies the explicit target resources passed with `--file`; `--partition` gives that target apply set the
-same omission-based pruning semantics as ordinary apply. The Promotion resource pins three independently selected
-revisions: the source desired revision, its matching source observed revision, and `--specification-revision`, which
-contains the target Environment, project configuration, and template sources.
+same omission-based pruning semantics as ordinary apply. A Stack-only promotion may reuse a retained target
+StackTemplate only when no authoritative partition selects it. When an authoritative partition selects that template,
+the target StackTemplate must be supplied explicitly with its `inline`, `fromGit`, or `fromPromotion` mode. The
+Promotion resource pins three independently selected revisions:
+the source desired revision, its matching source observed
+revision, and `--specification-revision`, which authenticates the target Project/Environment configuration and the
+exact bytes of the explicit target input files.
 `--source-desired-revision` defaults to the source desired-ref head; `--specification-revision` defaults to `HEAD`.
 Pass the latter explicitly when `HEAD` might have advanced beyond the source revision reviewed in the source
 environment.
 
-Within the target specification, each Stack still chooses its own template mode. `template: application` reads the
-target template at `--specification-revision`; `fromGit` resolves the target-authored Git request; and
-`template.source.fromPromotion` follows the source Stack's already-recorded template commit and digest before applying
-the target Stack's parameters. Promoted field values and artifact imports are separate selectors, so a target-owned
-Stack can use either without promoting its template.
+Promotion is a resolution context, not a source-tree copy. A target StackTemplate is reused only from target desired
+state when no authoritative partition selects the retained template, or supplied explicitly by `--file` input in its
+`inline`, `fromGit`, or `fromPromotion` mode. A target
+StackTemplate owned by an authoritative partition must be supplied explicitly so omission-based pruning remains
+deterministic. `apply` rejects `fromPromotion`; it requires the explicit `promote` transaction and its pinned source
+desired revision. `fromGit` is resolved from its requested ref and can be used where a StackTemplate input is accepted.
+Field-level `fromPromotion` values and `artifactImports[].fromPromotion` are resolved against the pinned source desired
+and observed revisions, with receipt, producer, artifact, and digest validation before publication.
+
+Repository-backed Unit paths inherit the exact source context retained by the desired StackTemplate unless
+`source.revision` selects an exact 40-hex commit. A StackTemplate parameter may provide that revision, allowing
+independent Stacks to use different commits from the same repository and acquired-ref history. Direct authored Units
+do not accept this field; they continue to use the operation's `--source-revision`. The effective revision
+is resolved before projection, contributes to the structural and desired identity, and is retained under the
+Stack/template incarnation. The driver `inputHash` reflects the selected bytes and deliberately excludes the revision
+value itself, so byte-identical commits have the same input hash while remaining distinct projections. Updating the
+template context reprojects inheritors; changing one Stack's override does not change another Stack.
 
 The target Environment decides whether promotion is published directly or through a pull-request candidate. After a
 gated candidate is merged, reconcile or converge the target without a source revision because its specification and
@@ -203,12 +285,13 @@ Forge identity is provenance only. `gitopsctr` does not decide whether a pull
 request or merge request is eligible, and normal desired-state operations do not
 call GitHub or GitLab.
 
-Trusted PR CI may create, update, delete, and finalize a preview Stack with the
-normal CLI primitives. A scheduled CI job may enumerate preview refs or
-resources by lineage, consult the forge for missed events, and request cleanup.
-Cleanup still uses UID-/revision-fenced Stack finalization. The deployment-owned
-scheduled job is responsible for lineage enumeration and forge API calls; this
-repository does not provide a forge-aware recovery command or watcher.
+Trusted PR CI may create, update, and delete a preview Stack with the normal CLI
+primitives, then run `converge` against the live desired ref. Convergence performs
+UID-/revision-fenced teardown and automatic child/dependent-first cleanup. A
+scheduled CI job may enumerate preview refs or resources by lineage, consult the
+forge for missed events, and request deletion intent; the deployment-owned job
+remains responsible for lineage enumeration and forge API calls. This repository
+does not provide a forge-aware recovery command or watcher.
 
 ## Verify GitHub merge policy
 

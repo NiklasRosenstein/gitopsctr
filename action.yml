@@ -62,7 +62,7 @@ inputs:
     required: false
     default: ""
   source-revision:
-    description: Source revision for apply/converge, or promotion source desired state
+    description: Exact source snapshot for apply/converge; for promote, the source desired revision
     required: false
     default: ""
   specification-revision:
@@ -74,7 +74,7 @@ inputs:
     required: false
     default: ""
   candidate-ref:
-    description: Optional exact candidate ref for a gated promotion or rollback
+    description: Optional exact candidate ref for a gated apply, converge, promote, or rollback
     required: false
     default: ""
   rollback-revision:
@@ -90,7 +90,7 @@ inputs:
     required: false
     default: ""
   dry:
-    description: Preview controller writes for apply or rollback
+    description: Show controller-owned desired writes without publishing for apply, promote, or rollback
     required: false
     default: "false"
   plan:
@@ -123,10 +123,10 @@ outputs:
     description: Whether prepare selected a desired revision that is still eligible
     value: ${{ steps.run.outputs.active }}
   reconciled:
-    description: Whether reconcile published a receipt
+    description: Whether reconcile made progress, including automatic deletion progression
     value: ${{ steps.run.outputs.reconciled }}
   desired-revision:
-    description: Resulting desired revision
+    description: Desired revision selected by prepare
     value: ${{ steps.run.outputs.desired_revision }}
   change-revision:
     description: Published change or candidate revision

@@ -81,9 +81,64 @@ def test_root_help_groups_commands_and_describes_each_command():
     assert "Git data:\n" in help_text
     assert "    promote             promote reviewed desired state" in help_text
     assert "    reconcile           reconcile one deployment unit" in help_text
+    assert "finalize" not in help_text
 
 
-def test_delete_and_finalize_use_generic_resource_commands():
+@pytest.mark.parametrize(
+    ("options", "expected_publication_head"),
+    [
+        (["--parent", "a" * 40], "a" * 40),
+        ([], None),
+        (["--parent", "a" * 40, "--expected-publication-head", "absent"], None),
+        (
+            ["--parent", "a" * 40, "--expected-publication-head", "b" * 40],
+            "b" * 40,
+        ),
+    ],
+)
+def test_publish_tree_uses_caller_authorized_publication_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    options: list[str],
+    expected_publication_head: str | None,
+):
+    directory = tmp_path / "tree"
+    directory.mkdir()
+    received: dict[str, object] = {}
+
+    def publish(
+        ref: str,
+        tree: Path,
+        parent: str | None,
+        message: str,
+        **kwargs: object,
+    ) -> str:
+        received.update(ref=ref, tree=tree, parent=parent, message=message, **kwargs)
+        return "c" * 40
+
+    monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: pytest.fail("publish-tree must not read its ref"))
+    monkeypatch.setattr(deploy_release, "publish_tree", publish)
+    args = deploy_release.build_parser().parse_args(
+        [
+            "publish-tree",
+            "--ref",
+            "deploy/dev",
+            "--directory",
+            str(directory),
+            "--message",
+            "publish",
+            *options,
+        ]
+    )
+
+    args.handler(args)
+
+    assert received["expected_publication_head"] == expected_publication_head
+    assert capsys.readouterr().out == f"{'c' * 40}\n"
+
+
+def test_delete_is_public_but_finalize_is_not():
     parser = deploy_release.build_parser()
 
     delete = parser.parse_args(
@@ -103,25 +158,8 @@ def test_delete_and_finalize_use_generic_resource_commands():
     assert delete.name == "application"
     assert delete.uid == "d1-application"
 
-    finalize = parser.parse_args(
-        [
-            "finalize",
-            "unit",
-            "--environment",
-            "preview",
-            "--name",
-            "application",
-            "--uid",
-            "d1-application",
-            "--deletion-generation",
-            "1",
-        ]
-    )
-    assert finalize.handler is deploy_release.command_finalize
-    assert finalize.kind == "unit"
-    assert finalize.name == "application"
-    assert finalize.uid == "d1-application"
-    assert finalize.deletion_generation == 1
+    with pytest.raises(SystemExit):
+        parser.parse_args(["finalize"])
 
 
 def test_candidate_publication_delegates_change_request_to_ci(tmp_path, monkeypatch):
@@ -159,6 +197,93 @@ def test_candidate_publication_delegates_change_request_to_ci(tmp_path, monkeypa
     assert revision == "d" * 40
     assert isinstance(outcome, deploy_release.ManualChangeRequest)
     assert "delegated" in outcome.reason
+
+
+@pytest.mark.parametrize(
+    ("lease_ref", "candidate_ref", "expected_conflict"),
+    [
+        ("lease/dev", "lease/dev", True),
+        ("refs/heads/lease/dev", "lease/dev", True),
+        ("lease/dev", "refs/heads/lease/dev", True),
+        ("deploy/dev", "refs/heads/deploy/dev", True),
+        (None, "candidate/dev", False),
+        ("lease/dev", "candidate/dev", False),
+    ],
+)
+def test_gated_desired_change_includes_resolved_effect_lease_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lease_ref: str | None,
+    candidate_ref: str,
+    expected_conflict: bool,
+):
+    published: list[tuple[object, ...]] = []
+    monkeypatch.setattr(deploy_release, "effect_lease_ref", lambda *_args: lease_ref)
+    monkeypatch.setattr(deploy_release, "load_desired_resource_graph", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(deploy_release, "validate_desired_resource_transition", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(deploy_release, "validate_effect_leases_preserved", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(deploy_release, "change_gate", lambda *_args, **_kwargs: "pullRequest")
+    monkeypatch.setattr(deploy_release, "_acquire_stack_template_source_pins", lambda *_args: ())
+    monkeypatch.setattr(deploy_release, "_required_stack_template_source_pins", lambda *_args: {})
+    monkeypatch.setattr(deploy_release, "_promote_stack_template_source_pins", lambda *_args: None)
+
+    def publish(*args: object, **_kwargs: object) -> tuple[str, None]:
+        published.append(args)
+        return "d" * 40, None
+
+    monkeypatch.setattr(deploy_release, "publish_change_candidate", publish)
+
+    if expected_conflict:
+        with pytest.raises(deploy_release.OperationError, match="conflicts with"):
+            deploy_release.publish_desired_change(
+                "dev",
+                tmp_path / "candidate",
+                "deploy/dev",
+                "b" * 40,
+                candidate_ref,
+                "Apply change",
+                "Apply change",
+                "Apply the desired state change.",
+                False,
+                configuration_root=tmp_path,
+            )
+        assert published == []
+    else:
+        operation = deploy_release.publish_desired_change(
+            "dev",
+            tmp_path / "candidate",
+            "deploy/dev",
+            "b" * 40,
+            candidate_ref,
+            "Apply change",
+            "Apply change",
+            "Apply the desired state change.",
+            False,
+            configuration_root=tmp_path,
+        )
+        assert operation == ("d" * 40, None)
+        assert len(published) == 1
+        if lease_ref is not None:
+            assert lease_ref in published[0][-1]
+
+
+@pytest.mark.parametrize("lease_ref", ["lease/dev", "refs/heads/lease/dev"])
+def test_change_candidate_rejects_candidate_equal_to_lease_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lease_ref: str
+):
+    monkeypatch.setattr(deploy_release, "publish_tree", lambda *_args, **_kwargs: pytest.fail("published"))
+
+    with pytest.raises(deploy_release.OperationError, match="conflicts with deployment state"):
+        deploy_release.publish_change_candidate(
+            tmp_path / "candidate",
+            lease_ref,
+            "deploy/dev",
+            "b" * 40,
+            "Apply change",
+            "Apply change",
+            "Apply the desired state change.",
+            lease_ref=lease_ref,
+        )
 
 
 def test_write_change_outputs_handles_delegated_change_request(tmp_path, monkeypatch):
@@ -264,11 +389,14 @@ def test_finalized_same_name_recreation_gets_new_uid_from_tombstone(tmp_path):
     deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, candidate, verbose=False)
     recreated = deploy_release.load_desired_unit(candidate / "units/application.json", "application")
     assert recreated.metadata.uid != old_uid
-    assert (
-        deploy_release.load_resource_incarnation_tombstones(candidate)[
-            ("unit.gitopsctr.io/v1", "Terraform", "application")
-        ].uid
-        == old_uid
+    assert deploy_release.load_resource_incarnation_evidence(candidate) == (
+        deploy_release.ResourceIncarnationTombstone(
+            api_version="unit.gitopsctr.io/v1",
+            kind="Terraform",
+            name="application",
+            uid=old_uid,
+            deletion_generation=1,
+        ),
     )
 
     deploy_release.build_desired_candidate("dev", source, "b" * 40, current, observed, None, repeated, verbose=False)
@@ -288,7 +416,7 @@ def test_effect_lease_is_cas_published_and_blocks_a_second_runner(tmp_path, monk
     def materialize(_revision, output):
         shutil.copytree(desired, output)
 
-    def publish(_ref, directory, _parent, _message):
+    def publish(_ref, directory, _parent, _message, **_kwargs):
         shutil.rmtree(desired)
         shutil.copytree(directory, desired)
         revisions["value"] = "b" * 40
@@ -301,7 +429,6 @@ def test_effect_lease_is_cas_published_and_blocks_a_second_runner(tmp_path, monk
     assert acquired.revision == "b" * 40
     persisted = deploy_release.load_desired_effect_leases(desired)["application"]
     assert persisted.token == "lease-runner-a"
-    assert persisted.expires_at is None
 
     with pytest.raises(deploy_release.EffectLeaseUnavailable, match="explicit UID/token recovery"):
         deploy_release.acquire_effect_lease("deploy/dev", "b" * 40, "application", "d1-application")
@@ -332,7 +459,7 @@ def test_effect_lease_precondition_rechecks_after_publish_race(tmp_path, monkeyp
     def materialize(_revision, output):
         shutil.copytree(desired, output)
 
-    def publish(_ref, _directory, _parent, _message):
+    def publish(_ref, _directory, _parent, _message, **_kwargs):
         nonlocal publish_attempts
         publish_attempts += 1
         raise subprocess.CalledProcessError(1, "git push", stderr="non-fast-forward")
@@ -359,14 +486,13 @@ def test_effect_lease_precondition_rechecks_after_publish_race(tmp_path, monkeyp
     assert deploy_release.load_desired_effect_leases(desired) == {}
 
 
-def test_effect_lease_heartbeat_renews_before_expiry_during_long_effect(monkeypatch):
+def test_effect_lease_heartbeat_renews_during_long_effect(monkeypatch):
     lease = deploy_release.EffectLease(
         unit_name="application",
         uid="d1-application",
         token="lease-runner-a",
         owner="runner-a",
         desired_revision="a" * 40,
-        expires_at=None,
     )
     acquisition = deploy_release.EffectLeaseAcquisition(lease=lease, revision="a" * 40)
     renewals = []
@@ -374,7 +500,7 @@ def test_effect_lease_heartbeat_renews_before_expiry_during_long_effect(monkeypa
     def renew(_ref, current):
         renewals.append(current)
         return deploy_release.EffectLeaseAcquisition(
-            lease=replace(current.lease, expires_at=None),
+            lease=current.lease,
             revision="a" * 40,
         )
 
@@ -385,7 +511,6 @@ def test_effect_lease_heartbeat_renews_before_expiry_during_long_effect(monkeypa
 
     assert renewals
     assert renewed.lease.token == lease.token
-    assert renewed.lease.expires_at is None
 
 
 def test_different_unit_heartbeats_rebase_and_preserve_each_other(monkeypatch, tmp_path):
@@ -408,7 +533,7 @@ def test_different_unit_heartbeats_rebase_and_preserve_each_other(monkeypatch, t
         with state_lock:
             shutil.copytree(desired, output)
 
-    def publish(_ref, directory, parent, _message):
+    def publish(_ref, directory, parent, _message, **_kwargs):
         with state_lock:
             if parent != revision["value"]:
                 raise subprocess.CalledProcessError(1, "git push", stderr="non-fast-forward")
@@ -468,7 +593,6 @@ def test_completion_rebases_after_unrelated_unit_renewal(tmp_path, monkeypatch):
             token="lease-a",
             owner="runner-a",
             desired_revision="a" * 40,
-            expires_at=None,
         ),
     )
     deploy_release.write_effect_lease(
@@ -479,7 +603,6 @@ def test_completion_rebases_after_unrelated_unit_renewal(tmp_path, monkeypatch):
             token="lease-b",
             owner="runner-b",
             desired_revision="a" * 40,
-            expires_at=None,
         ),
     )
     shutil.copytree(desired, local)
@@ -522,7 +645,6 @@ def test_observation_publication_rebases_after_unrelated_lease_renewal(tmp_path,
             token="lease-a",
             owner="runner-a",
             desired_revision="a" * 40,
-            expires_at=None,
         ),
     )
     deploy_release.write_effect_lease(
@@ -533,7 +655,6 @@ def test_observation_publication_rebases_after_unrelated_lease_renewal(tmp_path,
             token="lease-b",
             owner="runner-b",
             desired_revision="a" * 40,
-            expires_at=None,
         ),
     )
     application_lease = deploy_release.load_desired_effect_leases(desired)["application"]
@@ -563,7 +684,7 @@ def test_observation_publication_rebases_after_unrelated_lease_renewal(tmp_path,
     monkeypatch.setattr(deploy_release, "validate_effect_lease_head", validate_with_worker_renewal)
     monkeypatch.setattr(deploy_release, "observed_tree", lambda _ref, output: output.mkdir(parents=True) or None)
 
-    def publish(_ref, directory, _parent, _message):
+    def publish(_ref, directory, _parent, _message, **_kwargs):
         observed_publication.update(deploy_release.directory_files(directory))
         return "c" * 40
 
@@ -616,11 +737,9 @@ def test_desired_mutation_cannot_drop_active_effect_lease(tmp_path, monkeypatch)
         token="lease-runner-a",
         owner="runner-a",
         desired_revision="a" * 40,
-        expires_at=100,
     )
     deploy_release.write_effect_lease(current, lease)
     candidate.mkdir()
-    monkeypatch.setattr(deploy_release, "effect_lease_now", lambda: 1)
     monkeypatch.setattr(
         deploy_release, "materialize_revision", lambda _revision, output: shutil.copytree(current, output)
     )
@@ -1495,6 +1614,121 @@ def test_environment_refs_use_project_defaults_and_allow_environment_and_cli_ove
         "manual/desired",
         "manual/observed",
     )
+    assert deploy_release.deployment_refs(
+        tmp_path,
+        "staging",
+        desired_override="refs/heads/manual/desired",
+        observed_override="refs/heads/manual/observed",
+    ) == (
+        "manual/desired",
+        "manual/observed",
+    )
+
+
+@pytest.mark.parametrize(
+    "reserved_ref",
+    [
+        "gitopsctr/pins/fake",
+        "refs/heads/gitopsctr/pins/fake",
+        "gitopsctr/owners/fake",
+        "refs/heads/gitopsctr/owners/fake",
+        "gitopsctr/locks/fake",
+        "refs/heads/gitopsctr/locks/fake",
+    ],
+)
+def test_environment_refs_reject_controller_owned_namespaces(tmp_path, reserved_ref):
+    _write_json(
+        tmp_path / "deployment/environments/staging/environment.json",
+        {
+            "schema": 1,
+            "name": "staging",
+            "refs": {"desired": "refs/heads/deploy/staging", "observed": reserved_ref},
+        },
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="reserved"):
+        deploy_release.deployment_refs(tmp_path, "staging")
+
+
+def test_explicit_reconcile_rejects_reserved_ref_before_effect_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(
+        deploy_release,
+        "unit_effect_lock",
+        lambda *_args, **_kwargs: pytest.fail("reserved refs must be rejected before the effect lock"),
+    )
+    args = deploy_release.build_parser().parse_args(
+        [
+            "reconcile",
+            "--environment",
+            "staging",
+            "--unit",
+            "application",
+            "--desired-ref",
+            "deploy/staging",
+            "--observed-ref",
+            "gitopsctr/owners/fake",
+        ]
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="reserved"):
+        deploy_release.command_reconcile(args)
+
+
+def test_configured_reconcile_rejects_reserved_ref_before_effect_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
+    _write_json(
+        tmp_path / "deployment/environments/staging/environment.json",
+        {
+            "schema": 1,
+            "name": "staging",
+            "refs": {"desired": "deploy/staging", "observed": "gitopsctr/pins/fake"},
+        },
+    )
+    monkeypatch.setattr(
+        deploy_release,
+        "unit_effect_lock",
+        lambda *_args, **_kwargs: pytest.fail("reserved refs must be rejected before the effect lock"),
+    )
+    args = deploy_release.build_parser().parse_args(["reconcile", "--environment", "staging", "--unit", "application"])
+
+    with pytest.raises(deploy_release.OperationError, match="reserved"):
+        deploy_release.command_reconcile(args)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_converge_rejects_reserved_ref_before_reconcile(tmp_path, monkeypatch, explicit):
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
+    if explicit:
+        arguments = [
+            "converge",
+            "--environment",
+            "staging",
+            "--desired-ref",
+            "deploy/staging",
+            "--observed-ref",
+            "refs/heads/gitopsctr/locks/fake",
+            "--yes",
+        ]
+    else:
+        _write_json(
+            tmp_path / "deployment/environments/staging/environment.json",
+            {
+                "schema": 1,
+                "name": "staging",
+                "refs": {"desired": "deploy/staging", "observed": "gitopsctr/owners/fake"},
+            },
+        )
+        arguments = ["converge", "--environment", "staging", "--yes"]
+    monkeypatch.setattr(
+        deploy_release,
+        "command_reconcile",
+        lambda *_args, **_kwargs: pytest.fail("reserved refs must be rejected before reconciliation"),
+    )
+    args = deploy_release.build_parser().parse_args(arguments)
+
+    with pytest.raises(deploy_release.OperationError, match="reserved"):
+        deploy_release.command_converge(args)
 
 
 def test_environment_refs_must_differ_after_project_template_expansion(tmp_path):
@@ -1515,6 +1749,21 @@ def test_environment_refs_must_differ_after_project_template_expansion(tmp_path)
                 },
                 "effectLease": None,
             },
+        },
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="desired and observed refs must differ"):
+        deploy_release.deployment_refs(tmp_path, "staging")
+
+
+def test_environment_refs_compare_canonical_spellings(tmp_path):
+    environment = tmp_path / "deployment/environments/staging/environment.json"
+    _write_json(
+        environment,
+        {
+            "schema": 1,
+            "name": "staging",
+            "refs": {"desired": "refs/heads/deploy/staging", "observed": "deploy/staging"},
         },
     )
 
@@ -1552,7 +1801,7 @@ def test_candidate_ref_templates_use_project_and_environment_configuration(tmp_p
         {
             "schema": 1,
             "name": "staging",
-            "refs": {"candidate": "candidate/{environment}"},
+            "refs": {"candidate": "refs/heads/candidate/{environment}"},
         },
     )
     assert deploy_release.resolve_candidate_ref(tmp_path, "staging", "promotion", "ignored") == ("candidate/staging")
@@ -1562,10 +1811,39 @@ def test_candidate_ref_templates_use_project_and_environment_configuration(tmp_p
             "staging",
             "promotion",
             "ignored",
-            "manual/candidate",
+            "refs/heads/manual/candidate",
         )
         == "manual/candidate"
     )
+
+
+@pytest.mark.parametrize(
+    "candidate_ref",
+    [
+        "gitopsctr/pins/custom",
+        "refs/heads/gitopsctr/pins/custom",
+        "gitopsctr/owners/custom",
+        "refs/heads/gitopsctr/owners/custom",
+        "gitopsctr/locks/custom",
+        "refs/heads/gitopsctr/locks/custom",
+    ],
+)
+def test_candidate_ref_validation_rejects_controller_reserved_namespaces(tmp_path: Path, candidate_ref: str):
+    with pytest.raises(deploy_release.OperationError, match="reserved"):
+        deploy_release.resolve_candidate_ref(tmp_path, "staging", "promotion", "abc123", candidate_ref)
+
+
+def test_candidate_ref_validation_allows_user_gitopsctr_namespace(tmp_path: Path):
+    assert (
+        deploy_release.resolve_candidate_ref(tmp_path, "staging", "promotion", "abc123", "gitopsctr/user-candidate")
+        == "gitopsctr/user-candidate"
+    )
+
+
+@pytest.mark.parametrize("candidate_ref", ["observed/dev", "refs/heads/observed/dev"])
+def test_candidate_ref_conflicts_compare_short_and_full_spellings(candidate_ref: str):
+    assert deploy_release.candidate_ref_conflicts(candidate_ref, "refs/heads/observed/dev")
+    assert not deploy_release.candidate_ref_conflicts(candidate_ref, "desired/dev")
 
 
 def test_environment_candidate_ref_template_rejects_unknown_placeholders(tmp_path):
@@ -1658,6 +1936,37 @@ def test_occupied_candidate_slot_reuses_only_the_same_proposal(tmp_path, monkeyp
             "Different message",
             "Candidate",
             "Candidate body",
+        )
+
+
+@pytest.mark.parametrize(
+    ("candidate_ref", "target_ref", "conflicting_refs"),
+    [
+        ("desired/dev", "desired/dev", ()),
+        ("refs/heads/desired/dev", "desired/dev", ()),
+        ("observed/dev", "desired/dev", ("refs/heads/observed/dev",)),
+        ("refs/heads/observed/dev", "desired/dev", ("observed/dev",)),
+    ],
+)
+def test_change_candidate_rejects_deployment_ref_spellings(
+    tmp_path: Path, candidate_ref: str, target_ref: str, conflicting_refs: tuple[str, ...]
+):
+    candidate = tmp_path / "candidate"
+    _write_json(
+        candidate / "units/application.json",
+        deploy_release.serialize_unit_document(_terraform_desired_resource("application")),
+    )
+
+    with pytest.raises(deploy_release.OperationError, match="conflicts with"):
+        deploy_release.publish_change_candidate(
+            candidate,
+            candidate_ref,
+            target_ref,
+            "b" * 40,
+            "Candidate message",
+            "Candidate",
+            "Candidate body",
+            conflicting_refs=conflicting_refs,
         )
 
 

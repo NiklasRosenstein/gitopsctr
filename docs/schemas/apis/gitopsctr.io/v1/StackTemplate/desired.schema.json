@@ -56,10 +56,6 @@
             "fromEnvironment": {
               "additionalProperties": false,
               "properties": {
-                "dryFallback": {
-                  "$ref": "#/$defs/TemplateValue",
-                  "description": "Type-correct speculative value used only during dry resolution when the reference is unavailable."
-                },
                 "pointer": {
                   "description": "JSON Pointer relative to the target Environment resource.",
                   "pattern": "^(?:$|/(?:[^~]|~[01])*)$",
@@ -317,7 +313,572 @@
     },
     "spec": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "acquisition": {
+                "properties": {
+                  "resolvedSource": {
+                    "required": [
+                      "fromGit"
+                    ]
+                  }
+                },
+                "required": [
+                  "resolvedSource"
+                ]
+              }
+            },
+            "required": [
+              "acquisition"
+            ]
+          },
+          "then": {
+            "properties": {
+              "sourceContext": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "sourceContext"
+            ]
+          }
+        }
+      ],
+      "anyOf": [
+        {
+          "properties": {
+            "sourceContext": {
+              "not": {
+                "type": "null"
+              }
+            }
+          },
+          "required": [
+            "sourceContext"
+          ]
+        },
+        {
+          "properties": {
+            "unitTemplates": {
+              "additionalProperties": {
+                "properties": {
+                  "spec": {
+                    "not": {
+                      "properties": {
+                        "source": {
+                          "anyOf": [
+                            {
+                              "properties": {
+                                "path": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "path"
+                              ]
+                            },
+                            {
+                              "required": [
+                                "fromParameter"
+                              ]
+                            },
+                            {
+                              "properties": {
+                                "path": {
+                                  "required": [
+                                    "fromParameter"
+                                  ],
+                                  "type": "object"
+                                }
+                              },
+                              "required": [
+                                "path"
+                              ]
+                            }
+                          ],
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "source"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
       "properties": {
+        "acquisition": {
+          "additionalProperties": false,
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "documentDigest": {
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "requestedSource": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromInput": {
+                      "additionalProperties": false,
+                      "title": "StackTemplateFromInput",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromInput"
+                  ],
+                  "title": "StackTemplateRequestedFromInput",
+                  "type": "object"
+                },
+                "resolvedSource": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromInput": {
+                      "additionalProperties": false,
+                      "title": "StackTemplateFromInput",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromInput"
+                  ],
+                  "title": "StackTemplateResolvedFromInput",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "documentDigest",
+                "requestedSource",
+                "resolvedSource"
+              ],
+              "title": "StackTemplateInputAcquisition",
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "documentDigest": {
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "requestedSource": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromGit": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "documentDigest": {
+                          "anyOf": [
+                            {
+                              "pattern": "^sha256:[0-9a-f]{64}$",
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        },
+                        "path": {
+                          "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)(?:\\.{1,2})(?:/|$))[^/]+(?:/[^/]+)*$",
+                          "type": "string"
+                        },
+                        "repository": {
+                          "pattern": "^[^\\s\\x00]+$",
+                          "type": "string"
+                        },
+                        "revision": {
+                          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "repository",
+                        "revision",
+                        "path"
+                      ],
+                      "title": "StackTemplateGitRequest",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromGit"
+                  ],
+                  "title": "StackTemplateRequestedFromGit",
+                  "type": "object"
+                },
+                "resolvedSource": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromGit": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "path": {
+                          "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)(?:\\.{1,2})(?:/|$))[^/]+(?:/[^/]+)*$",
+                          "type": "string"
+                        },
+                        "repository": {
+                          "pattern": "^[^\\s\\x00]+$",
+                          "type": "string"
+                        },
+                        "revision": {
+                          "pattern": "^[0-9a-f]{40}$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "repository",
+                        "revision",
+                        "path"
+                      ],
+                      "title": "StackTemplateResolvedFromGit",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromGit"
+                  ],
+                  "title": "StackTemplateResolvedFromGitSource",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "documentDigest",
+                "requestedSource",
+                "resolvedSource"
+              ],
+              "title": "StackTemplateGitAcquisition",
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "documentDigest": {
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "requestedSource": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromPromotion": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "stack": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "stack"
+                      ],
+                      "title": "StackTemplatePromotionRequest",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromPromotion"
+                  ],
+                  "title": "StackTemplateRequestedFromPromotion",
+                  "type": "object"
+                },
+                "resolvedSource": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromPromotion": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "desiredRef": {
+                          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+                          "type": "string"
+                        },
+                        "desiredRevision": {
+                          "pattern": "^[0-9a-f]{40}$",
+                          "type": "string"
+                        },
+                        "environment": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        },
+                        "stack": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        },
+                        "stackUid": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        },
+                        "template": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        },
+                        "templateContentDigest": {
+                          "pattern": "^sha256:[0-9a-f]{64}$",
+                          "type": "string"
+                        },
+                        "templateUid": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "environment",
+                        "desiredRef",
+                        "desiredRevision",
+                        "stack",
+                        "stackUid",
+                        "template",
+                        "templateUid",
+                        "templateContentDigest"
+                      ],
+                      "title": "StackTemplateResolvedFromPromotion",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromPromotion"
+                  ],
+                  "title": "StackTemplateResolvedFromPromotionSource",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "documentDigest",
+                "requestedSource",
+                "resolvedSource"
+              ],
+              "title": "StackTemplatePromotionAcquisition",
+              "type": "object"
+            }
+          ],
+          "properties": {
+            "documentDigest": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "requestedSource": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromInput": {
+                      "additionalProperties": false,
+                      "title": "StackTemplateFromInput",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromInput"
+                  ],
+                  "title": "StackTemplateRequestedFromInput",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromGit": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "documentDigest": {
+                          "anyOf": [
+                            {
+                              "pattern": "^sha256:[0-9a-f]{64}$",
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "default": null
+                        },
+                        "path": {
+                          "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)(?:\\.{1,2})(?:/|$))[^/]+(?:/[^/]+)*$",
+                          "type": "string"
+                        },
+                        "repository": {
+                          "pattern": "^[^\\s\\x00]+$",
+                          "type": "string"
+                        },
+                        "revision": {
+                          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "repository",
+                        "revision",
+                        "path"
+                      ],
+                      "title": "StackTemplateGitRequest",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromGit"
+                  ],
+                  "title": "StackTemplateRequestedFromGit",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromPromotion": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "stack": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "stack"
+                      ],
+                      "title": "StackTemplatePromotionRequest",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromPromotion"
+                  ],
+                  "title": "StackTemplateRequestedFromPromotion",
+                  "type": "object"
+                }
+              ]
+            },
+            "resolvedSource": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromInput": {
+                      "additionalProperties": false,
+                      "title": "StackTemplateFromInput",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromInput"
+                  ],
+                  "title": "StackTemplateResolvedFromInput",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromGit": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "path": {
+                          "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)(?:\\.{1,2})(?:/|$))[^/]+(?:/[^/]+)*$",
+                          "type": "string"
+                        },
+                        "repository": {
+                          "pattern": "^[^\\s\\x00]+$",
+                          "type": "string"
+                        },
+                        "revision": {
+                          "pattern": "^[0-9a-f]{40}$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "repository",
+                        "revision",
+                        "path"
+                      ],
+                      "title": "StackTemplateResolvedFromGit",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromGit"
+                  ],
+                  "title": "StackTemplateResolvedFromGitSource",
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "fromPromotion": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "desiredRef": {
+                          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+                          "type": "string"
+                        },
+                        "desiredRevision": {
+                          "pattern": "^[0-9a-f]{40}$",
+                          "type": "string"
+                        },
+                        "environment": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        },
+                        "stack": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        },
+                        "stackUid": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        },
+                        "template": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        },
+                        "templateContentDigest": {
+                          "pattern": "^sha256:[0-9a-f]{64}$",
+                          "type": "string"
+                        },
+                        "templateUid": {
+                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "environment",
+                        "desiredRef",
+                        "desiredRevision",
+                        "stack",
+                        "stackUid",
+                        "template",
+                        "templateUid",
+                        "templateContentDigest"
+                      ],
+                      "title": "StackTemplateResolvedFromPromotion",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "fromPromotion"
+                  ],
+                  "title": "StackTemplateResolvedFromPromotionSource",
+                  "type": "object"
+                }
+              ]
+            }
+          },
+          "required": [
+            "documentDigest",
+            "requestedSource",
+            "resolvedSource"
+          ],
+          "title": "StackTemplateAcquisition",
+          "type": "object"
+        },
+        "contentDigest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
         "parameters": {
           "items": {
             "additionalProperties": false,
@@ -346,208 +907,25 @@
           },
           "type": "array"
         },
-        "requestedSource": {
-          "anyOf": [
-            {
-              "anyOf": [
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "fromResource": {
-                      "additionalProperties": false,
-                      "properties": {
-                        "name": {
-                          "anyOf": [
-                            {
-                              "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "default": null
-                        },
-                        "uid": {
-                          "anyOf": [
-                            {
-                              "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "default": null
-                        }
-                      },
-                      "title": "StackTemplateResourceReference",
-                      "type": "object"
-                    }
-                  },
-                  "title": "StackTemplateFromResource",
-                  "type": "object"
-                },
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "fromGit": {
-                      "additionalProperties": false,
-                      "properties": {
-                        "commit": {
-                          "anyOf": [
-                            {
-                              "pattern": "^[0-9a-f]{40}$",
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "default": null
-                        },
-                        "path": {
-                          "anyOf": [
-                            {
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "default": null
-                        },
-                        "ref": {
-                          "anyOf": [
-                            {
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "default": null
-                        },
-                        "remote": {
-                          "anyOf": [
-                            {
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "default": null
-                        }
-                      },
-                      "title": "GitSourceRequest",
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "fromGit"
-                  ],
-                  "title": "StackTemplateFromGit",
-                  "type": "object"
-                },
-                {
-                  "additionalProperties": false,
-                  "properties": {
-                    "fromPromotion": {
-                      "additionalProperties": false,
-                      "properties": {
-                        "stack": {
-                          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-                          "type": "string"
-                        }
-                      },
-                      "required": [
-                        "stack"
-                      ],
-                      "title": "StackTemplatePromotionReference",
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "fromPromotion"
-                  ],
-                  "title": "StackTemplateFromPromotion",
-                  "type": "object"
-                }
-              ]
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "resolvedSource": {
+        "sourceContext": {
           "anyOf": [
             {
               "additionalProperties": false,
               "properties": {
-                "fromGit": {
-                  "additionalProperties": false,
-                  "properties": {
-                    "commit": {
-                      "pattern": "^[0-9a-f]{40}$",
-                      "type": "string"
-                    },
-                    "digest": {
-                      "pattern": "^[0-9a-f]{64}$",
-                      "type": "string"
-                    },
-                    "path": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null
-                    },
-                    "ref": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null
-                    },
-                    "remote": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null
-                    },
-                    "resourcePath": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "commit",
-                    "resourcePath",
-                    "digest"
-                  ],
-                  "title": "ResolvedGitSource",
-                  "type": "object"
+                "repository": {
+                  "pattern": "^[^\\s\\x00]+$",
+                  "type": "string"
+                },
+                "revision": {
+                  "pattern": "^[0-9a-f]{40}$",
+                  "type": "string"
                 }
               },
               "required": [
-                "fromGit"
+                "repository",
+                "revision"
               ],
-              "title": "ResolvedStackTemplateSource",
+              "title": "StackTemplateSourceContext",
               "type": "object"
             },
             {
@@ -608,6 +986,12 @@
           "type": "object"
         }
       },
+      "required": [
+        "parameters",
+        "unitTemplates",
+        "contentDigest",
+        "acquisition"
+      ],
       "type": "object"
     }
   },

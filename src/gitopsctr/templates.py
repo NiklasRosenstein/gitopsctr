@@ -210,6 +210,28 @@ class TemplateObject(dict[str, TemplateValue], SerializableType):
         return cls(parsed)
 
 
+class ProjectionObject(dict[str, TemplateValue], SerializableType):
+    """A recursively typed projection object without parameter expressions.
+
+    Structural Stack projections have already expanded Stack parameters, but
+    they intentionally retain late-bound receipt, artifact, promotion, and
+    environment references.  Keeping a separate mapping type lets the
+    runtime parser and generated JSON Schema enforce that distinction.
+    """
+
+    def _serialize(self) -> dict[str, JsonValue]:
+        return {name: dump_template_value(value) for name, value in self.items()}
+
+    @classmethod
+    def _deserialize(cls, value: object) -> ProjectionObject:
+        parsed = parse_template_value(value)
+        if not isinstance(parsed, dict):
+            raise ValueError("expected a projection object")
+        if contains_parameter_expression(parsed):
+            raise ValueError("projection objects must not contain fromParameter expressions")
+        return cls(parsed)
+
+
 class ParameterTemplateObject(dict[str, ParameterTemplateValue], SerializableType):
     """A recursively typed object containing only fixed values and parameters."""
 
@@ -386,6 +408,34 @@ def parse_parameter_value(value: object, pointer: str = "") -> ParameterTemplate
     raise TemplateError(f"parameter template value is not JSON: {type(value).__name__}")
 
 
+def contains_parameter_expression(value: object) -> bool:
+    """Return whether a parsed template value contains ``fromParameter``."""
+
+    if isinstance(value, ParameterReference):
+        return True
+    if isinstance(value, (ReceiptReference, ArtifactReference, PromotionReference)):
+        target = (
+            value.fromReceipt
+            if isinstance(value, ReceiptReference)
+            else (value.fromArtifact if isinstance(value, ArtifactReference) else value.fromPromotion)
+        )
+        return has_dry_fallback(target) and contains_parameter_expression(target.dryFallback.value)
+    if isinstance(value, list):
+        return any(contains_parameter_expression(item) for item in value)
+    if isinstance(value, dict):
+        return "fromParameter" in value or any(contains_parameter_expression(item) for item in value.values())
+    return False
+
+
+def parse_projection_value(value: object, pointer: str = "") -> TemplateValue:
+    """Parse a late-bound projection value while rejecting parameters."""
+
+    parsed = parse_template_value(value, pointer)
+    if contains_parameter_expression(parsed):
+        raise TemplateError(f"{pointer or '/'}: projection values must not contain fromParameter expressions")
+    return parsed
+
+
 def dump_template_value(value: TemplateValue) -> JsonValue:
     """Serialize an authored expression tree to its public JSON representation."""
 
@@ -450,6 +500,29 @@ def resolve_parameter_value(
     value: ParameterTemplateValue, parameters: Mapping[str, JsonValue]
 ) -> ParameterTemplateValue:
     """Resolve parameters and preserve other runtime references for later resolution."""
+
+    def resolve_fallback(
+        target: ReceiptReferenceTarget | ArtifactReferenceTarget | PromotionReferenceTarget,
+    ) -> ReceiptReferenceTarget | ArtifactReferenceTarget | PromotionReferenceTarget:
+        if not has_dry_fallback(target):
+            return target
+        try:
+            fallback = parse_template_value(target.dryFallback.value)
+            expanded = resolve_parameter_value(fallback, parameters)
+        except TemplateError:
+            # Dynamic fallbacks are validated by the authored template parser;
+            # only the parameter-only portion is expanded here.  Leave a
+            # fallback containing a late-bound reference for the normal
+            # resolver instead of changing the outer reference expression.
+            return target
+        return replace(target, dryFallback=DryFallbackValue(dump_template_value(expanded)))
+
+    if isinstance(value, ReceiptReference):
+        return cast(ParameterTemplateValue, replace(value, fromReceipt=resolve_fallback(value.fromReceipt)))
+    if isinstance(value, ArtifactReference):
+        return cast(ParameterTemplateValue, replace(value, fromArtifact=resolve_fallback(value.fromArtifact)))
+    if isinstance(value, PromotionReference):
+        return cast(ParameterTemplateValue, replace(value, fromPromotion=resolve_fallback(value.fromPromotion)))
 
     if isinstance(value, ParameterReference):
         try:

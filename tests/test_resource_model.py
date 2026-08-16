@@ -9,14 +9,29 @@ import yaml
 
 from gitopsctr.api import GVK, ApiKind
 from gitopsctr.artifacts import CONTAINER_IMAGES
+from gitopsctr.contracts import (
+    DesiredStackSpec,
+    DesiredStackTemplateSpec,
+    StackProjection,
+    StackProjectionUnit,
+    StackTemplateAcquisition,
+    StackTemplateFromInput,
+    StackTemplateReference,
+    StackTemplateRequestedFromInput,
+    StackTemplateResolvedFromInput,
+    StackTemplateSpec,
+    StackTemplateUnitTemplate,
+)
 from gitopsctr.core_api import CORE_API_VERSION, CoreResourceApi
-from gitopsctr.document import ContractError, JsonObject
+from gitopsctr.document import ContractError, JsonObject, JsonObjectValue
 from gitopsctr.driver import UnitDriver
 from gitopsctr.formats import Project
+from gitopsctr.inspection_api import InspectionOutputApi
 from gitopsctr.registry import API_KINDS, RESOURCE_REGISTRY
 from gitopsctr.resource_model import (
     ArtifactResolutionContext,
     CollectionReadContext,
+    IdentityConstraint,
     ObservationCardinality,
     ObservationState,
     ProfiledApiMembership,
@@ -28,19 +43,24 @@ from gitopsctr.resource_model import (
     ResourcePlane,
     ResourceRegistry,
     ResourceScope,
+    ResourceSelection,
     UnitApiMembership,
 )
 from gitopsctr.resource_model_export import bundled_resource_registry, export_resource_model, render_resource_model
-from gitopsctr.resources import UnitResource
+from gitopsctr.resources import ResourceMetadata, StackResource, UnitResource
+from gitopsctr.templates import TemplateObject
 
 
-def rebuild(*, collections=None, families=None, observations=None, artifact_descriptions=None) -> ResourceRegistry:
+def rebuild(
+    *, collections=None, families=None, observations=None, artifact_descriptions=None, graph_relationships=None
+) -> ResourceRegistry:
     return ResourceRegistry(
-        API_KINDS,
+        RESOURCE_REGISTRY.api_kinds,
         RESOURCE_REGISTRY.collections if collections is None else collections,
         RESOURCE_REGISTRY.families if families is None else families,
         RESOURCE_REGISTRY.observations if observations is None else observations,
         RESOURCE_REGISTRY.artifact_descriptions if artifact_descriptions is None else artifact_descriptions,
+        RESOURCE_REGISTRY.graph_relationships if graph_relationships is None else graph_relationships,
     )
 
 
@@ -71,8 +91,9 @@ def relationship_resource(
 
 
 def test_builtin_registry_derives_core_driver_and_artifact_family_membership():
-    assert len(API_KINDS) == 13
-    assert {RESOURCE_REGISTRY.family_for_api_kind(gvk).name for gvk in API_KINDS} == {
+    assert len(API_KINDS) == 14
+    assert isinstance(API_KINDS[GVK("inspection.gitopsctr.io/v1", "ResourceList")].spec, InspectionOutputApi)
+    assert {RESOURCE_REGISTRY.family_for_api_kind(gvk).name for gvk in RESOURCE_REGISTRY.api_kinds} == {
         "artifact",
         "environment",
         "project",
@@ -97,6 +118,100 @@ def test_builtin_registry_derives_core_driver_and_artifact_family_membership():
     assert set(RESOURCE_REGISTRY.contracts_for("unit", "desired")) == {
         kind.gvk for kind in RESOURCE_REGISTRY.api_kinds_for_family("unit")
     }
+    assert {relationship.name for relationship in RESOURCE_REGISTRY.graph_relationships} == {
+        "stack-selects-stacktemplate",
+        "stack-owns-unit",
+    }
+
+
+def test_family_local_identity_is_registry_defined_and_generically_selectable():
+    artifact = RESOURCE_REGISTRY.family("artifact")
+    unit = RESOURCE_REGISTRY.family("unit")
+
+    identity = artifact.identity.parse("application--image/containers")
+    assert artifact.identity.render(identity) == "application--image/containers"
+    assert artifact.identity.value(identity, "producer") == "application--image"
+    assert artifact.identity.value(identity, "name") == "containers"
+    assert artifact.identity.matches(
+        identity,
+        ResourceSelection(constraints=(IdentityConstraint("producer", frozenset(("application--image",))),)),
+    )
+    assert not artifact.identity.matches(
+        identity,
+        ResourceSelection(constraints=(IdentityConstraint("producer", frozenset(("other",))),)),
+    )
+    assert artifact.identity.segments[0].filter_option == "--producer"
+    with pytest.raises(ResourceModelError, match="requires 1 segments"):
+        unit.identity.parse("application--image/containers")
+
+
+def test_registered_stack_template_selection_binding_checks_uid_and_content_digest():
+    unit_templates = {
+        "app": StackTemplateUnitTemplate(apiVersion="unit.gitopsctr.io/v1", kind="Terraform", spec=TemplateObject({}))
+    }
+    content = StackTemplateSpec(parameters=[], unitTemplates=unit_templates)
+    template_spec = DesiredStackTemplateSpec(
+        parameters=[],
+        contentDigest=content.semantic_content_digest(),
+        acquisition=StackTemplateAcquisition(
+            documentDigest="sha256:" + "b" * 64,
+            requestedSource=StackTemplateRequestedFromInput(fromInput=StackTemplateFromInput()),
+            resolvedSource=StackTemplateResolvedFromInput(fromInput=StackTemplateFromInput()),
+        ),
+        unitTemplates=unit_templates,
+    )
+    template = StackResource(
+        GVK(CORE_API_VERSION, "StackTemplate"),
+        ResourceMetadata(name="preview", uid="template-uid"),
+        template_spec,
+    )
+    stack = StackResource(
+        GVK(CORE_API_VERSION, "Stack"),
+        ResourceMetadata(name="preview", uid="stack-uid"),
+        DesiredStackSpec(
+            templateRef=StackTemplateReference(
+                name="preview",
+                uid="template-uid",
+                contentDigest=template_spec.semantic_content_digest(),
+            ),
+            structuralProjection=StackProjection.build(
+                stack_uid="stack-uid",
+                template_uid="template-uid",
+                template_content_digest=template_spec.contentDigest,
+                context_digest="sha256:" + "c" * 64,
+                units={
+                    "app": StackProjectionUnit(
+                        apiVersion="unit.gitopsctr.io/v1",
+                        kind="Terraform",
+                        spec=JsonObjectValue({}),
+                        dependsOn=[],
+                    )
+                },
+            ),
+        ),
+    )
+    binding = RESOURCE_REGISTRY.graph_relationship("stack-selects-stacktemplate").binding
+    binding.validate(stack, template)
+    with pytest.raises(ResourceModelError, match="different UID"):
+        binding.validate(
+            stack,
+            replace(template, metadata=replace(template.metadata, uid="other-template-uid")),
+        )
+    other_unit_templates = {
+        "other": StackTemplateUnitTemplate(apiVersion="unit.gitopsctr.io/v1", kind="Terraform", spec=TemplateObject({}))
+    }
+    other_content = StackTemplateSpec(parameters=[], unitTemplates=other_unit_templates)
+    other_template = replace(
+        template,
+        spec=DesiredStackTemplateSpec(
+            parameters=[],
+            contentDigest=other_content.semantic_content_digest(),
+            acquisition=template_spec.acquisition,
+            unitTemplates=other_unit_templates,
+        ),
+    )
+    with pytest.raises(ResourceModelError, match="different content digest"):
+        binding.validate(stack, other_template)
 
 
 def test_core_api_profiles_are_executable_resource_contracts():

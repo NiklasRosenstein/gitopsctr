@@ -11,7 +11,7 @@ from gitopsctr import controller
 from gitopsctr.driver import DriverError, TeardownResult
 from gitopsctr.errors import OperationError
 from tests.conftest import write_test_document
-from tests.test_finalization import _finalize_args, _mark, _prepare_finalization, _terraform_unit
+from tests.test_finalization import _mark, _prepare_finalization, _reconcile_args, _terraform_unit
 
 
 def test_failed_teardown_survives_restart_and_retries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -27,12 +27,12 @@ def test_failed_teardown_survives_restart_and_retries(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(type(controller.UNIT_DRIVERS["terraform"]), "teardown", teardown)
     with pytest.raises(DriverError, match="transient destroy failure"):
-        controller.command_finalize(_finalize_args())
+        controller.command_reconcile(_reconcile_args())
     assert len(teardown_calls) == 1
     retained = controller.load_desired_unit(desired / "units/application.json", "application")
     assert controller.resource_deletion(retained) is not None
 
-    assert controller.command_finalize(_finalize_args()) is True
+    assert controller.command_reconcile(_reconcile_args()) is True
     assert len(teardown_calls) == 2
     assert not (desired / "units/application.yaml").exists()
     assert controller.load_teardown_evidence(observed, "application", "d1-application", 1) is not None
@@ -55,12 +55,12 @@ def test_evidence_publication_crash_does_not_repeat_teardown(tmp_path: Path, mon
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("controller crashed after evidence")),
     )
     with pytest.raises(RuntimeError, match="controller crashed after evidence"):
-        controller.command_finalize(_finalize_args())
+        controller.command_reconcile(_reconcile_args())
     assert len(teardown_calls) == 1
     assert controller.load_teardown_evidence(observed, "application", "d1-application", 1) is not None
 
     monkeypatch.setattr(controller, "publish_desired_change", original_publish)
-    assert controller.command_finalize(_finalize_args()) is True
+    assert controller.command_reconcile(_reconcile_args()) is True
     assert len(teardown_calls) == 1
     assert not (desired / "units/application.yaml").exists()
 
@@ -90,7 +90,6 @@ def test_effect_lease_blocks_opaque_recovery(tmp_path: Path, monkeypatch: pytest
             token="lease-token",
             owner="test",
             desired_revision="c" * 40,
-            expires_at=None,
         ),
     )
     monkeypatch.setattr(controller, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))

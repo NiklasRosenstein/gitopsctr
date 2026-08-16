@@ -26,8 +26,8 @@ if [[ "${PLAN}" == "true" && "${OPERATION}" != "reconcile" ]]; then
   echo "plan is only valid for operation reconcile" >&2
   exit 2
 fi
-if [[ "${DRY}" == "true" && "${OPERATION}" != "apply" && "${OPERATION}" != "rollback" ]]; then
-  echo "dry is only valid for operations apply and rollback" >&2
+if [[ "${DRY}" == "true" && "${OPERATION}" != "apply" && "${OPERATION}" != "promote" && "${OPERATION}" != "rollback" ]]; then
+  echo "dry is only valid for operations apply, promote, and rollback" >&2
   exit 2
 fi
 if [[ "${PLAN}" == "true" && "${DRY}" == "true" ]]; then
@@ -44,6 +44,7 @@ if [[ -n "${PARTITION}" && "${OPERATION}" != "apply" && "${OPERATION}" != "conve
 fi
 
 working_directory="$(cd "${WORKING_DIRECTORY}" && pwd)"
+cd "${working_directory}"
 args=(--repository "${working_directory}")
 
 write_prepare_outputs() {
@@ -126,8 +127,6 @@ case "${OPERATION}" in
     [[ -n "${DESIRED_REF}" ]] && args+=(--desired-ref "${DESIRED_REF}")
     [[ -n "${OBSERVED_REF}" ]] && args+=(--observed-ref "${OBSERVED_REF}")
     [[ -n "${DESIRED_REVISION}" ]] && args+=(--desired-revision "${DESIRED_REVISION}")
-    [[ -n "${SOURCE_REVISION}" ]] && args+=(--source-revision "${SOURCE_REVISION}")
-    [[ -n "${REQUIRE_SOURCE_REF}" ]] && args+=(--require-source-ref "${REQUIRE_SOURCE_REF}")
     [[ -n "${REPORT}" ]] && args+=(--report "${REPORT}")
     [[ "${PLAN}" == "true" ]] && args+=(--plan)
     [[ "${REAPPLY}" == "true" ]] && args+=(--reapply)
@@ -178,6 +177,7 @@ case "${OPERATION}" in
     [[ -n "${PARTITION}" ]] && args+=(--partition "${PARTITION}")
     [[ -n "${SOURCE_REVISION}" ]] && args+=(--source-desired-revision "${SOURCE_REVISION}")
     [[ -n "${CANDIDATE_REF}" ]] && args+=(--candidate-ref "${CANDIDATE_REF}")
+    [[ "${DRY}" == "true" ]] && args+=(--dry)
     ;;
   *)
     echo "operation must be prepare, apply, converge, reconcile, promote, or rollback" >&2

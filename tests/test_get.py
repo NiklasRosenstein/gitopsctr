@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 from gitopsctr import controller
 from gitopsctr.errors import OperationError
+from gitopsctr.inventory import InventoryRecord, InventorySession
+from gitopsctr.resource_model import StackInspectionSummary
 from tests import test_inventory as inventory_support
 
 pytest_plugins = ("tests.test_inventory",)
@@ -27,17 +29,165 @@ def test_get_environments_and_units_vertical_slice(repository: Path, capsys: pyt
     assert "wait=1" in environments
 
     units = run_get(repository, capsys, "units", "--environment", "dev")
-    assert units.splitlines()[0].split() == ["NAME", "KIND", "DESIRED", "OBSERVATION", "RECONCILIATION", "REASON"]
+    assert units.splitlines()[0].split() == [
+        "NAME",
+        "KIND",
+        "PARTITION",
+        "DESIRED",
+        "OBSERVATION",
+        "RECONCILIATION",
+        "REASON",
+    ]
     assert "application" in units and "CURRENT" in units and "CLEAN" in units
     assert "external" in units and "N/A" in units and "MATERIALIZED" in units
+    rows = {parts[0]: parts for line in units.splitlines()[1:] if (parts := line.split())}
+    assert rows["application"][2] == "application"
+
+    receipts = run_get(repository, capsys, "receipts", "--environment", "dev")
+    receipt_rows = {parts[0]: parts for line in receipts.splitlines()[1:] if (parts := line.split())}
+    assert receipt_rows["application"][2] == "application"
+
+    promotions = run_get(repository, capsys, "promotions", "--environment", "dev")
+    promotion_rows = {parts[0]: parts for line in promotions.splitlines()[1:] if (parts := line.split())}
+    assert promotion_rows["dev"][2] == "-"
 
 
-def test_get_named_raw_document_and_multi_result_envelope(repository: Path, capsys: pytest.CaptureFixture[str]):
+def test_get_all_renders_registry_defined_environment_tables(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = run_get(repository, capsys, "all", "--environment", "dev")
+    lines = output.splitlines()
+
+    assert lines[0] == "UNITS"
+    assert lines[1].split() == [
+        "NAME",
+        "KIND",
+        "PARTITION",
+        "DESIRED",
+        "OBSERVATION",
+        "RECONCILIATION",
+        "REASON",
+    ]
+    assert "application" in output and "external" in output
+    assert "\n\nRECEIPTS\n" in output
+    assert "CURRENT" in output
+    assert "ENVIRONMENTS" not in output
+
+    wide = run_get(repository, capsys, "all", "--environment", "dev", "-o", "wide")
+    lines = wide.splitlines()
+    stack_section = lines.index("STACKS")
+    assert "UID" in lines[stack_section + 1].split()
+    assert "STRUCTURAL" in lines[stack_section + 1].split()
+
+
+def test_get_all_raw_output_is_always_one_provenance_list(repository: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    result = json.loads(run_get(repository, capsys, "all", "--environment", "dev", "-o", "json"))
+
+    assert result["apiVersion"] == "inspection.gitopsctr.io/v1"
+    assert result["kind"] == "ResourceList"
+    assert {item["document"]["kind"] for item in result["items"]} >= {"Terraform", "Receipt"}
+    assert {item["provenance"]["environment"] for item in result["items"]} == {"dev"}
+    assert {item["provenance"]["plane"] for item in result["items"]} == {"desired", "observed"}
+    assert {item["address"]["scope"] for item in result["items"]} == {"environment"}
+    assert all(item["address"]["qualifiedName"] for item in result["items"])
+
+
+def test_stack_tables_are_compact_by_default_and_preserve_details_in_wide_output(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stack = json.loads(run_get(repository, capsys, "stack", "web", "--environment", "staging", "-o", "json"))
+    template = json.loads(run_get(repository, capsys, "stacktemplate", "web", "--environment", "staging", "-o", "json"))
+    stack_uid = stack["metadata"]["uid"]
+    template_uid = template["metadata"]["uid"]
+    content_digest = template["spec"]["contentDigest"]
+
+    stacks = run_get(repository, capsys, "stacks", "--environment", "staging")
+    assert stacks.splitlines()[0].split() == [
+        "NAME",
+        "TEMPLATE",
+        "TEMPLATE-DIGEST",
+        "PARTITION",
+        "UNITS",
+        "OBSERVATION",
+        "STATE",
+    ]
+    assert stack_uid not in stacks
+    assert template_uid not in stacks
+    assert content_digest not in stacks
+    assert f"{content_digest[:19]}..." in stacks
+
+    templates = run_get(repository, capsys, "stacktemplates", "--environment", "staging")
+    assert templates.splitlines()[0].split() == [
+        "NAME",
+        "CONTENT-DIGEST",
+        "SOURCE",
+        "PARAMETERS",
+        "UNITS",
+        "PARTITION",
+        "REFERENCES",
+        "STATE",
+    ]
+    assert template_uid not in templates
+    assert content_digest not in templates
+    assert f"{content_digest[:19]}..." in templates
+
+    wide_stacks = run_get(repository, capsys, "stacks", "--environment", "staging", "-o", "wide")
+    wide_templates = run_get(repository, capsys, "stacktemplates", "--environment", "staging", "-o", "wide")
+    assert stack_uid in wide_stacks
+    assert template_uid in wide_stacks
+    assert content_digest in wide_stacks
+    assert template_uid in wide_templates
+    assert content_digest in wide_templates
+
+
+def test_get_all_across_environments_keeps_family_tables_and_namespace_columns(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = run_get(repository, capsys, "all", "-A")
+    lines = output.splitlines()
+
+    section_indexes = [index for index, line in enumerate(lines) if line in {"UNITS", "STACKS", "STACKTEMPLATES"}]
+    assert section_indexes
+    for index in section_indexes:
+        assert lines[index + 1].split()[0] == "ENVIRONMENT"
+    assert "dev" in output and "staging" in output
+
+
+def test_get_named_raw_document_and_collection_envelope(repository: Path, capsys: pytest.CaptureFixture[str]):
     raw = json.loads(run_get(repository, capsys, "unit", "application", "--environment", "dev", "-o", "json"))
     assert raw["apiVersion"] == "unit.gitopsctr.io/v1"
     assert raw["kind"] == "Terraform"
     assert raw["metadata"]["name"] == "application"
     assert "provenance" not in raw
+
+    named_list = json.loads(
+        run_get(
+            repository,
+            capsys,
+            "unit",
+            "application",
+            "--environment",
+            "dev",
+            "-o",
+            "json",
+            "--as-list",
+        )
+    )
+    assert named_list["kind"] == "ResourceList"
+    assert len(named_list["items"]) == 1
+    assert named_list["items"][0]["address"] == {
+        "family": "unit",
+        "scope": "environment",
+        "namespace": "dev",
+        "qualifiedName": "application",
+    }
+    assert named_list["items"][0]["provenance"]["environment"] == "dev"
+    assert named_list["items"][0]["document"] == raw
+
+    collection = json.loads(run_get(repository, capsys, "units", "--environment", "staging", "-o", "json"))
+    assert collection["apiVersion"] == "inspection.gitopsctr.io/v1"
+    assert collection["kind"] == "ResourceList"
+    assert collection["items"]
 
     result = json.loads(run_get(repository, capsys, "unit", "application", "-A", "-o", "json"))
     assert result["apiVersion"] == "inspection.gitopsctr.io/v1"
@@ -80,6 +230,35 @@ def test_get_named_raw_document_does_not_evaluate_unrelated_resources(
     assert raw["metadata"]["name"] == "application"
 
 
+def test_get_named_stack_table_does_not_validate_unrelated_stack(repository: Path, capsys: pytest.CaptureFixture[str]):
+    inventory_support.git(repository, "checkout", "desired")
+    inventory_support.write_json(
+        repository / "stacks/unrelated.yaml",
+        {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Stack",
+            "metadata": {"name": "unrelated", "uid": "uid-unrelated"},
+            "spec": {},
+        },
+    )
+    revision = inventory_support.commit(repository, "malformed unrelated desired Stack")
+    inventory_support.git(repository, "push", "origin", f"{revision}:refs/heads/gitopsctr/desired/local-stack")
+    inventory_support.git(repository, "checkout", "main")
+
+    output = run_get(
+        repository,
+        capsys,
+        "stack",
+        "web",
+        "--environment",
+        "staging",
+        "--desired-ref",
+        "gitopsctr/desired/local-stack",
+    )
+    assert "web" in output
+    assert "unrelated" not in output
+
+
 def test_get_named_all_environments_tolerates_uninitialized_refs(repository: Path, capsys: pytest.CaptureFixture[str]):
     inventory_support.git(repository, "push", "origin", "--delete", "gitopsctr/desired/staging")
     result = json.loads(run_get(repository, capsys, "unit", "application", "-A", "-o", "json"))
@@ -93,20 +272,72 @@ def test_get_validates_scope_overrides_and_named_misses(repository: Path, capsys
         run_get(repository, capsys, "units", "-A", "--desired-revision", "a" * 40)
     with pytest.raises(OperationError, match="no unit named 'missing'"):
         run_get(repository, capsys, "unit", "missing", "--environment", "dev")
+    with pytest.raises(OperationError, match="get all requires"):
+        run_get(repository, capsys, "all")
+    with pytest.raises(OperationError, match="does not accept a resource name"):
+        run_get(repository, capsys, "all", "application", "--environment", "dev")
+    with pytest.raises(OperationError, match="does not accept --artifact"):
+        run_get(repository, capsys, "all", "--environment", "dev", "--artifacts")
+    with pytest.raises(OperationError, match="cannot be combined"):
+        run_get(repository, capsys, "all", "-A", "--observed-revision", "a" * 40)
+    with pytest.raises(OperationError, match="requires --output yaml or json"):
+        run_get(repository, capsys, "unit", "application", "--environment", "dev", "--as-list")
 
 
 @pytest.mark.parametrize(
     ("arguments", "headers", "name"),
     [
         (("environment", "dev"), ("NAME", "DESIRED", "OBSERVED", "RECONCILIATION"), "dev"),
-        (("stacks", "--environment", "staging"), ("NAME", "TEMPLATE", "PARTITION", "UNITS", "STATE"), "web"),
-        (("stacktemplates", "--environment", "staging"), ("NAME", "PARAMETERS", "UNITS"), "web"),
+        (
+            ("stacks", "--environment", "staging", "-o", "wide"),
+            (
+                "NAME",
+                "UID",
+                "TEMPLATE",
+                "TEMPLATE-UID",
+                "TEMPLATE-DIGEST",
+                "PARTITION",
+                "STRUCTURAL",
+                "ACTIVE",
+                "TOPOLOGY",
+                "OBSERVATION",
+                "STATE",
+            ),
+            "web",
+        ),
+        (
+            ("stacktemplates", "--environment", "staging", "-o", "wide"),
+            (
+                "NAME",
+                "UID",
+                "CONTENT-DIGEST",
+                "ACQUISITION",
+                "SOURCE",
+                "PARAMETERS",
+                "UNITS",
+                "PARTITION",
+                "REFERENCES",
+                "STATE",
+            ),
+            "web",
+        ),
         (
             ("promotions", "--environment", "staging"),
-            ("NAME", "SOURCE", "DESIRED-REVISION", "OBSERVED-REVISION", "SPECIFICATION-REVISION"),
+            (
+                "NAME",
+                "SOURCE",
+                "PARTITION",
+                "DESIRED-REVISION",
+                "OBSERVED-REVISION",
+                "SPECIFICATION-REVISION",
+            ),
             "dev",
         ),
-        (("receipts", "--environment", "dev"), ("NAME", "KIND", "OBSERVATION", "ARTIFACTS"), "application"),
+        (
+            ("receipts", "--environment", "dev"),
+            ("NAME", "KIND", "PARTITION", "OBSERVATION", "ARTIFACTS"),
+            "application",
+        ),
     ],
 )
 def test_get_all_initial_inspection_tables(
@@ -120,14 +351,280 @@ def test_get_all_initial_inspection_tables(
     assert tuple(output.splitlines()[0].split()) == headers
     assert name in output
     if arguments[0] == "stacks":
-        assert output.splitlines()[1].split()[3] == "1"
+        assert "projection=" in output
+        assert "application:Terraform" in output
+        assert "topology=" not in output
+        assert "CURRENT" not in output  # the fixture has no Stack-owned Unit receipt
+
+
+def test_get_stack_and_template_documents_preserve_fences_and_content(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+):
+    template = json.loads(run_get(repository, capsys, "stacktemplate", "web", "--environment", "staging", "-o", "json"))
+    stack = json.loads(run_get(repository, capsys, "stack", "web", "--environment", "staging", "-o", "json"))
+
+    assert template["metadata"]["uid"] == "uid-web"
+    assert template["spec"]["contentDigest"].startswith("sha256:")
+    assert template["spec"]["acquisition"]["documentDigest"].startswith("sha256:")
+    assert template["spec"]["acquisition"]["requestedSource"] == {"fromInput": {}}
+    assert template["spec"]["acquisition"]["resolvedSource"] == {"fromInput": {}}
+    assert stack["spec"]["templateRef"] == {
+        "name": "web",
+        "uid": "uid-web",
+        "contentDigest": template["spec"]["contentDigest"],
+    }
+    assert stack["spec"]["structuralProjection"]["identity"]["templateUid"] == "uid-web"
+    assert (
+        stack["spec"]["structuralProjection"]["identity"]["templateContentDigest"] == template["spec"]["contentDigest"]
+    )
+
+    template_table = run_get(repository, capsys, "stacktemplate", "web", "--environment", "staging", "-o", "wide")
+    stack_table = run_get(repository, capsys, "stack", "web", "--environment", "staging", "-o", "wide")
+    assert "input(document=sha256:" in template_table
+    assert "REFERENCES" in template_table and "web" in template_table
+    assert "uid-web" in stack_table
+    assert template["spec"]["contentDigest"] in stack_table
+    assert "context=sha256:" in stack_table
+    assert "application<-" in stack_table
+
+
+def test_get_stacktemplate_inspection_renders_all_acquisition_modes(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+):
+    inventory_support.git(repository, "checkout", "desired")
+    inline = inventory_support.stack_template("inline", desired=True)
+    git_template = inventory_support.stack_template("git", desired=True)
+    git_spec = git_template["spec"]
+    assert isinstance(git_spec, dict)
+    git_spec["acquisition"] = {
+        "documentDigest": "sha256:" + "d" * 64,
+        "requestedSource": {
+            "fromGit": {
+                "repository": "https://deploy:secret@example.com/org/templates.git",
+                "revision": "main",
+                "path": "templates/git.yaml",
+            }
+        },
+        "resolvedSource": {
+            "fromGit": {
+                "repository": "https://deploy:secret@example.com/org/templates.git",
+                "revision": "c" * 40,
+                "path": "templates/git.yaml",
+            }
+        },
+    }
+    git_spec["sourceContext"] = {
+        "repository": "https://deploy:secret@example.com/org/templates.git",
+        "revision": "c" * 40,
+    }
+    promotion_template = inventory_support.stack_template("promotion", desired=True)
+    promotion_spec = promotion_template["spec"]
+    assert isinstance(promotion_spec, dict)
+    promotion_spec["acquisition"] = {
+        "documentDigest": "sha256:" + "e" * 64,
+        "requestedSource": {"fromPromotion": {"stack": "application"}},
+        "resolvedSource": {
+            "fromPromotion": {
+                "environment": "dev",
+                "desiredRef": "gitopsctr/desired/dev",
+                "desiredRevision": "b" * 40,
+                "stack": "application",
+                "stackUid": "uid-application",
+                "template": "promotion",
+                "templateUid": "uid-application-template",
+                "templateContentDigest": promotion_spec["contentDigest"],
+            }
+        },
+    }
+    inventory_support.write_json(repository / "stack-templates/inline.yaml", inline)
+    inventory_support.write_json(repository / "stack-templates/git.yaml", git_template)
+    inventory_support.write_json(repository / "stack-templates/promotion.yaml", promotion_template)
+    revision = inventory_support.commit(repository, "add StackTemplate acquisition inspection cases")
+    inventory_support.git(repository, "push", "origin", f"{revision}:refs/heads/gitopsctr/desired/acquisition-modes")
+    inventory_support.git(repository, "checkout", "main")
+
+    output = run_get(
+        repository,
+        capsys,
+        "stacktemplates",
+        "--environment",
+        "staging",
+        "--desired-ref",
+        "gitopsctr/desired/acquisition-modes",
+        "-o",
+        "wide",
+    )
+
+    assert "input(document=sha256:" in output
+    assert "git(repository=https://example.com/org/templates.git;requested=main;resolved=" in output
+    assert "promotion(requested=application;resolved=dev/gitopsctr/desired/dev@" in output
+    assert "https://deploy:secret@example.com" not in output
+    assert "c" * 40 in output
+    assert "b" * 40 in output
+
+
+def test_get_stack_table_prepares_with_explicit_observed_snapshot(
+    repository: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+):
+    observed_ref = "gitopsctr/observed/staging"
+    observed_revision = inventory_support.git(repository, "rev-parse", f"refs/remotes/origin/{observed_ref}")
+    calls: list[tuple[tuple[str, ...], str, str | None]] = []
+    original = InventorySession.prepare_stack_inspection
+
+    def record_prepare(
+        inventory: InventorySession,
+        records: tuple[InventoryRecord, ...],
+        *,
+        observed_ref: str,
+        observed_revision: str | None,
+        allow_missing_observed_ref: bool,
+    ) -> None:
+        calls.append((tuple(record.name for record in records), observed_ref, observed_revision))
+        original(
+            inventory,
+            records,
+            observed_ref=observed_ref,
+            observed_revision=observed_revision,
+            allow_missing_observed_ref=allow_missing_observed_ref,
+        )
+
+    monkeypatch.setattr(InventorySession, "prepare_stack_inspection", record_prepare)
+
+    output = run_get(
+        repository,
+        capsys,
+        "stack",
+        "web",
+        "--environment",
+        "staging",
+        "--observed-ref",
+        observed_ref,
+        "--observed-revision",
+        observed_revision,
+    )
+
+    assert "web" in output
+    assert calls[0] == (("web",), observed_ref, observed_revision)
+
+
+def test_get_stack_tables_batch_inspection_preparation(
+    repository: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+):
+    inventory_support.git(repository, "checkout", "desired")
+    template = json.loads((repository / "stack-templates/web.yaml").read_text())
+    inventory_support.write_json(
+        repository / "stacks/worker.yaml",
+        inventory_support.stack("worker", "web", desired=True, template_document=template),
+    )
+    inventory_support.write_json(
+        repository / "stack-templates/other.yaml",
+        inventory_support.stack_template("other", desired=True),
+    )
+    desired_revision = inventory_support.commit(repository, "add inspection batch resources")
+    inventory_support.git(
+        repository,
+        "push",
+        "origin",
+        f"{desired_revision}:refs/heads/gitopsctr/desired/inspection-batch",
+    )
+    inventory_support.git(repository, "checkout", "main")
+
+    batches: list[tuple[str, ...]] = []
+    original = InventorySession._build_stack_inspection_summaries
+
+    def record_batch(
+        inventory: InventorySession,
+        records: tuple[InventoryRecord, ...],
+        *,
+        observed_ref: str,
+        observed_revision: str | None,
+        allow_missing_observed_ref: bool,
+    ) -> dict[PurePosixPath, StackInspectionSummary]:
+        batches.append(tuple(record.name for record in records))
+        return original(
+            inventory,
+            records,
+            observed_ref=observed_ref,
+            observed_revision=observed_revision,
+            allow_missing_observed_ref=allow_missing_observed_ref,
+        )
+
+    monkeypatch.setattr(InventorySession, "_build_stack_inspection_summaries", record_batch)
+
+    stacks = run_get(
+        repository,
+        capsys,
+        "stacks",
+        "--environment",
+        "staging",
+        "--desired-ref",
+        "gitopsctr/desired/inspection-batch",
+    )
+    templates = run_get(
+        repository,
+        capsys,
+        "stacktemplates",
+        "--environment",
+        "staging",
+        "--desired-ref",
+        "gitopsctr/desired/inspection-batch",
+    )
+
+    assert "worker" in stacks
+    assert "other" in templates
+    assert {frozenset(batch) for batch in batches} == {
+        frozenset(("web", "worker")),
+        frozenset(("web", "other")),
+    }
+    assert len(batches) == 2
 
 
 def test_get_unit_desired_column_is_the_resource_blob(repository: Path, capsys: pytest.CaptureFixture[str]):
     output = run_get(repository, capsys, "unit", "application", "--environment", "dev")
-    desired = output.splitlines()[1].split()[2]
+    desired = output.splitlines()[1].split()[3]
     assert len(desired) == 12
     assert all(character in "0123456789abcdef" for character in desired)
+
+
+def test_get_desired_unit_table_uses_explicit_observed_snapshot(repository: Path, capsys: pytest.CaptureFixture[str]):
+    inventory_support.git(repository, "checkout", "observed")
+    (repository / "units/application.yaml").unlink()
+    empty_revision = inventory_support.commit(repository, "empty observed override")
+    inventory_support.git(
+        repository,
+        "push",
+        "origin",
+        f"{empty_revision}:refs/heads/gitopsctr/observed/empty-override",
+    )
+    inventory_support.git(repository, "checkout", "main")
+
+    table = run_get(
+        repository,
+        capsys,
+        "unit",
+        "application",
+        "--environment",
+        "dev",
+        "--observed-ref",
+        "gitopsctr/observed/empty-override",
+    )
+    assert "MISSING" in table
+
+    raw = json.loads(
+        run_get(
+            repository,
+            capsys,
+            "unit",
+            "application",
+            "--environment",
+            "dev",
+            "--observed-ref",
+            "gitopsctr/observed/empty-override",
+            "-o",
+            "json",
+        )
+    )
+    assert raw["metadata"]["name"] == "application"
 
 
 def test_get_all_environments_always_includes_environment_column(repository: Path, capsys: pytest.CaptureFixture[str]):
@@ -183,10 +680,43 @@ def test_get_explicit_missing_ref_fails_precisely(repository: Path, capsys: pyte
         )
 
 
+def test_get_stack_table_explicit_missing_observed_ref_fails(repository: Path, capsys: pytest.CaptureFixture[str]):
+    with pytest.raises(OperationError, match="observed ref 'gitopsctr/observed/missing' does not exist"):
+        run_get(
+            repository,
+            capsys,
+            "stack",
+            "web",
+            "--environment",
+            "staging",
+            "--observed-ref",
+            "gitopsctr/observed/missing",
+        )
+
+
+def test_get_stack_table_explicit_missing_observed_revision_fails(repository: Path, capsys: pytest.CaptureFixture[str]):
+    inventory_support.write_json(repository / "revision-only-marker.json", {})
+    missing_revision = inventory_support.commit(repository, "unrelated revision for observed override")
+
+    with pytest.raises(OperationError, match="requested revision is not part of"):
+        run_get(
+            repository,
+            capsys,
+            "stack",
+            "web",
+            "--environment",
+            "staging",
+            "--observed-revision",
+            missing_revision,
+        )
+
+
 def test_documented_get_commands_execute_across_dev_and_staging(repository: Path, capsys: pytest.CaptureFixture[str]):
     commands = (
         ("environments",),
         ("environment", "dev"),
+        ("all", "--environment", "dev"),
+        ("all", "-A"),
         ("units", "--environment", "dev"),
         ("unit", "application", "--environment", "dev"),
         ("units", "-A"),
@@ -319,7 +849,155 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
         "-o",
         "json",
     )
-    assert json.loads(all_output) == artifact
+    all_result = json.loads(all_output)
+    assert all_result["kind"] == "ResourceList"
+    assert [item["document"] for item in all_result["items"]] == [artifact]
+
+    artifact_collection = json.loads(run_get(repository, capsys, "artifacts", "--environment", "dev", "-o", "json"))
+    assert artifact_collection["kind"] == "ResourceList"
+    assert [item["document"] for item in artifact_collection["items"]] == [artifact]
+    assert artifact_collection["items"][0]["inspection"]["authentication"] == "CURRENT"
+
+    artifacts = run_get(repository, capsys, "artifacts", "--environment", "dev")
+    assert artifacts.splitlines()[0].split() == ["NAME", "KIND", "PARTITION", "AUTHENTICATION"]
+    assert artifacts.splitlines()[1].split() == [
+        "images/containers",
+        "ContainerImages",
+        "application",
+        "CURRENT",
+    ]
+
+    filtered = run_get(repository, capsys, "artifacts", "--environment", "dev", "--producer", "images")
+    assert filtered == artifacts
+
+    exact_arguments = (
+        "artifact",
+        "images/containers",
+        "--environment",
+        "dev",
+        "--desired-ref",
+        "gitopsctr/desired/dev",
+        "--desired-revision",
+        desired_revision,
+        "--observed-ref",
+        "gitopsctr/observed/dev",
+        "--observed-revision",
+        observed_revision,
+        "-o",
+        "json",
+    )
+    exact = run_get(repository, capsys, *exact_arguments)
+    exact_result = json.loads(exact)
+    assert exact_result == artifact
+
+    exact_list = json.loads(run_get(repository, capsys, *exact_arguments, "--as-list"))
+    assert exact_list["items"][0]["address"]["qualifiedName"] == "images/containers"
+    assert exact_list["items"][0]["document"] == artifact
+    assert exact_list["items"][0]["inspection"]["authentication"] == "CURRENT"
+
+    inventory_support.git(repository, "checkout", "observed")
+    orphan_artifact = json.loads(json.dumps(artifact))
+    orphan_artifact["producer"]["name"] = "orphan"
+    inventory_support.write_json(repository / "artifacts/orphan/containers.yaml", orphan_artifact)
+    orphan_revision = inventory_support.commit(repository, "orphan artifact")
+    inventory_support.git(
+        repository,
+        "push",
+        "origin",
+        f"{orphan_revision}:refs/heads/gitopsctr/observed/orphan-artifact",
+    )
+    inventory_support.git(repository, "checkout", "main")
+    orphan = run_get(
+        repository,
+        capsys,
+        "artifact",
+        "orphan/containers",
+        "--environment",
+        "dev",
+        "--observed-ref",
+        "gitopsctr/observed/orphan-artifact",
+    )
+    assert orphan.splitlines()[1].split() == ["orphan/containers", "ContainerImages", "-", "ORPHAN"]
+
+    inventory_support.git(repository, "checkout", "desired")
+    stale_producer = json.loads((repository / "units/images.yaml").read_text())
+    stale_producer["spec"]["source"]["inputHash"] = "sha256:changed"
+    inventory_support.write_json(repository / "units/images.yaml", stale_producer)
+    stale_desired_revision = inventory_support.commit(repository, "stale artifact producer")
+    inventory_support.git(
+        repository,
+        "push",
+        "origin",
+        f"{stale_desired_revision}:refs/heads/gitopsctr/desired/stale-artifact",
+    )
+    inventory_support.git(repository, "checkout", "main")
+    stale_output = json.loads(
+        run_get(
+            repository,
+            capsys,
+            "artifact",
+            "images/containers",
+            "--environment",
+            "dev",
+            "--desired-ref",
+            "gitopsctr/desired/stale-artifact",
+            "-o",
+            "json",
+        )
+    )
+    assert stale_output == artifact
+    stale_table = run_get(
+        repository,
+        capsys,
+        "artifact",
+        "images/containers",
+        "--environment",
+        "dev",
+        "--desired-ref",
+        "gitopsctr/desired/stale-artifact",
+    )
+    assert stale_table.splitlines()[1].split() == ["images/containers", "ContainerImages", "-", "STALE"]
+    inventory_support.git(repository, "checkout", "observed")
+    extra_artifact = json.loads(json.dumps(artifact))
+    extra_artifact["metadata"]["name"] = "other"
+    inventory_support.write_json(repository / "artifacts/images/other.yaml", extra_artifact)
+    stale_observed_revision = inventory_support.commit(repository, "undeclared stale artifact")
+    inventory_support.git(
+        repository,
+        "push",
+        "origin",
+        f"{stale_observed_revision}:refs/heads/gitopsctr/observed/stale-artifact",
+    )
+    inventory_support.git(repository, "checkout", "main")
+    with pytest.raises(OperationError, match="do not match its declared outputs"):
+        run_get(
+            repository,
+            capsys,
+            "artifacts",
+            "--environment",
+            "dev",
+            "--producer",
+            "images",
+            "--desired-ref",
+            "gitopsctr/desired/stale-artifact",
+            "--observed-ref",
+            "gitopsctr/observed/stale-artifact",
+        )
+
+    aggregate = run_get(repository, capsys, "all", "--environment", "dev")
+    assert "\n\nARTIFACTS\n" in aggregate
+    assert "images/containers" in aggregate
+    aggregate_document = json.loads(run_get(repository, capsys, "all", "--environment", "dev", "-o", "json"))
+    aggregate_artifact = next(
+        item for item in aggregate_document["items"] if item["address"]["qualifiedName"] == "images/containers"
+    )
+    assert aggregate_artifact["inspection"] == {"authentication": "CURRENT"}
+
+    with pytest.raises(OperationError, match="--producer is not available for units"):
+        run_get(repository, capsys, "units", "--environment", "dev", "--producer", "images")
+
+    with pytest.raises(OperationError, match="expected PRODUCER/NAME"):
+        run_get(repository, capsys, "artifact", "containers", "--environment", "dev")
 
     with pytest.raises(OperationError, match="has no artifact named 'missing'"):
         run_get(

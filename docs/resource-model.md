@@ -7,18 +7,20 @@ independent persisted representation; a relationship never implies that one reso
 
 ## Families and placements
 
-| Family | Selectors | Installed API kinds | Source | Desired | Observed |
-| --- | --- | --- | --- | --- | --- |
-| artifact | `artifact`, `artifacts` | `artifact.gitopsctr.io/v1/ContainerImages`<br>`artifact.gitopsctr.io/v1/FrontendBundle` | — | — | `environment` · `observed-artifacts` · `observed` |
-| environment | `environment`, `environments` | `gitopsctr.io/v1/Environment` | `project` · `source-environments` · `authored` · default | — | — |
-| project | `project`, `projects` | `gitopsctr.io/v1/Project` | `project` · `source-project` · `authored` | — | — |
-| promotion | `promotion`, `promotions` | `gitopsctr.io/v1/Promotion` | — | `environment` · `desired-promotions` · `desired` · default | — |
-| receipt | `receipt`, `receipts` | `gitopsctr.io/v1/Receipt` | — | — | `environment` · `observed-receipts` · `observed` · default |
-| stack | `stack`, `stacks` | `gitopsctr.io/v1/Stack` | `environment` · `source-stacks` · `authored` | `environment` · `desired-stacks` · `desired` · default | — |
-| stacktemplate | `stacktemplate`, `stacktemplates` | `gitopsctr.io/v1/StackTemplate` | `project` · `source-stacktemplates` · `authored` | `environment` · `desired-stacktemplates` · `desired` · default | — |
-| unit | `unit`, `units` | `unit.gitopsctr.io/v1/FrontendS3Cloudfront`<br>`unit.gitopsctr.io/v1/KubernetesManifests`<br>`unit.gitopsctr.io/v1/OciImages`<br>`unit.gitopsctr.io/v1/Terraform`<br>`unit.gitopsctr.io/v1/ViteOciBundle` | `environment` · `source-units` · `authored` | `environment` · `desired-units` · `desired` · default | — |
+| Family | Selectors | Local identity | Installed API kinds | Source | Desired | Observed |
+| --- | --- | --- | --- | --- | --- | --- |
+| artifact | `artifact`, `artifacts` | `producer/name` (--producer) | `artifact.gitopsctr.io/v1/ContainerImages`<br>`artifact.gitopsctr.io/v1/FrontendBundle` | — | — | `environment` · `observed-artifacts` · `observed` · default |
+| environment | `environment`, `environments` | `name` | `gitopsctr.io/v1/Environment` | `project` · `source-environments` · `authored` · default | — | — |
+| project | `project`, `projects` | `name` | `gitopsctr.io/v1/Project` | `project` · `source-project` · `authored` | — | — |
+| promotion | `promotion`, `promotions` | `name` | `gitopsctr.io/v1/Promotion` | — | `environment` · `desired-promotions` · `desired` · default | — |
+| receipt | `receipt`, `receipts` | `name` | `gitopsctr.io/v1/Receipt` | — | — | `environment` · `observed-receipts` · `observed` · default |
+| stack | `stack`, `stacks` | `name` | `gitopsctr.io/v1/Stack` | `environment` · `source-stacks` · `authored` | `environment` · `desired-stacks` · `desired` · default | — |
+| stacktemplate | `stacktemplate`, `stacktemplates` | `name` | `gitopsctr.io/v1/StackTemplate` | `project` · `source-stacktemplates` · `authored` | `environment` · `desired-stacktemplates` · `desired` · default | — |
+| unit | `unit`, `units` | `name` | `unit.gitopsctr.io/v1/FrontendS3Cloudfront`<br>`unit.gitopsctr.io/v1/KubernetesManifests`<br>`unit.gitopsctr.io/v1/OciImages`<br>`unit.gitopsctr.io/v1/Terraform`<br>`unit.gitopsctr.io/v1/ViteOciBundle` | `environment` · `source-units` · `authored` | `environment` · `desired-units` · `desired` · default | — |
 
-A placement names a logical collection. Its repository adapter—not the controller or presentation layer—
+A family-local identity is composed with its placement scope to form a complete address. Most families use
+one `name` segment. Artifact identity is `producer/name`, so two producers may publish the same logical output
+name without collision. A placement names a logical collection. Its repository adapter—not the controller or presentation layer—
 owns physical path discovery. `default` selects the persisted representation used by the family's inspection
 view; it does not make that representation authoritative for another plane.
 
@@ -40,3 +42,13 @@ subject violates the declared cardinality.
 
 Receipt artifact descriptors identify separately stored Artifact resources and bind their producer, media
 type, and serialized-byte digest. Artifact resources are not Receipt fields and are not Unit status.
+
+## Desired graph relationships
+
+| Relationship | Source | Target | Identity fence |
+| --- | --- | --- | --- |
+| stack-owns-unit | desired/stack | desired/unit | `Stack.apiVersion`, `Stack.kind`, `Stack.metadata.name`, `Stack.metadata.uid`, `Unit.apiVersion`, `Unit.kind`, `Unit.metadata.name`, `Unit.metadata.ownerReferences[0].apiVersion`, `Unit.metadata.ownerReferences[0].kind`, `Unit.metadata.ownerReferences[0].name`, `Unit.metadata.ownerReferences[0].uid` |
+| stack-selects-stacktemplate | desired/stack | desired/stacktemplate | `Stack.apiVersion`, `Stack.kind`, `Stack.metadata.name`, `Stack.metadata.uid`, `Stack.spec.templateRef.name`, `Stack.spec.templateRef.uid`, `Stack.spec.templateRef.contentDigest`, `Stack.spec.structuralProjection.identity.stackUid`, `Stack.spec.structuralProjection.identity.templateUid`, `Stack.spec.structuralProjection.identity.templateContentDigest`, `StackTemplate.apiVersion`, `StackTemplate.kind`, `StackTemplate.metadata.name`, `StackTemplate.metadata.uid`, `StackTemplate.spec.contentDigest` |
+
+Desired Stack relationships are registry contracts: a StackTemplate selection may be fenced by the
+template name, UID, and semantic content digest, while generated Units are fenced by the Stack owner UID.
