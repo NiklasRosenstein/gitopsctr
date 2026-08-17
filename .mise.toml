@@ -7,17 +7,17 @@ minikube = "1.38.1"
 kubectl = "latest"
 python = "3.12"
 terraform = "latest"
-uv = "latest"
+uv = "0.12.5"
 
 [tasks.sync]
 run = "uv sync --all-groups"
 
 [tasks.test]
-run = "uv run pytest -q"
+run = "uv run pytest -q -n auto"
 
 [tasks.coverage]
 description = "Run the test suite with branch coverage and enforce the baseline"
-run = "uv run pytest -q --cov=gitopsctr --cov-branch --cov-report=term-missing"
+run = "uv run pytest -q -n auto --cov=gitopsctr --cov-branch --cov-report=term-missing"
 
 [tasks.lint]
 run = "uv run ruff check ."

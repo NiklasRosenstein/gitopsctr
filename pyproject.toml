@@ -49,6 +49,7 @@ dev = [
   "mkdocs-material>=9.7.1",
   "pytest>=8",
   "pytest-cov>=6",
+  "pytest-xdist>=3.8",
   "ruff>=0.12",
   "ty>=0.0.1a16",
 ]
