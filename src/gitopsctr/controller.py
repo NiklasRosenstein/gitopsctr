@@ -23,10 +23,11 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from functools import cache
+from functools import cache, wraps
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TextIO, cast
@@ -124,6 +125,7 @@ from gitopsctr.formats import (
     document_candidates,
     load_document,
     load_project_config,
+    parse_document_bytes,
     project_config_path,
     project_environment_root,
     validate_project_document,
@@ -748,6 +750,7 @@ def write_desired_candidate_unit(path: Path, unit: UnitResource[Any], project_ro
 def _validate_desired_projection_context_records(
     root: Path,
     resources: Mapping[tuple[str, str, str], UnitResource[Any] | StackResource],
+    captured: Mapping[Path, bytes] | None = None,
 ) -> None:
     """Require every structural and active Stack context digest to be durable."""
 
@@ -761,17 +764,39 @@ def _validate_desired_projection_context_records(
             digests.add(resource.spec.activeProjection.projectionContextDigest)
             digests.update(binding.projectionContextDigest for binding in resource.spec.activeProjection.units.values())
         for digest in sorted(digests):
-            load_projection_context(root, digest)
+            path = _projection_context_path(root, digest)
+            if captured is None:
+                load_projection_context(root, digest)
+                continue
+            data = captured.get(path)
+            if data is None:
+                raise OperationError(f"projection context record {digest!r} is missing")
+            try:
+                document = parse_document_bytes(data, path)
+            except DocumentFormatError as exc:
+                raise OperationError(f"invalid durable projection context: {exc}") from exc
+            _validate_projection_context(document, expected_digest=digest)
 
 
-def load_desired_resource_graph(
-    root: Path, *, validate: bool = True
+def _load_desired_resource_graph(
+    root: Path, *, validate: bool = True, captured: Mapping[Path, bytes] | None = None
 ) -> dict[tuple[str, str, str], UnitResource[Any] | StackResource]:
     """Load and validate every desired resource in one desired ref before effects."""
 
+    def document(path: Path) -> JsonObject:
+        if captured is None:
+            return RESOURCE_CATALOG.load_document(path)
+        data = captured.get(path)
+        if data is None:
+            raise OperationError(f"desired graph input disappeared: {path.relative_to(root)}")
+        try:
+            return cast(JsonObject, parse_document_bytes(data, path))
+        except DocumentFormatError as exc:
+            raise OperationError(f"could not read {path}: {exc}") from exc
+
     resources: dict[tuple[str, str, str], UnitResource[Any] | StackResource] = {}
     for qualified_name, path in _current_desired_unit_paths(root).items():
-        unit = load_desired_unit(path, path.stem)
+        unit = RESOURCE_CATALOG.parse_unit(document(path), profile="desired", expected_name=path.stem)
         key = (unit.gvk.api_version, unit.gvk.kind, qualified_name)
         if key in resources:
             raise OperationError(f"duplicate desired resource identity: {key!r}")
@@ -780,20 +805,25 @@ def load_desired_resource_graph(
         for resource_name, path in _current_desired_stack_paths(root, kind).items():
             resource = (
                 RESOURCE_CATALOG.parse_stack_template(
-                    RESOURCE_CATALOG.load_document(path), profile="desired", expected_name=resource_name
+                    document(path), profile="desired", expected_name=resource_name
                 )
                 if kind == "StackTemplate"
                 else RESOURCE_CATALOG.parse_stack(
-                    RESOURCE_CATALOG.load_document(path), profile="desired", expected_name=resource_name
+                    document(path), profile="desired", expected_name=resource_name
                 )
             )
             key = (resource.gvk.api_version, resource.gvk.kind, resource.name)
             if key in resources:
                 raise OperationError(f"duplicate desired resource identity: {key!r}")
             resources[key] = resource
+    tombstones = (
+        _load_captured_incarnation_evidence(root, captured)
+        if captured is not None
+        else load_resource_incarnation_evidence(root)
+    )
     finalized_identities = {
         (tombstone.api_version, tombstone.kind, tombstone.qualified_name, tombstone.uid)
-        for tombstone in load_resource_incarnation_evidence(root)
+        for tombstone in tombstones
     }
     for key, resource in resources.items():
         if (
@@ -846,7 +876,6 @@ def load_desired_resource_graph(
                     )
                     not in resources
                 }
-                tombstones = load_resource_incarnation_evidence(root)
                 active_bindings = (
                     {
                         (
@@ -874,11 +903,124 @@ def load_desired_resource_graph(
                     and any(PurePosixPath(name).name == unit_name for _api_version, _kind, name in missing_resources)
                     and all(has_exact_tombstone(key) for key in missing_resources)
                 ):
-                    _validate_desired_projection_context_records(root, resources)
+                    _validate_desired_projection_context_records(root, resources, captured)
                     return resources
         raise OperationError(f"invalid desired resource graph: {exc}") from exc
-    _validate_desired_projection_context_records(root, resources)
+    _validate_desired_projection_context_records(root, resources, captured)
     return resources
+
+
+@dataclass(frozen=True)
+class _DesiredGraphCacheEntry:
+    resources: Mapping[tuple[str, str, str], UnitResource[Any] | StackResource]
+    validated: bool
+
+
+_DESIRED_GRAPH_CACHE: ContextVar[dict[tuple[Path, str], _DesiredGraphCacheEntry] | None] = ContextVar(
+    "gitopsctr_desired_graph_cache", default=None
+)
+
+
+@contextmanager
+def _desired_graph_cache_scope():
+    """Reuse content-identical desired graphs for one re-entrant operation."""
+
+    existing = _DESIRED_GRAPH_CACHE.get()
+    if existing is not None:
+        yield
+        return
+    token = _DESIRED_GRAPH_CACHE.set({})
+    try:
+        yield
+    finally:
+        _DESIRED_GRAPH_CACHE.reset(token)
+
+
+def _cached_desired_graph_operation[ReturnT](operation: Callable[..., ReturnT]) -> Callable[..., ReturnT]:
+    @wraps(operation)
+    def wrapped(*args: Any, **kwargs: Any) -> ReturnT:
+        with _desired_graph_cache_scope():
+            return operation(*args, **kwargs)
+
+    return wrapped
+
+
+def _desired_graph_snapshot(root: Path) -> tuple[str, dict[Path, bytes]]:
+    """Fingerprint every byte that can influence desired graph loading."""
+
+    paths = set(_current_desired_unit_paths(root).values())
+    for kind in ("StackTemplate", "Stack"):
+        paths.update(_current_desired_stack_paths(root, kind).values())
+    for directory, pattern in (
+        (root / DESIRED_RESOURCE_INCARNATIONS_PATH, "*.json"),
+        (root / DESIRED_PROJECTION_CONTEXTS_PATH, "*.json"),
+    ):
+        if directory.is_dir():
+            paths.update(path for path in directory.rglob(pattern) if path.is_file())
+
+    fingerprint = hashlib.sha256()
+    captured: dict[Path, bytes] = {}
+    for path in sorted(paths):
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise OperationError(f"could not read desired graph input {path}: {exc}") from exc
+        relative = path.relative_to(root).as_posix().encode()
+        fingerprint.update(len(relative).to_bytes(8, "big"))
+        fingerprint.update(relative)
+        fingerprint.update(len(data).to_bytes(8, "big"))
+        fingerprint.update(data)
+        captured[path] = data
+    return fingerprint.hexdigest(), captured
+
+
+def _load_captured_incarnation_evidence(
+    root: Path, captured: Mapping[Path, bytes]
+) -> tuple[ResourceIncarnationTombstone, ...]:
+    directory = root / DESIRED_RESOURCE_INCARNATIONS_PATH
+    evidence: list[ResourceIncarnationTombstone] = []
+    for path in sorted(path for path in captured if path.is_relative_to(directory)):
+        try:
+            tombstone = ResourceIncarnationTombstone.from_document(parse_document_bytes(captured[path], path))
+        except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
+            raise OperationError(f"invalid resource incarnation tombstone at {path.relative_to(root)}") from exc
+        if path != resource_incarnation_path(root, tombstone):
+            raise OperationError(f"invalid resource incarnation tombstone path for {tombstone.name!r}")
+        evidence.append(tombstone)
+    return tuple(evidence)
+
+
+def load_desired_resource_graph(
+    root: Path, *, validate: bool = True
+) -> dict[tuple[str, str, str], UnitResource[Any] | StackResource]:
+    """Load one desired graph, transparently reusing an unchanged operation snapshot."""
+
+    cache = _DESIRED_GRAPH_CACHE.get()
+    if cache is None:
+        return _load_desired_resource_graph(root, validate=validate)
+
+    fingerprint, captured = _desired_graph_snapshot(root)
+    key = (root.resolve(), fingerprint)
+    cached = cache.get(key)
+    if cached is not None and (cached.validated or not validate):
+        return dict(cached.resources)
+
+    if cached is not None:
+        resources = dict(cached.resources)
+        try:
+            validate_desired_resource_graph(resources)
+        except ValueError:
+            # Preserve the deleting-Stack exception implemented by the full
+            # loader; valid snapshots take the allocation-free upgrade path.
+            resources = _load_desired_resource_graph(root, validate=True, captured=captured)
+        else:
+            _validate_desired_projection_context_records(root, resources, captured)
+        cache[key] = _DesiredGraphCacheEntry(dict(resources), True)
+        return dict(resources)
+
+    resources = _load_desired_resource_graph(root, validate=validate, captured=captured)
+    cache[key] = _DesiredGraphCacheEntry(dict(resources), validate)
+    return dict(resources)
 
 
 def qualified_unit_name(
@@ -10100,6 +10242,7 @@ def _validate_durable_publication_policies(
     return common_digest, context_sources[common_digest]
 
 
+@_cached_desired_graph_operation
 def progress_durable_stack_projection(
     environment_name: str,
     desired_ref: str,
@@ -11984,6 +12127,7 @@ def _reject_applied_stacks_against_deleting_templates(
             )
 
 
+@_cached_desired_graph_operation
 def command_apply(args: argparse.Namespace) -> str | None:
     """Resolve explicit resources and atomically publish one desired snapshot."""
 
@@ -13163,7 +13307,8 @@ def main() -> int:
     try:
         if args.command != "schemas":
             REPOSITORY_ROOT = resolve_repository_root(args.repository)
-        args.handler(args)
+        with _desired_graph_cache_scope():
+            args.handler(args)
     except SourceRevisionUnavailableError as exc:
         log_status(
             "ERROR",

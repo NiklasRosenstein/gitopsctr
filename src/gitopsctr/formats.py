@@ -336,16 +336,26 @@ def _ensure_json_value(value: object, path: Path) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
-def load_document(path: Path) -> dict[str, Any]:
+def parse_document_bytes(data: bytes, path: Path) -> dict[str, Any]:
+    """Parse document bytes using the format implied by *path*."""
+
     try:
-        text = path.read_text()
-    except OSError as exc:
-        raise DocumentFormatError(f"could not read {path}: {exc}") from exc
+        text = data.decode()
+    except UnicodeDecodeError as exc:
+        raise DocumentFormatError(f"could not decode {path}: {exc}") from exc
     try:
         value = json.loads(text) if path.suffix.lower() == ".json" else yaml.safe_load(text)
     except (json.JSONDecodeError, yaml.YAMLError) as exc:
         raise DocumentFormatError(f"could not parse {path}: {exc}") from exc
     return _ensure_json_value(value, path)
+
+
+def load_document(path: Path) -> dict[str, Any]:
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise DocumentFormatError(f"could not read {path}: {exc}") from exc
+    return parse_document_bytes(data, path)
 
 
 def document_path(directory: Path, stem: str, root: Path, *, prefer_existing: bool = True) -> Path:
