@@ -804,13 +804,9 @@ def _load_desired_resource_graph(
     for kind in ("StackTemplate", "Stack"):
         for resource_name, path in _current_desired_stack_paths(root, kind).items():
             resource = (
-                RESOURCE_CATALOG.parse_stack_template(
-                    document(path), profile="desired", expected_name=resource_name
-                )
+                RESOURCE_CATALOG.parse_stack_template(document(path), profile="desired", expected_name=resource_name)
                 if kind == "StackTemplate"
-                else RESOURCE_CATALOG.parse_stack(
-                    document(path), profile="desired", expected_name=resource_name
-                )
+                else RESOURCE_CATALOG.parse_stack(document(path), profile="desired", expected_name=resource_name)
             )
             key = (resource.gvk.api_version, resource.gvk.kind, resource.name)
             if key in resources:
@@ -822,8 +818,7 @@ def _load_desired_resource_graph(
         else load_resource_incarnation_evidence(root)
     )
     finalized_identities = {
-        (tombstone.api_version, tombstone.kind, tombstone.qualified_name, tombstone.uid)
-        for tombstone in tombstones
+        (tombstone.api_version, tombstone.kind, tombstone.qualified_name, tombstone.uid) for tombstone in tombstones
     }
     for key, resource in resources.items():
         if (
