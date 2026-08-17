@@ -101,6 +101,61 @@ def test_nested_unit_cannot_reuse_its_finalized_uid(tmp_path: Path):
         controller.load_desired_resource_graph(root)
 
 
+def test_desired_graph_cache_reuses_only_content_identical_operation_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "desired"
+    stack_tree(root)
+    original = controller._load_desired_resource_graph
+    loads = 0
+
+    def counted_load(path: Path, *, validate: bool = True, **kwargs):
+        nonlocal loads
+        loads += 1
+        return original(path, validate=validate, **kwargs)
+
+    monkeypatch.setattr(controller, "_load_desired_resource_graph", counted_load)
+    with controller._desired_graph_cache_scope():
+        first = controller.load_desired_resource_graph(root, validate=False)
+        first.clear()
+        second = controller.load_desired_resource_graph(root, validate=False)
+        assert second
+        assert loads == 1
+
+        controller.load_desired_resource_graph(root)
+        assert loads == 1
+
+        unit_path = next((root / "units").rglob("*.json"))
+        unit_path.write_text(unit_path.read_text() + "\n")
+        controller.load_desired_resource_graph(root)
+        assert loads == 2
+
+    with controller._desired_graph_cache_scope():
+        controller.load_desired_resource_graph(root)
+        assert loads == 3
+
+
+def test_desired_graph_cache_does_not_remember_failed_loads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = tmp_path / "desired"
+    stack_tree(root)
+    unit_path = next((root / "units").rglob("*.json"))
+    unit_path.write_text("not json")
+    original = controller._load_desired_resource_graph
+    loads = 0
+
+    def counted_load(path: Path, *, validate: bool = True, **kwargs):
+        nonlocal loads
+        loads += 1
+        return original(path, validate=validate, **kwargs)
+
+    monkeypatch.setattr(controller, "_load_desired_resource_graph", counted_load)
+    with controller._desired_graph_cache_scope():
+        for _ in range(2):
+            with pytest.raises(OperationError):
+                controller.load_desired_resource_graph(root)
+    assert loads == 2
+
+
 def test_effect_lease_and_tombstone_round_trip_qualified_name(tmp_path: Path):
     lease = controller.EffectLease(
         unit_name="image",
