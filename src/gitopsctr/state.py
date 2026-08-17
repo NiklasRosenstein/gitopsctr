@@ -6,7 +6,6 @@ import hashlib
 import os
 import re
 import subprocess
-import tarfile
 import tempfile
 import time
 import uuid
@@ -19,6 +18,7 @@ from types import MappingProxyType
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from gitopsctr.errors import OperationError
+from gitopsctr.git_local import DulwichLocalRepository
 
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _CREDENTIAL_URL_RE = re.compile(r"((?:[A-Za-z][A-Za-z0-9+.-]*):)//[^/@\s]+@")
@@ -47,10 +47,7 @@ def _canonical_branch_ref(ref: str) -> str:
         raise OperationError(f"invalid publication ref: {ref!r}")
     if any(branch == prefix or branch.startswith(f"{prefix}/") for prefix in _RESERVED_PUBLICATION_PREFIXES):
         raise OperationError(f"publication ref is reserved for controller state: {ref!r}")
-    if (
-        subprocess.run(("git", "check-ref-format", f"refs/heads/{branch}"), check=False, capture_output=True).returncode
-        != 0
-    ):
+    if not DulwichLocalRepository.valid_ref(f"refs/heads/{branch}"):
         raise OperationError(f"invalid publication ref: {ref!r}")
     return branch
 
@@ -328,23 +325,41 @@ class GitStateStore:
     clock: Callable[[], float] = time.time
     claim_expiry_seconds: float = 3600.0
     claim_grace_seconds: float = 900.0
+    _local_repository: DulwichLocalRepository = field(init=False, repr=False, compare=False)
 
-    def git(
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_local_repository", DulwichLocalRepository(self.root))
+
+    @property
+    def _local(self) -> DulwichLocalRepository:
+        return self._local_repository
+
+    def _run_git(
         self,
         *args: str,
         check: bool = True,
         input_text: str | None = None,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ("git", *args),
-            check=check,
-            text=True,
-            input=input_text,
-            env=env,
-            cwd=self.root,
-            capture_output=True,
-        )
+        refresh_local_repository = bool(args and args[0] in {"fetch", "gc", "repack", "update-ref"})
+        try:
+            return subprocess.run(
+                ("git", *args),
+                check=check,
+                text=True,
+                input=input_text,
+                env=env,
+                cwd=self.root,
+                capture_output=True,
+            )
+        finally:
+            if refresh_local_repository:
+                self._local.refresh()
+
+    def close(self) -> None:
+        """Close the cached in-process repository handle."""
+
+        self._local.close()
 
     def _git_at(
         self,
@@ -373,7 +388,7 @@ class GitStateStore:
                     return snapshot
 
         patterns = [*sorted(query.exact_refs), *(f"{prefix}*" for prefix in sorted(query.prefixes))]
-        result = self.git("ls-remote", "--refs", "origin", *patterns, check=False)
+        result = self._run_git("ls-remote", "--refs", "origin", *patterns, check=False)
         if result.returncode != 0:
             detail = _redact_credentials(result.stderr.strip())
             raise OperationError(detail or "could not inspect remote refs")
@@ -408,7 +423,7 @@ class GitStateStore:
             raise OperationError("remote ref update transaction contains duplicate refs")
         leases = [f"--force-with-lease={update.ref}:{update.expected_previous or ''}" for update in updates]
         refspecs = [f"{update.new_revision or ''}:{update.ref}" for update in updates]
-        result = self.git("push", "--atomic", *leases, "origin", *refspecs, check=False)
+        result = self._run_git("push", "--atomic", *leases, "origin", *refspecs, check=False)
         self._invalidate_remote_ref_snapshots()
         return result
 
@@ -426,13 +441,7 @@ class GitStateStore:
             name = ref
         else:
             name = f"refs/heads/{ref}"
-        result = subprocess.run(
-            ("git", "check-ref-format", name),
-            check=False,
-            text=True,
-            capture_output=True,
-        )
-        if result.returncode != 0:
+        if not DulwichLocalRepository.valid_ref(name):
             raise OperationError("source ref is invalid")
         return _SourceRef(ref, name)
 
@@ -443,9 +452,7 @@ class GitStateStore:
         if source_ref.is_commit or source_ref.full_ref == "HEAD" or ref.startswith("refs/"):
             return source_ref
         matches = [
-            candidate
-            for candidate in (f"refs/heads/{ref}", f"refs/tags/{ref}")
-            if self._git_at(self.root, "show-ref", "--verify", "--quiet", candidate, check=False).returncode == 0
+            candidate for candidate in (f"refs/heads/{ref}", f"refs/tags/{ref}") if self._local.has_ref(candidate)
         ]
         if len(matches) > 1:
             raise OperationError(f"source ref {ref!r} is ambiguous; qualify it as a branch or tag")
@@ -484,23 +491,13 @@ class GitStateStore:
         return revision
 
     def _resolve_commit_at(self, root: Path, revision: str, message: str = "source revision is invalid") -> str:
-        if not revision or revision.startswith("-"):
-            raise OperationError(message)
-        result = self._git_at(
-            root,
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            f"{revision}^{{commit}}",
-            check=False,
-        )
-        return self._commit_from(result, message)
+        return DulwichLocalRepository(root).resolve_commit(revision, message)
 
     def _source_head_at(self, root: Path, ref: str) -> str:
         return self._resolve_commit_at(root, ref, "source ref does not exist")
 
     def _is_ancestor_at(self, root: Path, ancestor: str, descendant: str) -> bool:
-        return self._git_at(root, "merge-base", "--is-ancestor", ancestor, descendant, check=False).returncode == 0
+        return DulwichLocalRepository(root).is_ancestor(ancestor, descendant)
 
     def resolve_source(self, repository: str | Path, ref: str, revision: str | None = None) -> GitSourceRevision:
         """Resolve a source ref once and return its exact commit.
@@ -568,16 +565,10 @@ class GitStateStore:
             return GitSourceRevision(identity, source_ref.name, resolved, _transport=transport)
 
     def _local_ref_revision(self, ref: str) -> str | None:
-        result = self.git("rev-parse", "--verify", f"{ref}^{{commit}}", check=False)
-        if result.returncode != 0:
-            return None
-        revision = result.stdout.strip()
-        if not _COMMIT_RE.fullmatch(revision):
-            raise OperationError("local ref is invalid")
-        return revision
+        return self._local.ref_revision(ref)
 
     def _has_origin(self) -> bool:
-        return self.git("remote", "get-url", "origin", check=False).returncode == 0
+        return self._local.has_remote("origin")
 
     def fetch(self, ref: str) -> GitRefSnapshot:
         source_ref = self._source_ref(ref)
@@ -590,7 +581,7 @@ class GitStateStore:
         destination_name = source_ref.name.removeprefix("refs/heads/")
         if destination_name == source_ref.name:
             destination_name = f"gitopsctr/fetch/{hashlib.sha256(remote_ref.encode()).hexdigest()}"
-        fetched = self.git("fetch", "origin", f"+{remote_ref}:refs/remotes/origin/{destination_name}", check=False)
+        fetched = self._run_git("fetch", "origin", f"+{remote_ref}:refs/remotes/origin/{destination_name}", check=False)
         if fetched.returncode != 0:
             detail = _redact_credentials(fetched.stderr.strip())
             raise OperationError(detail or f"could not fetch {ref}")
@@ -603,14 +594,8 @@ class GitStateStore:
         if revision is None:
             resolved = snapshot.revision
         else:
-            resolved_result = self.git(
-                "rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}", check=False
-            )
-            resolved = self._commit_from(resolved_result, "requested revision is not a valid commit")
-        if (
-            revision is not None
-            and self.git("merge-base", "--is-ancestor", resolved, snapshot.revision, check=False).returncode
-        ):
+            resolved = self._local.resolve_commit(revision, "requested revision is not a valid commit")
+        if revision is not None and not self._local.is_ancestor(resolved, snapshot.revision):
             raise OperationError(f"requested revision is not part of {ref} history")
         return GitRefSnapshot(ref, resolved)
 
@@ -629,14 +614,7 @@ class GitStateStore:
             raise OperationError("invalid publication owner identity")
         encoded_ref = quote(branch, safe="")
         name = f"{encoded_ref}/{publication_revision}/{source_pin_name}"
-        if (
-            subprocess.run(
-                ("git", "check-ref-format", f"refs/heads/gitopsctr/owners/{name}"),
-                check=False,
-                capture_output=True,
-            ).returncode
-            != 0
-        ):
+        if not DulwichLocalRepository.valid_ref(f"refs/heads/gitopsctr/owners/{name}"):
             raise OperationError("invalid publication owner ref")
         return name
 
@@ -678,14 +656,7 @@ class GitStateStore:
 
         branch = cls._publication_branch(publication_ref)
         name = quote(branch, safe="")
-        if (
-            subprocess.run(
-                ("git", "check-ref-format", f"refs/heads/gitopsctr/locks/{name}"),
-                check=False,
-                capture_output=True,
-            ).returncode
-            != 0
-        ):
+        if not DulwichLocalRepository.valid_ref(f"refs/heads/gitopsctr/locks/{name}"):
             raise OperationError("invalid publication lock ref")
         return name
 
@@ -1026,11 +997,8 @@ class GitStateStore:
         candidate = self.fetch(owner.publication_ref)
         if candidate.revision != publication_revision or candidate.revision != owner.publication_revision:
             return False
-        parents = self.git("rev-list", "--parents", "-n", "1", owner.publication_revision, check=False)
-        if parents.returncode != 0:
-            raise OperationError("gated candidate head commit cannot be inspected")
-        parent_revisions = parents.stdout.split()
-        return len(parent_revisions) == 2 and parent_revisions[1] == accepted_target.revision
+        parent_revisions = self._local.parents(owner.publication_revision)
+        return len(parent_revisions) == 1 and parent_revisions[0] == accepted_target.revision
 
     def hydrate_source_revision(self, source_pin_name: str, revision: str) -> str:
         """Hydrate an exact source through canonical, owner, or live claim ownership."""
@@ -1042,7 +1010,7 @@ class GitStateStore:
             if self._remote_ref_revision(pin_ref) != revision:
                 return None
             local_ref = f"refs/remotes/origin/gitopsctr/source/{hashlib.sha256(pin_ref.encode()).hexdigest()}"
-            fetched = self.git(
+            fetched = self._run_git(
                 "fetch",
                 "--no-tags",
                 "--no-write-fetch-head",
@@ -1137,21 +1105,22 @@ class GitStateStore:
 
     def _controller_pin_ref(self, name: str) -> str:
         ref = f"refs/heads/gitopsctr/pins/{name}"
-        if self.git("check-ref-format", ref, check=False).returncode != 0:
+        if not self._local.valid_ref(ref):
             raise OperationError(f"invalid controller pin name: {name!r}")
         return ref
 
     def _resolve_commit(self, revision: str) -> str:
         if not revision or revision.startswith("-") or any(c in revision for c in "\r\n\x00"):
             raise OperationError("revision is not a valid commit")
-        resolved = self.git("rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}", check=False)
-        if resolved.returncode != 0:
+        try:
+            return self._local.resolve_commit(revision)
+        except OperationError:
             if _COMMIT_RE.fullmatch(revision):
                 self._hydrate_revision_from_canonical_pin(revision)
-                resolved = self.git("rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}", check=False)
-            if resolved.returncode != 0:
-                raise OperationError("revision is not a valid commit")
-        return self._commit_from(resolved, "revision is not a valid commit")
+            try:
+                return self._local.resolve_commit(revision)
+            except OperationError:
+                raise OperationError("revision is not a valid commit") from None
 
     def _hydrate_revision_from_canonical_pin(self, revision: str) -> bool:
         """Fetch one exact object through an existing canonical or claim pin."""
@@ -1170,7 +1139,7 @@ class GitStateStore:
             if name.startswith("claims/") and not self._valid_source_claim_name(name, revision):
                 continue
             local_ref = f"refs/remotes/origin/gitopsctr/pins/{name}"
-            fetched = self.git(
+            fetched = self._run_git(
                 "fetch",
                 "--no-tags",
                 "--no-write-fetch-head",
@@ -1200,7 +1169,7 @@ class GitStateStore:
         if self._remote_ref_revision(pin_ref) != revision:
             raise OperationError("controller pin does not retain the requested revision")
         local_ref = f"refs/remotes/origin/gitopsctr/pins/{name}"
-        fetched = self.git(
+        fetched = self._run_git(
             "fetch",
             "--no-tags",
             "--no-write-fetch-head",
@@ -1234,7 +1203,7 @@ class GitStateStore:
             if source.local and not available_locally:
                 raise OperationError("source revision is not available locally")
             if not source.local and not available_locally:
-                fetched = self.git(
+                fetched = self._run_git(
                     "fetch",
                     "--no-tags",
                     "--no-write-fetch-head",
@@ -1246,53 +1215,29 @@ class GitStateStore:
                 if fetched.returncode != 0 or self._local_ref_revision(temporary_ref) != source.revision:
                     detail = _redact_credentials(fetched.stderr.strip())
                     raise OperationError(detail or "could not materialize source revision")
-            archive = subprocess.run(
-                ("git", "archive", "--format=tar", source.revision),
-                check=True,
-                cwd=self.root,
-                stdout=subprocess.PIPE,
-            ).stdout
-            with tempfile.TemporaryFile() as stream:
-                stream.write(archive)
-                stream.seek(0)
-                with tarfile.open(fileobj=stream, mode="r:") as tar:
-                    tar.extractall(output, filter="data")
+            self._local.materialize(source.revision, output)
         finally:
             if fetched_ref:
-                self.git("update-ref", "-d", temporary_ref, check=False)
+                self._local.remove_ref(temporary_ref)
 
     def materialize(self, revision: str, output: Path) -> None:
-        if output.exists() and any(output.iterdir()):
-            raise OperationError(f"output directory is not empty: {output}")
-        output.mkdir(parents=True, exist_ok=True)
-        archive = subprocess.run(
-            ("git", "archive", "--format=tar", revision),
-            check=True,
-            cwd=self.root,
-            stdout=subprocess.PIPE,
-        ).stdout
-        with tempfile.TemporaryFile() as stream:
-            stream.write(archive)
-            stream.seek(0)
-            with tarfile.open(fileobj=stream, mode="r:") as tar:
-                tar.extractall(output, filter="data")
+        self._local.materialize(revision, output)
+
+    def blob_ids(self, revision: str) -> dict[Path, str]:
+        return {Path(path): object_id for path, object_id in self._local.blob_ids(revision).items()}
+
+    def local_commit(self, revision: str) -> str | None:
+        """Resolve a locally available commit without attempting remote hydration."""
+
+        try:
+            return self._local.resolve_commit(revision)
+        except OperationError:
+            return None
 
     def _tree_for_directory(self, directory: Path) -> str:
         """Write a deterministic Git tree for a candidate directory."""
 
-        files = sorted(path for path in directory.rglob("*") if path.is_file())
-        if not files:
-            raise OperationError(f"tree is empty: {directory}")
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            identity = os.environ | {"GIT_INDEX_FILE": str(Path(temporary_directory) / "index")}
-            self.git("read-tree", "--empty", env=identity)
-            for path in files:
-                if path.is_symlink():
-                    raise OperationError(f"tree contains a symbolic link: {path}")
-                relative = path.relative_to(directory).as_posix()
-                blob = self.git("hash-object", "-w", str(path)).stdout.strip()
-                self.git("update-index", "--add", "--cacheinfo", f"100644,{blob},{relative}", env=identity)
-            return self.git("write-tree", env=identity).stdout.strip()
+        return self._local.write_tree(directory)
 
     def verify_gated_candidate(self, candidate_revision: str | None, target_revision: str | None) -> GatedCandidate:
         """Verify the commit shape required by a gated candidate.
@@ -1307,31 +1252,21 @@ class GitStateStore:
         if not target_revision:
             raise OperationError("gated candidate is missing the current target head revision")
 
-        candidate = self.git("rev-parse", "--verify", f"{candidate_revision}^{{commit}}", check=False)
-        if candidate.returncode != 0:
-            raise OperationError("gated candidate head revision is missing or invalid")
-        target = self.git("rev-parse", "--verify", f"{target_revision}^{{commit}}", check=False)
-        if target.returncode != 0:
-            raise OperationError("gated candidate target head revision is missing or invalid")
-        resolved_candidate = candidate.stdout.strip()
-        resolved_target = target.stdout.strip()
-
-        parents = self.git("rev-list", "--parents", "-n", "1", resolved_candidate, check=False)
-        if parents.returncode != 0:
-            raise OperationError("gated candidate head commit cannot be inspected")
-        parent_revisions = parents.stdout.split()
-        if len(parent_revisions) != 2:
+        resolved_candidate = self._local.resolve_commit(
+            candidate_revision, "gated candidate head revision is missing or invalid"
+        )
+        resolved_target = self._local.resolve_commit(
+            target_revision, "gated candidate target head revision is missing or invalid"
+        )
+        parent_revisions = self._local.parents(resolved_candidate)
+        if len(parent_revisions) != 1:
             raise OperationError(
                 "gated candidate must contain exactly one controller commit with one parent; "
                 "roots and merge candidates are rejected"
             )
-        parent = parent_revisions[1]
+        parent = parent_revisions[0]
         if parent != resolved_target:
             raise OperationError("gated candidate is stale or rebased against a different target head")
-
-        count = self.git("rev-list", "--count", f"{resolved_target}..{resolved_candidate}", check=False)
-        if count.returncode != 0 or count.stdout.strip() != "1":
-            raise OperationError("gated candidate must contain exactly one commit after the target head")
 
         return GatedCandidate(resolved_candidate, resolved_target, parent)
 
@@ -1358,16 +1293,13 @@ class GitStateStore:
         if expected_publication_head is not None and not _COMMIT_RE.fullmatch(expected_publication_head):
             raise OperationError("expected publication head is invalid")
         tree = self._tree_for_directory(directory)
-        commit_args = ["commit-tree", tree]
-        if parent:
-            commit_args.extend(("-p", parent))
-        identity = os.environ | {
-            "GIT_AUTHOR_NAME": self.author_name,
-            "GIT_AUTHOR_EMAIL": self.author_email,
-            "GIT_COMMITTER_NAME": self.author_name,
-            "GIT_COMMITTER_EMAIL": self.author_email,
-        }
-        revision = self.git(*commit_args, input_text=f"{message}\n", env=identity).stdout.strip()
+        revision = self._local.create_commit(
+            tree,
+            parent,
+            f"{message}\n",
+            self.author_name,
+            self.author_email,
+        )
         owner_updates = self._expected_publication_owners(publication_ref, revision, source_pins or {})
         lock_ref = self._publication_lock_ref(publication_ref)
         publication_head_ref = f"refs/heads/{publication_ref}"
@@ -1381,13 +1313,13 @@ class GitStateStore:
         # A marker is deliberately a new commit even when the publication
         # tree/revision is recreated. The marker, rather than the publication
         # object ID, is the finalization fence.
-        marker_tree = self.git("mktree", input_text="").stdout.strip()
-        marker = self.git(
-            "commit-tree",
-            marker_tree,
-            input_text=f"publication fence {uuid.uuid4().hex}\n",
-            env=identity,
-        ).stdout.strip()
+        marker = self._local.create_commit(
+            self._local.empty_tree(),
+            None,
+            f"publication fence {uuid.uuid4().hex}\n",
+            self.author_name,
+            self.author_email,
+        )
         updates = [RemoteRefUpdate(publication_head_ref, revision, expected_publication_head)]
         for _name, owner_ref, source_revision in owner_updates:
             previous_owner = observation.revision(owner_ref)
@@ -1460,7 +1392,7 @@ class GitStateStore:
             resolved = self._resolve_commit(revision)
         except OperationError:
             local_ref = f"refs/remotes/origin/gitopsctr/verify/{hashlib.sha256(ref.encode()).hexdigest()}"
-            fetched = self.git(
+            fetched = self._run_git(
                 "fetch",
                 "--no-tags",
                 "--no-write-fetch-head",
@@ -1473,14 +1405,10 @@ class GitStateStore:
             resolved = self._local_ref_revision(local_ref)
             if resolved is None:
                 raise OperationError("published remote ref has no local commit object") from None
-        parents = self.git("rev-list", "--parents", "-n", "1", resolved, check=False)
-        if parents.returncode != 0:
-            return None
-        parent_revisions = parents.stdout.split()
-        actual_parent = parent_revisions[1] if len(parent_revisions) == 2 else None
+        parent_revisions = self._local.parents(resolved)
+        actual_parent = parent_revisions[0] if len(parent_revisions) == 1 else None
         if actual_parent != parent:
             return None
-        tree = self.git("rev-parse", f"{resolved}^{{tree}}", check=False)
-        if tree.returncode != 0 or tree.stdout.strip() != self._tree_for_directory(directory):
+        if self._local.tree_id(resolved) != self._tree_for_directory(directory):
             return None
         return PublishedTree(ref, resolved, parent)

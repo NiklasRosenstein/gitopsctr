@@ -31,6 +31,7 @@ class PlaneRepositorySession:
 
     def __init__(self, repository_root: Path, state_store: GitStateStore | None = None) -> None:
         self.repository_root = repository_root.resolve()
+        self._owns_state_store = state_store is None
         self.state_store = state_store or GitStateStore(self.repository_root)
         self._temporary = tempfile.TemporaryDirectory(prefix="gitopsctr-inventory-")
         self._requests: dict[tuple[ResourcePlane, str, str | None], PlaneSnapshot] = {}
@@ -44,6 +45,8 @@ class PlaneRepositorySession:
 
     def close(self) -> None:
         self._temporary.cleanup()
+        if self._owns_state_store:
+            self.state_store.close()
 
     def source(self) -> PlaneSnapshot:
         """Return the live source working tree.
@@ -100,12 +103,4 @@ class PlaneRepositorySession:
         return result
 
     def _blob_ids(self, revision: str) -> dict[PurePosixPath, str]:
-        listed = self.state_store.git("ls-tree", "-r", revision)
-        result: dict[PurePosixPath, str] = {}
-        for line in listed.stdout.splitlines():
-            metadata, separator, path = line.partition("\t")
-            fields = metadata.split()
-            if not separator or len(fields) != 3 or fields[1] != "blob":
-                raise OperationError(f"could not read Git tree for revision {revision!r}")
-            result[PurePosixPath(path)] = fields[2]
-        return result
+        return {PurePosixPath(path): object_id for path, object_id in self.state_store.blob_ids(revision).items()}

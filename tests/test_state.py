@@ -134,12 +134,30 @@ def test_remote_ref_snapshot_enforces_declared_coverage(bare_repository: BareRep
         RemoteRefSnapshot(RemoteRefQuery(exact_refs=frozenset(("main",))), {"other": revision})
 
 
+def test_local_repository_handle_is_reused_and_refreshed_after_fetch(bare_repository: BareRepository):
+    store = GitStateStore(bare_repository.working)
+    revision = _git(bare_repository.working, "rev-parse", "HEAD")
+
+    assert store.local_commit(revision) == revision
+    opened = store._local._repository
+    assert opened is not None
+    assert store.local_commit(revision) == revision
+    assert store._local._repository is opened
+
+    assert store.fetch("main").revision == revision
+    assert store._local._repository is None
+    assert store.local_commit(revision) == revision
+    assert store._local._repository is not opened
+    store.close()
+    assert store._local._repository is None
+
+
 def test_remote_ref_snapshot_scope_memoizes_only_covered_queries(
     bare_repository: BareRepository, monkeypatch: pytest.MonkeyPatch
 ):
     store = GitStateStore(bare_repository.working)
     calls = 0
-    original_git = GitStateStore.git
+    original_git = GitStateStore._run_git
 
     def recording_git(self: GitStateStore, *args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal calls
@@ -147,7 +165,7 @@ def test_remote_ref_snapshot_scope_memoizes_only_covered_queries(
             calls += 1
         return original_git(self, *args, **kwargs)
 
-    monkeypatch.setattr(GitStateStore, "git", recording_git)
+    monkeypatch.setattr(GitStateStore, "_run_git", recording_git)
     with remote_ref_snapshot_scope():
         broad = store.remote_ref_snapshot(RemoteRefQuery(prefixes=frozenset(("refs/heads/gitopsctr/",))))
         assert (
@@ -430,14 +448,14 @@ def test_first_owned_publication_uses_existing_head_lease(bare_repository: BareR
     initial = _publish(store, "custom/candidate", directory, first, "first")
     source_pin = "stack-templates/dev/preview/template-uid/" + first
     pushes: list[tuple[str, ...]] = []
-    original_git = GitStateStore.git
+    original_git = GitStateStore._run_git
 
     def recording_git(self: GitStateStore, *args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
         if self is store and args and args[0] == "push":
             pushes.append(args)
         return original_git(self, *args, **kwargs)
 
-    monkeypatch.setattr(GitStateStore, "git", recording_git)
+    monkeypatch.setattr(GitStateStore, "_run_git", recording_git)
     published = _publish(store, "custom/candidate", directory, first, "second", {source_pin: first})
 
     assert len(pushes) == 1
@@ -463,7 +481,7 @@ def test_first_owned_publication_fences_existing_head_race(
     (directory / "state").write_text("candidate\n")
     store = GitStateStore(bare_repository.working)
     raced = False
-    original_git = GitStateStore.git
+    original_git = GitStateStore._run_git
 
     def racing_git(self: GitStateStore, *args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal raced
@@ -475,7 +493,7 @@ def test_first_owned_publication_fences_existing_head_race(
                 _git(bare_repository.remote, "update-ref", publication_ref, base_revision)
         return original_git(self, *args, **kwargs)
 
-    monkeypatch.setattr(GitStateStore, "git", racing_git)
+    monkeypatch.setattr(GitStateStore, "_run_git", racing_git)
     with pytest.raises(subprocess.CalledProcessError):
         _publish(store, "custom/candidate", directory, observed_revision, "candidate", {source_pin: observed_revision})
 
@@ -497,7 +515,7 @@ def test_first_owned_publication_fences_expected_absent_head_creation(
     (directory / "state").write_text("candidate\n")
     store = GitStateStore(bare_repository.working)
     raced = False
-    original_git = GitStateStore.git
+    original_git = GitStateStore._run_git
 
     def racing_git(self: GitStateStore, *args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal raced
@@ -506,7 +524,7 @@ def test_first_owned_publication_fences_expected_absent_head_creation(
             _git(bare_repository.remote, "update-ref", publication_ref, base_revision)
         return original_git(self, *args, **kwargs)
 
-    monkeypatch.setattr(GitStateStore, "git", racing_git)
+    monkeypatch.setattr(GitStateStore, "_run_git", racing_git)
     with pytest.raises(subprocess.CalledProcessError):
         _publish(store, "custom/candidate", directory, base_revision, "candidate", {source_pin: base_revision})
 
@@ -768,14 +786,14 @@ def test_same_ref_accepted_target_is_deduplicated_in_cleanup_push(
     advanced = _publish(store, "custom/advanced", directory, None, "advanced")
     _git(bare_repository.remote, "update-ref", "refs/heads/deploy/dev", advanced.revision)
     pushes: list[tuple[str, ...]] = []
-    original_git = GitStateStore.git
+    original_git = GitStateStore._run_git
 
     def recording_git(self: GitStateStore, *args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
         if self is store and args and args[0] == "push":
             pushes.append(args)
         return original_git(self, *args, **kwargs)
 
-    monkeypatch.setattr(GitStateStore, "git", recording_git)
+    monkeypatch.setattr(GitStateStore, "_run_git", recording_git)
     assert store.release_publication_owner(owner, AcceptedDesiredTarget("refs/heads/deploy/dev", advanced.revision))
 
     assert len(pushes) == 1
@@ -899,7 +917,7 @@ def test_candidate_recreation_race_fails_closed_during_owner_release(
     _git(bare_repository.remote, "update-ref", "refs/heads/deploy/dev", published.revision)
     accepted_target = AcceptedDesiredTarget("deploy/dev", published.revision)
     raced = False
-    original_git = GitStateStore.git
+    original_git = GitStateStore._run_git
 
     def racing_git(self: GitStateStore, *args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal raced
@@ -909,7 +927,7 @@ def test_candidate_recreation_race_fails_closed_during_owner_release(
             _publish(store, "custom/candidate", directory, target_revision, "recreated", {source_pin: target_revision})
         return original_git(self, *args, **kwargs)
 
-    monkeypatch.setattr(GitStateStore, "git", racing_git)
+    monkeypatch.setattr(GitStateStore, "_run_git", racing_git)
     with pytest.raises(OperationError):
         store.release_publication_owner(owner, accepted_target)
 
@@ -948,7 +966,7 @@ def test_absent_candidate_direct_recreation_race_fails_closed_without_lock_updat
     lock_ref = store._publication_lock_ref(owner.publication_ref)
     lock_revision = _remote_revision(bare_repository, lock_ref)
     raced = False
-    original_git = GitStateStore.git
+    original_git = GitStateStore._run_git
 
     def racing_git(self: GitStateStore, *args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal raced
@@ -958,7 +976,7 @@ def test_absent_candidate_direct_recreation_race_fails_closed_without_lock_updat
             _git(bare_repository.remote, "update-ref", "refs/heads/custom/candidate", published.revision)
         return original_git(self, *args, **kwargs)
 
-    monkeypatch.setattr(GitStateStore, "git", racing_git)
+    monkeypatch.setattr(GitStateStore, "_run_git", racing_git)
     with pytest.raises(OperationError):
         store.release_publication_owner(owner, accepted_target)
 
@@ -994,7 +1012,7 @@ def test_same_ref_target_interleave_uses_one_observation_and_fails_closed(
     target_reads = 0
     push_read_counts: list[int] = []
     original_remote_snapshot = GitStateStore.remote_ref_snapshot
-    original_git = GitStateStore.git
+    original_git = GitStateStore._run_git
 
     def racing_remote_snapshot(self: GitStateStore, query, *, fresh: bool = False):
         nonlocal target_reads
@@ -1012,7 +1030,7 @@ def test_same_ref_target_interleave_uses_one_observation_and_fails_closed(
         return original_git(self, *args, **kwargs)
 
     monkeypatch.setattr(GitStateStore, "remote_ref_snapshot", racing_remote_snapshot)
-    monkeypatch.setattr(GitStateStore, "git", recording_git)
+    monkeypatch.setattr(GitStateStore, "_run_git", recording_git)
     with pytest.raises(OperationError):
         store.release_publication_owner(owner, accepted_target)
 
@@ -1029,7 +1047,7 @@ def test_same_ref_target_interleave_uses_one_observation_and_fails_closed(
             pushes.append(args)
         return original_git(self, *args, **kwargs)
 
-    monkeypatch.setattr(GitStateStore, "git", recording_fresh_push)
+    monkeypatch.setattr(GitStateStore, "_run_git", recording_fresh_push)
     assert store.release_publication_owner(owner, accepted_target)
     assert len(pushes) == 1
     assert pushes[0].count(f"--force-with-lease=refs/heads/deploy/dev:{tombstone}") == 1
@@ -1090,7 +1108,7 @@ def test_candidate_absence_cleanup_fails_closed_on_target_movement(
     _git(bare_repository.remote, "update-ref", "-d", "refs/heads/custom/candidate")
     accepted_target = AcceptedDesiredTarget("deploy/dev", target_revision)
     raced = False
-    original_git = GitStateStore.git
+    original_git = GitStateStore._run_git
 
     def racing_git(self: GitStateStore, *args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal raced
@@ -1099,7 +1117,7 @@ def test_candidate_absence_cleanup_fails_closed_on_target_movement(
             _git(bare_repository.remote, "update-ref", "refs/heads/deploy/dev", moved_target)
         return original_git(self, *args, **kwargs)
 
-    monkeypatch.setattr(GitStateStore, "git", racing_git)
+    monkeypatch.setattr(GitStateStore, "_run_git", racing_git)
     with pytest.raises(OperationError):
         store.release_publication_owner(owner, accepted_target)
 
@@ -1222,7 +1240,7 @@ def test_source_resolution_rejects_missing_or_invalid_revisions(
     with pytest.raises(OperationError, match=message):
         store.resolve_source(str(source_repository.remote), ref, revision)
 
-    assert not store.git("for-each-ref", "--format=%(refname)", "refs/heads/gitopsctr/source-retention/").stdout
+    assert not _git(store.root, "for-each-ref", "--format=%(refname)", "refs/heads/gitopsctr/source-retention/")
 
 
 def test_source_identity_and_errors_do_not_expose_credentials():
@@ -1246,7 +1264,7 @@ def test_claim_creation_hydrates_missing_object_from_existing_canonical_pin(
     fresh = tmp_path / "fresh"
     _git(tmp_path, "clone", str(bare_repository.remote), str(fresh))
     fresh_store = GitStateStore(fresh)
-    fresh_store.git("repack", "-ad")
+    _git(fresh, "repack", "-ad")
     claim = fresh_store.create_controller_pin_claims(
         {"stack-templates/dev/preview/template-uid/" + revision: revision}, "attempt"
     )
@@ -1266,7 +1284,7 @@ def test_claim_creation_hydrates_missing_object_from_exact_claim_ref(bare_reposi
     fresh = tmp_path / "fresh-claim"
     _git(tmp_path, "clone", str(bare_repository.remote), str(fresh))
     fresh_store = GitStateStore(fresh)
-    fresh_store.git("repack", "-ad")
+    _git(fresh, "repack", "-ad")
     claim = fresh_store.create_controller_pin_claims(
         {"stack-templates/dev/preview/template-uid/" + revision: revision}, "new-attempt"
     )
