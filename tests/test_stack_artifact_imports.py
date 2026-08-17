@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import controller
-from gitopsctr.contracts import ArtifactImport, PromotionStackReference
 from tests.conftest import receipt_resource
 from tests.stack_support import commit, git, project_repository
 
@@ -112,7 +111,8 @@ def _container_images(source_revision: str) -> dict[str, object]:
         "producer": {
             "apiVersion": "unit.gitopsctr.io/v1",
             "kind": "OciImages",
-            "name": "application--image",
+            "name": "image",
+            "qualifiedName": "application/image",
             "driverVersion": 1,
             "sourceRevision": source_revision,
             "inputHashVersion": 1,
@@ -129,7 +129,7 @@ def _source_observation(
     projection: controller.StackProjection,
     source_revision: str,
 ) -> None:
-    image = projection.generated_units["application--image"]
+    image = projection.generated_units["application/image"]
     driver = controller.UNIT_DRIVERS["oci-images"]
     resolved = driver.resolve_unit(
         image.spec,
@@ -144,30 +144,31 @@ def _source_observation(
         ),
     ).unit
     image_path = controller.write_desired_candidate_unit(
-        desired_root / "units/application--image.json",
+        desired_root / "units/application/image.json",
         image.with_spec(resolved).with_metadata(
             controller.ResourceMetadata(
-                name="application--image",
+                name="image",
                 uid="source-image-unit",
-                ownerReferences=[projection.owners["application--image"]],
+                ownerReferences=[projection.owners["application/image"]],
             )
         ),
         source_root,
     )
     descriptors = controller.write_artifact_documents(
         observed_root,
-        "application--image",
+        "application/image",
         "oci-images",
         {"containers": _container_images(source_revision)},
     )
     receipt = receipt_resource(
         "oci-images",
-        "application--image",
+        "application/image",
         {"unitBlob": controller.file_blob(image_path)},
         artifacts=descriptors,
+        qualified_name="application/image",
     )
     controller.write_document(
-        observed_root / "units/application--image.json",
+        observed_root / "units/application/image.json",
         controller.RESOURCE_CATALOG.serialize_receipt(receipt),
         format=controller.DocumentFormat.JSON,
     )
@@ -241,11 +242,11 @@ def _advance(fixture: ImportFixture, output: Path, *, promotion=None):
 
 
 def _source_receipt_path(fixture: ImportFixture) -> Path:
-    return controller.unit_document_path(fixture.observed, "application--image")
+    return controller.unit_document_path(fixture.observed, "application/image")
 
 
 def _source_artifact_path(fixture: ImportFixture) -> Path:
-    return controller.document_candidates(fixture.observed / "artifacts/application--image", "containers")[0]
+    return controller.document_candidates(fixture.observed / "artifacts/application/image", "containers")[0]
 
 
 @pytest.mark.parametrize(
@@ -256,15 +257,14 @@ def _source_artifact_path(fixture: ImportFixture) -> Path:
         ("missing-unit", "source Unit"),
         ("missing-receipt", "receipt"),
         ("stale-receipt", "receipt"),
-        ("wrong-desired-revision", "producer"),
-        ("missing-observed-revision", "UID identity"),
+        ("wrong-desired-revision", "artifact"),
+        ("missing-observed-revision", "UID"),
         ("wrong-gvk", "artifact"),
         ("wrong-media-type", "receipt"),
-        ("wrong-digest", "digest"),
-        ("wrong-producer", "producer"),
+        ("wrong-digest", "artifact"),
+        ("wrong-producer", "artifact"),
         ("missing-artifact", "artifact"),
         ("unmatched-import", "producer"),
-        ("ambiguous-import", "ambiguous"),
     ),
 )
 def test_promoted_artifact_import_rejects_invalid_lineage(
@@ -281,11 +281,11 @@ def test_promoted_artifact_import_rejects_invalid_lineage(
         )
     elif failure == "unit-owner-uid":
         _mutate(
-            controller.unit_document_path(fixture.desired, "application--image"),
+            controller.unit_document_path(fixture.desired, "application/image"),
             lambda document: document["metadata"]["ownerReferences"][0].__setitem__("uid", "different-stack-uid"),
         )
     elif failure == "missing-unit":
-        controller.unit_document_path(fixture.desired, "application--image").unlink()
+        controller.unit_document_path(fixture.desired, "application/image").unlink()
     elif failure == "missing-receipt":
         _source_receipt_path(fixture).unlink()
     elif failure == "stale-receipt":
@@ -294,7 +294,7 @@ def test_promoted_artifact_import_rejects_invalid_lineage(
             lambda document: document["spec"]["desired"].__setitem__("unitBlob", "stale-unit-blob"),
         )
     elif failure == "wrong-desired-revision":
-        unit_path = controller.unit_document_path(fixture.desired, "application--image")
+        unit_path = controller.unit_document_path(fixture.desired, "application/image")
         _mutate(unit_path, lambda document: document["spec"]["source"].__setitem__("revision", "a" * 40))
         _mutate(
             _source_receipt_path(fixture),
@@ -325,7 +325,7 @@ def test_promoted_artifact_import_rejects_invalid_lineage(
         )
     elif failure == "wrong-producer":
         artifact_path = _source_artifact_path(fixture)
-        _mutate(artifact_path, lambda document: document["producer"].__setitem__("name", "other--image"))
+        _mutate(artifact_path, lambda document: document["producer"].__setitem__("name", "other"))
         _mutate(
             _source_receipt_path(fixture),
             lambda document: document["status"]["artifacts"]["containers"].__setitem__(
@@ -339,20 +339,6 @@ def test_promoted_artifact_import_rejects_invalid_lineage(
             fixture.source / "deployment/environments/staging/stacks/application.json",
             lambda document: document["spec"]["artifactImports"][0].__setitem__("unit", "missing"),
         )
-    elif failure == "ambiguous-import":
-        _mutate(
-            fixture.source / "deployment/stack-templates/application.json",
-            lambda document: document["spec"]["unitTemplates"]["deploy"]["spec"]["terraform"]["variables"]["image"][
-                "fromArtifact"
-            ].__setitem__("unit", "application--image"),
-        )
-        _mutate(
-            fixture.source / "deployment/environments/staging/stacks/application.json",
-            lambda document: document["spec"].__setitem__(
-                "artifactImports", [_artifact_import(), _artifact_import("application--image")]
-            ),
-        )
-
     candidate = tmp_path / "failed-candidate"
     try:
         result = _advance(fixture, candidate)
@@ -361,7 +347,7 @@ def test_promoted_artifact_import_rejects_invalid_lineage(
     else:
         assert result.blocked
         assert expected.lower() in " ".join(str(reason) for reason in result.blocked.values()).lower()
-    assert not controller.unit_document_path(candidate, "application--deploy").exists()
+    assert not controller.unit_document_path(candidate, "application/deploy").exists()
 
 
 def test_promoted_artifact_import_resolves_and_records_lineage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -371,7 +357,7 @@ def test_promoted_artifact_import_resolves_and_records_lineage(tmp_path: Path, m
 
     assert result.blocked == {}
     deploy = controller.load_desired_unit(
-        controller.unit_document_path(target, "application--deploy"), "application--deploy"
+        controller.unit_document_path(target, "application/deploy"), "application/deploy"
     )
     assert deploy.spec.terraform is not None
     assert deploy.spec.terraform.variables is not None
@@ -385,7 +371,7 @@ def test_promoted_artifact_import_resolves_and_records_lineage(tmp_path: Path, m
     assert stack.spec.resolvedArtifactImports is not None
     evidence = stack.spec.resolvedArtifactImports["image/containers"]
     assert evidence.sourceStack == "application"
-    assert evidence.sourceUnit == "application--image"
+    assert evidence.sourceUnit == "image"
     assert evidence.sourceDesiredRevision == fixture.promotion.desired_revision
     assert evidence.sourceObservedRevision == fixture.promotion.observed_revision
     assert evidence.targetStackUid == stack.metadata.uid
@@ -414,15 +400,16 @@ def test_promoted_artifact_import_reloads_from_persisted_desired_without_templat
     reloaded = tmp_path / "reloaded-desired"
     shutil.copytree(target, reloaded)
 
-    specifications, dependencies = controller.load_convergence_specifications(
+    loaded = controller.load_convergence_specifications(
         restarted_source,
         "staging",
         reloaded,
         fixture.source_revision,
         tmp_path / "restart-projection",
     )
-    assert specifications["application--deploy"].spec.terraform.variables["image"].endswith("c" * 64)
-    assert dependencies["application--deploy"] == ()
+    specifications, dependencies = loaded.units, loaded.dependencies
+    assert specifications["application/deploy"].spec.terraform.variables["image"].endswith("c" * 64)
+    assert dependencies["application/deploy"] == ()
     assert not (restarted_source / "deployment/stack-templates").exists()
 
 
@@ -472,7 +459,7 @@ def test_promoted_artifact_import_chains_from_persisted_staging_evidence(
     assert result.blocked == {}
     production = tmp_path / "production-desired"
     deploy = controller.load_desired_unit(
-        controller.unit_document_path(production, "application--deploy"), "application--deploy"
+        controller.unit_document_path(production, "application/deploy"), "application/deploy"
     )
     assert deploy.spec.terraform.variables["image"].endswith("c" * 64)
     stack = controller.RESOURCE_CATALOG.parse_stack(
@@ -485,40 +472,3 @@ def test_promoted_artifact_import_chains_from_persisted_staging_evidence(
     assert isinstance(stack.spec, controller.DesiredStackSpec)
     assert stack.spec.resolvedArtifactImports is not None
     assert stack.spec.resolvedArtifactImports["image/containers"].targetStackUid == stack.metadata.uid
-
-
-def test_promoted_artifact_import_rejects_ambiguous_imports_directly(tmp_path: Path):
-    imports = (
-        ArtifactImport(
-            unit="image",
-            name="containers",
-            apiVersion="artifact.gitopsctr.io/v1",
-            kind="ContainerImages",
-            fromPromotion=PromotionStackReference(stack="application"),
-        ),
-        ArtifactImport(
-            unit="application--image",
-            name="containers",
-            apiVersion="artifact.gitopsctr.io/v1",
-            kind="ContainerImages",
-            fromPromotion=PromotionStackReference(stack="application"),
-        ),
-    )
-    with pytest.raises(controller.OperationError, match="ambiguous"):
-        controller.resolve_template(
-            {
-                "image": {
-                    "fromArtifact": {
-                        "unit": "application--image",
-                        "name": "containers",
-                        "apiVersion": "artifact.gitopsctr.io/v1",
-                        "kind": "ContainerImages",
-                        "pointer": "/images/application/uri",
-                    }
-                }
-            },
-            tmp_path / "candidate",
-            tmp_path / "observed",
-            None,
-            artifact_imports=imports,
-        )

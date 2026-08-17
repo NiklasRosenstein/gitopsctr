@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from importlib.metadata import entry_points
 
 from gitopsctr.api import api_kinds
 from gitopsctr.contracts import ArtifactDescriptor
@@ -16,11 +17,27 @@ from gitopsctr.driver import (
     load_unit_drivers,
 )
 from gitopsctr.inspection_api import InspectionOutputApi
-from gitopsctr.resource_model import build_resource_registry
+from gitopsctr.resource_model import ResourceModelContribution, ResourceModelError, build_resource_registry
+
+
+def load_resource_model_contributions() -> tuple[ResourceModelContribution, ...]:
+    """Load independently installable resource families and their supporting model definitions."""
+
+    contributions: list[ResourceModelContribution] = []
+    for entry_point in entry_points(group="gitopsctr.resource-models"):
+        contribution = entry_point.load()
+        if not isinstance(contribution, ResourceModelContribution):
+            raise ResourceModelError(
+                f"resource-model entry point {entry_point.name!r} did not load a ResourceModelContribution"
+            )
+        contributions.append(contribution)
+    return tuple(contributions)
+
 
 API_KINDS = api_kinds()
 RESOURCE_REGISTRY = build_resource_registry(
-    {gvk: api_kind for gvk, api_kind in API_KINDS.items() if not isinstance(api_kind.spec, InspectionOutputApi)}
+    {gvk: api_kind for gvk, api_kind in API_KINDS.items() if not isinstance(api_kind.spec, InspectionOutputApi)},
+    load_resource_model_contributions(),
 )
 UNIT_DRIVERS = load_unit_drivers(API_KINDS)
 DRIVER_GVKS = {name: f"{driver.api_version}/{driver.kind}" for name, driver in UNIT_DRIVERS.items()}

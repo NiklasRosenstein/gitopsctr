@@ -39,6 +39,7 @@ from gitopsctr.artifacts import require_artifact_api
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
     EXACT_REVISION_PATTERN,
+    QUALIFIED_RESOURCE_NAME_PATTERN,
     ArtifactDescriptor,
     ArtifactImport,
     AuthoredSource,
@@ -100,6 +101,7 @@ from gitopsctr.driver import (
     UnitResolutionContext,
     VerificationContext,
     VerificationStatus,
+    unit_materialization_path,
 )
 from gitopsctr.errors import OperationError, ReferenceUnavailable
 from gitopsctr.execution import DriverExecution
@@ -137,6 +139,7 @@ from gitopsctr.registry import (
     MATERIALIZATION_DRIVERS,
     PLANNING_DRIVERS,
     RECONCILIATION_DRIVERS,
+    RESOURCE_REGISTRY,
     UNIT_DRIVERS,
     VERIFICATION_DRIVERS,
     semantic_reconciliation_result,
@@ -150,6 +153,7 @@ from gitopsctr.resolution import (
 from gitopsctr.resolution import (
     resolve_template as resolve_template_value,
 )
+from gitopsctr.resource_model import ResourcePlane
 from gitopsctr.resources import (
     CORE_API_VERSION,
     UNIT_API_VERSION,
@@ -664,6 +668,30 @@ resource_documents_enabled = RESOURCE_CATALOG.resource_documents_enabled
 unit_document_path = RESOURCE_CATALOG.unit_document_path
 
 
+def receipt_document_path(root: Path, qualified_name: str) -> Path:
+    """Return the canonical observed Receipt path for a Unit address."""
+
+    relative = PurePosixPath(qualified_name)
+    candidates = document_candidates(root / "units" / relative.parent, relative.name)
+    if len(candidates) > 1:
+        raise OperationError(f"multiple Receipt document formats exist for {qualified_name!r}")
+    if candidates:
+        return candidates[0]
+    if not resource_documents_enabled(REPOSITORY_ROOT):
+        return root / "units" / relative.parent / f"{relative.name}.json"
+    project = load_project_config(REPOSITORY_ROOT)
+    return RESOURCE_REGISTRY.document_path(
+        family="receipt",
+        plane=ResourcePlane.OBSERVED,
+        root=root,
+        repository_root=REPOSITORY_ROOT,
+        project=project,
+        environment=None,
+        qualified_name=qualified_name,
+        suffix=project.write_format.suffix,
+    )
+
+
 def load_desired_unit(path: Path, expected_name: str | None = None) -> UnitResource[Any]:
     return RESOURCE_CATALOG.load_unit(path, expected_name, profile="desired")
 
@@ -742,9 +770,9 @@ def load_desired_resource_graph(
     """Load and validate every desired resource in one desired ref before effects."""
 
     resources: dict[tuple[str, str, str], UnitResource[Any] | StackResource] = {}
-    for unit_name, path in _current_desired_unit_paths(root).items():
-        unit = load_desired_unit(path, unit_name)
-        key = (unit.gvk.api_version, unit.gvk.kind, unit.name)
+    for qualified_name, path in _current_desired_unit_paths(root).items():
+        unit = load_desired_unit(path, path.stem)
+        key = (unit.gvk.api_version, unit.gvk.kind, qualified_name)
         if key in resources:
             raise OperationError(f"duplicate desired resource identity: {key!r}")
         resources[key] = unit
@@ -764,14 +792,13 @@ def load_desired_resource_graph(
                 raise OperationError(f"duplicate desired resource identity: {key!r}")
             resources[key] = resource
     finalized_identities = {
-        (tombstone.api_version, tombstone.kind, tombstone.name, tombstone.uid)
+        (tombstone.api_version, tombstone.kind, tombstone.qualified_name, tombstone.uid)
         for tombstone in load_resource_incarnation_evidence(root)
     }
-    for resource in resources.values():
+    for key, resource in resources.items():
         if (
             resource.metadata.uid is not None
-            and (resource.gvk.api_version, resource.gvk.kind, resource.name, resource.metadata.uid)
-            in finalized_identities
+            and (resource.gvk.api_version, resource.gvk.kind, key[2], resource.metadata.uid) in finalized_identities
         ):
             raise OperationError(
                 f"desired resource {resource.gvk.kind}/{resource.name} reuses finalized UID {resource.metadata.uid!r}"
@@ -803,17 +830,30 @@ def load_desired_resource_graph(
                 and isinstance(stack_resource.spec, (StackSpec, DesiredStackSpec))
             ):
                 missing_resources = {
-                    (resource.apiVersion, resource.kind, resource.name)
+                    (
+                        resource.apiVersion,
+                        resource.kind,
+                        stack_generated_unit_name(stack_name, resource.name),
+                    )
                     for resource in scope_stack_template_resources(
                         stack_name,
                         template_resource.spec.expand(stack_resource.spec.parameters),
                     )
-                    if (resource.apiVersion, resource.kind, resource.name) not in resources
+                    if (
+                        resource.apiVersion,
+                        resource.kind,
+                        stack_generated_unit_name(stack_name, resource.name),
+                    )
+                    not in resources
                 }
                 tombstones = load_resource_incarnation_evidence(root)
                 active_bindings = (
                     {
-                        (binding.apiVersion, binding.kind, binding.name): binding.uid
+                        (
+                            binding.apiVersion,
+                            binding.kind,
+                            stack_generated_unit_name(stack_name, binding.name),
+                        ): binding.uid
                         for binding in stack_resource.spec.activeProjection.units.values()
                     }
                     if isinstance(stack_resource.spec, DesiredStackSpec)
@@ -824,14 +864,14 @@ def load_desired_resource_graph(
                 def has_exact_tombstone(key: tuple[str, str, str]) -> bool:
                     expected_uid = active_bindings.get(key)
                     return any(
-                        (tombstone.api_version, tombstone.kind, tombstone.name) == key
+                        (tombstone.api_version, tombstone.kind, tombstone.qualified_name) == key
                         and (expected_uid is None or tombstone.uid == expected_uid)
                         for tombstone in tombstones
                     )
 
                 if (
                     missing_resources
-                    and any(name == unit_name for _api_version, _kind, name in missing_resources)
+                    and any(PurePosixPath(name).name == unit_name for _api_version, _kind, name in missing_resources)
                     and all(has_exact_tombstone(key) for key in missing_resources)
                 ):
                     _validate_desired_projection_context_records(root, resources)
@@ -839,6 +879,87 @@ def load_desired_resource_graph(
         raise OperationError(f"invalid desired resource graph: {exc}") from exc
     _validate_desired_projection_context_records(root, resources)
     return resources
+
+
+def qualified_unit_name(
+    resources: Mapping[tuple[str, str, str], UnitResource[Any] | StackResource],
+    unit: UnitResource[Any],
+) -> str:
+    """Return the registry-defined operator address for one validated desired Unit."""
+
+    owners = unit.metadata.ownerReferences
+    if not owners:
+        return unit.name
+    if len(owners) != 1:
+        raise OperationError(f"Unit {unit.name!r} does not have exactly one owner")
+    owner = owners[0]
+    stack = resources.get((owner.apiVersion, owner.kind, owner.name))
+    # Unit-to-Unit ownership is used for teardown ordering but does not create
+    # an operator-facing hierarchy. Only the registered Stack ownership
+    # relationship contributes a parent address.
+    if not isinstance(stack, StackResource):
+        return unit.name
+    if stack.metadata.uid != owner.uid:
+        raise OperationError(f"Unit {unit.name!r} has no exact owning Stack")
+    if not isinstance(stack.spec, DesiredStackSpec) or stack.spec.activeProjection is None:
+        raise OperationError(f"Stack {stack.name!r} has no active projection for Unit {unit.name!r}")
+    matches = tuple(
+        logical_name
+        for logical_name, binding in stack.spec.activeProjection.units.items()
+        if (binding.apiVersion, binding.kind, binding.name, binding.uid)
+        == (unit.gvk.api_version, unit.gvk.kind, unit.name, unit.metadata.uid)
+    )
+    if len(matches) != 1:
+        raise OperationError(
+            f"Stack {stack.name!r} has {len(matches)} active bindings for Unit {unit.name!r}; expected one"
+        )
+    return f"{stack.name}/{matches[0]}"
+
+
+def qualified_unit_name_map(
+    resources: Mapping[tuple[str, str, str], UnitResource[Any] | StackResource],
+) -> dict[str, str]:
+    """Map canonical operator addresses to concrete desired Unit names."""
+
+    result: dict[str, str] = {}
+    for key, resource in resources.items():
+        if not isinstance(resource, UnitResource):
+            continue
+        qualified = qualified_unit_name(resources, resource)
+        previous = result.get(qualified)
+        if previous is not None and previous != key[2]:
+            raise OperationError(f"duplicate Unit qualified name {qualified!r}")
+        result[qualified] = key[2]
+    return result
+
+
+def resolve_unit_selectors(
+    resources: Mapping[tuple[str, str, str], UnitResource[Any] | StackResource],
+    selectors: Sequence[str],
+    tombstones: Sequence[ResourceIncarnationTombstone] = (),
+) -> tuple[str, ...]:
+    addresses = qualified_unit_name_map(resources)
+    for tombstone in tombstones:
+        if f"{tombstone.api_version}/{tombstone.kind}" not in DRIVER_NAMES_BY_GVK:
+            continue
+        qualified = tombstone.qualified_name or tombstone.name
+        previous = addresses.get(qualified)
+        if previous is not None and previous != qualified:
+            raise OperationError(f"duplicate Unit qualified name {qualified!r}")
+        addresses.setdefault(qualified, qualified)
+    unknown = tuple(selector for selector in selectors if selector not in addresses)
+    if unknown:
+        available = ", ".join(sorted(addresses)) or "none"
+        raise OperationError(f"unknown Unit qualified name(s): {', '.join(unknown)}; available Units: {available}")
+    return tuple(addresses[selector] for selector in selectors)
+
+
+def resolve_qualified_unit_values(selectors: Sequence[str], addresses: Mapping[str, str]) -> tuple[str, ...]:
+    unknown = tuple(selector for selector in selectors if selector not in addresses)
+    if unknown:
+        available = ", ".join(sorted(addresses)) or "none"
+        raise OperationError(f"unknown Unit qualified name(s): {', '.join(unknown)}; available Units: {available}")
+    return tuple(addresses[selector] for selector in selectors)
 
 
 def stack_dependency_edges(
@@ -868,16 +989,19 @@ def stack_dependency_edges(
         )
         if use_active:
             for binding in active.units.values():
+                qualified_name = stack_generated_unit_name(stack.name, binding.name)
                 if not include_missing and not any(
-                    isinstance(item, UnitResource) and item.name == binding.name for item in resources.values()
+                    isinstance(item, UnitResource) and key[2] == qualified_name for key, item in resources.items()
                 ):
                     continue
-                edges.setdefault(binding.name, set()).update(binding.dependsOn)
+                edges.setdefault(qualified_name, set()).update(
+                    stack_generated_unit_name(stack.name, dependency) for dependency in binding.dependsOn
+                )
             continue
         for logical_name, projected in stack.spec.structuralProjection.units.items():
             generated_name = stack_generated_unit_name(stack.name, logical_name)
             if not include_missing and not any(
-                isinstance(item, UnitResource) and item.name == generated_name for item in resources.values()
+                isinstance(item, UnitResource) and key[2] == generated_name for key, item in resources.items()
             ):
                 # A deleting Stack may intentionally omit a finalized child.
                 continue
@@ -886,8 +1010,8 @@ def stack_dependency_edges(
                 for dependency in projected.dependsOn
                 if include_missing
                 or any(
-                    isinstance(item, UnitResource) and item.name == stack_generated_unit_name(stack.name, dependency)
-                    for item in resources.values()
+                    isinstance(item, UnitResource) and key[2] == stack_generated_unit_name(stack.name, dependency)
+                    for key, item in resources.items()
                 )
             )
     return {name: tuple(sorted(dependencies)) for name, dependencies in sorted(edges.items())}
@@ -896,14 +1020,7 @@ def stack_dependency_edges(
 def desired_unit_names(root: Path) -> tuple[str, ...]:
     """Return materialized desired Unit names, including Stack-owned Units."""
 
-    names = {path.stem for path in (root / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}}
-    if _current_desired_stack_paths(root, "Stack"):
-        names.update(
-            resource.name
-            for resource in load_desired_resource_graph(root).values()
-            if isinstance(resource, UnitResource)
-        )
-    return tuple(sorted(names))
+    return tuple(sorted(_current_desired_unit_paths(root)))
 
 
 def ensure_desired_units_materialized(root: Path) -> None:
@@ -1015,7 +1132,7 @@ def validate_unit_materialization(desired_root: Path, unit_name: str, unit: Unit
 def copy_unit_materialization(source: Path, destination: Path, unit_name: str, unit: UnitResource[Any]) -> None:
     validate_unit_materialization(source, unit_name, unit)
     descriptor = getattr(unit.spec, "materialization", None)
-    relative_path = descriptor.path if descriptor is not None else f"materialized/{unit_name}"
+    relative_path = unit_materialization_path(unit_name)
     target = destination / relative_path
     if target.exists():
         shutil.rmtree(target)
@@ -1171,13 +1288,13 @@ def _load_transition_resources(
 
     resources: dict[tuple[str, str, str], UnitResource[Any] | StackResource] = {}
     opaque_units: dict[str, object] = {}
-    for name, path in _current_desired_unit_paths(root).items():
+    for qualified_name, path in _current_desired_unit_paths(root).items():
         try:
-            resource = load_desired_unit(path, name)
+            resource = load_desired_unit(path, path.stem)
         except (DocumentFormatError, DriverError, KeyError, TypeError, ValueError, OperationError):
-            opaque_units[name] = opaque_document_payload(path)
+            opaque_units[qualified_name] = opaque_document_payload(path)
             continue
-        resources[(resource.gvk.api_version, resource.gvk.kind, resource.name)] = resource
+        resources[(resource.gvk.api_version, resource.gvk.kind, qualified_name)] = resource
     for kind in ("StackTemplate", "Stack"):
         for name, path in _current_desired_stack_paths(root, kind).items():
             resource = (
@@ -1214,7 +1331,7 @@ def validate_desired_resource_transition(
             fence = ResourceFinalizationFence(
                 previous.gvk.api_version,
                 previous.gvk.kind,
-                previous.name,
+                key[2],
                 previous.metadata.uid,
                 previous_deletion.generation,
             )
@@ -1314,9 +1431,25 @@ def deletion_reason(resource: UnitResource[Any] | StackResource) -> str:
 
 
 def artifact_document_path(root: Path, unit_name: str, artifact_name: str) -> Path:
-    directory = root / "artifacts" / unit_name
-    selected = load_project_config(REPOSITORY_ROOT).write_format
-    return directory / f"{artifact_name}{selected.suffix}"
+    directory = root / "artifacts" / PurePosixPath(unit_name)
+    candidates = document_candidates(directory, artifact_name)
+    if len(candidates) > 1:
+        raise OperationError(f"multiple Artifact document formats exist for {unit_name}/{artifact_name}")
+    if candidates:
+        return candidates[0]
+    if not resource_documents_enabled(REPOSITORY_ROOT):
+        return directory / f"{artifact_name}.json"
+    project = load_project_config(REPOSITORY_ROOT)
+    return RESOURCE_REGISTRY.document_path(
+        family="artifact",
+        plane=ResourcePlane.OBSERVED,
+        root=root,
+        repository_root=REPOSITORY_ROOT,
+        project=project,
+        environment=None,
+        qualified_name=f"{unit_name}/{artifact_name}",
+        suffix=project.write_format.suffix,
+    )
 
 
 def write_artifact_documents(
@@ -1329,7 +1462,7 @@ def write_artifact_documents(
     expected = set(driver.artifact_outputs)
     if set(documents) != expected:
         raise DriverError(f"{driver_name} returned artifact documents {sorted(documents)}; expected {sorted(expected)}")
-    target = observed / "artifacts" / unit_name
+    target = (artifact_document_path(observed, unit_name, "placeholder")).parent
     if target.exists():
         shutil.rmtree(target)
     if not documents:
@@ -1342,7 +1475,7 @@ def write_artifact_documents(
         resource = parse_artifact_document(artifact_api, document, f"{driver_name} artifact {name}")
         schema_id = str(artifact_api.json_schema()["$id"])
         serialized = {"$schema": schema_id, **artifact_api.dump(resource)}
-        path = write_document(target / f"{name}{selected.suffix}", serialized, format=selected)
+        path = write_document(artifact_document_path(observed, unit_name, name), serialized, format=selected)
         descriptors[name] = {
             "apiVersion": artifact_kind.gvk.api_version,
             "kind": artifact_kind.gvk.kind,
@@ -1357,6 +1490,7 @@ def validate_artifact_output_identity(
     driver_name: str,
     unit: UnitResource[Any],
     documents: Mapping[str, JsonObject],
+    qualified_name: str | None = None,
 ) -> None:
     driver = UNIT_DRIVERS[driver_name]
     if set(documents) != set(driver.artifact_outputs):
@@ -1380,6 +1514,7 @@ def validate_artifact_output_identity(
             or producer.get("apiVersion") != driver.api_version
             or producer.get("kind") != driver.kind
             or producer.get("name") != unit.name
+            or producer.get("qualifiedName") != (qualified_name or unit.name)
             or producer.get("driverVersion") != driver.version
             or producer.get("sourceRevision") != source.revision
             or producer.get("inputHashVersion") != 1
@@ -1404,7 +1539,7 @@ def load_artifact_document(
     descriptor = receipt.status.artifacts.get(artifact_name) if receipt.status.artifacts is not None else None
     if descriptor is None:
         raise ReferenceUnavailable(f"receipt does not describe artifact {artifact_name!r}")
-    expected_path = artifact_document_path(observed, receipt.name, artifact_name)
+    expected_path = artifact_document_path(observed, receipt.spec.subject.qualifiedName, artifact_name)
     recorded_path = descriptor.path
     if (
         not isinstance(recorded_path, str)
@@ -1446,6 +1581,7 @@ def load_artifact_document(
             producer.get("apiVersion") != UNIT_DRIVERS[driver_name].api_version
             or producer.get("kind") != UNIT_DRIVERS[driver_name].kind
             or producer.get("name") != unit.name
+            or producer.get("qualifiedName") != receipt.spec.subject.qualifiedName
             or producer.get("driverVersion") != UNIT_DRIVERS[driver_name].version
             or producer.get("sourceRevision") != source.revision
             or producer.get("inputHash") != source.inputHash
@@ -1469,9 +1605,9 @@ def validate_receipt_artifacts(
         raise OperationError(
             f"persisted {driver_name} receipt describes artifacts {sorted(descriptors)}; expected {sorted(expected)}"
         )
-    directory = observed / "artifacts" / unit.name
+    directory = observed / "artifacts" / receipt.spec.subject.qualifiedName
     actual_paths = {path for path in directory.rglob("*") if path.is_file()} if directory.is_dir() else set()
-    expected_paths = {artifact_document_path(observed, unit.name, name) for name in expected}
+    expected_paths = {artifact_document_path(observed, receipt.spec.subject.qualifiedName, name) for name in expected}
     if actual_paths != expected_paths:
         raise OperationError(f"persisted {driver_name} artifact files do not match its complete contract set")
     for artifact_name in expected:
@@ -1479,7 +1615,7 @@ def validate_receipt_artifacts(
 
 
 def current_receipt(observed: Path, candidate_units: Path, unit_name: str) -> ReceiptResource[Any] | None:
-    receipt_path = unit_document_path(observed, unit_name)
+    receipt_path = receipt_document_path(observed, unit_name)
     unit_path = unit_document_path(candidate_units.parent, unit_name)
     if not receipt_path.is_file() or not unit_path.is_file():
         return None
@@ -1497,7 +1633,7 @@ def parse_artifact_reference(reference: object) -> ArtifactReferenceTarget:
     artifact_name = reference.get("name")
     api_version = reference.get("apiVersion")
     kind = reference.get("kind")
-    if not isinstance(unit_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name):
+    if not isinstance(unit_name, str) or not re.fullmatch(QUALIFIED_RESOURCE_NAME_PATTERN, unit_name):
         raise OperationError(f"invalid fromArtifact unit: {unit_name!r}")
     if not isinstance(artifact_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", artifact_name):
         raise OperationError(f"invalid fromArtifact name: {artifact_name!r}")
@@ -1587,7 +1723,7 @@ def resolve_template(
             raise ReferenceUnavailable(f"receipt is stale: {reference.unit}")
         document = receipt.driver.result_contract.dump(receipt.status.result)
         return FingerprintedValue(
-            json_pointer(document, reference.pointer), file_blob(unit_document_path(observed, reference.unit))
+            json_pointer(document, reference.pointer), file_blob(receipt_document_path(observed, reference.unit))
         )
 
     def resolve_artifact(reference):
@@ -1617,11 +1753,10 @@ def resolve_template(
                 profile="desired",
                 expected_name=imported.fromPromotion.stack,
             )
-            source_unit_path = unit_document_path(
-                promotion.desired_root,
-                stack_generated_unit_name(imported.fromPromotion.stack, imported.unit),
-            )
+            source_unit_qualified_name = stack_generated_unit_name(imported.fromPromotion.stack, imported.unit)
+            source_unit_path = unit_document_path(promotion.desired_root, source_unit_qualified_name)
             if not source_unit_path.is_file():
+                source_unit_qualified_name = reference.unit
                 source_unit_path = unit_document_path(promotion.desired_root, reference.unit)
             if not source_unit_path.is_file():
                 chained = None
@@ -1671,7 +1806,9 @@ def resolve_template(
             if promotion.observed_root is None:
                 raise ReferenceUnavailable("promoted artifact observed state is unavailable")
             source_receipt = current_receipt(
-                promotion.observed_root, promotion.desired_root / "units", source_unit.name
+                promotion.observed_root,
+                promotion.desired_root / "units",
+                source_unit_qualified_name,
             )
             if source_receipt is None:
                 raise ReferenceUnavailable(f"promoted artifact receipt is stale: {source_unit.name}")
@@ -3007,52 +3144,56 @@ def _bind_active_stack_projections(
                 logical_name in structural.units
                 and structural.units[logical_name].apiVersion == binding.apiVersion
                 and structural.units[logical_name].kind == binding.kind
-                and stack_generated_unit_name(stack.name, logical_name) == binding.name
-                and sorted(binding.dependsOn)
-                == sorted(
-                    stack_generated_unit_name(stack.name, dependency)
-                    for dependency in structural.units[logical_name].dependsOn
-                )
+                and logical_name == binding.name
+                and sorted(binding.dependsOn) == sorted(structural.units[logical_name].dependsOn)
                 for logical_name, binding in previous_active.units.items()
             )
             staged = compatible
             source_projection_digest = (
                 structural.identity.projectionDigest if staged else previous_active.sourceProjectionDigest
             )
-            active_names = {binding.name for binding in previous_active.units.values()}
+            active_names = {
+                stack_generated_unit_name(stack.name, binding.name) for binding in previous_active.units.values()
+            }
             stack_owner = (stack.gvk.api_version, stack.gvk.kind, stack.name, stack.metadata.uid)
             retained_bindings = (
-                tuple(binding for binding in previous_active.units.values() if binding.name in blocked_names)
+                tuple(
+                    binding
+                    for binding in previous_active.units.values()
+                    if stack_generated_unit_name(stack.name, binding.name) in blocked_names
+                )
                 if staged
                 else tuple(previous_active.units.values())
             )
             if not staged:
-                for resource in tuple(candidate_resources.values()):
-                    if not isinstance(resource, UnitResource) or resource.name in active_names:
+                for resource_key, resource in tuple(candidate_resources.items()):
+                    if not isinstance(resource, UnitResource) or resource_key[2] in active_names:
                         continue
                     owner = resource_owner_reference(resource)
                     if owner is None or (owner.apiVersion, owner.kind, owner.name, owner.uid) != stack_owner:
                         continue
-                    for extra_path in document_candidates(candidate / "units", resource.name):
+                    extra_path = unit_document_path(candidate, resource_key[2])
+                    if extra_path.is_file():
                         extra_path.unlink()
                     materialization = getattr(resource.spec, "materialization", None)
                     if materialization is not None:
-                        materialized_path = candidate / materialization.path
+                        materialized_path = candidate / unit_materialization_path(resource_key[2])
                         if materialized_path.is_dir():
                             shutil.rmtree(materialized_path)
             for binding in retained_bindings:
-                previous_name = binding.name
+                previous_name = stack_generated_unit_name(stack.name, binding.name)
                 previous_path = unit_document_path(current_desired, previous_name)
                 if not previous_path.is_file():
                     raise OperationError(
                         f"Stack {stack.name!r} active projection references missing Unit {previous_name!r}"
                     )
-                for candidate_path in document_candidates(candidate / "units", previous_name):
+                candidate_path = unit_document_path(candidate, previous_name)
+                if candidate_path.is_file():
                     candidate_path.unlink()
-                target_path = candidate / "units" / previous_path.name
+                target_path = unit_document_path(candidate, previous_name, project_root)
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(previous_path, target_path)
-                previous_unit = load_desired_unit(previous_path, previous_name)
+                previous_unit = load_desired_unit(previous_path, previous_path.stem)
                 if getattr(previous_unit.spec, "materialization", None) is not None:
                     copy_unit_materialization(current_desired, candidate, previous_name, previous_unit)
                 atomically_retained_units.add(previous_name)
@@ -3076,7 +3217,7 @@ def _bind_active_stack_projections(
                 unit_path = unit_document_path(candidate, unit_name)
                 if not unit_path.is_file():
                     continue
-                unit = load_desired_unit(unit_path, unit_name)
+                unit = load_desired_unit(unit_path, unit_path.stem)
                 owner = resource_owner_reference(unit)
                 if (
                     resource_deletion(unit) is not None
@@ -3098,7 +3239,7 @@ def _bind_active_stack_projections(
                     desiredDigest=desired_unit_binding_digest(unit),
                     sourceProjectionDigest=structural.identity.projectionDigest,
                     projectionContextDigest=structural.identity.projectionContextDigest,
-                    dependsOn=[stack_generated_unit_name(stack.name, dependency) for dependency in projected.dependsOn],
+                    dependsOn=list(projected.dependsOn),
                 )
                 if staged and unit_name in blocked_names and previous_active is not None:
                     previous_binding = previous_active.units.get(logical_name)
@@ -3124,12 +3265,13 @@ def _bind_active_stack_projections(
                 active_names = set(bindings)
                 for logical_name in set(structural.units) - active_names:
                     unit_name = stack_generated_unit_name(stack.name, logical_name)
-                    for unit_path in document_candidates(candidate / "units", unit_name):
+                    unit_path = unit_document_path(candidate, unit_name)
+                    if unit_path.is_file():
                         unit_path.unlink()
                     unit = candidate_resources.get((UNIT_API_VERSION, structural.units[logical_name].kind, unit_name))
                     materialization = getattr(getattr(unit, "spec", None), "materialization", None)
                     if materialization is not None:
-                        materialized_path = candidate / materialization.path
+                        materialized_path = candidate / unit_materialization_path(unit_name)
                         if materialized_path.is_dir():
                             shutil.rmtree(materialized_path)
             active = StackActiveProjection.build(
@@ -3320,7 +3462,7 @@ def _required_stack_template_source_pins(environment: str, desired_root: Path) -
     required: set[tuple[str, str]] = set()
     resources = load_desired_resource_graph(desired_root, validate=False)
     finalized_identities = {
-        (tombstone.api_version, tombstone.kind, tombstone.name, tombstone.uid)
+        (tombstone.api_version, tombstone.kind, tombstone.qualified_name, tombstone.uid)
         for tombstone in load_resource_incarnation_evidence(desired_root)
     }
     for resource in resources.values():
@@ -3398,14 +3540,15 @@ def _required_stack_template_source_pins(environment: str, desired_root: Path) -
         if active is None:
             continue
         for binding in active.units.values():
-            unit = resources.get((binding.apiVersion, binding.kind, binding.name))
+            qualified_name = stack_generated_unit_name(resource.name, binding.name)
+            unit = resources.get((binding.apiVersion, binding.kind, qualified_name))
             if not isinstance(unit, UnitResource):
                 if (
                     resource_deletion(resource) is not None
                     and (
                         binding.apiVersion,
                         binding.kind,
-                        binding.name,
+                        qualified_name,
                         binding.uid,
                     )
                     in finalized_identities
@@ -4305,6 +4448,7 @@ def project_stack_resources(
             ),
         )
         for original_resource, resource in zip(expanded, scoped_resources, strict=True):
+            qualified_name = stack_generated_unit_name(name, resource.name)
             normalized = normalized_specs.get(
                 original_resource.name,
                 NormalizedStackUnitSource(
@@ -4326,21 +4470,21 @@ def project_stack_resources(
             }
             unit = RESOURCE_CATALOG.parse_unit(document, profile="authored", expected_name=resource.name)
             require_unit_specification(unit, resource.name)
-            if resource.name in generated:
-                raise OperationError(
-                    f"generated Unit {resource.name!r} is produced by more than one Stack; names must be globally unique"
-                )
-            generated[resource.name] = unit
-            dependencies[resource.name] = tuple(resource.dependsOn)
-            artifact_imports[resource.name] = tuple(stack.spec.artifactImports)
-            owners[resource.name] = DesiredOwnerReference(
+            if qualified_name in generated:
+                raise OperationError(f"generated Unit {qualified_name!r} is produced more than once")
+            generated[qualified_name] = unit
+            dependencies[qualified_name] = tuple(
+                stack_generated_unit_name(name, dependency) for dependency in resource.dependsOn
+            )
+            artifact_imports[qualified_name] = tuple(stack.spec.artifactImports)
+            owners[qualified_name] = DesiredOwnerReference(
                 apiVersion=stack.gvk.api_version,
                 kind=stack.gvk.kind,
                 name=stack.name,
                 uid=stack.metadata.uid,
             )
             if selected_source_context is not None:
-                source_contexts[resource.name] = selected_source_context
+                source_contexts[qualified_name] = selected_source_context
 
     return StackProjection(
         generated_units=generated,
@@ -4353,13 +4497,20 @@ def project_stack_resources(
     )
 
 
+@dataclass(frozen=True)
+class ConvergenceSpecifications:
+    units: dict[str, UnitResource[Any]]
+    dependencies: dict[str, tuple[str, ...]]
+    qualified_names: dict[str, str]
+
+
 def load_convergence_specifications(
     source_root: Path,
     environment_name: str,
     current_desired: Path,
     projection_revision: str,
     projection_root: Path,
-) -> tuple[dict[str, UnitResource[Any]], dict[str, tuple[str, ...]]]:
+) -> ConvergenceSpecifications:
     """Load source and desired-only Units participating in convergence.
 
     Source Unit documents remain the authored authority. Stack-generated and
@@ -4368,25 +4519,30 @@ def load_convergence_specifications(
 
     specifications = load_environment_specifications(source_root, environment_name)
     dependency_edges: dict[str, tuple[str, ...]] = {}
+    qualified_names = {name: name for name in specifications}
     if _current_desired_stack_paths(current_desired, "Stack"):
         # A desired Stack is an immutable projection. Reconcile must not
         # rebuild it from a mutable source branch or remote repository.
         resources = load_desired_resource_graph(current_desired)
+        qualified_names.update(
+            {concrete: qualified for qualified, concrete in qualified_unit_name_map(resources).items()}
+        )
         dependency_edges.update(stack_dependency_edges(resources))
         transition_blocks = load_desired_transition_blocks(current_desired)
-        for resource in resources.values():
+        for key, resource in resources.items():
             if not isinstance(resource, UnitResource) or resource_deletion(resource) is not None:
                 continue
-            if resource.name in transition_blocks:
+            unit_name = key[2]
+            if unit_name in transition_blocks:
                 continue
             owner = resource_owner_reference(resource)
             is_stack_owned = owner is not None and owner.kind == "Stack"
             if not (is_stack_owned or owner is None):
                 continue
-            existing = specifications.get(resource.name)
+            existing = specifications.get(unit_name)
             if existing is not None and existing.gvk != resource.gvk:
-                raise OperationError(f"desired-only Unit {resource.name!r} collides with a source Unit")
-            specifications[resource.name] = resource
+                raise OperationError(f"desired-only Unit {unit_name!r} collides with a source Unit")
+            specifications[unit_name] = resource
     else:
         projection = project_stack_resources(
             source_root,
@@ -4400,9 +4556,18 @@ def load_convergence_specifications(
             if name in specifications:
                 raise OperationError(f"generated Stack Unit {name!r} collides with a source Unit")
             specifications[name] = generated
+        for stack_name, structural in projection.structural_projections.items():
+            for logical_name in structural.units:
+                concrete = stack_generated_unit_name(stack_name, logical_name)
+                if concrete in projection.generated_units:
+                    qualified_names[concrete] = f"{stack_name}/{logical_name}"
         dependency_edges.update(projection.dependencies)
 
-    return specifications, {name: tuple(sorted(values)) for name, values in dependency_edges.items()}
+    return ConvergenceSpecifications(
+        specifications,
+        {name: tuple(sorted(values)) for name, values in dependency_edges.items()},
+        qualified_names,
+    )
 
 
 def reconciliation_statuses(unit_names: Sequence[str], desired: Path, observed: Path) -> list[tuple[str, str, str]]:
@@ -4418,7 +4583,7 @@ def reconciliation_statuses(unit_names: Sequence[str], desired: Path, observed: 
     statuses = []
     for unit_name in unit_names:
         unit_path = unit_document_path(desired, unit_name)
-        receipt_path = unit_document_path(observed, unit_name)
+        receipt_path = receipt_document_path(observed, unit_name)
         if unit_name in deleting:
             state = operational.classify_before_observation(
                 desired,
@@ -4647,7 +4812,7 @@ def classify_unit_change(
 
 
 def unit_change_explanation(unit_name: str, desired: Path, observed: Path) -> UnitChangeExplanation | None:
-    receipt_path = unit_document_path(observed, unit_name)
+    receipt_path = receipt_document_path(observed, unit_name)
     current_path = unit_document_path(desired, unit_name)
     if not receipt_path.is_file() or not current_path.is_file():
         return None
@@ -4789,12 +4954,13 @@ def log_convergence_action(
 def materialize_resolved_unit(
     environment_name: str,
     resolved: UnitResource[Any],
+    qualified_name: str,
     source_root: Path,
     source_revision: str | None,
     current_desired: Path,
     candidate: Path,
 ) -> UnitResource[Any]:
-    unit_name = resolved.name
+    unit_name = qualified_name
     plugin_name = resolved.driver_name
     plugin = MATERIALIZATION_DRIVERS.get(plugin_name)
     if plugin is None:
@@ -4809,7 +4975,6 @@ def materialize_resolved_unit(
             previous_descriptor = previous.spec.materialization
             previous_metadata = previous_descriptor.metadata
             descriptor = MaterializationDocument(
-                path=previous_descriptor.path,
                 digest=previous_descriptor.digest,
                 mediaType=previous_descriptor.mediaType,
                 metadata=JsonObjectValue(
@@ -4818,7 +4983,7 @@ def materialize_resolved_unit(
             )
             return resolved.with_spec(plugin.finalize_materialization(resolved.spec, descriptor))
 
-    output_root = candidate / "materialized" / unit_name
+    output_root = candidate / unit_materialization_path(unit_name)
     if output_root.exists():
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True)
@@ -4835,9 +5000,10 @@ def materialize_resolved_unit(
                 source_root=selected_source_root,
                 source_revision=selected_revision,
                 source_path=source_path,
-                unit_name=unit_name,
+                unit_name=resolved.name,
                 unit=resolved.spec,
                 output_root=output_root,
+                qualified_name=unit_name,
                 execution=DriverExecution.console(),
             )
         )
@@ -4855,7 +5021,6 @@ def materialize_resolved_unit(
     if not result.media_type:
         raise DriverError(f"{plugin_name} returned an empty materialization media type")
     descriptor = MaterializationDocument(
-        path=f"materialized/{unit_name}",
         digest=materialization_tree_digest(output_root),
         mediaType=result.media_type,
         metadata=JsonObjectValue(result.metadata),
@@ -4950,8 +5115,13 @@ class ResourceIncarnationTombstone:
     name: str
     uid: str
     deletion_generation: int
+    qualified_name: str | None = None
     partition: str | None = None
     effect_lease_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.qualified_name is None:
+            object.__setattr__(self, "qualified_name", self.name)
 
     def document(self) -> JsonObject:
         document: JsonObject = {
@@ -4963,6 +5133,7 @@ class ResourceIncarnationTombstone:
                 "name": self.name,
                 "uid": self.uid,
                 "deletionGeneration": self.deletion_generation,
+                "qualifiedName": self.qualified_name or self.name,
             },
         }
         if self.partition is not None:
@@ -4980,7 +5151,15 @@ class ResourceIncarnationTombstone:
         ):
             raise ValueError("invalid resource incarnation tombstone")
         resource = document.get("resource")
-        required = {"apiVersion", "kind", "name", "uid", "deletionGeneration", "effectLeaseRef"}
+        required = {
+            "apiVersion",
+            "kind",
+            "name",
+            "uid",
+            "deletionGeneration",
+            "qualifiedName",
+            "effectLeaseRef",
+        }
         allowed = required | {"partition"}
         if not isinstance(resource, dict) or not required <= set(resource) or not set(resource) <= allowed:
             raise ValueError("invalid resource incarnation identity")
@@ -4989,9 +5168,10 @@ class ResourceIncarnationTombstone:
         name = resource.get("name")
         uid = resource.get("uid")
         deletion_generation = resource.get("deletionGeneration")
+        qualified_name = resource.get("qualifiedName")
         partition = resource.get("partition")
         effect_lease_ref = resource.get("effectLeaseRef")
-        if not all(isinstance(value, str) and value for value in (api_version, kind, name, uid)):
+        if not all(isinstance(value, str) and value for value in (api_version, kind, name, uid, qualified_name)):
             raise ValueError("invalid resource incarnation identity")
         GVK(cast(str, api_version), cast(str, kind))
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", cast(str, name)):
@@ -5006,12 +5186,15 @@ class ResourceIncarnationTombstone:
             raise ValueError("invalid resource incarnation partition")
         if effect_lease_ref is not None and (not isinstance(effect_lease_ref, str) or not effect_lease_ref):
             raise ValueError("invalid resource incarnation effect lease ref")
+        if re.fullmatch(QUALIFIED_RESOURCE_NAME_PATTERN, cast(str, qualified_name)) is None:
+            raise ValueError("invalid resource incarnation qualified name")
         return cls(
             api_version=cast(str, api_version),
             kind=cast(str, kind),
             name=cast(str, name),
             uid=cast(str, uid),
             deletion_generation=deletion_generation,
+            qualified_name=cast(str, qualified_name),
             partition=cast(str | None, partition),
             effect_lease_ref=cast(str | None, effect_lease_ref),
         )
@@ -5100,7 +5283,12 @@ class EffectLease:
     token: str
     owner: str
     desired_revision: str
+    qualified_name: str | None = None
     snapshot: EffectLeaseSnapshot | None = None
+
+    def __post_init__(self) -> None:
+        if self.qualified_name is None:
+            object.__setattr__(self, "qualified_name", self.unit_name)
 
     def document(self) -> JsonObject:
         return {
@@ -5111,11 +5299,12 @@ class EffectLease:
             "token": self.token,
             "owner": self.owner,
             "desiredRevision": self.desired_revision,
+            "qualifiedName": self.qualified_name or self.unit_name,
             **({"snapshot": self.snapshot.document()} if self.snapshot is not None else {}),
         }
 
     @classmethod
-    def from_document(cls, document: object, expected_name: str) -> EffectLease:
+    def from_document(cls, document: object, expected_qualified_name: str) -> EffectLease:
         if not isinstance(document, dict) or set(document) not in (
             {
                 "schema",
@@ -5125,6 +5314,7 @@ class EffectLease:
                 "token",
                 "owner",
                 "desiredRevision",
+                "qualifiedName",
             },
             {
                 "schema",
@@ -5134,6 +5324,7 @@ class EffectLease:
                 "token",
                 "owner",
                 "desiredRevision",
+                "qualifiedName",
                 "snapshot",
             },
         ):
@@ -5142,29 +5333,35 @@ class EffectLease:
         token = document.get("token")
         owner = document.get("owner")
         desired_revision = document.get("desiredRevision")
+        qualified_name = document.get("qualifiedName")
         if (
             type(document.get("schema")) is not int
             or document.get("schema") != 1
             or document.get("kind") != "UnitEffectLease"
-            or document.get("unitName") != expected_name
+            or document.get("unitName") != PurePosixPath(expected_qualified_name).parts[-1]
             or not isinstance(uid, str)
             or not isinstance(token, str)
             or not isinstance(owner, str)
             or not isinstance(desired_revision, str)
+            or not isinstance(qualified_name, str)
             or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", uid)
             or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", token)
             or not owner
             or not re.fullmatch(r"[0-9a-f]{40}", desired_revision)
+            or not re.fullmatch(QUALIFIED_RESOURCE_NAME_PATTERN, qualified_name)
         ):
             raise ValueError("invalid effect lease fence")
-        ResourceMetadata(name=expected_name, uid=uid).validate_desired()
+        if qualified_name != expected_qualified_name:
+            raise ValueError("effect lease qualifiedName does not match its storage identity")
+        ResourceMetadata(name=PurePosixPath(expected_qualified_name).parts[-1], uid=uid).validate_desired()
         snapshot = EffectLeaseSnapshot.from_document(document["snapshot"]) if "snapshot" in document else None
         return cls(
-            unit_name=expected_name,
+            unit_name=PurePosixPath(expected_qualified_name).parts[-1],
             uid=uid,
             token=token,
             owner=owner,
             desired_revision=desired_revision,
+            qualified_name=qualified_name,
             snapshot=snapshot,
         )
 
@@ -5225,15 +5422,15 @@ def renew_effect_lease(
                 lease_ref,
                 Path(temporary_directory) / "leases",
             )
-            existing = load_desired_effect_leases(lease_root).get(acquisition.lease.unit_name)
+            qualified_name = acquisition.lease.qualified_name or acquisition.lease.unit_name
+            existing = load_desired_effect_leases(lease_root).get(qualified_name)
             if (
                 existing is None
                 or existing.token != acquisition.lease.token
                 or existing.uid != acquisition.lease.uid
                 or acquisition.lease.snapshot is None
                 or existing.snapshot != acquisition.lease.snapshot
-                or effect_lease_snapshot(current, acquisition.lease.unit_name, acquisition.lease.uid)
-                != acquisition.lease.snapshot
+                or effect_lease_snapshot(current, qualified_name, acquisition.lease.uid) != acquisition.lease.snapshot
             ):
                 raise EffectLeaseUnavailable(
                     f"effect lease for {acquisition.lease.unit_name!r} no longer fences the same Unit snapshot"
@@ -5329,6 +5526,7 @@ class TeardownEvidence:
     """Observed-state proof that one UID-fenced teardown completed."""
 
     unit_name: str
+    qualified_name: str
     uid: str
     deletion_generation: int
     desired_revision: str
@@ -5340,6 +5538,7 @@ class TeardownEvidence:
             "schema": 1,
             "kind": "UnitTeardownEvidence",
             "unitName": self.unit_name,
+            "qualifiedName": self.qualified_name,
             "uid": self.uid,
             "deletionGeneration": self.deletion_generation,
             "desiredRevision": self.desired_revision,
@@ -5348,11 +5547,12 @@ class TeardownEvidence:
         }
 
     @classmethod
-    def from_document(cls, document: object, expected_name: str) -> TeardownEvidence:
+    def from_document(cls, document: object, expected_qualified_name: str) -> TeardownEvidence:
         required_fields = {
             "schema",
             "kind",
             "unitName",
+            "qualifiedName",
             "uid",
             "deletionGeneration",
             "desiredRevision",
@@ -5372,7 +5572,8 @@ class TeardownEvidence:
             type(document.get("schema")) is not int
             or document.get("schema") != 1
             or document.get("kind") != "UnitTeardownEvidence"
-            or document.get("unitName") != expected_name
+            or document.get("unitName") != PurePosixPath(expected_qualified_name).name
+            or document.get("qualifiedName") != expected_qualified_name
             or not isinstance(raw_uid, str)
             or not isinstance(raw_generation, int)
             or isinstance(raw_generation, bool)
@@ -5383,7 +5584,7 @@ class TeardownEvidence:
             or not isinstance(raw_details, dict)
         ):
             raise ValueError("invalid teardown evidence envelope")
-        ResourceMetadata(name=expected_name, uid=raw_uid).validate_desired()
+        ResourceMetadata(name=PurePosixPath(expected_qualified_name).name, uid=raw_uid).validate_desired()
         if not re.fullmatch(r"[0-9a-f]{40}", raw_revision):
             raise ValueError("invalid teardown evidence desired revision")
         try:
@@ -5391,7 +5592,8 @@ class TeardownEvidence:
         except ValueError as exc:
             raise ValueError("invalid teardown evidence details") from exc
         return cls(
-            unit_name=expected_name,
+            unit_name=PurePosixPath(expected_qualified_name).name,
+            qualified_name=expected_qualified_name,
             uid=raw_uid,
             deletion_generation=raw_generation,
             desired_revision=raw_revision,
@@ -5404,22 +5606,26 @@ def desired_effect_lease_paths(root: Path) -> tuple[Path, ...]:
     directory = root / DESIRED_EFFECT_LEASES_PATH
     if not directory.is_dir():
         return ()
-    paths = sorted(path for path in directory.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"})
+    paths = sorted(
+        path for path in directory.rglob("*") if path.is_file() and path.suffix in {".json", ".yaml", ".yml"}
+    )
     names: dict[str, Path] = {}
     for path in paths:
-        if path.stem in names:
-            raise OperationError(f"multiple effect lease formats exist for {path.stem!r}")
-        names[path.stem] = path
+        qualified_name = path.relative_to(directory).with_suffix("").as_posix()
+        if qualified_name in names:
+            raise OperationError(f"multiple effect lease formats exist for {qualified_name!r}")
+        names[qualified_name] = path
     return tuple(paths)
 
 
 def resource_incarnation_path(root: Path, tombstone: ResourceIncarnationTombstone) -> Path:
+    qualified_name = tombstone.qualified_name or tombstone.name
     return (
         root
         / DESIRED_RESOURCE_INCARNATIONS_PATH
         / PurePosixPath(tombstone.api_version)
         / tombstone.kind
-        / tombstone.name
+        / PurePosixPath(qualified_name)
         / f"{tombstone.uid}.json"
     )
 
@@ -5467,7 +5673,7 @@ def finalized_incarnation_evidence(
         if (
             tombstone.api_version == api_version
             and tombstone.kind == kind
-            and tombstone.name == name
+            and (tombstone.name == name or tombstone.qualified_name == name)
             and tombstone.uid == uid
             and (deletion_generation is None or tombstone.deletion_generation == deletion_generation)
         ):
@@ -5478,7 +5684,7 @@ def finalized_incarnation_evidence(
 def load_desired_effect_leases(root: Path) -> dict[str, EffectLease]:
     leases: dict[str, EffectLease] = {}
     for path in desired_effect_lease_paths(root):
-        name = path.stem
+        name = path.relative_to(root / DESIRED_EFFECT_LEASES_PATH).with_suffix("").as_posix()
         try:
             lease = EffectLease.from_document(load_json(path), name)
         except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
@@ -5488,10 +5694,8 @@ def load_desired_effect_leases(root: Path) -> dict[str, EffectLease]:
 
 
 def effect_lease_snapshot(root: Path, unit_name: str, uid: str) -> EffectLeaseSnapshot:
-    unit_paths = document_candidates(root / "units", unit_name)
-    if len(unit_paths) > 1:
-        raise OperationError(f"multiple desired Unit formats exist for leased unit {unit_name!r}")
-    unit_path = unit_paths[0] if unit_paths else None
+    candidate_unit_path = unit_document_path(root, unit_name)
+    unit_path = candidate_unit_path if candidate_unit_path.is_file() else None
     api_version = kind = driver = source_revision = unit_blob = None
     if unit_path is not None:
         unit = load_desired_unit(unit_path, unit_name)
@@ -5521,16 +5725,20 @@ def effect_lease_snapshot(root: Path, unit_name: str, uid: str) -> EffectLeaseSn
 
 
 def write_effect_lease(root: Path, lease: EffectLease) -> Path:
+    qualified_name = lease.qualified_name or lease.unit_name
     if lease.snapshot is None:
-        lease = replace(lease, snapshot=effect_lease_snapshot(root, lease.unit_name, lease.uid))
-    directory = root / DESIRED_EFFECT_LEASES_PATH
-    for path in document_candidates(directory, lease.unit_name):
+        lease = replace(lease, snapshot=effect_lease_snapshot(root, qualified_name, lease.uid))
+    relative = PurePosixPath(qualified_name)
+    directory = root / DESIRED_EFFECT_LEASES_PATH / Path(*relative.parts[:-1])
+    for path in document_candidates(directory, relative.parts[-1]):
         path.unlink()
-    return write_document(directory / f"{lease.unit_name}.json", lease.document(), format=DocumentFormat.JSON)
+    return write_document(directory / f"{relative.parts[-1]}.json", lease.document(), format=DocumentFormat.JSON)
 
 
 def remove_effect_lease(root: Path, unit_name: str) -> None:
-    for path in document_candidates(root / DESIRED_EFFECT_LEASES_PATH, unit_name):
+    relative = PurePosixPath(unit_name)
+    directory = root / DESIRED_EFFECT_LEASES_PATH / Path(*relative.parts[:-1])
+    for path in document_candidates(directory, relative.parts[-1]):
         path.unlink()
 
 
@@ -5589,12 +5797,28 @@ def acquire_effect_lease(
                     f"desired Unit {unit_name!r} changed before acquiring its effect lease; retry"
                 )
             leases = load_desired_effect_leases(lease_root)
+            current_resources = load_desired_resource_graph(current)
+            current_unit = next(
+                (
+                    resource
+                    for key, resource in current_resources.items()
+                    if isinstance(resource, UnitResource) and key[2] == unit_name
+                ),
+                None,
+            )
+            qualified_name = (
+                qualified_unit_name(current_resources, current_unit) if current_unit is not None else unit_name
+            )
             existing = leases.get(unit_name)
             if existing is not None:
                 if resume_existing:
                     if existing.uid != uid:
                         raise EffectLeaseUnavailable(
                             f"effect lease for {unit_name!r} is fenced to a different Unit UID"
+                        )
+                    if existing.qualified_name != qualified_name:
+                        raise EffectLeaseUnavailable(
+                            f"effect lease for {unit_name!r} is fenced to a different qualified Unit address"
                         )
                     if existing.snapshot is None or effect_lease_snapshot(current, unit_name, uid) != existing.snapshot:
                         raise EffectLeaseUnavailable(
@@ -5608,11 +5832,12 @@ def acquire_effect_lease(
                 )
             snapshot = effect_lease_snapshot(current, unit_name, uid)
             lease = EffectLease(
-                unit_name=unit_name,
+                unit_name=current_unit.name if current_unit is not None else PurePosixPath(unit_name).parts[-1],
                 uid=uid,
                 token=effect_lease_token(),
                 owner=effect_lease_owner(),
                 desired_revision=current_revision,
+                qualified_name=qualified_name,
                 snapshot=snapshot,
             )
             if precondition is not None:
@@ -5696,7 +5921,7 @@ def release_pre_effect_lease(
 
     release_effect_lease(
         desired_ref,
-        acquisition.lease.unit_name,
+        acquisition.lease.qualified_name or acquisition.lease.unit_name,
         acquisition.lease.token,
         acquisition.lease.uid,
         verify_snapshot=False,
@@ -5869,12 +6094,12 @@ def validate_effect_lease_head_for_store(
     )
 
 
-def teardown_evidence_filename(unit_name: str, uid: str, deletion_generation: int) -> str:
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", uid):
+def teardown_evidence_filename(uid: str, deletion_generation: int) -> str:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", uid):
         raise OperationError("teardown evidence identity is not safe for a filename")
     if deletion_generation < 1:
         raise OperationError("teardown evidence generation must be positive")
-    return f"{unit_name}.{uid}.{deletion_generation}.json"
+    return f"{uid}.{deletion_generation}.json"
 
 
 def load_teardown_evidence(
@@ -5883,18 +6108,11 @@ def load_teardown_evidence(
     uid: str | None = None,
     deletion_generation: int | None = None,
 ) -> TeardownEvidence | None:
-    directory = root / OBSERVED_TEARDOWN_EVIDENCE_PATH
+    directory = root / OBSERVED_TEARDOWN_EVIDENCE_PATH / PurePosixPath(unit_name)
     if not directory.is_dir():
         return None
     candidates = sorted(
-        path
-        for path in directory.iterdir()
-        if path.is_file()
-        and path.suffix in {".json", ".yaml", ".yml"}
-        and (
-            path.name in {f"{unit_name}.json", f"{unit_name}.yaml", f"{unit_name}.yml"}
-            or path.name.startswith(f"{unit_name}.")
-        )
+        path for path in directory.iterdir() if path.is_file() and path.suffix in {".json", ".yaml", ".yml"}
     )
     selected: list[Path] = []
     for path in candidates:
@@ -5902,7 +6120,7 @@ def load_teardown_evidence(
             evidence = TeardownEvidence.from_document(load_json(path), unit_name)
         except (DocumentFormatError, KeyError, TypeError, ValueError) as exc:
             raise OperationError(f"invalid teardown evidence for {unit_name!r}") from exc
-        if path.name != teardown_evidence_filename(unit_name, evidence.uid, evidence.deletion_generation):
+        if path.name != teardown_evidence_filename(evidence.uid, evidence.deletion_generation):
             raise OperationError(f"teardown evidence filename does not match its fence for {unit_name!r}")
         if uid is not None and deletion_generation is not None:
             if evidence.uid == uid and evidence.deletion_generation == deletion_generation:
@@ -5969,15 +6187,19 @@ def publish_teardown_observation_cas(
             except (TypeError, ValueError) as exc:
                 raise OperationError("teardown returned non-JSON evidence details") from exc
             evidence = TeardownEvidence(
-                unit_name=unit_name,
+                unit_name=PurePosixPath(unit_name).name,
+                qualified_name=unit_name,
                 uid=uid,
                 deletion_generation=deletion_generation,
                 desired_revision=desired_revision,
                 effect_lease_ref=lease_ref,
                 details=evidence_details,
             )
-            receipt_paths = document_candidates(observed / "units", unit_name)
-            artifact_path = observed / "artifacts" / unit_name
+            receipt_paths = document_candidates(
+                observed / "units" / PurePosixPath(unit_name).parent,
+                PurePosixPath(unit_name).name,
+            )
+            artifact_path = observed / "artifacts" / PurePosixPath(unit_name)
             had_active_observation = bool(receipt_paths) or artifact_path.exists()
             for receipt_path in receipt_paths:
                 receipt_path.unlink()
@@ -5988,7 +6210,8 @@ def publish_teardown_observation_cas(
             evidence_path = (
                 observed
                 / OBSERVED_TEARDOWN_EVIDENCE_PATH
-                / teardown_evidence_filename(unit_name, uid, deletion_generation)
+                / PurePosixPath(unit_name)
+                / teardown_evidence_filename(uid, deletion_generation)
             )
             if desired_ref is not None and lease_token is not None:
                 latest_revision = validate_effect_lease_head_for_store(
@@ -6002,7 +6225,8 @@ def publish_teardown_observation_cas(
                 if latest_revision != desired_revision:
                     desired_revision = latest_revision
                     evidence = TeardownEvidence(
-                        unit_name=unit_name,
+                        unit_name=PurePosixPath(unit_name).name,
+                        qualified_name=unit_name,
                         uid=uid,
                         deletion_generation=deletion_generation,
                         desired_revision=desired_revision,
@@ -6307,7 +6531,7 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
             if any(
                 effect_lease_active(lease)
                 for lease in load_desired_effect_leases(lease_root).values()
-                if lease.unit_name == args.unit
+                if (lease.qualified_name or lease.unit_name) == args.unit
             ):
                 raise OperationError(f"active effect lease blocks opaque recovery for {args.unit!r}")
             if document_candidates(current / "units", args.unit):
@@ -6357,10 +6581,13 @@ def command_recover_opaque_unit(args: argparse.Namespace) -> bool:
             shutil.copytree(current, candidate)
             for path in document_candidates(candidate / DESIRED_CLEANUP_UNITS_PATH, args.unit):
                 path.unlink()
-            for path in document_candidates(candidate / "units", args.unit):
+            for path in document_candidates(
+                candidate / "units" / PurePosixPath(args.unit).parent,
+                PurePosixPath(args.unit).name,
+            ):
                 path.unlink()
             write_desired_candidate_unit(
-                candidate / "units" / f"{args.unit}{opaque.path.suffix}",
+                unit_document_path(candidate, args.unit),
                 restored,
                 source_root,
             )
@@ -6589,15 +6816,26 @@ def desired_metadata_for_candidate(
 def _current_desired_unit_paths(current_desired: Path) -> dict[str, Path]:
     units = current_desired / "units"
     paths: dict[str, Path] = {}
-    stems = sorted(
-        {path.stem for path in units.glob("*") if path.is_file() and path.suffix in {".json", ".yaml", ".yml"}}
+    relative_stems = (
+        sorted(
+            {
+                path.relative_to(units).with_suffix("").as_posix()
+                for path in units.rglob("*")
+                if path.is_file() and path.suffix in {".json", ".yaml", ".yml"}
+            }
+        )
+        if units.is_dir()
+        else []
     )
-    for stem in stems:
-        candidates = document_candidates(units, stem)
+    for qualified_name in relative_stems:
+        relative = PurePosixPath(qualified_name)
+        directory = units.joinpath(*relative.parts[:-1])
+        stem = relative.parts[-1]
+        candidates = document_candidates(directory, stem)
         if len(candidates) > 1:
-            raise OperationError(f"multiple document formats exist for source-absent unit {stem}")
+            raise OperationError(f"multiple document formats exist for Unit {qualified_name}")
         if candidates:
-            paths[stem] = candidates[0]
+            paths[qualified_name] = candidates[0]
     return paths
 
 
@@ -6774,7 +7012,7 @@ def build_desired_candidate(
         previous = None
         if previous_unit.is_file():
             try:
-                previous = load_desired_unit(previous_unit, unit_name)
+                previous = load_desired_unit(previous_unit, previous_unit.stem)
             except Exception:
                 opaque_payload = opaque_document_payload(previous_unit)
                 opaque_transitions[unit_name] = OpaqueCleanupRoot(
@@ -6864,8 +7102,8 @@ def build_desired_candidate(
         for unit_name in sorted(unresolved):
             authored, source_resolution = prepared[unit_name]
             resolved_source = source_resolution.source
-            unit_artifact_imports = stack_projection.artifact_imports.get(authored.name, ())
-            unit_owner = stack_projection.owners.get(authored.name)
+            unit_artifact_imports = stack_projection.artifact_imports.get(unit_name, ())
+            unit_owner = stack_projection.owners.get(unit_name)
             target_stack_uid = unit_owner.uid if unit_owner is not None else None
             unit_environment_document = (
                 stack_environment_documents.get(unit_owner.name, operation_environment)
@@ -6880,7 +7118,7 @@ def build_desired_candidate(
                     authored.spec,
                     UnitResolutionContext(
                         source=resolved_source,
-                        resolve_template=lambda value, pointer, target_unit=authored.name, target_gvk=authored.gvk, artifact_imports=unit_artifact_imports, target_stack_uid=target_stack_uid, unit_promotion=unit_promotion, unit_environment_document=unit_environment_document: (
+                        resolve_template=lambda value, pointer, target_unit=unit_name, target_gvk=authored.gvk, artifact_imports=unit_artifact_imports, target_stack_uid=target_stack_uid, unit_promotion=unit_promotion, unit_environment_document=unit_environment_document: (
                             resolve_template(
                                 value,
                                 candidate,
@@ -6905,13 +7143,14 @@ def build_desired_candidate(
             resolved = materialize_resolved_unit(
                 environment_name,
                 resolved,
+                unit_name,
                 unit_source_root,
                 unit_source_revision,
                 current_desired,
                 candidate,
             )
             previous_unit = unit_document_path(current_desired, unit_name)
-            previous = load_desired_unit(previous_unit, unit_name) if previous_unit.is_file() else None
+            previous = load_desired_unit(previous_unit, previous_unit.stem) if previous_unit.is_file() else None
             finalized_uids = (
                 tuple(
                     sorted(
@@ -6919,7 +7158,7 @@ def build_desired_candidate(
                         for tombstone in load_resource_incarnation_evidence(current_desired)
                         if tombstone.api_version == resolved.gvk.api_version
                         and tombstone.kind == resolved.gvk.kind
-                        and tombstone.name == unit_name
+                        and tombstone.qualified_name == unit_name
                     )
                 )
                 if previous is None
@@ -6931,10 +7170,10 @@ def build_desired_candidate(
                 if previous_owner is not None and previous_owner.kind == "Stack" and previous_owner.name == owner.name:
                     resolved = resolved.with_metadata(previous.metadata)
                 else:
-                    resolved = resolved.with_metadata(_stack_owned_metadata(unit_name, owner))
+                    resolved = resolved.with_metadata(_stack_owned_metadata(authored.name, owner))
             else:
                 resolved = resolved.with_metadata(
-                    _stack_owned_metadata(unit_name, owner)
+                    _stack_owned_metadata(authored.name, owner)
                     if owner is not None
                     else desired_metadata_for_candidate(
                         authored,
@@ -6945,7 +7184,9 @@ def build_desired_candidate(
                         partition=partition,
                     )
                 )
-            candidate_unit = write_desired_candidate_unit(candidate_units / f"{unit_name}.json", resolved, source_root)
+            candidate_unit = write_desired_candidate_unit(
+                unit_document_path(candidate, unit_name, source_root), resolved, source_root
+            )
             previous_inputs = getattr(previous.spec, "resolvedInputs", None) if previous is not None else None
             previous_receipts = previous_inputs.receipts if previous_inputs is not None else None
             previous_artifacts = previous_inputs.artifacts if previous_inputs is not None else None
@@ -7009,7 +7250,7 @@ def build_desired_candidate(
             if verbose:
                 log_status("CARRY", f"{style_unit(unit_name)}: {unavailable[unit_name]}; {resolution}")
         elif previous_driver == next_driver:
-            previous_resource = load_desired_unit(previous, unit_name)
+            previous_resource = load_desired_unit(previous, previous.stem)
             previous_owner = resource_owner_reference(previous_resource)
             stack_owner = stack_projection.owners.get(unit_name)
             retained_metadata = (
@@ -7027,7 +7268,7 @@ def build_desired_candidate(
                 )
             )
             retained = previous_resource.with_metadata(retained_metadata)
-            write_desired_candidate_unit(candidate_units / previous.name, retained, source_root)
+            write_desired_candidate_unit(unit_document_path(candidate, unit_name, source_root), retained, source_root)
             copy_unit_materialization(current_desired, candidate, unit_name, previous_resource)
             resolution = "retain previous desired state"
         elif previous_driver is not None:
@@ -7069,7 +7310,7 @@ def build_desired_candidate(
 
     for unit_name, retained in retained_transitions.items():
         previous_path = unit_document_path(current_desired, unit_name)
-        write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
+        write_desired_candidate_unit(unit_document_path(candidate, unit_name, source_root), retained, source_root)
         if getattr(retained.spec, "materialization", None) is not None:
             copy_unit_materialization(current_desired, candidate, unit_name, retained)
         cleanup_inputs[unit_name] = DesiredCleanupInput(
@@ -7078,7 +7319,7 @@ def build_desired_candidate(
             source=getattr(retained.spec, "source", None),
         )
         retained = cast(UnitResource[Any], mark_resource_for_deletion(retained))
-        write_desired_candidate_unit(candidate / "units" / previous_path.name, retained, source_root)
+        write_desired_candidate_unit(unit_document_path(candidate, unit_name, source_root), retained, source_root)
         cleanup_inputs[unit_name] = DesiredCleanupInput(
             unit_name=unit_name,
             desired=retained,
@@ -7090,7 +7331,7 @@ def build_desired_candidate(
         if unit_name in atomically_retained_units:
             continue
         try:
-            previous = load_desired_unit(previous_path, unit_name)
+            previous = load_desired_unit(previous_path, previous_path.stem)
         except Exception:
             opaque_payload = opaque_document_payload(previous_path)
             opaque_transitions[unit_name] = OpaqueCleanupRoot(
@@ -7109,7 +7350,7 @@ def build_desired_candidate(
                 # candidate copy step below.
                 continue
         retained = previous
-        write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
+        write_desired_candidate_unit(unit_document_path(candidate, unit_name, source_root), retained, source_root)
         if getattr(retained.spec, "materialization", None) is not None:
             copy_unit_materialization(current_desired, candidate, unit_name, previous)
         owner = resource_owner_reference(retained)
@@ -7119,7 +7360,7 @@ def build_desired_candidate(
         omitted_partition_root = partition is not None and owner is None and retained.metadata.partition == partition
         if removed_from_applied_stack or omitted_partition_root:
             retained = cast(UnitResource[Any], mark_resource_for_deletion(retained))
-            write_desired_candidate_unit(candidate_units / previous_path.name, retained, source_root)
+            write_desired_candidate_unit(unit_document_path(candidate, unit_name, source_root), retained, source_root)
             cleanup_inputs[unit_name] = DesiredCleanupInput(
                 unit_name=unit_name,
                 desired=retained,
@@ -7247,7 +7488,7 @@ def load_promotion_context(
 
 def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) -> bool:
     unit_path = unit_document_path(desired, unit_name)
-    receipt_path = unit_document_path(observed, unit_name)
+    receipt_path = receipt_document_path(observed, unit_name)
     if not unit_path.is_file():
         return False
     unit = load_desired_unit(unit_path, unit_name)
@@ -7266,7 +7507,7 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
     driver = unit.driver_name
     desired_evidence = receipt.spec.desired
     if (
-        receipt.name != unit_name
+        receipt.name != PurePosixPath(unit_name).name
         or receipt.driver_name != driver
         or not re.fullmatch(r"[0-9a-f]{40}", str(desired_evidence.revision or ""))
         or desired_evidence.unitBlob != file_blob(unit_path)
@@ -7281,9 +7522,7 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
 
 
 def require_clean_source(desired: Path, observed: Path, minimum_evidence: str = "reconciled") -> None:
-    unit_names = sorted(
-        {path.stem for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"}}
-    )
+    unit_names = sorted(_current_desired_unit_paths(desired))
     if not unit_names:
         raise OperationError("promotion source desired state has no units")
     unresolved = [
@@ -8111,12 +8350,13 @@ def _downstream_desired_unit_closure(
 def canonicalize_rollback_unit(
     candidate_path: Path,
     current_path: Path,
+    qualified_name: str,
     finalized_incarnations: Sequence[ResourceIncarnationTombstone] = (),
 ) -> None:
     """Keep historical payload while carrying forward the current incarnation identity."""
 
-    historical = load_desired_unit(candidate_path, candidate_path.stem)
-    current = load_desired_unit(current_path, current_path.stem) if current_path.is_file() else None
+    historical = load_desired_unit(candidate_path, qualified_name)
+    current = load_desired_unit(current_path, qualified_name) if current_path.is_file() else None
     if current is not None:
         metadata = current.metadata
     elif finalized_incarnations:
@@ -8148,11 +8388,14 @@ def copy_current_blocked_unit(current: Path, candidate: Path, unit_name: str) ->
     current_path = unit_document_path(current, unit_name)
     current_unit = load_desired_unit(current_path, unit_name)
     current_unit.metadata.validate_desired()
-    for unit_path in document_candidates(candidate / "units", unit_name):
+    for unit_path in document_candidates(
+        candidate / "units" / PurePosixPath(unit_name).parent,
+        PurePosixPath(unit_name).name,
+    ):
         unit_path.unlink()
     selected = DocumentFormat.YAML if current_path.suffix in {".yaml", ".yml"} else DocumentFormat.JSON
     write_document(
-        candidate / "units" / f"{unit_name}{current_path.suffix}",
+        unit_document_path(candidate, unit_name),
         serialize_unit_document(current_unit, profile="desired"),
         format=selected,
     )
@@ -8185,7 +8428,7 @@ def merge_current_cleanup_state(
             unit_path.unlink()
         write_opaque_cleanup_root(candidate, name, root)
     resources = load_desired_resource_graph(current, validate=False)
-    for resource in resources.values():
+    for key, resource in resources.items():
         if resource_deletion(resource) is None:
             continue
         source_path = _desired_resource_path(current, resource)
@@ -8193,7 +8436,7 @@ def merge_current_cleanup_state(
         target_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, target_path)
         if isinstance(resource, UnitResource):
-            copy_unit_materialization(current, candidate, resource.name, resource)
+            copy_unit_materialization(current, candidate, key[2], resource)
     retained_blocks = dict(current_blocks)
     for name in current_blocks:
         if name in current_roots:
@@ -8213,36 +8456,46 @@ def merge_current_cleanup_state(
     write_desired_transition_blocks(candidate, retained_blocks)
 
 
-def active_teardown_dependents(root: Path, target: UnitResource[Any]) -> tuple[str, ...]:
+def active_teardown_dependents(
+    root: Path,
+    target: UnitResource[Any],
+    qualified_name: str,
+) -> tuple[str, ...]:
     """Find active owned or observation-dependent descendants of a teardown target."""
 
     resources = load_desired_resource_graph(root, validate=False)
     explicit_dependencies = stack_dependency_edges(resources, include_missing=True)
     opaque_roots = load_desired_cleanup_roots(root)
-    target_identity = (target.gvk.api_version, target.gvk.kind, target.name, target.metadata.uid or "")
-    pending = [target_identity]
+    target_keys = tuple(
+        key
+        for key, resource in resources.items()
+        if key[2] == qualified_name and resource.gvk == target.gvk and resource.metadata.uid == target.metadata.uid
+    )
+    if len(target_keys) != 1:
+        raise OperationError(f"desired Unit {target.name!r} has no unique storage identity")
+    pending = [target_keys[0]]
     dependents: set[str] = set()
     for opaque_name in opaque_roots:
-        if opaque_name != target.name:
+        if opaque_name != target_keys[0][2]:
             dependents.add(f"{opaque_name} (opaque cleanup root lacks a validated deletion identity)")
     while pending:
-        parent_identity = pending.pop()
-        parent_names = {parent_identity[2]}
-        for _key, child in resources.items():
-            child_identity = (child.gvk.api_version, child.gvk.kind, child.name, child.metadata.uid or "")
-            if child_identity == parent_identity or child.name in dependents:
+        parent_key = pending.pop()
+        parent = resources[parent_key]
+        parent_identity = (parent.gvk.api_version, parent.gvk.kind, parent.name, parent.metadata.uid or "")
+        for child_key, child in resources.items():
+            if child_key == parent_key or child_key[2] in dependents:
                 continue
             owner = resource_owner_reference(child)
             owner_matches = (
                 owner is not None and (owner.apiVersion, owner.kind, owner.name, owner.uid) == parent_identity
             )
             dependency_matches = isinstance(child, UnitResource) and bool(
-                (desired_observation_reference_units(child) | set(explicit_dependencies.get(child.name, ())))
-                & parent_names
+                (desired_observation_reference_units(child) | set(explicit_dependencies.get(child_key[2], ())))
+                & {parent_key[2]}
             )
             if owner_matches or dependency_matches:
-                dependents.add(child.name)
-                pending.append(child_identity)
+                dependents.add(child_key[2])
+                pending.append(child_key)
     return tuple(sorted(dependents))
 
 
@@ -8350,6 +8603,8 @@ def command_rollback(args: argparse.Namespace) -> None:
         current_revision = observed_tree(desired_ref, current)
         if current_revision is None:
             raise OperationError(f"{desired_ref} does not exist")
+        if args.unit:
+            args.unit = list(resolve_unit_selectors(load_desired_resource_graph(current), tuple(args.unit)))
         lease_ref = effect_lease_ref(args.environment, desired_ref)
         lease_root = current
         if lease_ref != desired_ref:
@@ -8366,7 +8621,7 @@ def command_rollback(args: argparse.Namespace) -> None:
         if active_leases:
             raise OperationError(
                 "rollback is blocked by active desired-state effect lease(s): "
-                + ", ".join(f"{lease.unit_name} by {lease.owner}" for lease in active_leases)
+                + ", ".join(f"{lease.qualified_name or lease.unit_name} by {lease.owner}" for lease in active_leases)
             )
         target_revision = resolve_ref(desired_ref, args.to_desired_revision)
         mode = "units" if args.unit else "full"
@@ -8467,11 +8722,12 @@ def command_rollback(args: argparse.Namespace) -> None:
         )
         current_cleanup_names = set(load_desired_cleanup_roots(current))
         finalized_incarnations = load_resource_incarnation_evidence(candidate)
-        for candidate_path in _current_desired_unit_paths(candidate).values():
-            candidate_unit = load_desired_unit(candidate_path, candidate_path.stem)
+        for qualified_name, candidate_path in _current_desired_unit_paths(candidate).items():
+            candidate_unit = load_desired_unit(candidate_path, qualified_name)
             canonicalize_rollback_unit(
                 candidate_path,
-                unit_document_path(current, candidate_path.stem),
+                unit_document_path(current, qualified_name),
+                qualified_name,
                 tuple(
                     tombstone
                     for tombstone in finalized_incarnations
@@ -8483,7 +8739,7 @@ def command_rollback(args: argparse.Namespace) -> None:
                     == (
                         candidate_unit.gvk.api_version,
                         candidate_unit.gvk.kind,
-                        candidate_path.stem,
+                        qualified_name,
                     )
                 ),
             )
@@ -8664,16 +8920,19 @@ def _remove_finalized_resource(
         raise OperationError(f"desired resource {resource.name!r} is not fenced for deletion")
     candidate_resources = load_desired_resource_graph(candidate, validate=False)
     partition = _resource_management_partition(candidate_resources, resource)
+    qualified_name = (
+        qualified_unit_name(candidate_resources, resource) if isinstance(resource, UnitResource) else resource.name
+    )
     path = _desired_resource_path(candidate, resource)
     for candidate_path in document_candidates(path.parent, resource.name):
         candidate_path.unlink()
     if isinstance(resource, UnitResource):
         materialization = getattr(resource.spec, "materialization", None)
         if materialization is not None:
-            materialized_path = candidate / materialization.path
+            materialized_path = candidate / unit_materialization_path(qualified_name)
             if materialized_path.is_dir():
                 shutil.rmtree(materialized_path)
-        remove_effect_lease(candidate, resource.name)
+        remove_effect_lease(candidate, qualified_name)
     write_resource_incarnation_tombstone(
         candidate,
         ResourceIncarnationTombstone(
@@ -8682,6 +8941,7 @@ def _remove_finalized_resource(
             name=resource.name,
             uid=resource.metadata.uid,
             deletion_generation=deletion.generation,
+            qualified_name=qualified_name,
             partition=partition,
             effect_lease_ref=effect_lease_ref if isinstance(resource, UnitResource) else None,
         ),
@@ -8689,7 +8949,7 @@ def _remove_finalized_resource(
     return ResourceFinalizationFence(
         resource.gvk.api_version,
         resource.gvk.kind,
-        resource.name,
+        qualified_name,
         resource.metadata.uid,
         deletion.generation,
     )
@@ -8707,7 +8967,8 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
         "stack": "Stack",
         "stacktemplate": "StackTemplate",
     }[args.kind.lower()]
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.name):
+    name_pattern = QUALIFIED_RESOURCE_NAME_PATTERN if category == "Unit" else r"[a-z0-9][a-z0-9-]*"
+    if not re.fullmatch(name_pattern, args.name):
         raise OperationError(f"invalid resource name: {args.name!r}")
     if not isinstance(args.uid, str) or not args.uid:
         raise OperationError("deletion progression requires --uid")
@@ -8745,8 +9006,9 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
         resources = load_desired_resource_graph(current, validate=False)
         matches = [
             resource
-            for resource in resources.values()
-            if resource.name == args.name and _resource_matches_category(resource, category)
+            for key, resource in resources.items()
+            if (key[2] == args.name if category == "Unit" else resource.name == args.name)
+            and _resource_matches_category(resource, category)
         ]
         if len(matches) != 1:
             tombstone = finalized_incarnation_evidence(
@@ -8841,7 +9103,11 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
             tombstones = load_resource_incarnation_evidence(current)
             active_bindings = (
                 {
-                    (binding.apiVersion, binding.kind, binding.name): binding.uid
+                    (
+                        binding.apiVersion,
+                        binding.kind,
+                        stack_generated_unit_name(resource.name, binding.name),
+                    ): binding.uid
                     for binding in resource.spec.activeProjection.units.values()
                 }
                 if resource.spec.activeProjection is not None
@@ -8854,7 +9120,7 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                     continue
                 expected_uid = active_bindings.get(child_key)
                 if not any(
-                    (tombstone.api_version, tombstone.kind, tombstone.name) == child_key
+                    (tombstone.api_version, tombstone.kind, tombstone.qualified_name) == child_key
                     and (expected_uid is None or tombstone.uid == expected_uid)
                     for tombstone in tombstones
                 ):
@@ -8908,9 +9174,9 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
         teardown_details: Mapping[str, object] = {}
         source = getattr(unit.spec, "source", None) if unit is not None else None
         if unit is not None:
-            require_unit(unit, unit.name)
-            validate_unit_materialization(current, unit.name, unit)
-            dependents = active_teardown_dependents(current, unit)
+            require_unit(unit, PurePosixPath(args.name).name)
+            validate_unit_materialization(current, args.name, unit)
+            dependents = active_teardown_dependents(current, unit, args.name)
             if dependents:
                 log_status("WAIT", "active owned/dependent Units must be finalized first: " + ", ".join(dependents))
                 return False
@@ -8921,9 +9187,9 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                 )
                 return False
             observed_tree(observed_ref, observed)
-            receipt_path = unit_document_path(observed, unit.name)
+            receipt_path = receipt_document_path(observed, args.name)
             previous_receipt = load_receipt(receipt_path, unit.name) if receipt_path.is_file() else None
-            existing_evidence = load_teardown_evidence(observed, unit.name, args.uid, deletion.generation)
+            existing_evidence = load_teardown_evidence(observed, args.name, args.uid, deletion.generation)
             if existing_evidence is not None:
                 teardown_details = existing_evidence.details
                 # Resume with the exact lease store that fenced the original
@@ -8944,10 +9210,10 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                 materialize_revision(source.revision, source_root)
 
             def assert_no_dependents(desired_root: Path) -> None:
-                latest = load_desired_unit(unit_document_path(desired_root, unit.name), unit.name)
+                latest = load_desired_unit(unit_document_path(desired_root, args.name), unit.name)
                 if latest.metadata.uid != args.uid:
                     raise EffectLeaseUnavailable(f"desired Unit {unit.name!r} changed before finalization")
-                active = active_teardown_dependents(desired_root, latest)
+                active = active_teardown_dependents(desired_root, latest, args.name)
                 if active:
                     raise EffectLeaseUnavailable("active dependents appeared: " + ", ".join(active))
 
@@ -8955,7 +9221,7 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                 lease_acquisition = acquire_effect_lease(
                     desired_ref,
                     current_revision,
-                    unit.name,
+                    args.name,
                     args.uid,
                     precondition=assert_no_dependents,
                     resume_existing=existing_evidence is not None,
@@ -8971,7 +9237,7 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                 # Fence the external effect even when leases are disabled.
                 # The desired resource digest was checked above and this
                 # revision must still be the accepted live head.
-                assert_desired_ref_fence(desired_ref, current_revision, unit.name, args.uid)
+                assert_desired_ref_fence(desired_ref, current_revision, args.name, args.uid)
                 try:
                     result = unit.driver.teardown(
                         TeardownContext(
@@ -8985,6 +9251,7 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                             unit=unit.spec,
                             resource_uid=args.uid,
                             deletion_generation=deletion.generation,
+                            qualified_name=args.name,
                             previous_receipt=previous_receipt,
                             report=Path(args.report).resolve() if args.report else None,
                             execution=DriverExecution.console(),
@@ -8994,7 +9261,7 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                     if lease_acquisition is not None:
                         release_effect_lease(
                             desired_ref,
-                            resource.name,
+                            args.name,
                             lease_acquisition.lease.token,
                             args.uid,
                             verify_snapshot=False,
@@ -9009,7 +9276,7 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                     if lease_acquisition is not None:
                         release_effect_lease(
                             desired_ref,
-                            resource.name,
+                            args.name,
                             lease_acquisition.lease.token,
                             args.uid,
                             verify_snapshot=False,
@@ -9020,7 +9287,7 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                     if lease_acquisition is not None:
                         release_effect_lease(
                             desired_ref,
-                            resource.name,
+                            args.name,
                             lease_acquisition.lease.token,
                             args.uid,
                             verify_snapshot=False,
@@ -9030,7 +9297,7 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
                 teardown_details = result.details if result is not None else {}
             publish_teardown_observation_cas(
                 observed_ref,
-                unit.name,
+                args.name,
                 args.uid,
                 deletion.generation,
                 current_revision,
@@ -9095,7 +9362,11 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
             f"Remove the finalized resource {category} {args.name}.",
             args.dry,
             current,
-            frozenset(item.name for item in finalized if isinstance(item, UnitResource)),
+            frozenset(
+                fence.name
+                for item, fence in zip(finalized, finalized_fences, strict=True)
+                if isinstance(item, UnitResource)
+            ),
             request_change=False,
             finalized_resources=frozenset(finalized_fences),
             configuration_root=configuration_root,
@@ -9136,7 +9407,7 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
         if not args.dry and lease_acquisition is not None and outcome is None:
             release_effect_lease(
                 desired_ref,
-                resource.name,
+                args.name,
                 lease_acquisition.lease.token,
                 args.uid,
                 verify_snapshot=False,
@@ -9148,8 +9419,8 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
 
 
 def command_recover_effect_lease(args: argparse.Namespace) -> None:
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
-        raise OperationError(f"invalid unit name: {args.unit!r}")
+    if not re.fullmatch(QUALIFIED_RESOURCE_NAME_PATTERN, args.unit):
+        raise OperationError(f"invalid Unit qualified name: {args.unit!r}")
     if not args.confirm_stopped:
         raise OperationError("lease recovery requires --confirm-stopped")
     desired_ref, _observed_ref = deployment_refs(
@@ -9158,10 +9429,28 @@ def command_recover_effect_lease(args: argparse.Namespace) -> None:
         args.desired_ref,
         None,
     )
-    with unit_effect_lock(args.environment, args.unit):
+    selector = args.unit
+    with tempfile.TemporaryDirectory(prefix="gitopsctr-lease-address-") as temporary_directory:
+        desired = Path(temporary_directory) / "desired"
+        revision = observed_tree(desired_ref, desired)
+        if revision is None:
+            raise OperationError(f"desired ref {desired_ref!r} does not exist")
+        addresses = qualified_unit_name_map(load_desired_resource_graph(desired))
+        concrete = addresses.get(selector)
+        if concrete is None:
+            matches = {
+                tombstone.name
+                for tombstone in load_resource_incarnation_evidence(desired)
+                if tombstone.qualified_name == selector and tombstone.uid == args.uid
+            }
+            if len(matches) != 1:
+                raise OperationError(f"no exact Unit address {selector!r} exists for UID {args.uid!r}")
+            concrete = next(iter(matches))
+    args.unit = concrete
+    with unit_effect_lock(args.environment, concrete):
         revision = recover_effect_lease(
             desired_ref,
-            args.unit,
+            concrete,
             args.uid,
             args.token,
             lease_ref=effect_lease_ref(args.environment, desired_ref),
@@ -9250,17 +9539,28 @@ def command_status(args: argparse.Namespace) -> None:
             desired,
             observed,
         )
+        desired_resources = load_desired_resource_graph(desired)
+        display_names = {
+            concrete: qualified for qualified, concrete in qualified_unit_name_map(desired_resources).items()
+        }
+        for concrete in set(specifications) | set(desired_unit_names(desired)):
+            display_names.setdefault(concrete, concrete)
         if args.unit is not None:
+            selector = args.unit
+            concrete = resolve_qualified_unit_values(
+                (selector,), {qualified: concrete for concrete, qualified in display_names.items()}
+            )[0]
             status_names = {unit_name for unit_name, _status, _reason in statuses}
-            if args.unit not in status_names:
-                available = ", ".join(sorted(status_names)) or "none"
+            if concrete not in status_names:
+                available = ", ".join(sorted(display_names.get(name, name) for name in status_names)) or "none"
                 raise OperationError(
-                    f"unknown unit {args.unit!r} for environment {args.environment!r}; available units: {available}"
+                    f"unknown unit {selector!r} for environment {args.environment!r}; available units: {available}"
                 )
-            statuses = [item for item in statuses if item[0] == args.unit]
+            statuses = [item for item in statuses if item[0] == concrete]
+        display_statuses = [(display_names.get(name, name), status, reason) for name, status, reason in statuses]
         log_reconciliation_status(
             args.environment,
-            statuses,
+            display_statuses,
             desired_revision,
             desired,
             observed,
@@ -9282,23 +9582,15 @@ def command_verify(args: argparse.Namespace) -> None:
         materialize_revision(desired_revision, desired)
         log_status("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(desired_revision)}")
 
-        unit_paths = sorted(path for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"})
-        available = {path.stem: path for path in unit_paths}
-        requested = args.unit or sorted(available)
-        invalid = sorted({unit_name for unit_name in requested if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", unit_name)})
-        if invalid:
-            raise OperationError(f"invalid unit name(s): {', '.join(invalid)}")
-        selected = sorted(set(requested))
-        unknown = sorted(set(selected) - available.keys())
-        if unknown:
-            choices = ", ".join(sorted(available)) or "none"
-            raise OperationError(
-                f"{desired_ref} has no materialized unit(s): {', '.join(unknown)}; available units: {choices}"
-            )
+        available = _current_desired_unit_paths(desired)
+        ensure_desired_units_materialized(desired)
+        desired_resources = load_desired_resource_graph(desired)
+        addresses = qualified_unit_name_map(desired_resources)
+        display_names = {concrete: qualified for qualified, concrete in addresses.items()}
+        requested = tuple(args.unit or sorted(addresses))
+        selected = sorted(set(resolve_unit_selectors(desired_resources, requested)))
         if not selected:
             raise OperationError(f"{desired_ref} has no materialized units")
-        ensure_desired_units_materialized(desired)
-        load_desired_resource_graph(desired)
 
         prepared: list[tuple[str, str, UnitResource[Any], DesiredSource | None]] = []
         for unit_name in selected:
@@ -9315,7 +9607,8 @@ def command_verify(args: argparse.Namespace) -> None:
 
         drifted: list[str] = []
         for unit_name, driver_name, unit, source in prepared:
-            log_status("VERIFY", f"{style_unit(unit_name)} ({driver_name})")
+            display_name = display_names[unit_name]
+            log_status("VERIFY", f"{style_unit(display_name)} ({driver_name})")
             source_root = temporary / "sources" / unit_name if source is not None else None
             if source is not None:
                 assert source.revision is not None
@@ -9330,27 +9623,31 @@ def command_verify(args: argparse.Namespace) -> None:
                     source_root=source_root,
                     source_revision=source.revision if source is not None else None,
                     source_path=source.path if source is not None else None,
-                    unit_name=unit_name,
+                    unit_name=unit.name,
                     unit=unit.spec,
+                    qualified_name=next(
+                        qualified for qualified, concrete in addresses.items() if concrete == unit_name
+                    ),
                     execution=DriverExecution.console(),
                 )
             )
             if result.status is VerificationStatus.CLEAN:
-                log_status("CLEAN", style_unit(unit_name))
+                log_status("CLEAN", style_unit(display_name))
             elif result.status is VerificationStatus.DRIFT:
                 drifted.append(unit_name)
-                log_status("DRIFT", style_unit(unit_name))
+                log_status("DRIFT", style_unit(display_name))
             else:
                 raise DriverError(f"{driver_name} returned an invalid verification status: {result.status!r}")
 
     if drifted:
-        log_status("RESULT", f"DRIFT: {style_units(drifted)}")
-        raise OperationError(f"verification detected drift in: {', '.join(drifted)}")
+        display_drifted = [display_names[name] for name in drifted]
+        log_status("RESULT", f"DRIFT: {style_units(display_drifted)}")
+        raise OperationError(f"verification detected drift in: {', '.join(display_drifted)}")
     log_status("RESULT", "CLEAN")
 
 
 def require_unit(unit: UnitResource[Any], unit_name: str) -> tuple[str, DesiredSource | None]:
-    if unit.name != unit_name:
+    if unit.name != PurePosixPath(unit_name).name:
         raise OperationError(f"invalid desired unit: {unit_name}")
     driver = unit.driver_name
     source = getattr(unit.spec, "source", None)
@@ -9520,10 +9817,10 @@ def publish_observation_cas(
                     ),
                 )
             driver = receipt.driver_name
-            if receipt.name != unit_name:
-                raise OperationError(f"candidate receipt name is not {unit_name!r}")
-            validate_artifact_output_identity(driver, unit, artifact_documents)
-            receipt_path = unit_document_path(observed, unit_name)
+            if receipt.name != unit.name:
+                raise OperationError(f"candidate receipt name is not local Unit name {unit.name!r}")
+            validate_artifact_output_identity(driver, unit, artifact_documents, unit_name)
+            receipt_path = receipt_document_path(observed, unit_name)
             existing_receipt = load_receipt(receipt_path, unit_name) if receipt_path.is_file() else None
             if existing_receipt is not None:
                 if existing_receipt.spec.desired.unitBlob == receipt.spec.desired.unitBlob:
@@ -9876,9 +10173,10 @@ def progress_durable_stack_projection(
                     # resolved.  The resulting tree is complete before it
                     # becomes the next group's immutable baseline.
                     for unit_name, baseline_path in _current_desired_unit_paths(baseline).items():
-                        target_path = candidate_units / baseline_path.name
+                        target_path = unit_document_path(next_candidate, unit_name, context_source)
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(baseline_path, target_path)
-                        baseline_unit = load_desired_unit(baseline_path, unit_name)
+                        baseline_unit = load_desired_unit(baseline_path, baseline_path.stem)
                         if getattr(baseline_unit.spec, "materialization", None) is not None:
                             copy_unit_materialization(baseline, next_candidate, unit_name, baseline_unit)
                     build_desired_candidate(
@@ -10002,9 +10300,10 @@ def _stack_effect_context_digest(stack: StackResource, unit_name: str | None = N
 
 
 def _command_reconcile(args: argparse.Namespace) -> bool:
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.unit):
+    if not re.fullmatch(QUALIFIED_RESOURCE_NAME_PATTERN, args.unit):
         raise OperationError(f"invalid unit name: {args.unit!r}")
     verbose = getattr(args, "verbose", False)
+    display_unit = getattr(args, "qualified_unit", args.unit)
 
     def detail(status: str, message: str) -> None:
         if verbose:
@@ -10020,11 +10319,11 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         # both refs are handled from the desired Stack context below.
         load_environment(REPOSITORY_ROOT, args.environment)
     if verbose:
-        log_heading(f"Reconcile {style_unit(args.unit)}")
+        log_heading(f"Reconcile {style_unit(display_unit)}")
         log_status("START", f"environment {style_environment(args.environment)}")
         log_status("MODE", "plan" if args.plan else "apply")
     else:
-        log_heading(f"{style_unit(args.unit)} · {style_environment(args.environment)}")
+        log_heading(f"{style_unit(display_unit)} · {style_environment(args.environment)}")
     report = Path(args.report).resolve() if args.report else None
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
@@ -10054,8 +10353,8 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             selected_unit = next(
                 (
                     resource
-                    for resource in resources.values()
-                    if isinstance(resource, UnitResource) and resource.name == args.unit
+                    for key, resource in resources.items()
+                    if isinstance(resource, UnitResource) and key[2] == args.unit
                 ),
                 None,
             )
@@ -10070,7 +10369,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                         desired,
                         args.environment,
                         configuration_root,
-                        _stack_effect_context_digest(selected_stack, args.unit),
+                        _stack_effect_context_digest(selected_stack, PurePosixPath(args.unit).name),
                     )
         if configuration_root != REPOSITORY_ROOT:
             load_environment(configuration_root, args.environment)
@@ -10105,10 +10404,10 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                     )
                 )
                 if progressed:
-                    log_status("APPLY", f"{style_unit(args.unit)} deletion progressed")
+                    log_status("APPLY", f"{style_unit(display_unit)} deletion progressed")
                 else:
                     log_status("WAIT", deletion_reason(deleting_unit))
-                log_status("DONE", f"{style_unit(args.unit)}: {'progressed' if progressed else 'no changes'}")
+                log_status("DONE", f"{style_unit(display_unit)}: {'progressed' if progressed else 'no changes'}")
                 write_output(progressed)
                 return progressed
         # A desired cleanup commit can succeed while the final lease-release
@@ -10117,7 +10416,8 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
         finalized = [
             tombstone
             for tombstone in load_resource_incarnation_evidence(desired)
-            if tombstone.name == args.unit and f"{tombstone.api_version}/{tombstone.kind}" in DRIVER_NAMES_BY_GVK
+            if tombstone.qualified_name == args.unit
+            and f"{tombstone.api_version}/{tombstone.kind}" in DRIVER_NAMES_BY_GVK
         ]
         if not args.plan:
             for tombstone in finalized:
@@ -10129,26 +10429,27 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                     desired_root=desired,
                 )
                 if progressed:
-                    log_status("APPLY", f"{style_unit(args.unit)} deletion cleanup progressed")
+                    log_status("APPLY", f"{style_unit(display_unit)} deletion cleanup progressed")
                     write_output(True)
                     return True
         if transition_reason := load_desired_transition_blocks(desired).get(args.unit):
             log_status("WAIT", transition_reason)
-            log_status("DONE", f"{style_unit(args.unit)}: no changes")
+            log_status("DONE", f"{style_unit(display_unit)}: no changes")
             write_output(False)
             return False
         unit_path = unit_document_path(desired, args.unit)
         if not unit_path.is_file():
             log_status("WAIT", "desired inputs are not materialized")
-            log_status("DONE", f"{style_unit(args.unit)}: no changes")
+            log_status("DONE", f"{style_unit(display_unit)}: no changes")
             write_output(False)
             return False
         unit = load_desired_unit(unit_path, args.unit)
         ensure_desired_units_materialized(desired)
-        load_desired_resource_graph(desired)
+        desired_resources = load_desired_resource_graph(desired)
+        unit_qualified_name = qualified_unit_name(desired_resources, unit)
         if raw_unit_contains_reference(load_json(unit_path)):
             log_status("WAIT", "desired inputs are not materialized")
-            log_status("DONE", f"{style_unit(args.unit)}: no changes")
+            log_status("DONE", f"{style_unit(display_unit)}: no changes")
             write_output(False)
             return False
         driver_name, source = require_unit(unit, args.unit)
@@ -10163,12 +10464,12 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             raise OperationError(f"{args.unit} desired state is not fully materialized")
         if not unit_requires_reconciliation(unit):
             log_status("SKIP", "unit is complete after desired-state materialization")
-            log_status("DONE", f"{style_unit(args.unit)}: materialized for external delivery")
+            log_status("DONE", f"{style_unit(display_unit)}: materialized for external delivery")
             write_output(False)
             return False
 
         unit_blob = file_blob(unit_path)
-        receipt_path = unit_document_path(observed, args.unit)
+        receipt_path = receipt_document_path(observed, args.unit)
         previous_receipt = load_receipt(receipt_path, args.unit) if receipt_path.is_file() else None
         receipt_is_current = False
         if receipt_path.is_file():
@@ -10181,7 +10482,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             if not getattr(args, "reapply", False) and skip_clean_unit and receipt_is_current:
                 detail("KEEP", "observation already matches desired state")
                 if verbose:
-                    log_status("DONE", f"{style_unit(args.unit)}: clean")
+                    log_status("DONE", f"{style_unit(display_unit)}: clean")
                 else:
                     log_reconcile_outcome(
                         "UP TO DATE",
@@ -10233,8 +10534,8 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                     lease_ref=lease_ref,
                 )
             except EffectLeaseUnavailable as exc:
-                log_status("WAIT", f"{style_unit(args.unit)}: {exc}")
-                log_status("DONE", f"{style_unit(args.unit)}: no changes")
+                log_status("WAIT", f"{style_unit(display_unit)}: {exc}")
+                log_status("DONE", f"{style_unit(display_unit)}: no changes")
                 write_output(False)
                 return False
             try:
@@ -10250,7 +10551,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 except Exception as release_exc:
                     log_status(
                         "WAIT",
-                        f"{style_unit(args.unit)}: pre-effect lease release failed; explicit recovery remains: "
+                        f"{style_unit(display_unit)}: pre-effect lease release failed; explicit recovery remains: "
                         f"{release_exc}",
                     )
                 raise
@@ -10300,8 +10601,9 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 "source_root": source_root,
                 "source_revision": source.revision if source is not None else None,
                 "source_path": source.path if source is not None else None,
-                "unit_name": args.unit,
+                "unit_name": unit.name,
                 "unit": unit.spec,
+                "qualified_name": unit_qualified_name,
                 "report": report,
                 "execution": DriverExecution.console(),
             }
@@ -10315,7 +10617,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                     raise DriverError(f"{driver_name} planning returned a value; planning evidence belongs in reports")
                 if verbose:
                     log_status("PLAN", f"{driver_name} planning succeeded")
-                    log_status("DONE", f"{style_unit(args.unit)}: no remote changes")
+                    log_status("DONE", f"{style_unit(display_unit)}: no remote changes")
                 else:
                     log_status("PLAN", "SUCCEEDED")
                     log_status("EFFECTS", "None; planning does not change remote state")
@@ -10336,7 +10638,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 except Exception as release_exc:
                     log_status(
                         "WAIT",
-                        f"{style_unit(args.unit)}: pre-effect lease release failed; explicit recovery remains: "
+                        f"{style_unit(display_unit)}: pre-effect lease release failed; explicit recovery remains: "
                         f"{release_exc}",
                     )
             log_compact_failure()
@@ -10354,8 +10656,8 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                     lease_ref=lease_ref,
                 )
             except EffectLeaseUnavailable as exc:
-                log_status("WAIT", f"{style_unit(args.unit)}: {exc}; reconciliation result was not published")
-                log_status("DONE", f"{style_unit(args.unit)}: no changes")
+                log_status("WAIT", f"{style_unit(display_unit)}: {exc}; reconciliation result was not published")
+                log_status("DONE", f"{style_unit(display_unit)}: no changes")
                 write_output(False)
                 return False
             desired_revision = lease_acquisition.revision
@@ -10370,7 +10672,8 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                 subject=ReceiptSubject(
                     apiVersion=unit.gvk.api_version,
                     kind=unit.gvk.kind,
-                    name=args.unit,
+                    name=unit.name,
+                    qualifiedName=unit_qualified_name,
                 ),
                 desired=ReceiptDesired(revision=desired_revision, unitBlob=unit_blob),
                 resolvedInputs=getattr(unit.spec, "resolvedInputs", None),
@@ -10426,11 +10729,11 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             except OperationError as exc:
                 log_status(
                     "WAIT",
-                    f"{style_unit(args.unit)}: effect lease release deferred; explicit recovery remains available: {exc}",
+                    f"{style_unit(display_unit)}: effect lease release deferred; explicit recovery remains available: {exc}",
                 )
                 write_output(True)
                 if verbose:
-                    log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully; lease release deferred")
+                    log_status("DONE", f"{style_unit(display_unit)}: reconciled successfully; lease release deferred")
                 else:
                     log_status("APPLY", "SUCCEEDED; lease release deferred")
                     observation_status = "UPDATED" if revision != observed_revision else "UNCHANGED"
@@ -10451,7 +10754,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             desired_revision = progressed_desired_revision
         write_output(True)
         if verbose:
-            log_status("DONE", f"{style_unit(args.unit)}: reconciled successfully")
+            log_status("DONE", f"{style_unit(display_unit)}: reconciled successfully")
         else:
             log_status("APPLY", "SUCCEEDED")
             observation_status = "UPDATED" if revision != observed_revision else "UNCHANGED"
@@ -10483,6 +10786,21 @@ def command_reconcile(args: argparse.Namespace) -> bool:
         # implementation resolves them again to preserve its live-config
         # behavior and to keep explicit both-ref calls configuration-free.
         deployment_refs(REPOSITORY_ROOT, args.environment, args.desired_ref, args.observed_ref)
+    if not getattr(args, "_unit_is_concrete", False):
+        desired_ref = args.desired_ref or deployment_refs(REPOSITORY_ROOT, args.environment)[0]
+        with tempfile.TemporaryDirectory(prefix="gitopsctr-unit-address-") as temporary_directory:
+            desired_revision = resolve_ref(desired_ref, args.desired_revision)
+            desired = Path(temporary_directory) / "desired"
+            materialize_revision(desired_revision, desired)
+            selector = args.unit
+            resources = load_desired_resource_graph(desired)
+            tombstones = load_resource_incarnation_evidence(desired)
+            addresses = qualified_unit_name_map(resources)
+            if not addresses and not tombstones and "/" not in selector:
+                args.unit = selector
+            else:
+                args.unit = resolve_unit_selectors(resources, (selector,), tombstones)[0]
+            args.qualified_unit = selector
     with unit_effect_lock(args.environment, getattr(args, "unit", "<invalid>")):
         return _command_reconcile(args)
 
@@ -10507,16 +10825,20 @@ def log_compact_convergence_summary(
     steps: list[str],
     result: str,
     unselected: list[tuple[str, str, str]] | None = None,
+    display_names: Mapping[str, str] | None = None,
 ) -> None:
+    names = display_names or {}
+    display_scope = tuple(names.get(name, name) for name in scope)
+    display_steps = [names.get(name, name) for name in steps]
     log_heading(f"Convergence result for {style_environment(environment)}")
     if result == "CLEAN":
-        driver_summary = f"drivers ran for {style_units(steps)}" if steps else "no drivers ran"
-        log_status("RESULT", f"CLEAN: {len(scope)}/{len(scope)} units; {driver_summary}")
+        driver_summary = f"drivers ran for {style_units(display_steps)}" if display_steps else "no drivers ran"
+        log_status("RESULT", f"CLEAN: {len(display_scope)}/{len(display_scope)} units; {driver_summary}")
     else:
         log_status("RESULT", result)
     for unit_name, status, reason in unselected or []:
         if status not in {"CLEAN", "MATERIALIZED"}:
-            log_status("UNSCOPED", f"{style_unit(unit_name)}: {status.lower()}; {reason}")
+            log_status("UNSCOPED", f"{style_unit(names.get(unit_name, unit_name))}: {status.lower()}; {reason}")
 
 
 def command_dependencies(args: argparse.Namespace) -> None:
@@ -10526,14 +10848,17 @@ def command_dependencies(args: argparse.Namespace) -> None:
         materialize_revision(source_revision, source_root)
         current_desired = Path(temporary_directory) / "current-desired"
         current_desired.mkdir()
-        specifications, stack_dependencies = load_convergence_specifications(
+        loaded = load_convergence_specifications(
             source_root,
             args.environment,
             current_desired,
             source_revision,
             Path(temporary_directory) / "stack-projection",
         )
-        selection = convergence_scope(specifications, args.unit, args.depth, stack_dependencies)
+        specifications, stack_dependencies = loaded.units, loaded.dependencies
+        addresses = {qualified: concrete for concrete, qualified in loaded.qualified_names.items()}
+        requested = resolve_qualified_unit_values(args.unit or (), addresses)
+        selection = convergence_scope(specifications, requested, args.depth, stack_dependencies)
         targets, scope = selection.targets, selection.scope
         graph = dependency_graph(specifications, scope, stack_dependencies)
         order = convergence_order(specifications, scope, stack_dependencies)
@@ -10555,12 +10880,19 @@ def command_dependencies(args: argparse.Namespace) -> None:
         )
         return
     if args.list:
-        print("\n".join(order))
+        print("\n".join(loaded.qualified_names.get(name, name) for name in order))
         return
     for index, target in enumerate(targets):
         if index:
             print()
-        print("\n".join(graph.render_tree(target, lambda unit_name: style_unit(unit_name, sys.stdout))))
+        print(
+            "\n".join(
+                graph.render_tree(
+                    target,
+                    lambda unit_name: style_unit(loaded.qualified_names.get(unit_name, unit_name), sys.stdout),
+                )
+            )
+        )
 
 
 def _partition_unit_names(desired: Path, partition: str) -> list[str]:
@@ -10568,12 +10900,10 @@ def _partition_unit_names(desired: Path, partition: str) -> list[str]:
     selected: set[tuple[str, str, str]] = set()
     for resource in resources.values():
         if resource_owner_reference(resource) is None and resource.metadata.partition == partition:
-            selected.update(
-                (item.gvk.api_version, item.gvk.kind, item.name)
-                for item in _owned_resource_closure(resources, resource)
-            )
+            closure = _owned_resource_closure(resources, resource)
+            selected.update(key for key, item in resources.items() if any(item is child for child in closure))
     return sorted(
-        resource.name for key, resource in resources.items() if key in selected and isinstance(resource, UnitResource)
+        key[2] for key, resource in resources.items() if key in selected and isinstance(resource, UnitResource)
     )
 
 
@@ -10581,7 +10911,7 @@ def _desired_convergence_model(
     desired: Path,
 ) -> tuple[dict[str, UnitResource[Any]], dict[str, tuple[str, ...]]]:
     resources = load_desired_resource_graph(desired)
-    units = {resource.name: resource for resource in resources.values() if isinstance(resource, UnitResource)}
+    units = {key[2]: resource for key, resource in resources.items() if isinstance(resource, UnitResource)}
     return units, stack_dependency_edges(resources)
 
 
@@ -10625,19 +10955,23 @@ def _resource_deletion_blockers(
             )
         )
     explicit_dependencies = stack_dependency_edges(resources, include_missing=True)
+    target_key = next((key for key, resource in resources.items() if resource is target), None)
+    if target_key is None:
+        raise OperationError(f"desired resource {target.name!r} is absent from its graph")
     blockers: dict[tuple[str, str, str], UnitResource[Any] | StackResource] = {}
-    pending = [target_identity]
-    visited = {target_identity}
+    pending = [target_key]
+    visited = {target_key}
     while pending:
-        parent_identity = pending.pop()
+        parent_key = pending.pop()
+        parent = resources[parent_key]
+        parent_identity = (
+            parent.gvk.api_version,
+            parent.gvk.kind,
+            parent.name,
+            parent.metadata.uid or "",
+        )
         for key, child in resources.items():
-            child_identity = (
-                child.gvk.api_version,
-                child.gvk.kind,
-                child.name,
-                child.metadata.uid or "",
-            )
-            if child_identity in visited:
+            if key in visited:
                 continue
             owner = resource_owner_reference(child)
             owner_matches = (
@@ -10650,8 +10984,8 @@ def _resource_deletion_blockers(
                 )
                 == parent_identity
             )
-            dependency_matches = isinstance(child, UnitResource) and parent_identity[2] in (
-                set(desired_observation_reference_units(child)) | set(explicit_dependencies.get(child.name, ()))
+            dependency_matches = isinstance(child, UnitResource) and parent_key[2] in (
+                set(desired_observation_reference_units(child)) | set(explicit_dependencies.get(key[2], ()))
             )
             template_matches = (
                 parent_identity[1] == "StackTemplate"
@@ -10662,9 +10996,9 @@ def _resource_deletion_blockers(
                 and child.spec.templateRef.uid == parent_identity[3]
             )
             if owner_matches or dependency_matches or template_matches:
-                visited.add(child_identity)
+                visited.add(key)
                 blockers[key] = child
-                pending.append(child_identity)
+                pending.append(key)
     return tuple(sorted(blockers.values(), key=lambda item: (item.gvk.kind, item.name)))
 
 
@@ -10689,13 +11023,11 @@ def _deletion_scope_resources(
     else:
         names = set(selected_units or ())
         roots = [
-            resource for resource in resources.values() if isinstance(resource, UnitResource) and resource.name in names
+            resource for key, resource in resources.items() if isinstance(resource, UnitResource) and key[2] in names
         ]
     for root in roots:
-        selected.update(
-            (resource.gvk.api_version, resource.gvk.kind, resource.name)
-            for resource in _owned_resource_closure(resources, root)
-        )
+        closure = _owned_resource_closure(resources, root)
+        selected.update(key for key, resource in resources.items() if any(resource is item for item in closure))
     authorized_partitions = {_resource_management_partition(resources, root) for root in roots}
 
     # A deleting producer cannot finalize until its dependents have either
@@ -10733,8 +11065,9 @@ def _deletion_scope_resources(
                 if _resource_management_partition(resources, parent) not in authorized_partitions:
                     continue
                 selected.update(
-                    (item.gvk.api_version, item.gvk.kind, item.name)
-                    for item in _owned_resource_closure(resources, parent)
+                    key
+                    for key, item in resources.items()
+                    if any(item is child for child in _owned_resource_closure(resources, parent))
                 )
                 changed = True
     return frozenset(selected)
@@ -10780,7 +11113,7 @@ def _selected_finalized_cleanup(
     selected_units = tuple(
         tombstone
         for tombstone in cleanup_capable
-        if tombstone.name in names and f"{tombstone.api_version}/{tombstone.kind}" in DRIVER_NAMES_BY_GVK
+        if tombstone.qualified_name in names and f"{tombstone.api_version}/{tombstone.kind}" in DRIVER_NAMES_BY_GVK
     )
     partitions = {tombstone.partition for tombstone in selected_units if tombstone.partition is not None}
     return selected_units + tuple(
@@ -10828,7 +11161,7 @@ def _retry_finalized_cleanup(
     if f"{tombstone.api_version}/{tombstone.kind}" not in DRIVER_NAMES_BY_GVK:
         return False
     return _release_finalized_unit_lease(
-        tombstone.name,
+        tombstone.qualified_name or tombstone.name,
         tombstone.uid,
         tombstone.deletion_generation,
         desired_ref,
@@ -10878,7 +11211,8 @@ def command_converge(args: argparse.Namespace) -> None:
     max_steps = args.max_steps
     iteration = 0
     selected_partition_once = False
-    requested_units = tuple(dict.fromkeys(args.unit or ()))
+    requested_selectors = tuple(dict.fromkeys(args.unit or ()))
+    requested_units: tuple[str, ...] = ()
     seen_requested_units: set[str] = set()
     reconciled = False
 
@@ -10920,6 +11254,10 @@ def command_converge(args: argparse.Namespace) -> None:
             materialize_revision(desired_revision, desired)
             observed_tree(observed_ref, observed)
             resources = load_desired_resource_graph(desired)
+            tombstones = load_resource_incarnation_evidence(desired)
+            display_names = {concrete: qualified for qualified, concrete in qualified_unit_name_map(resources).items()}
+            if requested_selectors and not requested_units:
+                requested_units = resolve_unit_selectors(resources, requested_selectors, tombstones)
             specifications, stack_dependencies = _desired_convergence_model(desired)
             finalized_cleanup = _selected_finalized_cleanup(
                 desired,
@@ -10931,7 +11269,7 @@ def command_converge(args: argparse.Namespace) -> None:
             elif requested_units:
                 present_requested_units = [name for name in requested_units if name in specifications]
                 finalized_unit_names = {
-                    tombstone.name
+                    tombstone.qualified_name
                     for tombstone in finalized_cleanup
                     if f"{tombstone.api_version}/{tombstone.kind}" in DRIVER_NAMES_BY_GVK
                 }
@@ -10971,7 +11309,7 @@ def command_converge(args: argparse.Namespace) -> None:
                     finish()
                     return
             deletion_units = {
-                resource.name
+                key[2]
                 for key, resource in resources.items()
                 if key in deletion_scope
                 and isinstance(resource, UnitResource)
@@ -11017,7 +11355,7 @@ def command_converge(args: argparse.Namespace) -> None:
                 reconciled = True
                 continue
             if not deleting and all(status in {"CLEAN", "MATERIALIZED"} for _, status, _ in statuses):
-                log_compact_convergence_summary(args.environment, scope, steps, "CLEAN")
+                log_compact_convergence_summary(args.environment, scope, steps, "CLEAN", display_names=display_names)
                 finish()
                 return
             ready = [
@@ -11034,9 +11372,10 @@ def command_converge(args: argparse.Namespace) -> None:
                         raise OperationError(f"convergence did not finish within {max_steps} reconciliation steps")
                     deletion = resource_deletion(deleting_resource)
                     assert deletion is not None
+                    deleting_name = next(key[2] for key, item in resources.items() if item is deleting_resource)
                     deletion_args = argparse.Namespace(
                         kind=deleting_resource.gvk.kind,
-                        name=deleting_resource.name,
+                        name=deleting_name,
                         environment=args.environment,
                         desired_ref=desired_ref,
                         observed_ref=observed_ref,
@@ -11049,7 +11388,7 @@ def command_converge(args: argparse.Namespace) -> None:
                     if isinstance(deleting_resource, UnitResource):
                         progressed = command_reconcile(
                             argparse.Namespace(
-                                unit=deleting_resource.name,
+                                unit=deleting_name,
                                 environment=args.environment,
                                 desired_ref=desired_ref,
                                 desired_revision=desired_revision,
@@ -11058,7 +11397,9 @@ def command_converge(args: argparse.Namespace) -> None:
                                 report=None,
                                 reapply=False,
                                 verbose=args.verbose,
+                                qualified_unit=deleting_name,
                                 _defer_reconcile_output=True,
+                                _unit_is_concrete=True,
                             )
                         )
                     else:
@@ -11080,7 +11421,7 @@ def command_converge(args: argparse.Namespace) -> None:
                     attempted_steps += 1
                     if progressed:
                         reconciled = True
-                        steps.append(deleting_resource.name)
+                        steps.append(deleting_name)
                         break
                 if progressed:
                     # Every deletion publication changes the desired graph or
@@ -11088,7 +11429,11 @@ def command_converge(args: argparse.Namespace) -> None:
                     # newly unblocked parent.
                     continue
             if not ready:
-                waiting = [f"{name} ({reason})" for name, status, reason in statuses if status == "WAIT"]
+                waiting = [
+                    f"{display_names.get(name, name)} ({reason})"
+                    for name, status, reason in statuses
+                    if status == "WAIT"
+                ]
                 waiting.extend(
                     f"{resource.gvk.kind}/{resource.name} (deletion blocked)"
                     for resource in deleting
@@ -11099,6 +11444,7 @@ def command_converge(args: argparse.Namespace) -> None:
                     scope,
                     steps,
                     "WAIT: " + (", ".join(waiting) or "deletion progression is waiting"),
+                    display_names=display_names,
                 )
                 finish()
                 return
@@ -11106,7 +11452,7 @@ def command_converge(args: argparse.Namespace) -> None:
                 raise OperationError(f"convergence did not finish within {max_steps} reconciliation steps")
             unit_name = ready[0]
             if not args.yes:
-                require_reconciliation_approval(unit_name)
+                require_reconciliation_approval(display_names.get(unit_name, unit_name))
             unit_progressed = command_reconcile(
                 argparse.Namespace(
                     unit=unit_name,
@@ -11118,7 +11464,9 @@ def command_converge(args: argparse.Namespace) -> None:
                     report=None,
                     reapply=False,
                     verbose=args.verbose,
+                    qualified_unit=display_names.get(unit_name, unit_name),
                     _defer_reconcile_output=True,
+                    _unit_is_concrete=True,
                 )
             )
             attempted_steps += 1
@@ -11129,6 +11477,7 @@ def command_converge(args: argparse.Namespace) -> None:
                     scope,
                     steps,
                     "WAIT: reconciliation made no progress",
+                    display_names=display_names,
                 )
                 return
             reconciled = True
@@ -11566,7 +11915,11 @@ def _copy_unrelated_desired_resources(
         if partition is not None and resource.metadata.partition == partition:
             continue
         for selected in _owned_resource_closure(current_resources, resource):
-            selected_key = (selected.gvk.api_version, selected.gvk.kind, selected.name)
+            selected_key = (
+                selected.gvk.api_version,
+                selected.gvk.kind,
+                _unit_storage_name(selected) if isinstance(selected, UnitResource) else selected.name,
+            )
             copied.add(selected_key)
             if selected_key in candidate_resources:
                 continue
@@ -11575,7 +11928,7 @@ def _copy_unrelated_desired_resources(
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_path, target)
             if isinstance(selected, UnitResource) and getattr(selected.spec, "materialization", None) is not None:
-                copy_unit_materialization(current, candidate, selected.name, selected)
+                copy_unit_materialization(current, candidate, selected_key[2], selected)
 
 
 def _prune_omitted_partition_resources(
@@ -11873,9 +12226,18 @@ def command_create_stack(args: argparse.Namespace) -> None:
     _print_created(written)
 
 
+def _unit_storage_name(resource: UnitResource[Any]) -> str:
+    owner = resource_owner_reference(resource)
+    return (
+        stack_generated_unit_name(owner.name, resource.name)
+        if owner is not None and owner.kind == "Stack"
+        else resource.name
+    )
+
+
 def _desired_resource_path(root: Path, resource: UnitResource[Any] | StackResource) -> Path:
     if isinstance(resource, UnitResource):
-        return unit_document_path(root, resource.name)
+        return unit_document_path(root, _unit_storage_name(resource))
     directory = "stack-templates" if resource.gvk.kind == "StackTemplate" else "stacks"
     paths = document_candidates(root / directory, resource.name)
     if len(paths) != 1:
@@ -11929,8 +12291,8 @@ def _command_delete_state_resource(args: argparse.Namespace) -> bool:
         resources = load_desired_resource_graph(current)
         matches = [
             resource
-            for resource in resources.values()
-            if resource.name == args.name
+            for key, resource in resources.items()
+            if (key[2] == args.name if args.kind == "Unit" else resource.name == args.name)
             and (
                 (args.kind == "Unit" and isinstance(resource, UnitResource))
                 or (args.kind in {"Stack", "StackTemplate"} and resource.gvk.kind == args.kind)
@@ -12535,7 +12897,7 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.add_argument(
         "--unit",
         action="append",
-        help="unit to roll back; repeat for multiple units (defaults to the full tree)",
+        help="qualified Unit name to roll back; repeat for multiple units (defaults to the full tree)",
     )
     rollback.add_argument("--reason", required=True)
     rollback.add_argument("--desired-ref", help="override the environment's desired ref")
@@ -12552,7 +12914,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="recover an abandoned effect lease after verifying its effect stopped",
     )
     recover_effect_lease.add_argument("--environment", required=True)
-    recover_effect_lease.add_argument("--unit", required=True)
+    recover_effect_lease.add_argument("--unit", required=True, help="qualified Unit name")
     recover_effect_lease.add_argument("--uid", required=True, help="expected leased Unit UID fence")
     recover_effect_lease.add_argument("--token", required=True, help="exact persisted lease token")
     recover_effect_lease.add_argument(
@@ -12628,7 +12990,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="show deployment status",
     )
     status.add_argument("--environment", help="environment to inspect; omit for all environments")
-    status.add_argument("--unit", help="limit detailed status to one unit in the selected environment")
+    status.add_argument("--unit", help="limit detailed status to one qualified Unit name")
     status.add_argument("--desired-ref", help="override the environment's desired ref")
     status.add_argument(
         "--desired-revision",
@@ -12640,7 +13002,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     get = commands.add_parser("get", help="inspect persisted resources")
     get.add_argument("selector", choices=inspectable_selectors(), help="singular or plural resource selector")
-    get.add_argument("name", nargs="?", help="exact resource name; omit to list the selected family")
+    get.add_argument("name", nargs="?", help="exact qualified resource name; omit to list the selected family")
     for identity_filter in identity_filter_options():
         assert identity_filter.filter_option is not None
         get.add_argument(
@@ -12683,7 +13045,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument(
         "--unit",
         action="append",
-        help="unit to verify; repeat for multiple units (defaults to all desired units)",
+        help="qualified Unit name to verify; repeat for multiple units (defaults to all desired Units)",
     )
     verify.set_defaults(handler=command_verify)
 
@@ -12694,7 +13056,7 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument(
         "--unit",
         required=True,
-        help="unit name under units/ in the desired ref",
+        help="qualified Unit name",
     )
     reconcile.add_argument("--desired-ref", help="override the environment's desired ref")
     reconcile.add_argument(
@@ -12730,7 +13092,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--unit",
         action="append",
         required=True,
-        help="target unit; repeat to show multiple dependency trees",
+        help="target qualified Unit name; repeat to show multiple dependency trees",
     )
     dependency_format = dependencies.add_mutually_exclusive_group()
     dependency_format.add_argument(
@@ -12760,7 +13122,7 @@ def build_parser() -> argparse.ArgumentParser:
     converge_selection.add_argument(
         "--unit",
         action="append",
-        help="target unit to converge; repeat for multiple targets (defaults to all units)",
+        help="target qualified Unit name; repeat for multiple targets (defaults to all Units)",
     )
     converge_selection.add_argument(
         "--partition",

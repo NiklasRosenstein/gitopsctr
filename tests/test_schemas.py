@@ -74,7 +74,6 @@ def desired_example(unit: UnitResource) -> UnitResource:
         desired = unit.driver.finalize_materialization(
             desired,
             MaterializationDocument(
-                path=f"materialized/{unit.name}",
                 digest=DIGEST,
                 mediaType="application/vnd.gitopsctr.kubernetes-manifests.v1",
                 metadata=JsonObjectValue(metadata),
@@ -248,7 +247,12 @@ def test_result_contracts_and_receipt_resource_schemas(driver):
         "kind": "Receipt",
         "metadata": {"name": "example"},
         "spec": {
-            "subject": {"apiVersion": plugin.api_version, "kind": plugin.kind, "name": "example"},
+            "subject": {
+                "apiVersion": plugin.api_version,
+                "kind": plugin.kind,
+                "name": "example",
+                "qualifiedName": "example",
+            },
             "desired": {"revision": REVISION, "unitBlob": "f" * 40},
             "resolvedInputs": {},
         },

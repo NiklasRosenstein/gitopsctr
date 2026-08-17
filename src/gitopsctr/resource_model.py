@@ -65,8 +65,8 @@ class IdentityConstraint:
     values: frozenset[str]
 
     def __post_init__(self) -> None:
-        if any(not value or "/" in value for value in self.values):
-            raise ResourceModelError(f"identity constraint {self.segment!r} requires safe values")
+        if any(not value for value in self.values):
+            raise ResourceModelError(f"identity constraint {self.segment!r} requires non-empty values")
 
 
 @dataclass(frozen=True)
@@ -106,8 +106,10 @@ class ResourceIdentityDefinition:
             raise ResourceModelError(
                 f"resource identity requires {len(self.segments)} segments, received {len(values)}"
             )
-        if any(not value or self.separator in value for value in values):
-            raise ResourceModelError("resource identity values must be non-empty and must not contain the separator")
+        if any(not value for value in values) or self.separator in values[-1]:
+            raise ResourceModelError("resource identity values must be non-empty and the local name cannot nest")
+        for value in values[:-1]:
+            _address_segments(value)
         return LocalResourceIdentity(values)
 
     def from_name(self, name: str, qualifiers: tuple[str, ...] = ()) -> LocalResourceIdentity:
@@ -143,12 +145,15 @@ class ResourceIdentityDefinition:
 
 @dataclass(frozen=True)
 class ResourceAddress:
-    """Complete inventory address: family, placement scope, and local identity."""
+    """Complete inventory address with a canonical collection-qualified name."""
 
     family: str
     scope: ResourceScope
     namespace: str | None
-    local_identity: LocalResourceIdentity
+    qualified_name: str
+
+    def __post_init__(self) -> None:
+        _address_segments(self.qualified_name)
 
 
 @runtime_checkable
@@ -169,6 +174,164 @@ class InspectionRecord(Protocol):
 
     @property
     def blob_id(self) -> str | None: ...
+
+    @property
+    def parsed(self) -> object: ...
+
+
+@runtime_checkable
+class ResourceAddressRuntime(Protocol):
+    """Inventory services available to registry-owned address resolvers."""
+
+    def relationship_sources(self, relationship: str, target: InspectionRecord) -> tuple[InspectionRecord, ...]: ...
+
+    def resource_qualified_name(self, record: InspectionRecord) -> str: ...
+
+
+@runtime_checkable
+class ResourceAddressing(Protocol):
+    """Resolve and validate one family's operator-facing resource portion."""
+
+    @property
+    def parent_families(self) -> tuple[str, ...]: ...
+
+    @property
+    def relationships(self) -> tuple[str, ...]: ...
+
+    @property
+    def requires_relationship_authentication(self) -> bool: ...
+
+    def validate(self, value: str) -> None: ...
+
+    def storage_selection(self, value: str, identity: ResourceIdentityDefinition) -> ResourceSelection | None: ...
+
+    def storage_constraint(
+        self, segment: str, value: str, identity: ResourceIdentityDefinition
+    ) -> IdentityConstraint | None: ...
+
+    def filter_value(self, qualified_name: str, segment: str, identity: ResourceIdentityDefinition) -> str: ...
+
+    def documentation(self) -> str: ...
+
+    def qualified_name(self, record: InspectionRecord, runtime: ResourceAddressRuntime) -> str: ...
+
+
+def _address_segments(value: str) -> tuple[str, ...]:
+    segments = tuple(value.split("/"))
+    if not segments or any(not segment or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", segment) for segment in segments):
+        raise ResourceModelError(f"invalid qualified resource name: {value!r}")
+    return segments
+
+
+@dataclass(frozen=True)
+class RootResourceAddressing:
+    """Address a root resource by its persisted local name."""
+
+    parent_families: tuple[str, ...] = ()
+    relationships: tuple[str, ...] = ()
+    requires_relationship_authentication: bool = False
+
+    def validate(self, value: str) -> None:
+        if len(_address_segments(value)) != 1:
+            raise ResourceModelError("root resource addresses contain exactly one segment")
+
+    def qualified_name(self, record: InspectionRecord, runtime: ResourceAddressRuntime) -> str:
+        self.validate(record.name)
+        return record.name
+
+    def storage_selection(self, value: str, identity: ResourceIdentityDefinition) -> ResourceSelection:
+        self.validate(value)
+        return ResourceSelection(exact=identity.parse(value))
+
+    def storage_constraint(self, segment: str, value: str, identity: ResourceIdentityDefinition) -> IdentityConstraint:
+        if segment != "name":
+            raise ResourceModelError(f"root resource addressing has no filter segment {segment!r}")
+        self.validate(value)
+        return IdentityConstraint(segment, frozenset((value,)))
+
+    def filter_value(self, qualified_name: str, segment: str, identity: ResourceIdentityDefinition) -> str:
+        if segment != "name":
+            raise ResourceModelError(f"root resource addressing has no filter segment {segment!r}")
+        self.validate(qualified_name)
+        return qualified_name
+
+    def documentation(self) -> str:
+        return "`name` (root)"
+
+
+@dataclass(frozen=True)
+class StackUnitResourceAddressing:
+    """Address direct Units by name and Stack-owned Units by Stack/local projection key."""
+
+    relationship: str
+    parent_family: str
+    requires_relationship_authentication: bool = False
+
+    @property
+    def parent_families(self) -> tuple[str, ...]:
+        return (self.parent_family,)
+
+    @property
+    def relationships(self) -> tuple[str, ...]:
+        return (self.relationship,)
+
+    def validate(self, value: str) -> None:
+        if len(_address_segments(value)) not in {1, 2}:
+            raise ResourceModelError("Unit addresses are NAME or STACK/UNIT")
+
+    def qualified_name(self, record: InspectionRecord, runtime: ResourceAddressRuntime) -> str:
+        metadata = getattr(record.parsed, "metadata", None)
+        owners = getattr(metadata, "ownerReferences", None)
+        if not owners:
+            self.validate(record.name)
+            return record.name
+        sources = runtime.relationship_sources(self.relationship, record)
+        if len(sources) != 1:
+            raise ResourceModelError(
+                f"Unit {record.name!r} has {len(sources)} valid Stack owners; expected exactly one"
+            )
+        stack = sources[0]
+        specification = stack.document.get("spec")
+        active = specification.get("activeProjection") if isinstance(specification, dict) else None
+        units = active.get("units") if isinstance(active, dict) else None
+        unit_uid = getattr(metadata, "uid", None)
+        matches = tuple(
+            logical_name
+            for logical_name, binding in (units.items() if isinstance(units, dict) else ())
+            if isinstance(binding, dict)
+            and binding.get("apiVersion") == record.gvk.api_version
+            and binding.get("kind") == record.gvk.kind
+            and binding.get("name") == record.name
+            and binding.get("uid") == unit_uid
+        )
+        if len(matches) != 1:
+            raise ResourceModelError(
+                f"Stack {stack.name!r} has {len(matches)} active bindings for Unit {record.name!r}; expected one"
+            )
+        value = f"{runtime.resource_qualified_name(stack)}/{matches[0]}"
+        self.validate(value)
+        return value
+
+    def storage_selection(self, value: str, identity: ResourceIdentityDefinition) -> ResourceSelection | None:
+        self.validate(value)
+        return ResourceSelection(exact=identity.parse(value)) if "/" not in value else None
+
+    def storage_constraint(
+        self, segment: str, value: str, identity: ResourceIdentityDefinition
+    ) -> IdentityConstraint | None:
+        if segment != "name":
+            raise ResourceModelError(f"Unit addressing has no filter segment {segment!r}")
+        _address_segments(value)
+        return IdentityConstraint(segment, frozenset((value,))) if "/" not in value else None
+
+    def filter_value(self, qualified_name: str, segment: str, identity: ResourceIdentityDefinition) -> str:
+        if segment != "name":
+            raise ResourceModelError(f"Unit addressing has no filter segment {segment!r}")
+        self.validate(qualified_name)
+        return _address_segments(qualified_name)[-1]
+
+    def documentation(self) -> str:
+        return f"`name` (root) or `stack/logical-unit` (child via `{self.relationship}`)"
 
 
 @dataclass(frozen=True)
@@ -200,6 +363,8 @@ class InspectionRuntime(Protocol):
     def environment_summary(self, environment: str) -> EnvironmentInspectionSummary: ...
 
     def resource_partition(self, record: InspectionRecord) -> str | None: ...
+
+    def resource_qualified_name(self, record: InspectionRecord) -> str: ...
 
     def stack_inspection_summary(self, record: InspectionRecord) -> StackInspectionSummary: ...
 
@@ -245,18 +410,106 @@ class ObservationState(StrEnum):
     STALE = "STALE"
 
 
-class CollectionLayout(StrEnum):
-    PROJECT = "project"
-    ENVIRONMENTS = "environments"
-    SOURCE_UNITS = "source-units"
-    SOURCE_STACKS = "source-stacks"
-    SOURCE_STACKTEMPLATES = "source-stacktemplates"
-    DESIRED_UNITS = "desired-units"
-    DESIRED_STACKS = "desired-stacks"
-    DESIRED_STACKTEMPLATES = "desired-stacktemplates"
-    DESIRED_PROMOTION = "desired-promotion"
-    OBSERVED_RECEIPTS = "observed-receipts"
-    OBSERVED_ARTIFACTS = "observed-artifacts"
+class CollectionDocumentMode(StrEnum):
+    """How a filesystem collection derives its document key."""
+
+    ADDRESS = "address"
+    DOCUMENT_NAME = "document-name"
+    DIRECTORY_NAME = "directory-name"
+
+
+@runtime_checkable
+class FilesystemCollectionRoot(Protocol):
+    """Resolve one or more physical collection roots for a read context."""
+
+    def directories(self, context: CollectionReadContext) -> tuple[Path, ...]: ...
+
+
+@dataclass(frozen=True)
+class RepositoryRoot:
+    """The materialized repository root."""
+
+    def directories(self, context: CollectionReadContext) -> tuple[Path, ...]:
+        return (context.root,)
+
+
+@dataclass(frozen=True)
+class ProjectConfiguredDirectory:
+    """A directory selected by one of Project's relative path fields."""
+
+    field: str
+    child: str | None = None
+    environment_scoped: bool = False
+
+    def directories(self, context: CollectionReadContext) -> tuple[Path, ...]:
+        value = getattr(context.project, self.field, None)
+        if not isinstance(value, PurePosixPath):
+            raise ResourceModelError(f"Project has no relative path field {self.field!r}")
+        base = context.root.joinpath(*value.parts)
+        if self.environment_scoped:
+            if context.environment is None:
+                raise ResourceModelError(f"collection requires an environment for {self.field!r}")
+            base /= context.environment
+        if self.child is not None:
+            base /= self.child
+        return (base,)
+
+
+@dataclass(frozen=True)
+class EnvironmentDirectories:
+    """All configured Environment directories, or one selected directory."""
+
+    field: str = "environments_path"
+
+    def directories(self, context: CollectionReadContext) -> tuple[Path, ...]:
+        value = getattr(context.project, self.field, None)
+        if not isinstance(value, PurePosixPath):
+            raise ResourceModelError(f"Project has no relative path field {self.field!r}")
+        base = context.root.joinpath(*value.parts)
+        if context.environment is not None:
+            return (base / context.environment,)
+        if not base.is_dir():
+            return ()
+        selected = context.selection.values_for("name") if context.selection is not None else None
+        if selected is None and context.selection is not None and context.selection.exact is not None:
+            selected = frozenset((context.family.identity.value(context.selection.exact, "name"),))
+        return tuple(
+            sorted(path for path in base.iterdir() if path.is_dir() and (selected is None or path.name in selected))
+        )
+
+
+@dataclass(frozen=True)
+class SnapshotSubdirectory:
+    """A fixed subdirectory below a materialized desired/observed snapshot."""
+
+    child: str
+
+    def directories(self, context: CollectionReadContext) -> tuple[Path, ...]:
+        return (context.root / self.child,)
+
+
+@dataclass(frozen=True)
+class FilesystemDocumentLayout:
+    """Physical document naming policy independent of any resource family."""
+
+    mode: CollectionDocumentMode
+    stems: tuple[str, ...] = ()
+
+    @classmethod
+    def addressed(cls) -> FilesystemDocumentLayout:
+        return cls(CollectionDocumentMode.ADDRESS)
+
+    @classmethod
+    def fixed(cls, *stems: str) -> FilesystemDocumentLayout:
+        if not stems or any(not stem for stem in stems):
+            raise ResourceModelError("fixed document layout requires non-empty stems")
+        return cls(CollectionDocumentMode.DOCUMENT_NAME, tuple(stems))
+
+    @classmethod
+    def directory_keyed(cls, stem: str) -> FilesystemDocumentLayout:
+        if not stem:
+            raise ResourceModelError("directory-keyed document layout requires a stem")
+        return cls(CollectionDocumentMode.DIRECTORY_NAME, (stem,))
 
 
 @runtime_checkable
@@ -687,7 +940,7 @@ class UnitInspectionPresenter:
         if not isinstance(reason, str):
             raise ResourceModelError(f"Unit {record.name!r} has no reconciliation reason")
         return (
-            record.name,
+            runtime.resource_qualified_name(record),
             record.gvk.kind,
             runtime.resource_partition(record) or "-",
             _short_revision(record.blob_id),
@@ -711,7 +964,7 @@ class StackInspectionPresenter:
         specification = _mapping_field(record.document, "spec")
         summary = runtime.stack_inspection_summary(record)
         return (
-            record.name,
+            runtime.resource_qualified_name(record),
             summary.template_name or "-",
             _short_digest(summary.template_digest),
             runtime.resource_partition(record) or "-",
@@ -842,7 +1095,7 @@ class ReceiptInspectionPresenter:
         unit = getattr(relationship, "unit", None)
         partition = runtime.resource_partition(unit) if isinstance(unit, InspectionRecord) else None
         return (
-            record.name,
+            runtime.resource_qualified_name(record),
             kind if isinstance(kind, str) else "-",
             partition or "-",
             _enum_value(getattr(relationship, "observation", None), "observation state"),
@@ -865,7 +1118,7 @@ class ArtifactInspectionPresenter:
         producer = getattr(relationship, "producer", None)
         partition = runtime.resource_partition(producer) if isinstance(producer, InspectionRecord) else None
         return (
-            record.qualified_name,
+            runtime.resource_qualified_name(record),
             record.gvk.kind,
             partition or "-",
             _enum_value(getattr(relationship, "authentication", None), "authentication state"),
@@ -902,6 +1155,7 @@ class ResourceFamilyDefinition:
     inspection: InspectionViewDefinition | None = None
     namespace_boundary: bool = False
     identity: ResourceIdentityDefinition = field(default_factory=ResourceIdentityDefinition)
+    addressing: ResourceAddressing = field(default_factory=RootResourceAddressing)
 
     @property
     def selectors(self) -> tuple[str, ...]:
@@ -937,19 +1191,41 @@ class DiscoveredResource:
     content_digest: str
     media_type: str | None
     local_identity: LocalResourceIdentity
+    storage_qualified_name: str
 
 
 @runtime_checkable
 class ResourceCollectionProvider(Protocol):
     def discover(self, context: CollectionReadContext) -> Iterable[DiscoveredResource]: ...
 
+    def document_path(self, context: CollectionReadContext, qualified_name: str, suffix: str) -> Path: ...
+
 
 @dataclass(frozen=True)
 class FilesystemCollectionProvider:
     """Built-in Git tree layout adapter; inventory supplies a materialized plane root."""
 
-    layout: CollectionLayout
+    root: FilesystemCollectionRoot
+    documents: FilesystemDocumentLayout
     media_typed: bool = False
+
+    def document_path(self, context: CollectionReadContext, qualified_name: str, suffix: str) -> Path:
+        """Encode the registry address into this collection's canonical path."""
+
+        context.family.addressing.validate(qualified_name)
+        if suffix not in {".json", ".yaml", ".yml"}:
+            raise ResourceModelError(f"unsupported resource document suffix: {suffix!r}")
+        directories = self.root.directories(context)
+        if len(directories) != 1:
+            raise ResourceModelError(
+                f"collection {context.placement.collection!r} has {len(directories)} writable roots; expected one"
+            )
+        if self.documents.mode is not CollectionDocumentMode.ADDRESS:
+            raise ResourceModelError(
+                f"collection {context.placement.collection!r} does not support address-keyed document paths"
+            )
+        relative = PurePosixPath(qualified_name)
+        return directories[0].joinpath(*relative.parts[:-1], f"{relative.name}{suffix}")
 
     @staticmethod
     def _selected_values(context: CollectionReadContext, segment: str) -> frozenset[str] | None:
@@ -964,50 +1240,8 @@ class FilesystemCollectionProvider:
             return None
         return frozenset((context.family.identity.value(context.selection.exact, segment),))
 
-    def _directories(self, context: CollectionReadContext) -> tuple[Path, ...]:
-        if self.layout is CollectionLayout.PROJECT:
-            return ()
-        if self.layout is CollectionLayout.ENVIRONMENTS:
-            base = context.root.joinpath(*context.project.environments_path.parts)
-            if context.environment is not None:
-                return (base / context.environment,)
-            return (
-                tuple(
-                    sorted(
-                        path
-                        for path in base.iterdir()
-                        if path.is_dir()
-                        and (
-                            self._selected_values(context, "name") is None
-                            or path.name in cast(frozenset[str], self._selected_values(context, "name"))
-                        )
-                    )
-                )
-                if base.is_dir()
-                else ()
-            )
-        if self.layout is CollectionLayout.SOURCE_STACKTEMPLATES:
-            return (context.root.joinpath(*context.project.stack_templates_path.parts),)
-        source_collection = {
-            CollectionLayout.SOURCE_UNITS: "units",
-            CollectionLayout.SOURCE_STACKS: "stacks",
-        }.get(self.layout)
-        if source_collection is not None:
-            if context.environment is None:
-                raise ResourceModelError(f"collection {self.layout} requires an environment")
-            environment_root = context.root.joinpath(*context.project.environments_path.parts, context.environment)
-            return (environment_root / source_collection,)
-        relative = {
-            CollectionLayout.DESIRED_UNITS: "units",
-            CollectionLayout.DESIRED_STACKS: "stacks",
-            CollectionLayout.DESIRED_STACKTEMPLATES: "stack-templates",
-            CollectionLayout.OBSERVED_RECEIPTS: "units",
-            CollectionLayout.OBSERVED_ARTIFACTS: "artifacts",
-        }.get(self.layout)
-        return (context.root / relative,) if relative is not None else ()
-
     @staticmethod
-    def _document_files(directory: Path, *, recursive: bool = False) -> tuple[Path, ...]:
+    def _document_files(directory: Path, *, recursive: bool = True) -> tuple[Path, ...]:
         if not directory.is_dir():
             return ()
         iterator = directory.rglob("*") if recursive else directory.iterdir()
@@ -1016,47 +1250,26 @@ class FilesystemCollectionProvider:
         )
 
     def _paths(self, context: CollectionReadContext) -> tuple[Path, ...]:
-        if self.layout is CollectionLayout.PROJECT:
-            return tuple(context.root / name for name in PROJECT_CONFIG_NAMES if (context.root / name).is_file())
-        if self.layout is CollectionLayout.ENVIRONMENTS:
+        directories = self.root.directories(context)
+        if self.documents.mode is CollectionDocumentMode.DOCUMENT_NAME:
+            return tuple(
+                path
+                for directory in directories
+                for stem in self.documents.stems
+                for path in self._fixed_candidates(directory, stem)
+            )
+        if self.documents.mode is CollectionDocumentMode.DIRECTORY_NAME:
+            stem = self.documents.stems[0]
             paths: list[Path] = []
-            for directory in self._directories(context):
-                candidates = self._stem_candidates(directory, "environment")
+            for directory in directories:
+                candidates = self._stem_candidates(directory, stem)
                 if not candidates:
-                    raise ResourceModelError(
-                        f"authored environment directory {directory} has no environment.yaml, environment.yml, "
-                        "or environment.json"
-                    )
+                    raise ResourceModelError(f"directory {directory} has no {stem}.yaml, {stem}.yml, or {stem}.json")
                 paths.extend(candidates)
             return tuple(paths)
-        if self.layout is CollectionLayout.DESIRED_PROMOTION:
-            return self._stem_candidates(context.root, "promotion")
-        recursive = self.layout is CollectionLayout.OBSERVED_ARTIFACTS
-        paths = tuple(
-            path
-            for directory in self._directories(context)
-            for path in self._document_files(directory, recursive=recursive)
-        )
-        producer_names = self._selected_values(context, "producer")
+        paths = tuple(path for directory in directories for path in self._document_files(directory))
         selected_names = self._selected_values(context, "name")
-        if self.layout is CollectionLayout.OBSERVED_ARTIFACTS and producer_names is not None:
-            paths = tuple(
-                path
-                for path in paths
-                if len(path.relative_to(context.root).parts) == 3
-                and path.relative_to(context.root).parts[1] in producer_names
-            )
-        elif (
-            self.layout
-            not in {
-                CollectionLayout.PROJECT,
-                CollectionLayout.ENVIRONMENTS,
-                CollectionLayout.DESIRED_PROMOTION,
-            }
-            and selected_names is not None
-        ):
-            paths = tuple(path for path in paths if path.stem in selected_names)
-        return paths
+        return paths if selected_names is None else tuple(path for path in paths if path.stem in selected_names)
 
     @staticmethod
     def _stem_candidates(directory: Path, stem: str) -> tuple[Path, ...]:
@@ -1065,6 +1278,13 @@ class FilesystemCollectionProvider:
             for path in (directory / f"{stem}.yaml", directory / f"{stem}.yml", directory / f"{stem}.json")
             if path.is_file()
         )
+
+    @staticmethod
+    def _fixed_candidates(directory: Path, stem: str) -> tuple[Path, ...]:
+        if Path(stem).suffix.lower() in {".yaml", ".yml", ".json"}:
+            path = directory / stem
+            return (path,) if path.is_file() else ()
+        return FilesystemCollectionProvider._stem_candidates(directory, stem)
 
     def discover(self, context: CollectionReadContext) -> Iterable[DiscoveredResource]:
         for path in self._paths(context):
@@ -1092,11 +1312,11 @@ class FilesystemCollectionProvider:
                 parsed = contract.parse(document)
             except Exception as exc:
                 raise ResourceModelError(f"invalid {context.placement.plane} resource {path}: {exc}") from exc
-            relative = PurePosixPath(path.relative_to(context.root).as_posix())
-            identity_qualifier = self._validate_canonical_identity(context, path, relative, document, name)
-            local_identity = context.family.identity.from_name(name, identity_qualifier)
+            storage_qualified_name = self._storage_qualified_name(context, path, name)
+            local_identity = self._local_identity(context, storage_qualified_name, name)
             if not context.family.identity.matches(local_identity, context.selection):
                 continue
+            relative = PurePosixPath(path.relative_to(context.root).as_posix())
             try:
                 raw = path.read_bytes()
             except OSError as exc:
@@ -1121,71 +1341,53 @@ class FilesystemCollectionProvider:
                 "sha256:" + hashlib.sha256(raw).hexdigest(),
                 media_type,
                 local_identity,
+                storage_qualified_name,
             )
 
-    def _validate_canonical_identity(
+    def _storage_qualified_name(
         self,
         context: CollectionReadContext,
         path: Path,
-        relative: PurePosixPath,
-        document: JsonObject,
         name: str,
-    ) -> tuple[str, ...]:
-        """Validate the layout-owned logical identity and return its qualifier."""
+    ) -> str:
+        directory = self._directory_for_path(context, path)
+        if self.documents.mode is CollectionDocumentMode.ADDRESS:
+            relative = PurePosixPath(path.relative_to(directory).as_posix())
+            qualified_name = relative.with_suffix("").as_posix()
+            context.family.addressing.validate(qualified_name)
+            expected_name = context.family.addressing.filter_value(qualified_name, "name", context.family.identity)
+            if expected_name != name:
+                raise ResourceModelError(
+                    f"resource metadata.name {name!r} in {path} does not match address terminal {expected_name!r}"
+                )
+            return qualified_name
+        if self.documents.mode is CollectionDocumentMode.DIRECTORY_NAME:
+            qualified_name = directory.name
+            context.family.addressing.validate(qualified_name)
+            if name != qualified_name:
+                raise ResourceModelError(
+                    f"resource metadata.name {name!r} in {path} does not match directory address {qualified_name!r}"
+                )
+            return qualified_name
+        return name
 
-        if self.layout is CollectionLayout.ENVIRONMENTS:
-            directory_name = path.parent.name
-            if name != directory_name:
-                raise ResourceModelError(
-                    f"Environment metadata.name {name!r} in {path} must match directory {directory_name!r}"
-                )
-            return ()
+    def _directory_for_path(self, context: CollectionReadContext, path: Path) -> Path:
+        directories = self.root.directories(context)
+        matches = tuple(directory for directory in directories if directory in path.parents or path == directory)
+        if len(matches) != 1:
+            raise ResourceModelError(f"resource path {path} is not under exactly one collection root")
+        return matches[0]
 
-        filename_owned = {
-            CollectionLayout.SOURCE_UNITS,
-            CollectionLayout.SOURCE_STACKS,
-            CollectionLayout.SOURCE_STACKTEMPLATES,
-            CollectionLayout.DESIRED_UNITS,
-            CollectionLayout.DESIRED_STACKS,
-            CollectionLayout.DESIRED_STACKTEMPLATES,
-            CollectionLayout.OBSERVED_RECEIPTS,
-        }
-        if self.layout in filename_owned:
-            if name != path.stem:
-                raise ResourceModelError(
-                    f"resource metadata.name {name!r} in {path} must match filename stem {path.stem!r}"
-                )
-            return ()
-
-        if self.layout is CollectionLayout.OBSERVED_ARTIFACTS:
-            if len(relative.parts) != 3 or relative.parts[0] != "artifacts":
-                raise ResourceModelError(
-                    f"Artifact {path} must use canonical path artifacts/PRODUCER/NAME.yaml|yml|json"
-                )
-            producer_name = relative.parts[1]
-            if name != path.stem:
-                raise ResourceModelError(
-                    f"Artifact metadata.name {name!r} in {path} must match filename stem {path.stem!r}"
-                )
-            producer = document.get("producer")
-            if not isinstance(producer, dict):
-                raise ResourceModelError(f"Artifact {path} requires a producer identity")
-            values = producer.get("apiVersion"), producer.get("kind"), producer.get("name")
-            if not all(isinstance(value, str) and value for value in values):
-                raise ResourceModelError(f"Artifact {path} has an invalid producer identity")
-            try:
-                GVK(cast(str, values[0]), cast(str, values[1]))
-            except ValueError as exc:
-                raise ResourceModelError(f"Artifact {path} has an invalid producer API kind: {exc}") from exc
-            if values[2] != producer_name:
-                raise ResourceModelError(
-                    f"Artifact producer name {values[2]!r} in {path} must match directory {producer_name!r}"
-                )
-            return (producer_name,)
-
-        # Project and Promotion have fixed collection-owned filenames; their
-        # semantic identities are validated by their executable contracts.
-        return ()
+    @staticmethod
+    def _local_identity(context: CollectionReadContext, qualified_name: str, name: str) -> LocalResourceIdentity:
+        values = tuple(
+            context.family.addressing.filter_value(qualified_name, segment.name, context.family.identity)
+            for segment in context.family.identity.segments
+        )
+        identity = context.family.identity.build(values)
+        if identity.values[-1] != name:
+            raise ResourceModelError(f"resource metadata.name {name!r} does not match its registered address identity")
+        return identity
 
 
 @dataclass(frozen=True)
@@ -1365,6 +1567,70 @@ class JsonFieldPath:
         return "/" + "/".join(self.parts)
 
 
+@dataclass(frozen=True)
+class PersistedQualifiedNameAddressing:
+    """Use a qualified parent or subject name persisted in relationship evidence."""
+
+    path: JsonFieldPath
+    parent_family: str
+    relationship: str
+    append_local_name: bool = False
+    requires_relationship_authentication: bool = True
+
+    @property
+    def parent_families(self) -> tuple[str, ...]:
+        return (self.parent_family,)
+
+    @property
+    def relationships(self) -> tuple[str, ...]:
+        return (self.relationship,)
+
+    def validate(self, value: str) -> None:
+        count = len(_address_segments(value))
+        minimum = 2 if self.append_local_name else 1
+        if count < minimum:
+            raise ResourceModelError(f"resource address requires at least {minimum} segment(s)")
+
+    def qualified_name(self, record: InspectionRecord, runtime: ResourceAddressRuntime) -> str:
+        parent = self.path.get(record.document)
+        if not isinstance(parent, str):
+            raise ResourceModelError(f"resource {record.name!r} has no persisted qualified parent name")
+        value = f"{parent}/{record.name}" if self.append_local_name else parent
+        self.validate(value)
+        return value
+
+    def storage_selection(self, value: str, identity: ResourceIdentityDefinition) -> ResourceSelection | None:
+        self.validate(value)
+        if not self.append_local_name and "/" not in value:
+            return ResourceSelection(exact=identity.parse(value))
+        return None
+
+    def storage_constraint(
+        self, segment: str, value: str, identity: ResourceIdentityDefinition
+    ) -> IdentityConstraint | None:
+        segment_names = tuple(item.name for item in identity.segments)
+        if segment not in segment_names:
+            raise ResourceModelError(f"resource addressing has no filter segment {segment!r}")
+        _address_segments(value)
+        return IdentityConstraint(segment, frozenset((value,))) if "/" not in value else None
+
+    def filter_value(self, qualified_name: str, segment: str, identity: ResourceIdentityDefinition) -> str:
+        parts = _address_segments(qualified_name)
+        segment_names = tuple(item.name for item in identity.segments)
+        if segment not in segment_names:
+            raise ResourceModelError(f"resource addressing has no filter segment {segment!r}")
+        if segment == "name":
+            return parts[-1]
+        if self.append_local_name and segment == segment_names[-2]:
+            return "/".join(parts[:-1])
+        raise ResourceModelError(f"resource addressing cannot derive filter segment {segment!r}")
+
+    def documentation(self) -> str:
+        if self.append_local_name:
+            return f"`parent-qualified-name/name` (child via `{self.relationship}`)"
+        return f"`subject-qualified-name` (mirror via `{self.relationship}`)"
+
+
 @runtime_checkable
 class ObservationBinding(Protocol):
     def subject_identity(self, observer: RelationshipResource) -> ResourceIdentity: ...
@@ -1463,6 +1729,7 @@ class ArtifactBindingDocumentation:
 @dataclass(frozen=True)
 class ArtifactResolutionContext:
     producer: RelationshipResource
+    producer_qualified_name: str
     artifacts_by_path: Mapping[PurePosixPath, RelationshipResource]
     declared_artifacts: Mapping[str, GVK]
     producer_observation: ObservationState | None
@@ -1528,7 +1795,7 @@ class ReceiptArtifactDescriptionBinding:
                 suffix = "yaml"
             else:
                 raise ResourceModelError(f"Receipt artifact descriptor {name!r} has an unsupported media type")
-            expected_path = PurePosixPath("artifacts", context.producer.identity.name, f"{name}.{suffix}")
+            expected_path = PurePosixPath("artifacts", context.producer_qualified_name, f"{name}.{suffix}")
             if path != expected_path:
                 raise ResourceModelError(
                     f"Receipt artifact descriptor {name!r} must use canonical path {expected_path}"
@@ -1554,7 +1821,7 @@ class ReceiptArtifactDescriptionBinding:
             if context.producer_observation is ObservationState.CURRENT:
                 self._validate_producer_pin(name, artifact, context.producer)
             links.append(ArtifactLink(name, artifact))
-        producer_root = PurePosixPath("artifacts", context.producer.identity.name)
+        producer_root = PurePosixPath("artifacts", context.producer_qualified_name)
         actual_paths = {path for path in context.artifacts_by_path if path.parent == producer_root}
         expected_paths = {link.artifact.path for link in links}
         if actual_paths != expected_paths:
@@ -1619,6 +1886,17 @@ class ArtifactDescriptionDefinition:
 
 
 @dataclass(frozen=True)
+class ResourceModelContribution:
+    """One plugin's declarative additions to the executable resource registry."""
+
+    collections: tuple[ResourceCollection, ...] = ()
+    families: tuple[ResourceFamilyDefinition, ...] = ()
+    observations: tuple[ObservationDefinition, ...] = ()
+    artifact_descriptions: tuple[ArtifactDescriptionDefinition, ...] = ()
+    graph_relationships: tuple[ResourceGraphRelationship, ...] = ()
+
+
+@dataclass(frozen=True)
 class ResourceRegistry:
     """Validated API family, placement, collection, and relationship definitions."""
 
@@ -1672,6 +1950,48 @@ class ResourceRegistry:
         for relationship in self.graph_relationships:
             self._claim_relationship_name(relationship.name, relationship_names)
             self._validate_graph_relationship(relationship, families)
+        address_edges = {
+            **{item.name: (item.observer_family, item.subject_family) for item in self.observations},
+            **{item.name: (item.artifact_family, item.producer_family) for item in self.artifact_descriptions},
+            **{item.name: (item.target_family, item.source_family) for item in self.graph_relationships},
+        }
+        for family in self.families:
+            missing_families = set(family.addressing.parent_families) - set(families)
+            missing_relationships = set(family.addressing.relationships) - relationship_names
+            if missing_families:
+                raise ResourceModelError(
+                    f"resource family {family.name!r} addressing references unknown families: "
+                    f"{', '.join(sorted(missing_families))}"
+                )
+            if missing_relationships:
+                raise ResourceModelError(
+                    f"resource family {family.name!r} addressing references unknown relationships: "
+                    f"{', '.join(sorted(missing_relationships))}"
+                )
+            for relationship_name in family.addressing.relationships:
+                child_family, parent_family = address_edges[relationship_name]
+                if child_family != family.name or parent_family not in family.addressing.parent_families:
+                    raise ResourceModelError(
+                        f"resource family {family.name!r} addressing relationship {relationship_name!r} "
+                        f"must connect it to one of its declared parent families"
+                    )
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit_addressing(name: str) -> None:
+            if name in visiting:
+                raise ResourceModelError("resource addressing relationships must be acyclic")
+            if name in visited:
+                return
+            visiting.add(name)
+            for parent in families[name].addressing.parent_families:
+                visit_addressing(parent)
+            visiting.remove(name)
+            visited.add(name)
+
+        for name in families:
+            visit_addressing(name)
         self._validate_inspection_relationships(families)
         artifact_outputs = self._validate_driver_artifact_outputs(family_by_gvk)
 
@@ -1727,6 +2047,12 @@ class ResourceRegistry:
             not isinstance(rule, ApiKindMembership) for rule in family.membership_rules
         ):
             raise ResourceModelError(f"resource family {family.name!r} has no executable API membership rule")
+        if not isinstance(family.addressing, ResourceAddressing):
+            raise ResourceModelError(f"resource family {family.name!r} has no executable address resolver")
+        if family.identity.separator != "/":
+            raise ResourceModelError(
+                f"resource family {family.name!r} identity must use the canonical '/' address separator"
+            )
         placement_keys: set[tuple[ResourcePlane, ResourceScope, str]] = set()
         defaults = 0
         for placement in family.placements:
@@ -2024,6 +2350,40 @@ class ResourceRegistry:
         except KeyError as exc:
             raise KeyError(f"unknown resource collection: {name!r}") from exc
 
+    def document_path(
+        self,
+        *,
+        family: str,
+        plane: ResourcePlane,
+        root: Path,
+        repository_root: Path,
+        project: Project,
+        environment: str | None,
+        qualified_name: str,
+        suffix: str,
+    ) -> Path:
+        """Encode a family address through its registered placement provider."""
+
+        definition = self.family(family)
+        placements = tuple(item for item in definition.placements if item.plane is plane)
+        if len(placements) != 1:
+            raise ResourceModelError(
+                f"resource family {definition.name!r} has {len(placements)} {plane.value!r} placements; expected one"
+            )
+        placement = placements[0]
+        collection = self.collection(placement.collection)
+        context = CollectionReadContext(
+            root=root,
+            repository_root=repository_root,
+            project=project,
+            environment=environment,
+            family=definition,
+            placement=placement,
+            api_kinds=self.api_kinds,
+            contracts=self.contracts_for(definition.name, placement.contract_profile),
+        )
+        return collection.provider.document_path(context, qualified_name, suffix)
+
     def observation(self, name: str) -> ObservationDefinition:
         try:
             return next(definition for definition in self.observations if definition.name == name)
@@ -2063,7 +2423,10 @@ def _placement(
     return ResourcePlacement(plane, scope, collection, profile, default)
 
 
-def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> ResourceRegistry:
+def build_resource_registry(
+    api_kinds: Mapping[GVK, ApiKind[object]],
+    contributions: Iterable[ResourceModelContribution] = (),
+) -> ResourceRegistry:
     """Build the built-in model around all installed core and plugin API kinds."""
 
     from gitopsctr.artifacts import ArtifactApi
@@ -2081,30 +2444,109 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
         plane: ResourcePlane,
         scope: ResourceScope,
         profiles: tuple[str, ...],
-        layout: CollectionLayout,
+        root: FilesystemCollectionRoot,
+        documents: FilesystemDocumentLayout,
+        *,
+        media_typed: bool = False,
     ) -> ResourceCollection:
         return ResourceCollection(
             name,
             plane,
             scope,
             frozenset(profiles),
-            FilesystemCollectionProvider(layout, media_typed=layout is CollectionLayout.OBSERVED_ARTIFACTS),
+            FilesystemCollectionProvider(root, documents, media_typed=media_typed),
         )
 
     collections = (
-        collection("source-project", source, project, ("authored",), CollectionLayout.PROJECT),
-        collection("source-environments", source, project, ("authored",), CollectionLayout.ENVIRONMENTS),
-        collection("source-units", source, environment, ("authored",), CollectionLayout.SOURCE_UNITS),
-        collection("source-stacks", source, environment, ("authored",), CollectionLayout.SOURCE_STACKS),
-        collection("source-stacktemplates", source, project, ("authored",), CollectionLayout.SOURCE_STACKTEMPLATES),
-        collection("desired-units", desired, environment, ("desired",), CollectionLayout.DESIRED_UNITS),
-        collection("desired-stacks", desired, environment, ("desired",), CollectionLayout.DESIRED_STACKS),
         collection(
-            "desired-stacktemplates", desired, environment, ("desired",), CollectionLayout.DESIRED_STACKTEMPLATES
+            "source-project",
+            source,
+            project,
+            ("authored",),
+            RepositoryRoot(),
+            FilesystemDocumentLayout.fixed(*PROJECT_CONFIG_NAMES),
         ),
-        collection("desired-promotions", desired, environment, ("desired",), CollectionLayout.DESIRED_PROMOTION),
-        collection("observed-receipts", observed, environment, ("observed",), CollectionLayout.OBSERVED_RECEIPTS),
-        collection("observed-artifacts", observed, environment, ("observed",), CollectionLayout.OBSERVED_ARTIFACTS),
+        collection(
+            "source-environments",
+            source,
+            project,
+            ("authored",),
+            EnvironmentDirectories(),
+            FilesystemDocumentLayout.directory_keyed("environment"),
+        ),
+        collection(
+            "source-units",
+            source,
+            environment,
+            ("authored",),
+            ProjectConfiguredDirectory("environments_path", "units", True),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "source-stacks",
+            source,
+            environment,
+            ("authored",),
+            ProjectConfiguredDirectory("environments_path", "stacks", True),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "source-stacktemplates",
+            source,
+            project,
+            ("authored",),
+            ProjectConfiguredDirectory("stack_templates_path"),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "desired-units",
+            desired,
+            environment,
+            ("desired",),
+            SnapshotSubdirectory("units"),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "desired-stacks",
+            desired,
+            environment,
+            ("desired",),
+            SnapshotSubdirectory("stacks"),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "desired-stacktemplates",
+            desired,
+            environment,
+            ("desired",),
+            SnapshotSubdirectory("stack-templates"),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "desired-promotions",
+            desired,
+            environment,
+            ("desired",),
+            RepositoryRoot(),
+            FilesystemDocumentLayout.fixed("promotion"),
+        ),
+        collection(
+            "observed-receipts",
+            observed,
+            environment,
+            ("observed",),
+            SnapshotSubdirectory("units"),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "observed-artifacts",
+            observed,
+            environment,
+            ("observed",),
+            SnapshotSubdirectory("artifacts"),
+            FilesystemDocumentLayout.addressed(),
+            media_typed=True,
+        ),
     )
 
     def core(kind: str) -> tuple[ApiKindMembership, ...]:
@@ -2148,6 +2590,7 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
                 artifact_description="receipt-describes-artifacts",
                 relationship_role=InspectionRelationshipRole.SUBJECT,
             ),
+            addressing=StackUnitResourceAddressing("stack-owns-unit", "stack"),
         ),
         ResourceFamilyDefinition(
             "stack",
@@ -2254,6 +2697,11 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
                 artifact_description="receipt-describes-artifacts",
                 relationship_role=InspectionRelationshipRole.OBSERVER,
             ),
+            addressing=PersistedQualifiedNameAddressing(
+                JsonFieldPath(("spec", "subject", "qualifiedName")),
+                "unit",
+                "receipt-observes-unit",
+            ),
         ),
         ResourceFamilyDefinition(
             "artifact",
@@ -2274,6 +2722,12 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
                     IdentitySegmentDefinition("producer", filter_option="--producer"),
                     IdentitySegmentDefinition("name"),
                 )
+            ),
+            addressing=PersistedQualifiedNameAddressing(
+                JsonFieldPath(("producer", "qualifiedName")),
+                "unit",
+                "receipt-describes-artifacts",
+                append_local_name=True,
             ),
         ),
     )
@@ -2330,4 +2784,18 @@ def build_resource_registry(api_kinds: Mapping[GVK, ApiKind[object]]) -> Resourc
             binding=StackOwnedUnitBinding(),
         ),
     )
-    return ResourceRegistry(api_kinds, collections, families, observations, artifact_descriptions, graph_relationships)
+    installed = tuple(contributions)
+    return ResourceRegistry(
+        api_kinds,
+        (*collections, *(item for contribution in installed for item in contribution.collections)),
+        (*families, *(item for contribution in installed for item in contribution.families)),
+        (*observations, *(item for contribution in installed for item in contribution.observations)),
+        (
+            *artifact_descriptions,
+            *(item for contribution in installed for item in contribution.artifact_descriptions),
+        ),
+        (
+            *graph_relationships,
+            *(item for contribution in installed for item in contribution.graph_relationships),
+        ),
+    )

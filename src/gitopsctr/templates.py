@@ -24,7 +24,7 @@ from gitopsctr.document import JsonObject, JsonScalar, JsonValue, require_json_v
 # document contract used by resolved JSON values.
 REFERENCE_KEYS = frozenset((*DOCUMENT_REFERENCE_KEYS, "fromEnvironment"))
 
-type ResourceName = Annotated[str, Pattern("^[a-z0-9][a-z0-9-]*$")]
+type ResourceName = Annotated[str, Pattern("^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$")]
 type JsonPointer = Annotated[str, Pattern("^(?:$|/(?:[^~]|~[01])*)$")]
 type ApiVersion = Annotated[str, Pattern("^[^/]+/[^/]+$")]
 type Kind = Annotated[str, Pattern("^[A-Z][A-Za-z0-9]*$")]
@@ -246,7 +246,7 @@ class ParameterTemplateObject(dict[str, ParameterTemplateValue], SerializableTyp
         return cls(parsed)
 
 
-_RESOURCE_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+_RESOURCE_NAME = re.compile(r"[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*")
 _KIND = re.compile(r"[A-Z][A-Za-z0-9]*")
 
 

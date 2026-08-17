@@ -1,6 +1,6 @@
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -70,8 +70,10 @@ def receipt_document(
     resolved_inputs: dict[str, object] | None = None,
     controller: dict[str, object] | None = None,
     artifacts: dict[str, object] | None = None,
+    qualified_name: str | None = None,
 ) -> dict[str, object]:
     plugin = controller_module.UNIT_DRIVERS[driver]
+    local_name = PurePosixPath(unit).name
     if result is None and driver == "terraform":
         result = {"applied": {"sourceRevision": "0" * 40}, "outputs": {}}
     typed_result = plugin.result_contract.parse(result or {})
@@ -79,9 +81,14 @@ def receipt_document(
         "$schema": controller_module.resource_schema_url(plugin.api_version, plugin.kind, "receipt"),
         "apiVersion": "gitopsctr.io/v1",
         "kind": "Receipt",
-        "metadata": {"name": unit},
+        "metadata": {"name": local_name},
         "spec": {
-            "subject": {"apiVersion": plugin.api_version, "kind": plugin.kind, "name": unit},
+            "subject": {
+                "apiVersion": plugin.api_version,
+                "kind": plugin.kind,
+                "name": local_name,
+                "qualifiedName": qualified_name or unit,
+            },
             "desired": desired,
         },
         "status": {
@@ -105,6 +112,7 @@ def receipt_resource(
     resolved_inputs: dict[str, object] | None = None,
     controller: dict[str, object] | None = None,
     artifacts: dict[str, object] | None = None,
+    qualified_name: str | None = None,
 ):
     if artifacts is None:
         plugin = controller_module.UNIT_DRIVERS[driver]
@@ -128,8 +136,9 @@ def receipt_resource(
             resolved_inputs=resolved_inputs,
             controller=controller,
             artifacts=artifacts,
+            qualified_name=qualified_name,
         ),
-        unit,
+        PurePosixPath(unit).name,
     )
 
 

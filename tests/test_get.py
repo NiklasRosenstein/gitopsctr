@@ -773,6 +773,7 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
             "apiVersion": "unit.gitopsctr.io/v1",
             "kind": "OciImages",
             "name": "images",
+            "qualifiedName": "images",
             "driverVersion": 1,
             "sourceRevision": "a" * 40,
             "inputHashVersion": 1,
@@ -789,7 +790,12 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
             "kind": "Receipt",
             "metadata": {"name": "images"},
             "spec": {
-                "subject": {"apiVersion": "unit.gitopsctr.io/v1", "kind": "OciImages", "name": "images"},
+                "subject": {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "OciImages",
+                    "name": "images",
+                    "qualifiedName": "images",
+                },
                 "desired": {"unitBlob": desired_blob},
             },
             "status": {
@@ -885,6 +891,7 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
     inventory_support.git(repository, "checkout", "observed")
     orphan_artifact = json.loads(json.dumps(artifact))
     orphan_artifact["producer"]["name"] = "orphan"
+    orphan_artifact["producer"]["qualifiedName"] = "orphan"
     inventory_support.write_json(repository / "artifacts/orphan/containers.yaml", orphan_artifact)
     orphan_revision = inventory_support.commit(repository, "orphan artifact")
     inventory_support.git(
@@ -983,7 +990,7 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
     with pytest.raises(OperationError, match="--producer is not available for units"):
         run_get(repository, capsys, "units", "--environment", "dev", "--producer", "images")
 
-    with pytest.raises(OperationError, match="expected PRODUCER/NAME"):
+    with pytest.raises(OperationError, match="requires at least 2 segment"):
         run_get(repository, capsys, "artifact", "containers", "--environment", "dev")
 
     with pytest.raises(OperationError, match="has no artifact named 'missing'"):

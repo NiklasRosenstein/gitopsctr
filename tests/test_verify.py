@@ -1,6 +1,7 @@
 """Driver-neutral deployment verification and explicit reconciliation reapplication."""
 
 import json
+import shutil
 from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
@@ -14,6 +15,7 @@ from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import ReconciliationOutput, VerificationContext, VerificationResult, VerificationStatus
 from gitopsctr.resources import ResourceMetadata, UnitResource
 from tests.conftest import receipt_document
+from tests.stack_deletion_support import stack_tree
 
 
 @pytest.fixture(autouse=True)
@@ -180,6 +182,34 @@ def test_verify_deduplicates_selected_units_and_reports_clean(monkeypatch, capsy
     assert calls == ["infrastructure"]
     assert materialized == [DESIRED_REVISION, "b" * 40]
     assert "RESULT   CLEAN" in capsys.readouterr().err
+
+
+def test_verify_resolves_stack_owned_unit_storage_path(tmp_path, monkeypatch):
+    snapshot = tmp_path / "snapshot"
+    _stack_uid, qualified_name = stack_tree(snapshot)
+    calls: list[VerificationContext] = []
+    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args: ("deploy/dev", "observed/dev"))
+    monkeypatch.setattr(deploy_release, "resolve_ref", lambda *_args: DESIRED_REVISION)
+
+    def materialize(revision: str, output: Path) -> None:
+        if revision == DESIRED_REVISION:
+            shutil.copytree(snapshot, output)
+        else:
+            output.mkdir(parents=True)
+
+    monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
+    monkeypatch.setattr(deploy_release, "_hydrate_stack_workload_pin_for_unit", lambda *_args: None)
+    monkeypatch.setitem(
+        deploy_release.VERIFICATION_DRIVERS,
+        "terraform",
+        SimpleNamespace(verify=lambda context: calls.append(context) or VerificationResult(VerificationStatus.CLEAN)),
+    )
+
+    deploy_release.command_verify(Namespace(environment="dev", unit=[qualified_name]))
+
+    assert len(calls) == 1
+    assert calls[0].unit_name == "preview-app"
+    assert calls[0].qualified_name == qualified_name
 
 
 def test_verify_preflights_unsupported_drivers_before_running_any_unit(monkeypatch):

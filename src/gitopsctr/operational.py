@@ -117,9 +117,7 @@ def validate_unit_materialization(desired_root: Path, unit_name: str, unit: Unit
         return
     if descriptor is None:
         raise OperationError(f"{unit_name} has an invalid materialization descriptor")
-    expected_path = f"materialized/{unit_name}"
-    if descriptor.path != expected_path:
-        raise OperationError(f"{unit_name} materialization path must be {expected_path}")
+    expected_path = PurePosixPath("materialized", *unit_name.split("/"))
     if not isinstance(descriptor.digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", descriptor.digest):
         raise OperationError(f"{unit_name} has an invalid materialization digest")
     if not descriptor.mediaType:

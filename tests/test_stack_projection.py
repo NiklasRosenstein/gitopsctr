@@ -519,8 +519,8 @@ def test_first_projection_omits_transitively_blocked_dependency_descendants(
     assert isinstance(stack_resource.spec, DesiredStackSpec)
     assert stack_resource.spec.activeProjection is not None
     assert set(stack_resource.spec.activeProjection.units) == {"a"}
-    assert not controller.unit_document_path(_root, "web--b").exists()
-    assert not controller.unit_document_path(_root, "web--c").exists()
+    assert not controller.unit_document_path(_root, "web/b").exists()
+    assert not controller.unit_document_path(_root, "web/c").exists()
 
 
 def test_apply_template_and_stack_together_publishes_one_fenced_projection(
@@ -550,7 +550,7 @@ def test_apply_template_and_stack_together_publishes_one_fenced_projection(
     assert desired_stack.spec.structuralProjection.identity.stackUid == desired_stack.metadata.uid
     assert desired_stack.spec.structuralProjection.identity.templateUid == desired_template.metadata.uid
 
-    generated = controller.load_desired_unit(controller.unit_document_path(root, "web--app"), "web--app")
+    generated = controller.load_desired_unit(controller.unit_document_path(root, "web/app"), "web/app")
     owner = controller.resource_owner_reference(generated)
     assert owner is not None
     assert owner.uid == desired_stack.metadata.uid
@@ -571,7 +571,7 @@ def test_template_update_preserves_identities_and_fans_out_to_two_stacks_atomica
     first_template = first_resources[("gitopsctr.io/v1", "StackTemplate", "preview")]
     assert isinstance(first_template.spec, DesiredStackTemplateSpec)
     first_units = {
-        name: controller.load_desired_unit(controller.unit_document_path(first_root, f"{name}--app"), f"{name}--app")
+        name: controller.load_desired_unit(controller.unit_document_path(first_root, f"{name}/app"), f"{name}/app")
         for name in ("web", "worker")
     }
 
@@ -591,7 +591,7 @@ def test_template_update_preserves_identities_and_fans_out_to_two_stacks_atomica
         assert stack.metadata.uid == first_stack.metadata.uid
         assert stack.spec.templateRef.contentDigest == second_template.spec.contentDigest
         assert stack.spec.structuralProjection.identity.templateContentDigest == second_template.spec.contentDigest
-        unit = controller.load_desired_unit(controller.unit_document_path(root, f"{name}--app"), f"{name}--app")
+        unit = controller.load_desired_unit(controller.unit_document_path(root, f"{name}/app"), f"{name}/app")
         assert unit.spec != first_units[name].spec
         assert unit.spec.terraform.variables == {"description": "v2"}  # type: ignore[union-attr]
         assert stack.spec.activeProjection is not None
@@ -629,7 +629,7 @@ def test_stacks_select_and_retain_exact_workload_revisions_independently(
     input_hashes = {}
     pins = {pin.name for pin in store.list_controller_pins()}
     for name in ("web", "worker"):
-        unit = controller.load_desired_unit(controller.unit_document_path(root, f"{name}--app"), f"{name}--app")
+        unit = controller.load_desired_unit(controller.unit_document_path(root, f"{name}/app"), f"{name}/app")
         revisions[name] = unit.spec.source.revision  # type: ignore[union-attr]
         input_hashes[name] = unit.spec.source.inputHash  # type: ignore[union-attr]
         stack = resources[("gitopsctr.io/v1", "Stack", name)]
@@ -647,7 +647,7 @@ def test_stacks_select_and_retain_exact_workload_revisions_independently(
     assert published is not None
     root, _resources = desired_stack_resources(store, published, tmp_path / "retained-overrides")
     for name, expected in (("web", first_revision), ("worker", second_revision)):
-        unit = controller.load_desired_unit(controller.unit_document_path(root, f"{name}--app"), f"{name}--app")
+        unit = controller.load_desired_unit(controller.unit_document_path(root, f"{name}/app"), f"{name}/app")
         assert unit.spec.source.revision == expected  # type: ignore[union-attr]
 
 
@@ -706,7 +706,7 @@ def test_inherited_workload_revision_advances_with_template_context(tmp_path: Pa
     first_published = _apply(source, first_revision, template, stack)
     assert first_published is not None
     first_root, _resources = desired_stack_resources(store, first_published, tmp_path / "inherited-first")
-    first_unit = controller.load_desired_unit(controller.unit_document_path(first_root, "web--app"), "web--app")
+    first_unit = controller.load_desired_unit(controller.unit_document_path(first_root, "web/app"), "web/app")
     assert first_unit.spec.source.revision == first_revision  # type: ignore[union-attr]
 
     (source / "workload.txt").write_text("revision-b\n")
@@ -714,7 +714,7 @@ def test_inherited_workload_revision_advances_with_template_context(tmp_path: Pa
     second_published = _apply(source, second_revision, template)
     assert second_published is not None
     second_root, _resources = desired_stack_resources(store, second_published, tmp_path / "inherited-second")
-    second_unit = controller.load_desired_unit(controller.unit_document_path(second_root, "web--app"), "web--app")
+    second_unit = controller.load_desired_unit(controller.unit_document_path(second_root, "web/app"), "web/app")
     assert second_unit.spec.source.revision == second_revision  # type: ignore[union-attr]
     assert second_unit.spec.source.inputHash != first_unit.spec.source.inputHash  # type: ignore[union-attr]
 
@@ -746,8 +746,8 @@ def test_stack_projection_wait_stages_ready_units_then_durable_evidence_switches
     assert isinstance(first_stack.spec, DesiredStackSpec)
     assert first_stack.spec.activeProjection is not None
     assert set(first_stack.spec.activeProjection.units) == {"a", "b"}
-    first_a_bytes = controller.unit_document_path(first_root, "web--a").read_bytes()
-    first_b_bytes = controller.unit_document_path(first_root, "web--b").read_bytes()
+    first_a_bytes = controller.unit_document_path(first_root, "web/a").read_bytes()
+    first_b_bytes = controller.unit_document_path(first_root, "web/b").read_bytes()
 
     write_atomic_template(template, version="v2", blocked_b=True)
     second_source_revision = commit(source, "block one updated Stack child")
@@ -769,12 +769,12 @@ def test_stack_projection_wait_stages_ready_units_then_durable_evidence_switches
         second_stack.spec.activeProjection.units["b"].sourceProjectionDigest
         == first_stack.spec.activeProjection.units["b"].sourceProjectionDigest
     )
-    assert controller.unit_document_path(second_root, "web--a").read_bytes() != first_a_bytes
-    assert controller.unit_document_path(second_root, "web--b").read_bytes() == first_b_bytes
+    assert controller.unit_document_path(second_root, "web/a").read_bytes() != first_a_bytes
+    assert controller.unit_document_path(second_root, "web/b").read_bytes() == first_b_bytes
     assert controller.load_desired_unit(
-        controller.unit_document_path(second_root, "web--a"), "web--a"
+        controller.unit_document_path(second_root, "web/a"), "web/a"
     ).spec.terraform.variables == {"version": "v2"}  # type: ignore[union-attr]
-    assert controller.load_desired_transition_blocks(second_root)["web--b"]
+    assert controller.load_desired_transition_blocks(second_root)["web/b"]
 
     producer_path = controller.unit_document_path(second_root, "producer")
     observed = tmp_path / "observed"
@@ -822,10 +822,10 @@ def test_stack_projection_wait_stages_ready_units_then_durable_evidence_switches
     )
     assert set(final_stack.spec.activeProjection.units) == {"a", "b"}
     assert controller.load_desired_unit(
-        controller.unit_document_path(final_root, "web--a"), "web--a"
+        controller.unit_document_path(final_root, "web/a"), "web/a"
     ).spec.terraform.variables == {"version": "v2"}  # type: ignore[union-attr]
     assert controller.load_desired_unit(
-        controller.unit_document_path(final_root, "web--b"), "web--b"
+        controller.unit_document_path(final_root, "web/b"), "web/b"
     ).spec.terraform.variables == {"producer": "evidence"}  # type: ignore[union-attr]
 
 
@@ -849,17 +849,17 @@ def test_stack_source_update_stages_changed_producer_before_its_stale_receipt_co
     assert first_stack.spec.activeProjection is not None
     assert set(first_stack.spec.activeProjection.units) == {"image"}
 
-    image_path = controller.unit_document_path(first_root, "web--image")
+    image_path = controller.unit_document_path(first_root, "web/image")
     observed = tmp_path / "receipt-observed"
     observed.mkdir()
     receipt = receipt_resource(
         "terraform",
-        "web--image",
+        "web/image",
         {"revision": first_revision, "unitBlob": controller.file_blob(image_path)},
         result={"applied": {"sourceRevision": first_revision}, "outputs": {"value": "image-v1"}},
     )
     controller.write_document(
-        observed / "units/web--image.json",
+        observed / "units/web/image.json",
         controller.RESOURCE_CATALOG.serialize_receipt(receipt),
         format=controller.DocumentFormat.JSON,
     )
@@ -876,9 +876,9 @@ def test_stack_source_update_stages_changed_producer_before_its_stale_receipt_co
     assert isinstance(second_stack.spec, DesiredStackSpec)
     assert second_stack.spec.activeProjection is not None
     assert set(second_stack.spec.activeProjection.units) == {"deploy", "image"}
-    assert controller.load_desired_transition_blocks(second_root)["web--deploy"].startswith("receipt is stale")
-    image = controller.load_desired_unit(controller.unit_document_path(second_root, "web--image"), "web--image")
-    deploy = controller.load_desired_unit(controller.unit_document_path(second_root, "web--deploy"), "web--deploy")
+    assert controller.load_desired_transition_blocks(second_root)["web/deploy"].startswith("receipt is stale")
+    image = controller.load_desired_unit(controller.unit_document_path(second_root, "web/image"), "web/image")
+    deploy = controller.load_desired_unit(controller.unit_document_path(second_root, "web/deploy"), "web/deploy")
     assert image.spec.source.revision == second_revision  # type: ignore[union-attr]
     assert deploy.spec.source.revision == first_revision  # type: ignore[union-attr]
     assert (
@@ -950,15 +950,15 @@ def test_durable_projection_progresses_saved_context_groups_cumulatively(
         for stack_name in ("web", "worker"):
             stack = final_resources[("gitopsctr.io/v1", "Stack", stack_name)]
             assert isinstance(stack.spec, DesiredStackSpec)
-            unit_path = controller.unit_document_path(final_root, f"{stack_name}--app")
+            unit_path = controller.unit_document_path(final_root, f"{stack_name}/app")
             if stack_name in ready:
                 assert stack.spec.activeProjection is not None
                 assert set(stack.spec.activeProjection.units) == {"app"}
                 assert unit_path.is_file()
-                assert f"{stack_name}--app" not in blocks
+                assert f"{stack_name}/app" not in blocks
             else:
                 assert not unit_path.is_file()
-                assert f"{stack_name}--app" in blocks
+                assert f"{stack_name}/app" in blocks
 
     # A non-minimum context must progress without consulting the deleted live
     # Project/Environment files. This catches starvation by digest ordering.
@@ -1063,8 +1063,8 @@ def test_blocked_topology_switch_drops_new_resolved_children_until_activation(
     assert stack_resource.spec.activeProjection is not None
     assert set(stack_resource.spec.activeProjection.units) == {"a", "b"}
     assert stack_resource.spec.activeProjection.units["b"].dependsOn == []
-    assert not controller.unit_document_path(root, "web--c").exists()
-    assert controller.stack_dependency_edges(resources)["web--b"] == ()
+    assert not controller.unit_document_path(root, "web/c").exists()
+    assert controller.stack_dependency_edges(resources)["web/b"] == ()
 
 
 def test_canonical_stacktemplate_update_recomputes_fanout_and_ignores_caller_identity(
@@ -1150,7 +1150,7 @@ def test_canonical_stacktemplate_update_recomputes_fanout_and_ignores_caller_ide
     for name in ("web", "worker"):
         stack_resource = resources[("gitopsctr.io/v1", "Stack", name)]
         assert stack_resource.metadata.uid == first_resources[("gitopsctr.io/v1", "Stack", name)].metadata.uid
-        unit = controller.load_desired_unit(controller.unit_document_path(root, f"{name}--app"), f"{name}--app")
+        unit = controller.load_desired_unit(controller.unit_document_path(root, f"{name}/app"), f"{name}/app")
         assert unit.spec.terraform.variables == {"description": "v2"}  # type: ignore[union-attr]
 
     invalid_stack = replace(
@@ -1205,7 +1205,7 @@ def test_template_only_partition_apply_prunes_stack_fanout_but_keeps_template_ac
     desired_stack = resources[("gitopsctr.io/v1", "Stack", "web")]
     assert controller.resource_deletion(desired_template) is None
     assert controller.resource_deletion(desired_stack) is not None
-    owned = resources[("unit.gitopsctr.io/v1", "Terraform", "web--app")]
+    owned = resources[("unit.gitopsctr.io/v1", "Terraform", "web/app")]
     assert controller.resource_deletion(owned) is not None
 
 
@@ -1227,8 +1227,8 @@ def test_unrelated_stack_roots_and_owned_closures_are_carried_byte_for_byte(
             (first / "stack-templates", "preview"),
             (first / "stacks", "web"),
             (first / "stacks", "worker"),
-            (first / "units", "web--app"),
-            (first / "units", "worker--app"),
+            (first / "units", "web/app"),
+            (first / "units", "worker/app"),
         )
     )
     preserved = {path.relative_to(first): path.read_bytes() for path in preserved_paths}
@@ -1261,7 +1261,7 @@ def test_later_stack_apply_uses_persisted_template_source_context_without_a_revi
     assert isinstance(desired_template.spec, DesiredStackTemplateSpec)
     assert desired_template.spec.sourceContext is not None
     assert desired_template.spec.sourceContext.revision == template_revision
-    generated = controller.load_desired_unit(controller.unit_document_path(root, "web--app"), "web--app")
+    generated = controller.load_desired_unit(controller.unit_document_path(root, "web/app"), "web/app")
     assert generated.spec.source.revision == template_revision  # type: ignore[union-attr]
 
 
@@ -1301,7 +1301,7 @@ def test_revision_backed_stacktemplate_preserves_support_payload_under_template_
     published = _apply(source, revision, template, stack)
     assert published is not None
     root, _resources = desired_stack_resources(store, published, tmp_path / "support-payload")
-    generated = controller.load_desired_unit(controller.unit_document_path(root, "web--app"), "web--app")
+    generated = controller.load_desired_unit(controller.unit_document_path(root, "web/app"), "web/app")
     assert generated.spec.source.path == "deployment/stack-templates/support"  # type: ignore[union-attr]
     assert generated.spec.source.revision == revision  # type: ignore[union-attr]
 
@@ -1348,7 +1348,7 @@ def test_object_parameter_source_context_is_pinned_for_later_stack_apply(
     assert isinstance(template_resource.spec, DesiredStackTemplateSpec)
     assert template_resource.spec.sourceContext is not None
     assert template_resource.spec.sourceContext.revision == template_revision
-    generated = controller.load_desired_unit(controller.unit_document_path(root, "web--app"), "web--app")
+    generated = controller.load_desired_unit(controller.unit_document_path(root, "web/app"), "web/app")
     assert generated.spec.source.revision == template_revision  # type: ignore[union-attr]
 
 
@@ -1363,12 +1363,12 @@ def test_concrete_stack_unit_tampering_breaks_active_projection_binding(
     assert published is not None
     desired = tmp_path / "tampered"
     store.materialize(published, desired)
-    unit_path = controller.unit_document_path(desired, "web--app")
+    unit_path = controller.unit_document_path(desired, "web/app")
     document = controller.RESOURCE_CATALOG.load_document(unit_path)
     document["spec"]["terraform"]["variables"] = {"description": "tampered"}  # type: ignore[index]
     unit_path.write_text(json.dumps(document))
 
-    with pytest.raises(OperationError, match="does not authenticate Unit 'web--app'"):
+    with pytest.raises(OperationError, match="does not authenticate Unit 'app'"):
         controller.load_desired_resource_graph(desired)
 
 
@@ -1397,8 +1397,8 @@ def test_dynamic_unit_projection_waits_without_active_evidence(tmp_path: Path, m
     assert desired_stack.spec.structuralProjection.units["app"].spec["terraform"]
     assert desired_stack.spec.activeProjection is not None
     assert desired_stack.spec.activeProjection.units == {}
-    assert not controller.unit_document_path(root, "web--app").exists()
-    assert "web--app" in controller.load_desired_transition_blocks(root)
+    assert not controller.unit_document_path(root, "web/app").exists()
+    assert "web/app" in controller.load_desired_transition_blocks(root)
 
 
 def test_durable_projection_does_not_create_a_provenance_only_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1447,7 +1447,7 @@ def test_projected_unit_from_environment_reference_resolves_through_normal_unit_
     published = _apply(source, revision, template, stack)
     assert published is not None
     root, _resources = desired_stack_resources(store, published, tmp_path / "environment-reference")
-    generated = controller.load_desired_unit(controller.unit_document_path(root, "web--app"), "web--app")
+    generated = controller.load_desired_unit(controller.unit_document_path(root, "web/app"), "web/app")
     assert generated.spec.terraform.variables == {"environment": "dev"}  # type: ignore[union-attr]
 
 

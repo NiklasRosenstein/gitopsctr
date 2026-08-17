@@ -18,7 +18,7 @@ def _stack(root: Path):
 
 
 def _unit(root: Path):
-    return controller.load_desired_unit(root / "units/preview--preview-app.json", "preview--preview-app")
+    return controller.load_desired_unit(root / "units/preview/preview-app.json", "preview/preview-app")
 
 
 def _publish_snapshots(tmp_path: Path):

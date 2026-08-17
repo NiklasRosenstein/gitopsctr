@@ -70,7 +70,7 @@
                 },
                 "unit": {
                   "description": "Logical name of the unit that provides the referenced value.",
-                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                   "type": "string"
                 }
               },
@@ -101,7 +101,7 @@
                 },
                 "unit": {
                   "description": "Logical name of the unit that provides the referenced value.",
-                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                   "type": "string"
                 }
               },
@@ -131,7 +131,7 @@
                 },
                 "unit": {
                   "description": "Promoted source unit name; omit it to use the target unit name.",
-                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                   "type": "string"
                 }
               },
@@ -162,7 +162,7 @@
                 },
                 "unit": {
                   "description": "Logical name of the unit that provides the referenced value.",
-                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                   "type": "string"
                 }
               },
@@ -296,7 +296,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -341,7 +341,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -376,7 +376,7 @@
                                 },
                                 "unit": {
                                   "description": "Promoted source unit name; omit it to use the target unit name.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -402,7 +402,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -448,7 +448,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -493,7 +493,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -528,7 +528,7 @@
                                 },
                                 "unit": {
                                   "description": "Promoted source unit name; omit it to use the target unit name.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -554,7 +554,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -600,7 +600,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -645,7 +645,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -680,7 +680,7 @@
                                 },
                                 "unit": {
                                   "description": "Promoted source unit name; omit it to use the target unit name.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -706,7 +706,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -757,7 +757,7 @@
                                         },
                                         "unit": {
                                           "description": "Logical name of the unit that provides the referenced value.",
-                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                           "type": "string"
                                         }
                                       },
@@ -802,7 +802,7 @@
                                         },
                                         "unit": {
                                           "description": "Logical name of the unit that provides the referenced value.",
-                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                           "type": "string"
                                         }
                                       },
@@ -837,7 +837,7 @@
                                         },
                                         "unit": {
                                           "description": "Promoted source unit name; omit it to use the target unit name.",
-                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                           "type": "string"
                                         }
                                       },
@@ -863,7 +863,7 @@
                                         },
                                         "unit": {
                                           "description": "Logical name of the unit that provides the referenced value.",
-                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                           "type": "string"
                                         }
                                       },
@@ -910,7 +910,7 @@
                                                 },
                                                 "unit": {
                                                   "description": "Logical name of the unit that provides the referenced value.",
-                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                                   "type": "string"
                                                 }
                                               },
@@ -955,7 +955,7 @@
                                                 },
                                                 "unit": {
                                                   "description": "Logical name of the unit that provides the referenced value.",
-                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                                   "type": "string"
                                                 }
                                               },
@@ -990,7 +990,7 @@
                                                 },
                                                 "unit": {
                                                   "description": "Promoted source unit name; omit it to use the target unit name.",
-                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                                   "type": "string"
                                                 }
                                               },
@@ -1016,7 +1016,7 @@
                                                 },
                                                 "unit": {
                                                   "description": "Logical name of the unit that provides the referenced value.",
-                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                                   "type": "string"
                                                 }
                                               },
@@ -1058,7 +1058,7 @@
                                                 },
                                                 "unit": {
                                                   "description": "Logical name of the unit that provides the referenced value.",
-                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                                   "type": "string"
                                                 }
                                               },
@@ -1103,7 +1103,7 @@
                                                 },
                                                 "unit": {
                                                   "description": "Logical name of the unit that provides the referenced value.",
-                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                                   "type": "string"
                                                 }
                                               },
@@ -1138,7 +1138,7 @@
                                                 },
                                                 "unit": {
                                                   "description": "Promoted source unit name; omit it to use the target unit name.",
-                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                                   "type": "string"
                                                 }
                                               },
@@ -1164,7 +1164,7 @@
                                                 },
                                                 "unit": {
                                                   "description": "Logical name of the unit that provides the referenced value.",
-                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                                   "type": "string"
                                                 }
                                               },
@@ -1206,7 +1206,7 @@
                                                 },
                                                 "unit": {
                                                   "description": "Logical name of the unit that provides the referenced value.",
-                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                                   "type": "string"
                                                 }
                                               },
@@ -1251,7 +1251,7 @@
                                                 },
                                                 "unit": {
                                                   "description": "Logical name of the unit that provides the referenced value.",
-                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                                   "type": "string"
                                                 }
                                               },
@@ -1286,7 +1286,7 @@
                                                 },
                                                 "unit": {
                                                   "description": "Promoted source unit name; omit it to use the target unit name.",
-                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                                   "type": "string"
                                                 }
                                               },
@@ -1312,7 +1312,7 @@
                                                 },
                                                 "unit": {
                                                   "description": "Logical name of the unit that provides the referenced value.",
-                                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                                   "type": "string"
                                                 }
                                               },
@@ -1358,7 +1358,7 @@
                                         },
                                         "unit": {
                                           "description": "Logical name of the unit that provides the referenced value.",
-                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                           "type": "string"
                                         }
                                       },
@@ -1403,7 +1403,7 @@
                                         },
                                         "unit": {
                                           "description": "Logical name of the unit that provides the referenced value.",
-                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                           "type": "string"
                                         }
                                       },
@@ -1438,7 +1438,7 @@
                                         },
                                         "unit": {
                                           "description": "Promoted source unit name; omit it to use the target unit name.",
-                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                           "type": "string"
                                         }
                                       },
@@ -1464,7 +1464,7 @@
                                         },
                                         "unit": {
                                           "description": "Logical name of the unit that provides the referenced value.",
-                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                           "type": "string"
                                         }
                                       },
@@ -1506,7 +1506,7 @@
                                         },
                                         "unit": {
                                           "description": "Logical name of the unit that provides the referenced value.",
-                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                           "type": "string"
                                         }
                                       },
@@ -1551,7 +1551,7 @@
                                         },
                                         "unit": {
                                           "description": "Logical name of the unit that provides the referenced value.",
-                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                           "type": "string"
                                         }
                                       },
@@ -1586,7 +1586,7 @@
                                         },
                                         "unit": {
                                           "description": "Promoted source unit name; omit it to use the target unit name.",
-                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                           "type": "string"
                                         }
                                       },
@@ -1612,7 +1612,7 @@
                                         },
                                         "unit": {
                                           "description": "Logical name of the unit that provides the referenced value.",
-                                          "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                          "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                           "type": "string"
                                         }
                                       },
@@ -1658,7 +1658,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -1703,7 +1703,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -1738,7 +1738,7 @@
                                 },
                                 "unit": {
                                   "description": "Promoted source unit name; omit it to use the target unit name.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -1764,7 +1764,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -1810,7 +1810,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -1855,7 +1855,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -1890,7 +1890,7 @@
                                 },
                                 "unit": {
                                   "description": "Promoted source unit name; omit it to use the target unit name.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },
@@ -1916,7 +1916,7 @@
                                 },
                                 "unit": {
                                   "description": "Logical name of the unit that provides the referenced value.",
-                                  "pattern": "^[a-z0-9][a-z0-9-]*$",
+                                  "pattern": "^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
                                   "type": "string"
                                 }
                               },

@@ -272,6 +272,22 @@ def test_oci_images_without_provider_uses_existing_docker_auth(tmp_path, monkeyp
     assert f"| AUTH {REGISTRY}: existing Docker credentials or anonymous access" in capsys.readouterr().err
 
 
+def test_oci_images_artifact_records_local_and_qualified_producer_names(tmp_path, monkeypatch):
+    monkeypatch.setattr(oci_images, "oci_digest", lambda *_args, **_kwargs: DIGEST)
+    context = replace(
+        _oci_context(tmp_path),
+        unit_name="image",
+        qualified_name="application/image",
+        execution=execution_for(lambda *_args, **_kwargs: None),
+    )
+
+    result = oci_images.DRIVER.reconcile(context)
+
+    producer = result.artifacts["containers"]["producer"]
+    assert producer["name"] == "image"
+    assert producer["qualifiedName"] == "application/image"
+
+
 @pytest.mark.parametrize(
     ("provider", "targets", "message"),
     (

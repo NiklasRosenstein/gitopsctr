@@ -24,6 +24,7 @@ from gitopsctr.contracts import (
     DesiredStackSpec,
     DesiredStackTemplateDocument,
     DesiredStackTemplateSpec,
+    QualifiedResourceName,
     ReceiptDesired,
     ResolvedInputs,
     StackDocument,
@@ -235,9 +236,9 @@ def _resolved_stack_projection(stack: StackResource) -> tuple[_ProjectedStackUni
                 logical_name=logical_name,
                 api_version=api_version,
                 kind=kind,
-                name=stack_generated_unit_name(stack.name, logical_name),
+                name=logical_name,
                 spec=dump_template_value(cast(TemplateValue, value.spec)),
-                dependencies=tuple(stack_generated_unit_name(stack.name, dependency) for dependency in dependencies),
+                dependencies=tuple(dependencies),
             )
         )
     return tuple(projected)
@@ -288,9 +289,9 @@ def _resource_template_projection(
             logical_name=resource.name,
             api_version=resource.apiVersion,
             kind=resource.kind,
-            name=stack_generated_unit_name(stack.name, resource.name),
+            name=resource.name,
             spec=normalized_spec(resource),
-            dependencies=tuple(stack_generated_unit_name(stack.name, dependency) for dependency in resource.dependsOn),
+            dependencies=tuple(resource.dependsOn),
         )
         for resource in expanded
     )
@@ -389,7 +390,9 @@ def _validate_stack_projection(
         # that is absent from the new structural projection until the complete
         # transition resolves.
         for binding in active_units.values():
-            generated_resource = identities.get((binding.apiVersion, binding.kind, binding.name))
+            generated_resource = identities.get(
+                (binding.apiVersion, binding.kind, stack_generated_unit_name(stack.name, binding.name))
+            )
             if not isinstance(generated_resource, UnitResource):
                 raise ValueError(f"Stack {stack.name!r} stale active projection is missing Unit {binding.name!r}")
             owner_references = generated_resource.metadata.ownerReferences
@@ -411,7 +414,10 @@ def _validate_stack_projection(
                     f"Stack {stack.name!r} stale active projection Unit {binding.name!r} depends on "
                     f"non-active Unit(s): {', '.join(missing_dependencies)}"
                 )
-        active_keys = {(binding.apiVersion, binding.kind, binding.name) for binding in active_units.values()}
+            active_keys = {
+                (binding.apiVersion, binding.kind, stack_generated_unit_name(stack.name, binding.name))
+                for binding in active_units.values()
+            }
         unexpected = [
             resource
             for key, resource in actual_owned.items()
@@ -432,13 +438,19 @@ def _validate_stack_projection(
         if binding is None:
             # A structurally valid Unit may be absent while its dynamic inputs
             # wait, or may still be represented by a deleting old child.
-            stale = actual_owned.get((generated.api_version, generated.kind, generated.name))
+            stale = actual_owned.get(
+                (generated.api_version, generated.kind, stack_generated_unit_name(stack.name, generated.name))
+            )
             if stale is not None and stale.metadata.deletion is None:
                 raise ValueError(
                     f"Stack {stack.name!r} generated Unit {generated.name!r} is concrete but absent from active projection"
                 )
             continue
-        generated_key = (generated.api_version, generated.kind, generated.name)
+        generated_key = (
+            generated.api_version,
+            generated.kind,
+            stack_generated_unit_name(stack.name, generated.name),
+        )
         generated_resource = identities.get(generated_key)
         if generated_resource is None:
             same_name = [resource for resource in actual_owned.values() if resource.name == generated.name]
@@ -494,7 +506,7 @@ def _validate_stack_projection(
             dependency_key = (
                 dependency_resource.api_version,
                 dependency_resource.kind,
-                dependency_resource.name,
+                stack_generated_unit_name(stack.name, dependency_resource.name),
             )
             if dependency_key not in identities:
                 raise ValueError(f"Stack {stack.name!r} dependency {dependency!r} is absent from this ref")
@@ -510,7 +522,7 @@ def _validate_stack_projection(
                 )
 
     expected_keys = {
-        (resource.api_version, resource.kind, resource.name)
+        (resource.api_version, resource.kind, stack_generated_unit_name(stack.name, resource.name))
         for resource in projected
         if resource.logical_name in active_units
     }
@@ -547,7 +559,13 @@ def validate_desired_resource_graph(resources: Mapping[tuple[str, str, str], Des
 
     identities: dict[tuple[str, str, str], DesiredGraphResource] = {}
     for key, unit in resources.items():
-        expected_key = (unit.gvk.api_version, unit.gvk.kind, unit.name)
+        owner_references = unit.metadata.ownerReferences
+        qualified_name = (
+            stack_generated_unit_name(owner_references[0].name, unit.name)
+            if isinstance(unit, UnitResource) and owner_references is not None and owner_references[0].kind == "Stack"
+            else unit.name
+        )
+        expected_key = (unit.gvk.api_version, unit.gvk.kind, qualified_name)
         if expected_key in identities:
             raise ValueError(f"duplicate desired resource identity: {expected_key!r}")
         if key != expected_key:
@@ -627,6 +645,7 @@ class ReceiptSubject(StrictModel):
     apiVersion: str
     kind: str
     name: str
+    qualifiedName: QualifiedResourceName
 
     @property
     def gvk(self) -> GVK:
@@ -1020,15 +1039,26 @@ class ResourceCatalog:
 
     def load_receipt(self, path: Path, expected_unit: str | None = None) -> ReceiptResource[Any]:
         document = self.load_document(path)
-        return self.parse_receipt(document, expected_unit or path.stem)
+        selected_name = expected_unit or path.stem
+        return self.parse_receipt(document, PurePosixPath(selected_name).parts[-1])
 
     @staticmethod
     def resource_documents_enabled(root: Path) -> bool:
         return any((root / name).is_file() for name in PROJECT_CONFIG_NAMES)
 
     def unit_document_path(self, root: Path, unit_name: str, project_root: Path | None = None) -> Path:
-        directory = root / "units"
-        candidates = document_candidates(directory, unit_name)
+        posix = PurePosixPath(unit_name)
+        if (
+            not posix.parts
+            or unit_name != posix.as_posix()
+            or any(part in {".", ".."} for part in posix.parts)
+            or posix.is_absolute()
+        ):
+            raise OperationError(f"invalid Unit qualified name {unit_name!r}")
+        parts = posix.parts
+        directory = root / "units" / Path(*parts[:-1])
+        local_name = parts[-1]
+        candidates = document_candidates(directory, local_name)
         if len(candidates) > 1:
             raise OperationError(
                 f"multiple document formats exist for unit {unit_name}: {', '.join(map(str, candidates))}"
@@ -1036,8 +1066,21 @@ class ResourceCatalog:
         if candidates:
             return candidates[0]
         if project_root is not None and self.resource_documents_enabled(project_root):
-            return directory / f"{unit_name}{load_project_config(project_root).write_format.suffix}"
-        return directory / f"{unit_name}.json"
+            from gitopsctr.registry import RESOURCE_REGISTRY
+            from gitopsctr.resource_model import ResourcePlane
+
+            project = load_project_config(project_root)
+            return RESOURCE_REGISTRY.document_path(
+                family="unit",
+                plane=ResourcePlane.DESIRED,
+                root=root,
+                repository_root=project_root,
+                project=project,
+                environment=None,
+                qualified_name=unit_name,
+                suffix=project.write_format.suffix,
+            )
+        return directory / f"{local_name}.json"
 
     def load_unit[ModelT: StrictModel](
         self,
@@ -1047,7 +1090,12 @@ class ResourceCatalog:
         profile: Literal["authored", "resolved", "desired"],
     ) -> UnitResource[ModelT]:
         document = self.load_document(path)
-        return self.parse_unit(document, profile=profile, expected_name=expected_name or path.stem)
+        selected_name = expected_name or path.stem
+        return self.parse_unit(
+            document,
+            profile=profile,
+            expected_name=PurePosixPath(selected_name).parts[-1],
+        )
 
     def reference_document_path(self, root: Path, reference: str) -> Path:
         exact = root / reference

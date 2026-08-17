@@ -67,6 +67,14 @@ def _validated_unit_name(value: object, description: str) -> str:
     return value
 
 
+def _validated_qualified_unit_name(value: object, description: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise OperationError(f"invalid {description} unit name: {value!r}")
+    for segment in value.split("/"):
+        _validated_unit_name(segment, description)
+    return value
+
+
 def desired_observation_reference_units(unit: UnitResource) -> frozenset[str]:
     """Return authored and persisted observation producers for a desired Unit."""
 
@@ -75,12 +83,12 @@ def desired_observation_reference_units(unit: UnitResource) -> frozenset[str]:
     if resolved_inputs is None:
         return frozenset(producers)
     for producer in resolved_inputs.receipts or {}:
-        producers.add(_validated_unit_name(producer, "receipt producer"))
+        producers.add(_validated_qualified_unit_name(producer, "receipt producer"))
     for key in resolved_inputs.artifacts or {}:
-        if not isinstance(key, str) or key.count("/") != 1:
+        if not isinstance(key, str) or "/" not in key:
             raise OperationError(f"invalid artifact dependency key: {key!r}")
-        producer, artifact = key.split("/", 1)
-        _validated_unit_name(producer, "artifact producer")
+        producer, _, artifact = key.rpartition("/")
+        _validated_qualified_unit_name(producer, "artifact producer")
         _validated_unit_name(artifact, "artifact")
         producers.add(producer)
     return frozenset(producers)

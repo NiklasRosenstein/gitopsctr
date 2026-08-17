@@ -45,7 +45,7 @@ def test_unpartitioned_root_has_no_reserved_label() -> None:
 
 
 def test_owned_metadata_uses_one_owner_reference() -> None:
-    metadata = ResourceMetadata(name="application--deploy", uid="d1-deploy", ownerReferences=[OWNER])
+    metadata = ResourceMetadata(name="deploy", uid="d1-deploy", ownerReferences=[OWNER])
 
     metadata.validate_desired()
     assert metadata.document(profile="desired")["ownerReferences"] == [OWNER.to_dict()]
@@ -116,7 +116,7 @@ def test_lifecycle_field_is_rejected() -> None:
     with pytest.raises((TypeError, ValueError, KeyError)):
         DesiredResourceMetadata.from_dict(
             {
-                "name": "application--deploy",
+                "name": "deploy",
                 "uid": "d1-deploy",
                 "lifecycle": {"management": {"mode": "sourceTracked"}},
             }

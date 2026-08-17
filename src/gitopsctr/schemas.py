@@ -209,8 +209,12 @@ def receipt_resource_schema(driver: str) -> JsonObject:
                             "apiVersion": {"const": driver_instance.api_version},
                             "kind": {"const": driver_instance.kind},
                             "name": {"type": "string", "minLength": 1},
+                            "qualifiedName": {
+                                "type": "string",
+                                "pattern": r"^[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*$",
+                            },
                         },
-                        "required": ["apiVersion", "kind", "name"],
+                        "required": ["apiVersion", "kind", "name", "qualifiedName"],
                         "additionalProperties": False,
                     },
                     "desired": {"type": "object"},

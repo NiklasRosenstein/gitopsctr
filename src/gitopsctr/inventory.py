@@ -78,6 +78,7 @@ class InventoryRecord:
     content_digest: str
     media_type: str | None
     local_identity: LocalResourceIdentity
+    storage_qualified_name: str
     snapshot_root: Path | None = None
 
     @property
@@ -86,12 +87,12 @@ class InventoryRecord:
 
     @property
     def qualified_name(self) -> str:
-        return self.family.identity.render(self.local_identity)
+        return self.storage_qualified_name
 
     @property
     def address(self) -> ResourceAddress:
         placement = InventorySession._placement(self.family, self.plane)
-        return ResourceAddress(self.family.name, placement.scope, self.environment, self.local_identity)
+        return ResourceAddress(self.family.name, placement.scope, self.environment, self.storage_qualified_name)
 
     @property
     def logical_identity(self) -> ResourceAddress:
@@ -221,6 +222,7 @@ class InventorySession:
             dict[PurePosixPath, StackInspectionSummary],
         ] = {}
         self._stack_inspection_observed_keys: dict[tuple[str, str, str | None], tuple[str, str | None, bool]] = {}
+        self._qualified_name_cache: dict[tuple[str | None, str | None, PurePosixPath], str] = {}
 
     def __enter__(self) -> InventorySession:
         return self
@@ -231,6 +233,51 @@ class InventorySession:
     def close(self) -> None:
         if self._owns_planes:
             self.planes.close()
+
+    def resource_qualified_name(self, record: object) -> str:
+        if not isinstance(record, InventoryRecord):
+            raise InventoryError("resource address resolution requires an inventory record")
+        key = record.ref, record.revision, record.path
+        cached = self._qualified_name_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            value = record.family.addressing.qualified_name(record, self)
+            record.family.addressing.validate(value)
+            if value != record.storage_qualified_name:
+                raise ResourceModelError(
+                    f"derived address {value!r} does not match canonical storage address "
+                    f"{record.storage_qualified_name!r}"
+                )
+        except ResourceModelError as exc:
+            raise InventoryError(
+                f"could not resolve {record.family.singular} {record.name!r} address at {record.path}: {exc}"
+            ) from exc
+        self._qualified_name_cache[key] = value
+        return value
+
+    def relationship_sources(self, relationship: str, target: object) -> tuple[InventoryRecord, ...]:
+        if not isinstance(target, InventoryRecord):
+            raise InventoryError("relationship address resolution requires an inventory record")
+        definition = self.registry.graph_relationship(relationship)
+        if target.family.name != definition.target_family or target.plane is not definition.target_plane:
+            raise InventoryError(f"relationship {relationship!r} does not target {target.family.name!r}")
+        candidates = self.resources(
+            definition.source_family,
+            environment=target.environment,
+            plane=definition.source_plane,
+            ref=target.ref,
+            revision=target.revision,
+            allow_missing_ref=False,
+        )
+        matches: list[InventoryRecord] = []
+        for source in candidates:
+            try:
+                definition.binding.validate(_graph_parsed(source), _graph_parsed(target))
+            except ResourceModelError:
+                continue
+            matches.append(source)
+        return tuple(matches)
 
     def resources(
         self,
@@ -287,6 +334,10 @@ class InventorySession:
             location = f"environment {environment!r}, " if environment is not None else ""
             raise InventoryError(f"{location}{placement.plane} {family.plural}: {exc}") from exc
         records = tuple(self._record(item, family, snapshot, environment) for item in discovered)
+        # A collection path is a storage claim.  Relationship-derived address
+        # authentication is performed by presenters and relationship joins
+        # when a record is used; discovery itself must remain able to surface
+        # orphaned or transition-state records for diagnostics.
         identities: dict[ResourceAddress, InventoryRecord] = {}
         for record in records:
             previous = identities.get(record.logical_identity)
@@ -324,6 +375,7 @@ class InventorySession:
             item.content_digest,
             item.media_type,
             item.local_identity,
+            item.storage_qualified_name,
             snapshot.root,
         )
 
@@ -409,6 +461,7 @@ class InventorySession:
             resolve_artifacts=resolve_artifacts,
             observation=self.registry.observation(unit_view.observation),
             description=self.registry.artifact_description(unit_view.artifact_description),
+            address_runtime=self,
         )
 
     def reconciliation_counts(self, environment: str) -> dict[ReconciliationState, int]:
@@ -781,6 +834,7 @@ class InventorySession:
                 resolve_artifacts=False,
                 observation=self.registry.observation(unit_view.observation),
                 description=self.registry.artifact_description(unit_view.artifact_description),
+                address_runtime=self,
             )
             unit_states = {value.unit.path: value for value in evaluation.units}
         for stack in stacks:
@@ -878,6 +932,7 @@ def evaluate_relationships(
     strict_artifacts: bool = True,
     observation: ObservationDefinition | None = None,
     description: ArtifactDescriptionDefinition | None = None,
+    address_runtime: InventorySession | None = None,
 ) -> RelationshipEvaluation:
     """Evaluate registered observations and artifact descriptions without joining documents."""
 
@@ -915,10 +970,10 @@ def evaluate_relationships(
                 if len(descriptions) != 1:
                     raise InventoryError("registered Unit artifact-description relationship is not unambiguous")
                 description = descriptions[0]
-    units_by_identity = {item.identity: item for item in units}
+    units_by_qualified_name = {item.qualified_name: item for item in units}
     artifacts_by_path = {item.path: item.relationship_resource() for item in artifacts}
     artifact_records_by_path = {item.path: item for item in artifacts}
-    receipt_by_subject: dict[ResourceIdentity, InventoryRecord] = {}
+    receipt_by_subject: dict[str, InventoryRecord] = {}
     states_by_receipt: dict[PurePosixPath, ReceiptOperationalState] = {}
     linked_artifact_paths: set[PurePosixPath] = set()
     artifact_states_by_path: dict[PurePosixPath, ArtifactOperationalState] = {}
@@ -929,14 +984,30 @@ def evaluate_relationships(
             subject_identity = observation.binding.subject_identity(observer)
         except ResourceModelError as exc:
             raise InventoryError(f"environment {receipt.environment!r}, observed {receipt.path}: {exc}") from exc
-        if subject_identity in receipt_by_subject:
-            previous = receipt_by_subject[subject_identity]
+        subject_qualified_name = receipt.qualified_name
+        if subject_qualified_name in receipt_by_subject:
+            previous = receipt_by_subject[subject_qualified_name]
             raise InventoryError(
                 f"environment {receipt.environment!r}: Receipts {previous.path} and {receipt.path} both observe "
-                f"{subject_identity.gvk} {subject_identity.name!r}"
+                f"{subject_identity.gvk} {subject_qualified_name!r}"
             )
-        receipt_by_subject[subject_identity] = receipt
-        unit = units_by_identity.get(subject_identity)
+        receipt_by_subject[subject_qualified_name] = receipt
+        unit = units_by_qualified_name.get(subject_qualified_name)
+        if unit is not None and unit.identity != subject_identity:
+            raise InventoryError(
+                f"environment {receipt.environment!r}, observed {receipt.path}: Receipt subject identity "
+                f"does not authenticate desired Unit {subject_qualified_name!r}"
+            )
+        if unit is not None and address_runtime is not None:
+            specification = receipt.document.get("spec")
+            subject = specification.get("subject") if isinstance(specification, dict) else None
+            qualified_name = subject.get("qualifiedName") if isinstance(subject, dict) else None
+            expected_qualified_name = address_runtime.resource_qualified_name(unit)
+            if qualified_name != expected_qualified_name:
+                raise InventoryError(
+                    f"environment {receipt.environment!r}, observed {receipt.path}: Receipt subject qualifiedName "
+                    f"does not authenticate desired Unit {expected_qualified_name!r}"
+                )
         producer = unit.relationship_resource() if unit is not None else None
         try:
             freshness = observation.binding.evaluate(observer, producer) if producer is not None else None
@@ -950,6 +1021,7 @@ def evaluate_relationships(
                     observer,
                     ArtifactResolutionContext(
                         producer,
+                        subject_qualified_name,
                         artifacts_by_path,
                         registry.artifact_outputs_for(subject_identity.gvk),
                         freshness,
@@ -961,6 +1033,15 @@ def evaluate_relationships(
         linked_artifact_paths.update(link.artifact.path for link in links)
         for link in links:
             artifact = artifact_records_by_path[link.artifact.path]
+            if unit is not None and address_runtime is not None:
+                producer = artifact.document.get("producer")
+                qualified_name = producer.get("qualifiedName") if isinstance(producer, dict) else None
+                expected_qualified_name = address_runtime.resource_qualified_name(unit)
+                if qualified_name != expected_qualified_name:
+                    raise InventoryError(
+                        f"environment {artifact.environment!r}, observed {artifact.path}: Artifact producer "
+                        f"qualifiedName does not authenticate desired Unit {expected_qualified_name!r}"
+                    )
             artifact_states_by_path[artifact.path] = ArtifactOperationalState(
                 artifact,
                 state,
@@ -986,7 +1067,7 @@ def evaluate_relationships(
 
     unit_states: list[UnitOperationalState] = []
     for unit in units:
-        receipt = receipt_by_subject.get(unit.identity)
+        receipt = receipt_by_subject.get(unit.qualified_name)
         observation_state = (
             InventoryObservationState.MISSING if receipt is None else states_by_receipt[receipt.path].observation
         )
@@ -995,10 +1076,10 @@ def evaluate_relationships(
         if not isinstance(unit.parsed, UnitResource):
             raise InventoryError(f"desired Unit {unit.name!r} has no typed Unit representation")
         try:
-            transition_reason = load_desired_transition_blocks(unit.snapshot_root).get(unit.name)
+            transition_reason = load_desired_transition_blocks(unit.snapshot_root).get(unit.qualified_name)
             status = classify_before_observation(
                 unit.snapshot_root,
-                unit.name,
+                unit.qualified_name,
                 unit.document,
                 unit.parsed,
                 transition_reason,

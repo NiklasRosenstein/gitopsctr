@@ -27,6 +27,7 @@ class _DeletionHarness:
         self.desired_revision = "c" * 40
         self.observed_revision: str | None = None
         self.desired_publications: list[Path] = []
+        self.removed_unit_sets: list[frozenset[str]] = []
         self.observed_publications: list[Path] = []
         self.reconcile_outputs: list[bool] = []
 
@@ -59,6 +60,10 @@ class _DeletionHarness:
             return self.observed_revision
 
         def publish_desired(_environment: str, candidate: Path, *_args: object, **_kwargs: object):
+            if len(_args) > 8:
+                removed_units = _args[8]
+                assert isinstance(removed_units, frozenset)
+                self.removed_unit_sets.append(removed_units)
             snapshot = self.desired.parent / f"desired-{len(self.desired_publications)}"
             shutil.copytree(candidate, snapshot)
             self.desired_publications.append(snapshot)
@@ -133,7 +138,7 @@ def test_converge_tears_down_deleting_dependency_closure_consumer_before_produce
     consumer = _mark(consumer, "consumer")
     harness = _DeletionHarness(tmp_path, _unit_tree(tmp_path, producer, consumer))
     harness.install(monkeypatch)
-    calls: list[str] = []
+    calls: list[tuple[str, str | None]] = []
 
     def teardown(_driver, context):
         calls.append(context.unit_name)
@@ -181,16 +186,16 @@ def test_converge_partition_includes_deleting_units_in_scope(tmp_path, monkeypat
     document = _mark(_terraform_unit("application", "d1-application"))
     harness = _DeletionHarness(tmp_path, _unit_tree(tmp_path, document))
     harness.install(monkeypatch)
-    calls: list[str] = []
+    calls: list[tuple[str, str | None]] = []
     monkeypatch.setattr(
         type(controller.UNIT_DRIVERS["terraform"]),
         "teardown",
-        lambda _driver, context: calls.append(context.unit_name) or TeardownResult(),
+        lambda _driver, context: calls.append((context.unit_name, context.qualified_name)) or TeardownResult(),
     )
 
     controller.command_converge(harness.converge_args(partition="application"))
 
-    assert calls == ["application"]
+    assert calls == [("application", "application")]
 
 
 def test_converge_finalization_removes_a_completed_unit_materialization(tmp_path, monkeypatch):
@@ -200,7 +205,6 @@ def test_converge_finalization_removes_a_completed_unit_materialization(tmp_path
     materialized.mkdir(parents=True)
     (materialized / "manifest.yaml").write_text("apiVersion: v1\nkind: ConfigMap\n")
     document["spec"]["materialization"] = {  # type: ignore[index]
-        "path": "materialized/application",
         "digest": controller.materialization_tree_digest(initial / "materialized/application"),
         "mediaType": "application/vnd.gitopsctr.kubernetes-manifests.v1",
         "metadata": {"renderer": "plain", "inventory": []},
@@ -251,26 +255,70 @@ def test_converge_stack_deletion_is_child_first_and_writes_one_progressive_clean
         harness.desired / f"units/{child_name}.json",
         controller.serialize_unit_document(controller.mark_resource_for_deletion(child), profile="desired"),
     )
-    calls: list[str] = []
+    calls: list[tuple[str, str | None]] = []
+    released_leases: list[str] = []
+    monkeypatch.setattr(controller, "effect_lease_ref", lambda *_args, **_kwargs: "deploy/dev")
+    monkeypatch.setattr(controller, "file_blob", lambda _path: "b" * 40)
+
+    def acquire_lease(_ref, revision, qualified_name, uid, **_kwargs):
+        assert qualified_name == child_name
+        return controller.EffectLeaseAcquisition(
+            lease=controller.EffectLease(
+                unit_name="preview-app",
+                qualified_name=qualified_name,
+                uid=uid,
+                token="lease-test",
+                owner="test-runner",
+                desired_revision=revision,
+                snapshot=controller.EffectLeaseSnapshot(
+                    unit_path="units/preview/preview-app.json",
+                    unit_blob="b" * 40,
+                    api_version=controller.UNIT_API_VERSION,
+                    kind="Terraform",
+                    driver="terraform",
+                    source_revision="a" * 40,
+                    cleanup_path=None,
+                    cleanup_blob=None,
+                ),
+            ),
+            revision=revision,
+        )
+
+    monkeypatch.setattr(controller, "acquire_effect_lease", acquire_lease)
+    monkeypatch.setattr(
+        controller,
+        "validate_effect_lease_head_for_store",
+        lambda *_args, **_kwargs: harness.desired_revision,
+    )
+    monkeypatch.setattr(
+        controller,
+        "release_effect_lease",
+        lambda _ref, qualified_name, *_args, **_kwargs: released_leases.append(qualified_name),
+    )
     monkeypatch.setattr(
         type(controller.UNIT_DRIVERS["terraform"]),
         "teardown",
-        lambda _driver, context: calls.append(context.unit_name) or TeardownResult(),
+        lambda _driver, context: calls.append((context.unit_name, context.qualified_name)) or TeardownResult(),
     )
 
-    controller.command_converge(harness.converge_args(unit=[child_name]))
+    controller.command_converge(harness.converge_args(unit=["preview/preview-app"]))
 
-    assert calls == [child_name]
+    assert calls == [("preview-app", "preview/preview-app")]
+    assert released_leases == ["preview/preview-app"]
     assert not (harness.desired / "units" / f"{child_name}.json").exists()
     assert not (harness.desired / "stacks/preview.json").exists()
     assert not (harness.desired / "stack-templates/preview.json").exists()
     tombstones = controller.load_resource_incarnation_evidence(harness.desired)
-    assert {(tombstone.api_version, tombstone.kind, tombstone.name, tombstone.uid) for tombstone in tombstones} == {
-        (controller.CORE_API_VERSION, "Stack", "preview", "d1-stack-preview"),
-        (controller.CORE_API_VERSION, "StackTemplate", "preview", "d1-template"),
-        (controller.UNIT_API_VERSION, "Terraform", child_name, "d1-preview-app"),
+    assert {
+        (tombstone.api_version, tombstone.kind, tombstone.name, tombstone.qualified_name, tombstone.uid)
+        for tombstone in tombstones
+    } == {
+        (controller.CORE_API_VERSION, "Stack", "preview", "preview", "d1-stack-preview"),
+        (controller.CORE_API_VERSION, "StackTemplate", "preview", "preview", "d1-template"),
+        (controller.UNIT_API_VERSION, "Terraform", "preview-app", child_name, "d1-preview-app"),
     }
     assert len(harness.desired_publications) == 1
+    assert harness.removed_unit_sets == [frozenset({"preview/preview-app"})]
     assert harness.reconcile_outputs == [True]
     cleanup = harness.desired_publications[0]
     assert not (cleanup / "units" / f"{child_name}.json").exists()
@@ -328,22 +376,22 @@ def test_converge_retries_template_pin_cleanup_after_desired_removal(tmp_path, m
             return True
 
     monkeypatch.setattr(controller, "state_store", FlakyPinStore)
-    teardown_calls: list[str] = []
+    teardown_calls: list[tuple[str, str | None]] = []
     monkeypatch.setattr(
         type(controller.UNIT_DRIVERS["terraform"]),
         "teardown",
-        lambda _driver, context: teardown_calls.append(context.unit_name) or TeardownResult(),
+        lambda _driver, context: teardown_calls.append((context.unit_name, context.qualified_name)) or TeardownResult(),
     )
 
     with pytest.raises(RuntimeError, match="temporary pin-store failure"):
-        controller.command_converge(harness.converge_args(unit=[child_name]))
+        controller.command_converge(harness.converge_args(unit=["preview/preview-app"]))
     assert not (harness.desired / "stack-templates/preview.json").exists()
 
-    controller.command_converge(harness.converge_args(unit=[child_name]))
+    controller.command_converge(harness.converge_args(unit=["preview/preview-app"]))
 
     assert attempts == 2
     assert pins == []
-    assert teardown_calls == [child_name]
+    assert teardown_calls == [("preview-app", "preview/preview-app")]
     assert harness.reconcile_outputs == [True]
 
 
@@ -351,7 +399,7 @@ def test_converge_finalizes_a_standalone_deleting_stacktemplate(tmp_path, monkey
     initial = tmp_path / "initial"
     stack_tree(initial)
     (initial / "stacks/preview.json").unlink()
-    (initial / "units/preview--preview-app.json").unlink()
+    (initial / "units/preview/preview-app.json").unlink()
     template = controller.RESOURCE_CATALOG.parse_stack_template(
         controller.RESOURCE_CATALOG.load_document(initial / "stack-templates/preview.json"),
         profile="desired",
@@ -415,6 +463,7 @@ def test_converge_missing_stack_child_without_tombstone_fails_closed(tmp_path, m
             api_version=child.gvk.api_version,
             kind=child.gvk.kind,
             name=child.name,
+            qualified_name=child_name,
             uid="d1-old-preview-app",
             deletion_generation=1,
         ),
@@ -452,6 +501,7 @@ def test_deleting_stack_source_retention_accepts_exact_finalized_child_tombstone
             api_version=child.gvk.api_version,
             kind=child.gvk.kind,
             name=child.name,
+            qualified_name=child_name,
             uid=child.metadata.uid,
             deletion_generation=1,
         ),

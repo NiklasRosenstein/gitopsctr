@@ -16,8 +16,8 @@ gitopsctr/desired/dev
     └── manifest.yaml
 ```
 
-The controller records the payload path, media type, digest, renderer metadata, and deterministic resource inventory
-in `units/web.yaml`. Reconciliation, verification, promotion, and rollback consume these committed bytes. Rollback
+The controller records the media type, digest, renderer metadata, and deterministic resource inventory in
+`units/web.yaml`; the payload location is derived as `materialized/web/`. Reconciliation, verification, promotion, and rollback consume these committed bytes. Rollback
 copies historical bytes and their unit descriptor exactly; it never reruns Helm.
 
 ## Rendering

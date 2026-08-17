@@ -52,6 +52,7 @@ def artifact_producer_identity(
         apiVersion="unit.gitopsctr.io/v1",
         kind=kind,
         name=context.unit_name,
+        qualifiedName=context.qualified_name or context.unit_name,
         driverVersion=driver_version,
         inputHashVersion=1,
         inputHash=input_hash,

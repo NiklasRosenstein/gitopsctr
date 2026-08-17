@@ -643,10 +643,10 @@ def _active_binding(name: str, depends_on: list[str] | None = None) -> StackProj
 @pytest.mark.parametrize(
     "units",
     [
-        {"a": _active_binding("web--a"), "b": _active_binding("web--a")},
-        {"a": _active_binding("web--a", ["web--missing"]), "b": _active_binding("web--b")},
-        {"a": _active_binding("web--a", ["web--a"]), "b": _active_binding("web--b")},
-        {"a": _active_binding("web--a", ["web--b"]), "b": _active_binding("web--b", ["web--a"])},
+        {"a": _active_binding("a"), "b": _active_binding("a")},
+        {"a": _active_binding("a", ["missing"]), "b": _active_binding("b")},
+        {"a": _active_binding("a", ["a"]), "b": _active_binding("b")},
+        {"a": _active_binding("a", ["b"]), "b": _active_binding("b", ["a"])},
     ],
 )
 def test_active_projection_direct_construction_rejects_invalid_concrete_graph(units):
@@ -671,12 +671,12 @@ def test_desired_stack_requires_exact_active_dependencies_for_current_structure(
         projection_context_digest=structural.identity.projectionContextDigest,
         units={
             "db": replace(
-                _active_binding("web--db"),
+                _active_binding("db"),
                 sourceProjectionDigest=structural.identity.projectionDigest,
                 projectionContextDigest=structural.identity.projectionContextDigest,
             ),
             "app": replace(
-                _active_binding("web--app"),
+                _active_binding("app"),
                 sourceProjectionDigest=structural.identity.projectionDigest,
                 projectionContextDigest=structural.identity.projectionContextDigest,
             ),

@@ -1,7 +1,7 @@
 # Artifact resources
 
 Artifact resources are immutable, typed outputs published by unit drivers on the observed ref. A producer writes each
-artifact to `artifacts/<unit>/<logical-name>.yaml|json` and records its GVK, path, media type, and digest in the unit's
+artifact to `artifacts/<unit-qualified-name>/<logical-name>.yaml|json` and records its GVK, path, media type, and digest in the unit's
 [Receipt](receipt.md).
 
 The current bundled artifact kinds are:
@@ -16,17 +16,18 @@ ecosystem.
 
 ## Inspect artifacts
 
-Artifact local identity has two registry-declared segments: `producer/name`. It composes with the Environment scope;
-it does not introduce a separate Unit namespace. The qualified name rendered by the table is also the exact lookup
-address:
+Artifact `metadata.name` remains local. The registry composes its canonical storage path and operator-facing qualified
+name from the producer Unit's address plus that local name. A Stack-owned producer therefore renders
+`stack/unit/artifact`, while a direct producer renders `unit/artifact`. The Environment and family remain separate
+command context:
 
 ```console
-$ gitopsctr get artifacts --environment dev --producer application--image
+$ gitopsctr get artifacts --environment dev --producer application/image
 NAME                           KIND             PARTITION    AUTHENTICATION
-application--image/containers  ContainerImages  application  CURRENT
+application/image/containers  ContainerImages  application  CURRENT
 ```
 
-Copy the rendered name into `gitopsctr get artifact application--image/containers --environment dev`. Add
+Copy the rendered name into `gitopsctr get artifact application/image/containers --environment dev`. Add
 `-o yaml --as-list` when the generic address, Git provenance, and derived authentication should accompany the exact
 Artifact document; the [tutorial](../tutorial.md#inspect-desired-and-observed-state) shows that output shape.
 

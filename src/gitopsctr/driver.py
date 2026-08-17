@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from gitopsctr.api import GVK, ApiKind, api_kinds
@@ -32,6 +32,15 @@ class DriverError(RuntimeError):
 
 class TeardownUnsupported(DriverError):
     """The selected Unit delivery mode has no controller-owned teardown."""
+
+
+def unit_materialization_path(qualified_name: str) -> PurePosixPath:
+    """Return the canonical payload path for a qualified Unit address."""
+
+    parts = tuple(qualified_name.split("/"))
+    if not parts or any(not part or part in {".", ".."} for part in parts):
+        raise ValueError(f"invalid qualified Unit name for materialization: {qualified_name!r}")
+    return PurePosixPath("materialized", *parts)
 
 
 @dataclass(frozen=True)
@@ -142,6 +151,7 @@ class MaterializationContext[ResolvedT: StrictModel]:
     unit_name: str
     unit: ResolvedT
     output_root: Path
+    qualified_name: str | None = None
     execution: DriverExecution = field(default_factory=default_driver_execution)
 
 
@@ -161,8 +171,13 @@ class UnitExecutionContext[DesiredT: StrictModel]:
     source_path: str | None
     unit_name: str
     unit: DesiredT
+    qualified_name: str | None = None
     report: Path | None = None
     execution: DriverExecution = field(default_factory=default_driver_execution)
+
+    @property
+    def materialization_root(self) -> Path:
+        return self.desired_root / unit_materialization_path(self.qualified_name or self.unit_name)
 
 
 @dataclass(frozen=True)
@@ -179,6 +194,7 @@ class TeardownContext[DesiredT: StrictModel]:
     unit: DesiredT
     resource_uid: str
     deletion_generation: int
+    qualified_name: str | None = None
     previous_receipt: ReceiptResource[Any] | None = None
     report: Path | None = None
     execution: DriverExecution = field(default_factory=default_driver_execution)
@@ -217,8 +233,13 @@ class VerificationContext[DesiredT: StrictModel]:
     source_path: str | None
     unit_name: str
     unit: DesiredT
+    qualified_name: str | None = None
     report: Path | None = None
     execution: DriverExecution = field(default_factory=default_driver_execution)
+
+    @property
+    def materialization_root(self) -> Path:
+        return self.desired_root / unit_materialization_path(self.qualified_name or self.unit_name)
 
 
 class MaterializationCapability[ResolvedT: StrictModel, DesiredT: StrictModel](ABC):

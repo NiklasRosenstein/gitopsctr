@@ -412,13 +412,9 @@
               ],
               "title": "KubernetesMaterializationMetadata",
               "type": "object"
-            },
-            "path": {
-              "type": "string"
             }
           },
           "required": [
-            "path",
             "digest",
             "mediaType",
             "metadata"

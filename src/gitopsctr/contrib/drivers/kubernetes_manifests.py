@@ -216,7 +216,6 @@ class KubernetesMaterializationMetadata(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class KubernetesMaterializationDescriptor(StrictModel):
-    path: str
     digest: str
     mediaType: str
     metadata: KubernetesMaterializationMetadata
@@ -332,7 +331,6 @@ def materialization_configuration(
 
 @dataclass(frozen=True)
 class ResolvedMaterialization:
-    path: str
     digest: str
     inventory: list[ResourceIdentity]
 
@@ -340,7 +338,6 @@ class ResolvedMaterialization:
 def materialization_descriptor(unit: KubernetesDesiredUnit) -> ResolvedMaterialization:
     descriptor = unit.materialization
     return ResolvedMaterialization(
-        descriptor.path,
         descriptor.digest,
         [cast(ResourceIdentity, item.to_dict()) for item in descriptor.metadata.inventory],
     )
@@ -643,7 +640,6 @@ class KubernetesManifestsDriver(
             inputs=unit.inputs,
             resolvedInputs=unit.resolvedInputs,
             materialization=KubernetesMaterializationDescriptor(
-                path=descriptor.path,
                 digest=descriptor.digest,
                 mediaType=descriptor.mediaType,
                 metadata=metadata,
@@ -690,14 +686,14 @@ class KubernetesManifestsDriver(
         context_name = delivery.kubeContext
         prune = delivery.prune
         waits = delivery.wait or []
-        manager = field_manager(context.environment, context.unit_name)
+        manager = field_manager(context.environment, context.qualified_name or context.unit_name)
         context.execution.run(
             *kubectl_prefix(context_name),
             "apply",
             "--server-side",
             f"--field-manager={manager}",
             "--filename",
-            str(context.desired_root / materialization.path),
+            str(context.materialization_root),
         )
         for item in waits:
             context.execution.run(
@@ -807,14 +803,13 @@ class KubernetesManifestsDriver(
         if not isinstance(delivery, DirectDelivery):
             raise DriverError("external Kubernetes delivery without an observer cannot be verified")
         context_name = delivery.kubeContext
-        materialization = materialization_descriptor(context.unit)
         result = context.execution.run(
             *kubectl_prefix(context_name),
             "diff",
             "--server-side",
-            f"--field-manager={field_manager(context.environment, context.unit_name)}",
+            f"--field-manager={field_manager(context.environment, context.qualified_name or context.unit_name)}",
             "--filename",
-            str(context.desired_root / materialization.path),
+            str(context.materialization_root),
             output=CommandOutput.CAPTURE,
             check=False,
         )

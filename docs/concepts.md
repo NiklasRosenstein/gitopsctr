@@ -32,8 +32,19 @@ source, desired, or observed representations the family can have, their scope, a
 Unit. Persisted YAML or JSON documents are instances of those definitions; the registry does not create an additional
 document format.
 
+Local document identity and hierarchical placement are intentionally separate. `metadata.name` is local to the
+resource's placement; the registered collection adapter encodes that placement as a hierarchical storage path and
+rejects duplicate composite identities. Each family also registers a root, child, or mirror address rule. Those rules
+produce the same `qualifiedName` used by storage and accepted by the CLI: roots such as `database`, Stack children such as
+`application/image`, mirrored Receipts with the same Unit address, and Artifacts such as
+`application/image/containers`. The Environment and family remain separate command context, and partitions are never
+address components. The registry validates address dependencies, storage round-tripping, and rejects missing
+relationships, ambiguity, and cycles.
+
 The built-in kinds are only the kinds bundled with this distribution. Plugins can register additional Unit and
-Artifact kinds by full group/version/kind and participate in the same model. See [Resources and API
+Artifact kinds by full group/version/kind. A `gitopsctr.resource-models` entry point may contribute collections,
+families, relationships, inspection presenters, and address rules; all contributions are merged into and validated by
+the same registry, and their selectors automatically appear in `get`. See [Resources and API
 kinds](documents.md) for the authoring contracts and the generated [resource model](resource-model.md) for the
 authoritative plane and relationship matrix.
 
@@ -85,7 +96,7 @@ desired ref first.
 
 `apply` pins source inputs and resolves available references into an immutable desired Unit. A Unit is ready only when
 all required inputs are available. Materialization-capable drivers may also commit rendered payloads below
-`materialized/<unit>/`. Repository-backed Unit sources inherit the exact source context retained by their desired
+`materialized/<qualified-unit>/`. Repository-backed Unit sources inherit the exact source context retained by their desired
 StackTemplate unless an authored `source.revision` selects an exact 40-hex commit. StackTemplate parameters may supply
 that override from the same acquired-ref history; it is not a direct-Unit field. The effective revision is persisted
 in the structural projection and desired Unit.

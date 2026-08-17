@@ -102,7 +102,7 @@ def stack_tree(root: Path) -> tuple[str, str]:
             "apiVersion": controller.UNIT_API_VERSION,
             "kind": "Terraform",
             "metadata": {
-                "name": "preview--preview-app",
+                "name": "preview-app",
                 "uid": "d1-preview-app",
                 "ownerReferences": [
                     {
@@ -124,7 +124,7 @@ def stack_tree(root: Path) -> tuple[str, str]:
             },
         },
         profile="desired",
-        expected_name="preview--preview-app",
+        expected_name="preview-app",
     )
     active_projection = StackActiveProjection.build(
         source_projection_digest=projection.identity.projectionDigest,
@@ -161,8 +161,8 @@ def stack_tree(root: Path) -> tuple[str, str]:
     (root / "stacks/preview.json").write_text(
         json.dumps(controller.RESOURCE_CATALOG.serialize_stack_resource(stack, profile="desired"))
     )
-    controller.write_desired_candidate_unit(root / "units/preview--preview-app.json", unit, root)
-    return stack_uid, "preview--preview-app"
+    controller.write_desired_candidate_unit(root / "units/preview/preview-app.json", unit, root)
+    return stack_uid, "preview/preview-app"
 
 
 def deletion_args(**overrides: object) -> Namespace:

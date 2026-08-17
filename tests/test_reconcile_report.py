@@ -166,6 +166,7 @@ def test_observation_reference_materializes_artifact_into_consumer(tmp_path):
                 "apiVersion": "unit.gitopsctr.io/v1",
                 "kind": "OciImages",
                 "name": "application-images",
+                "qualifiedName": "application-images",
                 "driverVersion": 1,
                 "sourceRevision": "a" * 40,
                 "inputHashVersion": 1,

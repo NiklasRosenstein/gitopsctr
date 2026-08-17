@@ -38,13 +38,20 @@ from gitopsctr.resource_model import (
     ReceiptArtifactDescriptionBinding,
     ReceiptObservationBinding,
     RelationshipResource,
+    ResourceFamilyDefinition,
+    ResourceGraphRelationship,
     ResourceIdentity,
+    ResourceIdentityDefinition,
+    ResourceModelContribution,
     ResourceModelError,
     ResourcePlane,
     ResourceRegistry,
     ResourceScope,
     ResourceSelection,
+    RootResourceAddressing,
+    StackUnitResourceAddressing,
     UnitApiMembership,
+    build_resource_registry,
 )
 from gitopsctr.resource_model_export import bundled_resource_registry, export_resource_model, render_resource_model
 from gitopsctr.resources import ResourceMetadata, StackResource, UnitResource
@@ -109,6 +116,13 @@ def test_builtin_registry_derives_core_driver_and_artifact_family_membership():
     assert len(RESOURCE_REGISTRY.api_kinds_for_family("units")) == 5
     assert len(RESOURCE_REGISTRY.api_kinds_for_family("artifacts")) == 2
 
+    artifact = RESOURCE_REGISTRY.family("artifact")
+    assert (
+        artifact.addressing.filter_value("application/image/containers", "producer", artifact.identity)
+        == "application/image"
+    )
+    assert artifact.addressing.storage_constraint("producer", "application/image", artifact.identity) is None
+
     unit = RESOURCE_REGISTRY.family("unit")
     assert {(item.plane, item.scope, item.contract_profile) for item in unit.placements} == {
         (ResourcePlane.SOURCE, ResourceScope.ENVIRONMENT, "authored"),
@@ -128,13 +142,13 @@ def test_family_local_identity_is_registry_defined_and_generically_selectable():
     artifact = RESOURCE_REGISTRY.family("artifact")
     unit = RESOURCE_REGISTRY.family("unit")
 
-    identity = artifact.identity.parse("application--image/containers")
-    assert artifact.identity.render(identity) == "application--image/containers"
-    assert artifact.identity.value(identity, "producer") == "application--image"
+    identity = artifact.identity.parse("image/containers")
+    assert artifact.identity.render(identity) == "image/containers"
+    assert artifact.identity.value(identity, "producer") == "image"
     assert artifact.identity.value(identity, "name") == "containers"
     assert artifact.identity.matches(
         identity,
-        ResourceSelection(constraints=(IdentityConstraint("producer", frozenset(("application--image",))),)),
+        ResourceSelection(constraints=(IdentityConstraint("producer", frozenset(("image",))),)),
     )
     assert not artifact.identity.matches(
         identity,
@@ -142,7 +156,7 @@ def test_family_local_identity_is_registry_defined_and_generically_selectable():
     )
     assert artifact.identity.segments[0].filter_option == "--producer"
     with pytest.raises(ResourceModelError, match="requires 1 segments"):
-        unit.identity.parse("application--image/containers")
+        unit.identity.parse("application/image")
 
 
 def test_registered_stack_template_selection_binding_checks_uid_and_content_digest():
@@ -280,6 +294,7 @@ def test_receipt_contract_dispatches_to_subject_driver_result_and_artifacts():
                 "apiVersion": "unit.gitopsctr.io/v1",
                 "kind": "Terraform",
                 "name": "infrastructure",
+                "qualifiedName": "infrastructure",
             },
             "desired": {"unitBlob": "blob"},
         },
@@ -400,7 +415,12 @@ def test_receipt_observation_binding_executes_identity_and_freshness():
             "kind": "Receipt",
             "metadata": {"name": "application"},
             "spec": {
-                "subject": {"apiVersion": "unit.gitopsctr.io/v1", "kind": "Terraform", "name": "application"},
+                "subject": {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "Terraform",
+                    "name": "application",
+                    "qualifiedName": "application",
+                },
                 "desired": {"unitBlob": "blob-a"},
             },
             "status": {"controller": {}, "result": {}},
@@ -447,7 +467,12 @@ def test_receipt_artifact_binding_executes_identity_digest_media_and_producer_in
             "apiVersion": "artifact.gitopsctr.io/v1",
             "kind": "ContainerImages",
             "metadata": {"name": "containers"},
-            "producer": {"apiVersion": "unit.gitopsctr.io/v1", "kind": "OciImages", "name": "application"},
+            "producer": {
+                "apiVersion": "unit.gitopsctr.io/v1",
+                "kind": "OciImages",
+                "name": "application",
+                "qualifiedName": "application",
+            },
             "images": {},
         },
         path=str(artifact_path),
@@ -463,7 +488,12 @@ def test_receipt_artifact_binding_executes_identity_digest_media_and_producer_in
             "kind": "Receipt",
             "metadata": {"name": "application"},
             "spec": {
-                "subject": {"apiVersion": "unit.gitopsctr.io/v1", "kind": "OciImages", "name": "application"},
+                "subject": {
+                    "apiVersion": "unit.gitopsctr.io/v1",
+                    "kind": "OciImages",
+                    "name": "application",
+                    "qualifiedName": "application",
+                },
                 "desired": {"unitBlob": "blob"},
             },
             "status": {
@@ -484,6 +514,7 @@ def test_receipt_artifact_binding_executes_identity_digest_media_and_producer_in
     )
     context = ArtifactResolutionContext(
         producer,
+        "application",
         {artifact_path: artifact},
         {"containers": GVK("artifact.gitopsctr.io/v1", "ContainerImages")},
         ObservationState.CURRENT,
@@ -551,6 +582,60 @@ def test_receipt_artifact_binding_executes_identity_digest_media_and_producer_in
 def test_registry_rejects_duplicate_selectors_and_aliases():
     with pytest.raises(ResourceModelError, match="duplicate resource selector 'units'"):
         rebuild(families=replace_family("artifact", aliases=("units",)))
+
+
+def test_registry_validates_address_relationships_cycles_and_separator():
+    with pytest.raises(ResourceModelError, match="unknown relationships: missing-owner"):
+        rebuild(families=replace_family("unit", addressing=StackUnitResourceAddressing("missing-owner", "stack")))
+
+    inverse = ResourceGraphRelationship(
+        "unit-owns-stack",
+        source_family="unit",
+        source_plane=ResourcePlane.DESIRED,
+        target_family="stack",
+        target_plane=ResourcePlane.DESIRED,
+        source_gvk=None,
+        target_gvk=GVK(CORE_API_VERSION, "Stack"),
+        binding=RESOURCE_REGISTRY.graph_relationship("stack-owns-unit").binding,
+    )
+    with pytest.raises(ResourceModelError, match="addressing relationships must be acyclic"):
+        rebuild(
+            families=replace_family("stack", addressing=StackUnitResourceAddressing("unit-owns-stack", "unit")),
+            graph_relationships=(*RESOURCE_REGISTRY.graph_relationships, inverse),
+        )
+
+    with pytest.raises(ResourceModelError, match="canonical '/' address separator"):
+        rebuild(
+            families=replace_family(
+                "stack",
+                identity=ResourceIdentityDefinition(separator=":"),
+                addressing=RootResourceAddressing(),
+            )
+        )
+
+
+def test_resource_model_contribution_merges_family_into_validated_registry():
+    project_api = API_KINDS[GVK(CORE_API_VERSION, "Project")]
+    widget_gvk = GVK("example.gitopsctr.io/v1", "Widget")
+    widget_api = ApiKind(widget_gvk, project_api.spec)
+    project = RESOURCE_REGISTRY.family("project")
+    widget = ResourceFamilyDefinition(
+        "widget",
+        "widget",
+        "widgets",
+        project.placements,
+        (ProfiledApiMembership(frozenset((widget_gvk,)), CoreResourceApi),),
+    )
+    registry = build_resource_registry(
+        {
+            **RESOURCE_REGISTRY.api_kinds,
+            widget_gvk: widget_api,
+        },
+        (ResourceModelContribution(families=(widget,)),),
+    )
+
+    assert registry.family("widgets") is widget
+    assert registry.family_for_api_kind(widget_gvk) is widget
 
 
 @pytest.mark.parametrize(

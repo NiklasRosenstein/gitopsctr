@@ -1,7 +1,7 @@
 # ContainerImages
 
 `artifact.gitopsctr.io/v1` `ContainerImages` contains immutable image URIs produced by an `OciImages` unit. The bundled
-driver publishes it under the logical name `containers` at `artifacts/<unit>/containers.yaml|json` on the observed ref.
+driver publishes it under the logical name `containers` at `artifacts/<qualified-unit>/containers.yaml|json` on the observed ref.
 
 ```yaml
 apiVersion: artifact.gitopsctr.io/v1

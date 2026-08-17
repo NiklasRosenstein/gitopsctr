@@ -19,8 +19,8 @@ Representative queries are:
 ```console
 gitopsctr get environments
 gitopsctr get all --environment dev
-gitopsctr get unit application--deploy --environment dev
-gitopsctr get artifacts --environment dev --producer application--image
+gitopsctr get unit application/deploy --environment dev
+gitopsctr get artifacts --environment dev --producer application/image
 gitopsctr status --environment dev
 gitopsctr validate
 ```
@@ -32,7 +32,7 @@ Singular and plural selectors are equivalent apart from whether a name is suppli
 every matching resource and includes its Environment, which is useful when names are reused across namespaces:
 
 ```console
-gitopsctr get unit application--deploy -A
+gitopsctr get unit application/deploy -A
 ```
 
 `get all` is the namespace overview, analogous to `kubectl get all`. It queries every registry-defined,
@@ -64,7 +64,7 @@ The built-in views use these columns, with `ENVIRONMENT` added for `-A`:
 | StackTemplates | `NAME`, short `CONTENT-DIGEST`, short `SOURCE`, `PARAMETERS`, `UNITS`, `PARTITION`, `REFERENCES`, `STATE` |
 | Promotions | `NAME`, `SOURCE`, `PARTITION`, pinned desired, observed, and specification revisions |
 | Receipts | `NAME`, subject `KIND`, subject `PARTITION`, `OBSERVATION`, `ARTIFACTS` |
-| Artifacts | qualified `NAME` (`producer/name`), `KIND`, producer `PARTITION`, `AUTHENTICATION` |
+| Artifacts | qualified `NAME` (`unit/artifact`), `KIND`, producer `PARTITION`, `AUTHENTICATION` |
 
 The default Stack view keeps `TEMPLATE` and a short `TEMPLATE-DIGEST` for quick identification; `UNITS` is the
 active/structural projection count. In `-o wide`, Stack `TEMPLATE`, `TEMPLATE-UID`, and `TEMPLATE-DIGEST` are the
@@ -93,8 +93,8 @@ Unpartitioned and orphaned resources render `-`.
 Use `-o yaml` or `-o json` for machine-readable output:
 
 ```console
-gitopsctr get unit application--deploy --environment dev -o yaml
-gitopsctr get unit application--deploy --environment dev -o yaml --as-list
+gitopsctr get unit application/deploy --environment dev -o yaml
+gitopsctr get unit application/deploy --environment dev -o yaml --as-list
 gitopsctr get receipts -A -o json
 ```
 
@@ -116,26 +116,33 @@ Queries accept ref/revision overrides for every plane used by their registry-def
 and Receipt authentication can therefore select both historical desired and observed snapshots. Explicit ref or
 revision overrides cannot be combined with `-A`, because each Environment may resolve different deployment refs.
 
-Artifacts are first-class inspectable resources with a producer-qualified local identity. The table renders this exact
-address in `NAME`, so it can be copied into a named lookup. `--producer` filters a collection by its first identity
-segment:
+Each family defines its operator-facing `qualifiedName`. Roots use one segment, Stack-owned Units and their Receipts
+use `stack/unit`, and Artifacts append their local name as `unit/artifact`. Direct Units remain one segment, so a direct
+producer's Artifact is `unit/artifact`. Environment and family stay in the command context; partition is management
+metadata and never part of the address. Controller-generated storage names are not accepted as aliases for
+Stack-owned Units.
+
+Artifacts are first-class inspectable resources. The table renders their exact address in `NAME`, so it can be copied
+into a named lookup. `--producer` accepts the producer Unit's qualified name:
 
 ```console
-$ gitopsctr get artifacts --environment dev --producer application--image
+$ gitopsctr get artifacts --environment dev --producer application/image
 NAME                           KIND             PARTITION    AUTHENTICATION
-application--image/containers  ContainerImages  application  CURRENT
+application/image/containers  ContainerImages  application  CURRENT
 ```
 
 Artifact identity and authentication are separate. Inspection follows the registered Receipt-to-Artifact description
 and Receipt-to-desired-Unit observation before reporting `CURRENT`; the authenticated Unit supplies `PARTITION`.
-The generic resource model declares identity segments per family rather than hardcoding a three-level Artifact address.
+The registry composes these addresses from root, child, and mirror rules rather than hardcoding a three-level Artifact
+identity. Persisted documents retain local names for execution and are stored under the corresponding hierarchical
+collection path; ResourceList addresses and human output use the qualified form.
 
 The Receipt relationship shortcuts remain available. `--artifact NAME` prints one typed Artifact resource and
 `--artifacts` prints every artifact described by the Receipt:
 
 ```console
-gitopsctr get receipt application--image --environment dev --artifact containers
-gitopsctr get receipt application--image --environment dev --artifacts
+gitopsctr get receipt application/image --environment dev --artifact containers
+gitopsctr get receipt application/image --environment dev --artifacts
 ```
 
 `status` remains the higher-level diagnostic view and includes authored resources that have not yet resolved into persisted
@@ -152,8 +159,8 @@ gitopsctr apply --environment dev \
   --file deployment/stack-templates/application.yaml \
   --file deployment/environments/dev/stacks/application.yaml \
   --source-revision HEAD
-gitopsctr reconcile --environment dev --unit application --plan
-gitopsctr reconcile --environment dev --unit application
+gitopsctr reconcile --environment dev --unit application/deploy --plan
+gitopsctr reconcile --environment dev --unit application/deploy
 ```
 
 The optional partition identifies an authoritative apply set. Reapplying partition `application` means the supplied

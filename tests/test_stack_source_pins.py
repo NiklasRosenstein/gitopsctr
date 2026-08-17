@@ -495,7 +495,7 @@ def test_finalized_stack_releases_all_nested_aliases_for_exact_uid(tmp_path: Pat
     template_uid, _unit_name, revision_a = _source_backed_tree(candidate)
     stack_path = candidate / "stacks/preview.json"
     stack_path.unlink()
-    (candidate / "units/preview--preview-app.json").unlink()
+    (candidate / "units/preview/preview-app.json").unlink()
     controller.write_resource_incarnation_tombstone(
         candidate,
         controller.ResourceIncarnationTombstone(
@@ -529,7 +529,7 @@ def test_finalized_template_releases_all_incarnation_pins(tmp_path: Path, monkey
     template_uid, _unit_name, source_revision = _source_backed_tree(candidate)
     (candidate / "stack-templates/preview.json").unlink()
     (candidate / "stacks/preview.json").unlink()
-    (candidate / "units/preview--preview-app.json").unlink()
+    (candidate / "units/preview/preview-app.json").unlink()
     tombstone = controller.ResourceIncarnationTombstone(
         api_version=controller.CORE_API_VERSION,
         kind="StackTemplate",
@@ -564,7 +564,7 @@ def test_finalization_does_not_delete_live_candidate_publication_owner(tmp_path:
     template_uid, _unit_name, source_revision = _source_backed_tree(candidate)
     (candidate / "stack-templates/preview.json").unlink()
     (candidate / "stacks/preview.json").unlink()
-    (candidate / "units/preview--preview-app.json").unlink()
+    (candidate / "units/preview/preview-app.json").unlink()
     controller.write_resource_incarnation_tombstone(
         candidate,
         controller.ResourceIncarnationTombstone(
@@ -619,7 +619,7 @@ def test_finalization_releases_source_pins_for_source_less_tombstone_with_new_ui
     template_document["metadata"]["uid"] = "new-template"
     template_path.write_text(json.dumps(template_document))
     (candidate / "stacks/preview.json").unlink()
-    (candidate / "units/preview--preview-app.json").unlink()
+    (candidate / "units/preview/preview-app.json").unlink()
     controller.write_resource_incarnation_tombstone(
         candidate,
         controller.ResourceIncarnationTombstone(

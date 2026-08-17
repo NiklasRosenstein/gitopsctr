@@ -7,21 +7,22 @@ independent persisted representation; a relationship never implies that one reso
 
 ## Families and placements
 
-| Family | Selectors | Local identity | Installed API kinds | Source | Desired | Observed |
-| --- | --- | --- | --- | --- | --- | --- |
-| artifact | `artifact`, `artifacts` | `producer/name` (--producer) | `artifact.gitopsctr.io/v1/ContainerImages`<br>`artifact.gitopsctr.io/v1/FrontendBundle` | — | — | `environment` · `observed-artifacts` · `observed` · default |
-| environment | `environment`, `environments` | `name` | `gitopsctr.io/v1/Environment` | `project` · `source-environments` · `authored` · default | — | — |
-| project | `project`, `projects` | `name` | `gitopsctr.io/v1/Project` | `project` · `source-project` · `authored` | — | — |
-| promotion | `promotion`, `promotions` | `name` | `gitopsctr.io/v1/Promotion` | — | `environment` · `desired-promotions` · `desired` · default | — |
-| receipt | `receipt`, `receipts` | `name` | `gitopsctr.io/v1/Receipt` | — | — | `environment` · `observed-receipts` · `observed` · default |
-| stack | `stack`, `stacks` | `name` | `gitopsctr.io/v1/Stack` | `environment` · `source-stacks` · `authored` | `environment` · `desired-stacks` · `desired` · default | — |
-| stacktemplate | `stacktemplate`, `stacktemplates` | `name` | `gitopsctr.io/v1/StackTemplate` | `project` · `source-stacktemplates` · `authored` | `environment` · `desired-stacktemplates` · `desired` · default | — |
-| unit | `unit`, `units` | `name` | `unit.gitopsctr.io/v1/FrontendS3Cloudfront`<br>`unit.gitopsctr.io/v1/KubernetesManifests`<br>`unit.gitopsctr.io/v1/OciImages`<br>`unit.gitopsctr.io/v1/Terraform`<br>`unit.gitopsctr.io/v1/ViteOciBundle` | `environment` · `source-units` · `authored` | `environment` · `desired-units` · `desired` · default | — |
+| Family | Selectors | Storage identity | Operator address | Installed API kinds | Source | Desired | Observed |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| artifact | `artifact`, `artifacts` | `producer/name` (--producer) | `parent-qualified-name/name` (child via `receipt-describes-artifacts`) | `artifact.gitopsctr.io/v1/ContainerImages`<br>`artifact.gitopsctr.io/v1/FrontendBundle` | — | — | `environment` · `observed-artifacts` · `observed` · default |
+| environment | `environment`, `environments` | `name` | `name` (root) | `gitopsctr.io/v1/Environment` | `project` · `source-environments` · `authored` · default | — | — |
+| project | `project`, `projects` | `name` | `name` (root) | `gitopsctr.io/v1/Project` | `project` · `source-project` · `authored` | — | — |
+| promotion | `promotion`, `promotions` | `name` | `name` (root) | `gitopsctr.io/v1/Promotion` | — | `environment` · `desired-promotions` · `desired` · default | — |
+| receipt | `receipt`, `receipts` | `name` | `subject-qualified-name` (mirror via `receipt-observes-unit`) | `gitopsctr.io/v1/Receipt` | — | — | `environment` · `observed-receipts` · `observed` · default |
+| stack | `stack`, `stacks` | `name` | `name` (root) | `gitopsctr.io/v1/Stack` | `environment` · `source-stacks` · `authored` | `environment` · `desired-stacks` · `desired` · default | — |
+| stacktemplate | `stacktemplate`, `stacktemplates` | `name` | `name` (root) | `gitopsctr.io/v1/StackTemplate` | `project` · `source-stacktemplates` · `authored` | `environment` · `desired-stacktemplates` · `desired` · default | — |
+| unit | `unit`, `units` | `name` | `name` (root) or `stack/logical-unit` (child via `stack-owns-unit`) | `unit.gitopsctr.io/v1/FrontendS3Cloudfront`<br>`unit.gitopsctr.io/v1/KubernetesManifests`<br>`unit.gitopsctr.io/v1/OciImages`<br>`unit.gitopsctr.io/v1/Terraform`<br>`unit.gitopsctr.io/v1/ViteOciBundle` | `environment` · `source-units` · `authored` | `environment` · `desired-units` · `desired` · default | — |
 
-A family-local identity is composed with its placement scope to form a complete address. Most families use
-one `name` segment. Artifact identity is `producer/name`, so two producers may publish the same logical output
-name without collision. A placement names a logical collection. Its repository adapter—not the controller or presentation layer—
-owns physical path discovery. `default` selects the persisted representation used by the family's inspection
+Local identity plus placement drives collection discovery and duplicate detection. Each family's root, child, or
+mirror rule defines the qualified address that the CLI renders and accepts; the collection adapter encodes that
+same address into its canonical path while the document retains its local metadata.name. Environment and family
+remain separate command context. The repository adapter—not the controller or presentation layer—owns physical
+path discovery and encoding. `default` selects the persisted representation used by the family's inspection
 view; it does not make that representation authoritative for another plane.
 
 ## Observation relationships

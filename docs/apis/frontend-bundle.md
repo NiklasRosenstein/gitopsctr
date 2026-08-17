@@ -1,7 +1,7 @@
 # FrontendBundle
 
 `artifact.gitopsctr.io/v1` `FrontendBundle` describes the immutable OCI bundle produced by a `ViteOciBundle` unit. The
-bundled driver publishes it under the logical name `frontend` at `artifacts/<unit>/frontend.yaml|json` on the observed
+bundled driver publishes it under the logical name `frontend` at `artifacts/<qualified-unit>/frontend.yaml|json` on the observed
 ref.
 
 ```yaml

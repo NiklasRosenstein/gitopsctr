@@ -160,9 +160,12 @@ is bound to the new projection, while the retained consumer stays fenced to its 
 the evidence arrives. Reconciliation always uses the selected Unit binding's context. Every referenced context record
 must remain available in the desired snapshot.
 
-Generated Units use names such as `application--deploy` and carry an owner reference fenced by the exact Stack
-`apiVersion`, kind, name, and UID. Missing, stale, cyclic, or unknown dependencies and unsupported unresolved dynamic
-artifact/receipt/promotion evidence fail before desired publication.
+Generated Units keep their StackTemplate-local name in `metadata.name` and carry an owner reference fenced by the exact
+Stack `apiVersion`, kind, name, and UID. The registry combines that placement with the local name to derive both the
+The registry combines that placement with the local name to derive both the operator address and the persisted collection path: `application/deploy` is stored at `units/application/deploy.yaml`.
+Its Receipt mirrors that path. Any artifacts published by the Unit are stored under `artifacts/application/deploy/<artifact-name>.yaml|yml|json`. Partition never participates in the address. Missing, stale, cyclic,
+or unknown dependencies and unsupported unresolved dynamic artifact/receipt/promotion evidence fail before desired
+publication.
 
 Artifact imports with `artifactImports[].fromPromotion` are a separate Unit artifact-lineage feature; they do not select
 or acquire a StackTemplate.

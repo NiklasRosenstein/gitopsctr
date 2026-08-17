@@ -31,7 +31,6 @@ from gitopsctr.inventory import (
 )
 from gitopsctr.registry import RESOURCE_REGISTRY
 from gitopsctr.resource_model import (
-    IdentityConstraint,
     IdentitySegmentDefinition,
     InspectionRelationshipRole,
     ResourceFamilyDefinition,
@@ -49,6 +48,7 @@ class InspectionResult:
 
     record: InventoryRecord
     relationship: object | None = None
+    qualified_name: str | None = None
 
 
 ALL_SELECTOR = "all"
@@ -121,18 +121,42 @@ def _environments(inventory: InventorySession) -> tuple[str, ...]:
 
 
 def _selection(family: ResourceFamilyDefinition, args: argparse.Namespace) -> ResourceSelection | None:
+    storage_selection: ResourceSelection | None = None
     try:
-        exact = family.identity.parse(args.name) if args.name is not None else None
+        if args.name is not None:
+            family.addressing.validate(args.name)
+            storage_selection = family.addressing.storage_selection(args.name, family.identity)
     except ResourceModelError as exc:
-        expected = family.identity.separator.join(segment.name.upper() for segment in family.identity.segments)
-        raise OperationError(f"invalid {family.singular} name {args.name!r}; expected {expected}") from exc
-    constraints = tuple(
-        IdentityConstraint(segment.name, frozenset((value,)))
-        for segment in family.identity.segments
-        if segment.option_destination is not None
-        and isinstance(value := getattr(args, segment.option_destination, None), str)
-    )
-    return ResourceSelection(exact, constraints) if exact is not None or constraints else None
+        raise OperationError(f"invalid {family.singular} qualified name {args.name!r}: {exc}") from exc
+    try:
+        constraints = tuple(
+            constraint
+            for segment in family.identity.segments
+            if segment.option_destination is not None
+            and isinstance(value := getattr(args, segment.option_destination, None), str)
+            and (constraint := family.addressing.storage_constraint(segment.name, value, family.identity)) is not None
+        )
+    except ResourceModelError as exc:
+        raise OperationError(f"invalid {family.singular} address filter: {exc}") from exc
+    if storage_selection is not None and constraints:
+        return ResourceSelection(storage_selection.exact, (*storage_selection.constraints, *constraints))
+    return storage_selection or (ResourceSelection(constraints=constraints) if constraints else None)
+
+
+def _matches_address_filters(
+    family: ResourceFamilyDefinition,
+    qualified_name: str,
+    args: argparse.Namespace,
+) -> bool:
+    try:
+        return all(
+            family.addressing.filter_value(qualified_name, segment.name, family.identity) == value
+            for segment in family.identity.segments
+            if segment.option_destination is not None
+            and isinstance(value := getattr(args, segment.option_destination, None), str)
+        )
+    except ResourceModelError as exc:
+        raise OperationError(f"invalid {family.singular} address filter: {exc}") from exc
 
 
 def _names_selection(names: frozenset[str]) -> ResourceSelection:
@@ -236,16 +260,30 @@ def _records_for_environment(
             selection=selection,
         )
 
+    addressed_records = tuple(
+        (record, inventory.resource_qualified_name(record))
+        for record in records
+        if (
+            (args.name is None or inventory.resource_qualified_name(record) == args.name)
+            and _matches_address_filters(family, inventory.resource_qualified_name(record), args)
+        )
+    )
+    selected_records = tuple(record for record, _qualified_name in addressed_records)
     if evaluate and family.name in {"stack", "stacktemplate"}:
         allow_missing_observed_ref = args.observed_ref is None and args.observed_revision is None
         inventory.prepare_stack_inspection(
-            records,
+            selected_records,
             observed_ref=args.observed_ref or observed_ref,
             observed_revision=args.observed_revision,
             allow_missing_observed_ref=allow_missing_observed_ref,
         )
-    relationship_by_path = _relationship_states(inventory, family, records, environment, args) if evaluate else {}
-    return tuple(InspectionResult(record, relationship_by_path.get(record.path)) for record in records)
+    relationship_by_path = (
+        _relationship_states(inventory, family, selected_records, environment, args) if evaluate else {}
+    )
+    return tuple(
+        InspectionResult(record, relationship_by_path.get(record.path), qualified_name)
+        for record, qualified_name in addressed_records
+    )
 
 
 def _relationship_states(
@@ -301,59 +339,26 @@ def _relationship_states(
             selection=selection,
         )
 
-    selected_artifact_producers: frozenset[str] | None = None
     if view.relationship_role is InspectionRelationshipRole.SUBJECT:
         units = records
-        subject_identities = {record.identity for record in records}
-        candidate_receipts = related_resources(
+        receipts = related_resources(
             observation.observer_family,
             observation.observer_plane,
         )
-        try:
-            receipts = tuple(
-                receipt
-                for receipt in candidate_receipts
-                if observation.binding.subject_identity(receipt.relationship_resource()) in subject_identities
-            )
-        except ResourceModelError as exc:
-            raise OperationError(f"environment {environment!r}: invalid observation relationship: {exc}") from exc
     elif view.relationship_role is InspectionRelationshipRole.OBSERVER:
         receipts = records
-        subject_names = set()
-        for receipt in receipts:
-            try:
-                subject_names.add(observation.binding.subject_identity(receipt.relationship_resource()).name)
-            except ResourceModelError as exc:
-                raise OperationError(f"environment {environment!r}, observed {receipt.path}: {exc}") from exc
         units = related_resources(
             observation.subject_family,
             observation.subject_plane,
-            _names_selection(frozenset(subject_names)),
         )
     elif view.relationship_role is InspectionRelationshipRole.DESCRIBED_RESOURCE and description is not None:
-        selected_artifact_producers = frozenset(
-            family.identity.value(record.local_identity, description.producer_identity_segment) for record in records
-        )
-        candidate_receipts = related_resources(
+        receipts = related_resources(
             description.describer_family,
             description.describer_plane,
         )
-        try:
-            receipts = tuple(
-                receipt
-                for receipt in candidate_receipts
-                if observation.binding.subject_identity(receipt.relationship_resource()).name
-                in selected_artifact_producers
-            )
-            subject_names = {
-                observation.binding.subject_identity(receipt.relationship_resource()).name for receipt in receipts
-            }
-        except ResourceModelError as exc:
-            raise OperationError(f"environment {environment!r}: invalid observation relationship: {exc}") from exc
         units = related_resources(
             description.producer_family,
             description.producer_plane,
-            _names_selection(frozenset(subject_names)),
         )
     else:
         raise OperationError(
@@ -364,11 +369,9 @@ def _relationship_states(
     if description is not None and (
         resolve_artifacts or view.relationship_role is InspectionRelationshipRole.DESCRIBED_RESOURCE
     ):
-        producer_names = selected_artifact_producers or frozenset(unit.name for unit in units)
         artifacts = related_resources(
             description.artifact_family,
             description.artifact_plane,
-            ResourceSelection.segment(description.producer_identity_segment, producer_names),
         )
     if description is None:
         evaluation = evaluate_observation_relationship(observation, units, receipts)
@@ -392,6 +395,7 @@ def _relationship_states(
         strict_artifacts=view.relationship_role is not InspectionRelationshipRole.DESCRIBED_RESOURCE,
         observation=observation,
         description=description,
+        address_runtime=inventory,
     )
     if view.relationship_role is InspectionRelationshipRole.SUBJECT:
         return {value.unit.path: value for value in evaluation.units}
@@ -413,7 +417,7 @@ def _select(
     default_placement = next(item for item in family.placements if item.default_for_inspection)
     if default_placement.scope is ResourceScope.PROJECT:
         results = tuple(
-            InspectionResult(record)
+            InspectionResult(record, qualified_name=inventory.resource_qualified_name(record))
             for record in inventory.resources(
                 family.name,
                 selection=_selection(family, args),
@@ -433,6 +437,8 @@ def _select(
             for environment in environments
             for result in _records_for_environment(inventory, family, environment, args, evaluate=evaluate)
         )
+    if args.name is not None:
+        results = tuple(result for result in results if result.qualified_name == args.name)
     if args.name is not None and not results:
         location = (
             " in any environment"
@@ -442,7 +448,12 @@ def _select(
         raise OperationError(f"no {family.singular} named {args.name!r}{location}")
     return tuple(
         sorted(
-            results, key=lambda item: (item.record.environment or "", item.record.qualified_name, str(item.record.gvk))
+            results,
+            key=lambda item: (
+                item.record.environment or "",
+                item.qualified_name or item.record.qualified_name,
+                str(item.record.gvk),
+            ),
         )
     )
 
@@ -509,7 +520,7 @@ def _envelope(results: Sequence[InspectionResult]) -> JsonObject:
                     family=result.record.family.name,
                     scope=result.record.address.scope.value,
                     namespace=result.record.address.namespace,
-                    qualifiedName=result.record.qualified_name,
+                    qualifiedName=result.qualified_name or result.record.qualified_name,
                 ),
                 document=JsonObjectValue(result.record.document),
                 inspection=(
@@ -575,14 +586,15 @@ def _artifact_results(
             allow_missing_ref=args.observed_ref is None and args.observed_revision is None,
             selection=ResourceSelection.segment(
                 description.producer_identity_segment,
-                frozenset((receipt_result.record.name,)),
+                frozenset((receipt_result.record.qualified_name,)),
             ),
         )
         by_path = {artifact.path: artifact for artifact in artifacts}
         links = getattr(current, "artifacts", ())
         for link in links:
             if args.artifact is None or link.name == args.artifact:
-                selected.append(InspectionResult(by_path[link.artifact.path]))
+                artifact = by_path[link.artifact.path]
+                selected.append(InspectionResult(artifact, qualified_name=inventory.resource_qualified_name(artifact)))
     if args.artifact is not None and not selected:
         raise OperationError(f"receipt {args.name!r} has no artifact named {args.artifact!r}")
     return tuple(selected)
@@ -601,12 +613,16 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
             table = args.output in {"table", "wide"}
             for family in _aggregate_families():
                 evaluate = (
-                    table
-                    and (
-                        bool(family.inspection and family.inspection.observation)
-                        or family.name in {"stack", "stacktemplate"}
+                    (
+                        table
+                        and (
+                            bool(family.inspection and family.inspection.observation)
+                            or family.name in {"stack", "stacktemplate"}
+                        )
                     )
-                ) or _is_authenticated_artifact_family(family)
+                    or _is_authenticated_artifact_family(family)
+                    or family.addressing.requires_relationship_authentication
+                )
                 selected.append((family, _select(inventory, family, args, evaluate=evaluate)))
             if table:
                 populated = tuple((family, results) for family, results in selected if results)
@@ -646,9 +662,13 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
         table_output = args.output in {"table", "wide"}
         table = table_output and not wants_artifacts
         evaluate = (
-            (table or wants_artifacts)
-            and (bool(family.inspection.observation) or family.name in {"stack", "stacktemplate"})
-        ) or _is_authenticated_artifact_family(family)
+            (
+                (table or wants_artifacts)
+                and (bool(family.inspection.observation) or family.name in {"stack", "stacktemplate"})
+            )
+            or _is_authenticated_artifact_family(family)
+            or family.addressing.requires_relationship_authentication
+        )
         results = _select(inventory, family, args, evaluate=evaluate)
         if wants_artifacts:
             results = _artifact_results(inventory, results, args)

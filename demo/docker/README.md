@@ -2,9 +2,9 @@
 
 This demo applies one authored `Stack` as the authoritative `application` partition and exercises real local effects:
 
-1. `application--image` builds the HTTP application and publishes it to a local OCI registry.
+1. `application/image` builds the HTTP application and publishes it to a local OCI registry.
 2. Its `containers` artifact carries the immutable image digest.
-3. `application--deploy` resolves that artifact and uses Terraform's Docker provider to run the container.
+3. `application/deploy` resolves that artifact and uses Terraform's Docker provider to run the container.
 
 Both Units are generated from the inline `StackTemplate` in `deployment/stack-templates/application.yaml`; there are no
 separately authored Units. The demo passes that template explicitly with the Stack, so its desired acquisition mode is

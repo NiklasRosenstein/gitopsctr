@@ -71,7 +71,6 @@ def unit(
             "materialize": renderer or {"type": "plain", "paths": ["*.yaml"]},
             "delivery": delivery or {"mode": "external"},
             "materialization": {
-                "path": "materialized/web",
                 "digest": DIGEST,
                 "mediaType": "application/vnd.gitopsctr.kubernetes-manifests.v1",
                 "metadata": {
