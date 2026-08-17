@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -32,8 +33,10 @@ from gitopsctr.resource_model import (
     ArtifactResolutionContext,
     CollectionReadContext,
     IdentityConstraint,
+    JsonFieldPath,
     ObservationCardinality,
     ObservationState,
+    PersistedQualifiedNameAddressing,
     ProfiledApiMembership,
     ReceiptArtifactDescriptionBinding,
     ReceiptObservationBinding,
@@ -157,6 +160,31 @@ def test_family_local_identity_is_registry_defined_and_generically_selectable():
     assert artifact.identity.segments[0].filter_option == "--producer"
     with pytest.raises(ResourceModelError, match="requires 1 segments"):
         unit.identity.parse("application/image")
+
+
+def test_root_and_persisted_relationship_addresses_round_trip_canonically():
+    root_identity = ResourceIdentityDefinition()
+    root = RootResourceAddressing()
+    selected = root.storage_selection("application", root_identity)
+
+    assert selected.exact is not None
+    assert root_identity.render(selected.exact) == "application"
+    assert root.filter_value("application", "name", root_identity) == "application"
+
+    mirror = PersistedQualifiedNameAddressing(
+        JsonFieldPath(("spec", "subject", "qualifiedName")),
+        parent_family="unit",
+        relationship="receipt-observes-unit",
+    )
+    record = SimpleNamespace(
+        name="application-receipt",
+        document={"spec": {"subject": {"qualifiedName": "stack/application"}}},
+    )
+    qualified_name = mirror.qualified_name(record, SimpleNamespace())
+
+    mirror.validate(qualified_name)
+    assert qualified_name == "stack/application"
+    assert mirror.storage_selection(qualified_name, root_identity) is None
 
 
 def test_registered_stack_template_selection_binding_checks_uid_and_content_digest():
