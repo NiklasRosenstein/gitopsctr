@@ -936,6 +936,8 @@ class GitStateStore:
         snapshot = self.remote_ref_snapshot(RemoteRefQuery(prefixes=frozenset((prefix,))))
         pins: list[ControllerPin] = []
         for ref, revision in snapshot.revisions.items():
+            if not ref.startswith(prefix):
+                continue
             name = ref.removeprefix(prefix)
             self._controller_pin_ref(name)
             pins.append(ControllerPin(name, ref, revision))

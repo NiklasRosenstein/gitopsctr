@@ -289,6 +289,17 @@ def test_controller_pin_listing_is_sorted_and_read_only(bare_repository: BareRep
     )
 
 
+def test_controller_pin_listing_filters_broader_cached_snapshot(bare_repository: BareRepository):
+    revision = _git(bare_repository.working, "rev-parse", "HEAD")
+    store = GitStateStore(bare_repository.working)
+    pin = store.create_controller_pin("stacks/dev/example", revision)
+
+    with remote_ref_snapshot_scope():
+        snapshot = store.remote_ref_snapshot(RemoteRefQuery(prefixes=frozenset(("refs/heads/",))))
+        assert "refs/heads/main" in snapshot.revisions
+        assert store.list_controller_pins() == (pin,)
+
+
 def test_remote_ref_listing_is_sorted_and_read_only(bare_repository: BareRepository):
     first = _git(bare_repository.working, "rev-parse", "HEAD")
     _git(bare_repository.working, "branch", "candidate/z")
