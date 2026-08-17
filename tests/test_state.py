@@ -15,7 +15,11 @@ from gitopsctr.state import (
     GitSourceRevision,
     GitStateStore,
     PublishedTree,
+    RemoteRefQuery,
+    RemoteRefSnapshot,
+    RemoteRefUpdate,
     canonical_repository_identity,
+    remote_ref_snapshot_scope,
 )
 
 
@@ -110,6 +114,58 @@ def source_repository(tmp_path: Path) -> BareRepository:
     _commit(working, "source", "first\n", "first")
     _git(working, "push", "-u", "origin", "main")
     return BareRepository(working, remote)
+
+
+def test_remote_ref_snapshot_enforces_declared_coverage(bare_repository: BareRepository):
+    store = GitStateStore(bare_repository.working)
+    revision = _git(bare_repository.working, "rev-parse", "HEAD")
+    snapshot = store.remote_ref_snapshot(
+        RemoteRefQuery(
+            exact_refs=frozenset(("main",)),
+            prefixes=frozenset(("refs/heads/gitopsctr/pins/",)),
+        )
+    )
+
+    assert snapshot.revision("refs/heads/main") == revision
+    assert snapshot.revision("refs/heads/gitopsctr/pins/missing") is None
+    with pytest.raises(OperationError, match="outside snapshot coverage"):
+        snapshot.revision("other")
+    with pytest.raises(OperationError, match="undeclared"):
+        RemoteRefSnapshot(RemoteRefQuery(exact_refs=frozenset(("main",))), {"other": revision})
+
+
+def test_remote_ref_snapshot_scope_memoizes_only_covered_queries(
+    bare_repository: BareRepository, monkeypatch: pytest.MonkeyPatch
+):
+    store = GitStateStore(bare_repository.working)
+    calls = 0
+    original_git = GitStateStore.git
+
+    def recording_git(self: GitStateStore, *args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        if self is store and args[:2] == ("ls-remote", "--refs"):
+            calls += 1
+        return original_git(self, *args, **kwargs)
+
+    monkeypatch.setattr(GitStateStore, "git", recording_git)
+    with remote_ref_snapshot_scope():
+        broad = store.remote_ref_snapshot(RemoteRefQuery(prefixes=frozenset(("refs/heads/gitopsctr/",))))
+        assert (
+            store.remote_ref_snapshot(RemoteRefQuery(exact_refs=frozenset(("refs/heads/gitopsctr/pins/missing",))))
+            is broad
+        )
+        store.remote_ref_snapshot(RemoteRefQuery(exact_refs=frozenset(("main",))))
+    assert calls == 2
+
+
+def test_remote_ref_updates_require_unique_typed_compare_and_swap_entries(bare_repository: BareRepository):
+    store = GitStateStore(bare_repository.working)
+    revision = _git(bare_repository.working, "rev-parse", "HEAD")
+    update = RemoteRefUpdate("typed/new", revision, None)
+    assert store.update_remote_refs((update,)).returncode == 0
+    assert _remote_revision(bare_repository, "refs/heads/typed/new") == revision
+    with pytest.raises(OperationError, match="duplicate refs"):
+        store.update_remote_refs((update, update))
 
 
 def _pin_ref(name: str) -> str:
@@ -926,16 +982,16 @@ def test_same_ref_target_interleave_uses_one_observation_and_fails_closed(
     accepted_target = AcceptedDesiredTarget("refs/heads/deploy/dev", tombstone)
     target_reads = 0
     push_read_counts: list[int] = []
-    original_remote_revision = GitStateStore._remote_ref_revision
+    original_remote_snapshot = GitStateStore.remote_ref_snapshot
     original_git = GitStateStore.git
 
-    def racing_remote_revision(self: GitStateStore, ref: str) -> str | None:
+    def racing_remote_snapshot(self: GitStateStore, query, *, fresh: bool = False):
         nonlocal target_reads
-        value = original_remote_revision(self, ref)
-        if self is store and ref == accepted_target.ref:
+        value = original_remote_snapshot(self, query, fresh=fresh)
+        if self is store and query.covers_ref(accepted_target.ref):
             target_reads += 1
             if target_reads == 1:
-                # The old two-read sequence would observe this value and lease it.
+                # The atomic snapshot is leased even if the ref changes immediately after it.
                 _git(bare_repository.remote, "update-ref", "refs/heads/deploy/dev", published.revision)
         return value
 
@@ -944,7 +1000,7 @@ def test_same_ref_target_interleave_uses_one_observation_and_fails_closed(
             push_read_counts.append(target_reads)
         return original_git(self, *args, **kwargs)
 
-    monkeypatch.setattr(GitStateStore, "_remote_ref_revision", racing_remote_revision)
+    monkeypatch.setattr(GitStateStore, "remote_ref_snapshot", racing_remote_snapshot)
     monkeypatch.setattr(GitStateStore, "git", recording_git)
     with pytest.raises(OperationError):
         store.release_publication_owner(owner, accepted_target)
