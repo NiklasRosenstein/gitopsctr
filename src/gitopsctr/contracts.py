@@ -8,10 +8,12 @@ import re
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from typing import Annotated, Any, Literal, cast
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
+from jsonschema.protocols import Validator
 from mashumaro.config import BaseConfig
 from mashumaro.jsonschema import build_json_schema
 from mashumaro.jsonschema.annotations import Pattern
@@ -1598,7 +1600,8 @@ class MashumaroContract[ModelT: StrictModel](TypedDocumentContract[ModelT]):
     model: type[ModelT]
     schema_id: str
 
-    def json_schema(self) -> JsonObject:
+    @cached_property
+    def _compiled_schema(self) -> JsonObject:
         schema = cast(
             JsonObject,
             build_json_schema(
@@ -1613,12 +1616,19 @@ class MashumaroContract[ModelT: StrictModel](TypedDocumentContract[ModelT]):
         schema["$id"] = self.schema_id
         return schema
 
+    @cached_property
+    def _validator(self) -> Validator:
+        return Draft202012Validator(self._compiled_schema)
+
+    def json_schema(self) -> JsonObject:
+        return deepcopy(self._compiled_schema)
+
     def _candidate(self, document: object) -> JsonObject:
         if not isinstance(document, dict) or not all(isinstance(key, str) for key in document):
             raise ContractError("expected a JSON object")
         candidate = cast(JsonObject, dict(document))
         # $schema is only a transport hint. Its value never selects a validator or triggers IO.
-        schema = self.json_schema()
+        schema = self._compiled_schema
         if "$schema" in cast(dict[str, Any], schema.get("properties", {})):
             candidate["$schema"] = None
         else:
@@ -1628,7 +1638,7 @@ class MashumaroContract[ModelT: StrictModel](TypedDocumentContract[ModelT]):
     def parse(self, document: object) -> ModelT:
         candidate = self._candidate(document)
         try:
-            Draft202012Validator(self.json_schema()).validate(candidate)
+            self._validator.validate(candidate)
             return self.model.from_dict(candidate)
         except (ValidationError, TypeError, ValueError) as exc:
             detail = exc.message if isinstance(exc, ValidationError) else str(exc)
@@ -1651,7 +1661,8 @@ class MashumaroUnionContract[ModelT: StrictModel](TypedDocumentContract[ModelT])
     schema_id: str
     title: str
 
-    def json_schema(self) -> JsonObject:
+    @cached_property
+    def _compiled_schema(self) -> JsonObject:
         variants: list[JsonObject] = []
         for model in self.models:
             schema = cast(JsonObject, build_json_schema(model).to_dict())
@@ -1667,12 +1678,19 @@ class MashumaroUnionContract[ModelT: StrictModel](TypedDocumentContract[ModelT])
             },
         )
 
+    @cached_property
+    def _validator(self) -> Validator:
+        return Draft202012Validator(self._compiled_schema)
+
+    def json_schema(self) -> JsonObject:
+        return deepcopy(self._compiled_schema)
+
     def parse(self, document: object) -> ModelT:
         if not isinstance(document, dict) or not all(isinstance(key, str) for key in document):
             raise ContractError("expected a JSON object")
         candidate = dict(document)
         try:
-            Draft202012Validator(self.json_schema()).validate(candidate)
+            self._validator.validate(candidate)
         except ValidationError as exc:
             raise ContractError(exc.message) from exc
         errors: list[Exception] = []

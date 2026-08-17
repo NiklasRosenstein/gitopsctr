@@ -16,8 +16,11 @@ from gitopsctr.contracts import (
     AuthoredSource,
     ContractError,
     DesiredSource,
+    MashumaroContract,
+    MashumaroUnionContract,
     MaterializationDocument,
 )
+from gitopsctr.core_api import PROJECT, JsonSchemaResourceContract
 from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import DriverError, MaterializationCapability, UnitResolutionContext
 from gitopsctr.errors import ReferenceUnavailable
@@ -528,6 +531,27 @@ def test_core_schemas_are_draft_2020_12_and_environment_examples_validate():
         CORE_CONTRACTS["environment"].validate(
             controller.normalize_environment_document(json.loads(path.read_text()), path.parent.name)
         )
+
+
+def test_contracts_cache_compiled_schemas_and_validators_without_exposing_mutable_state():
+    typed = CORE_CONTRACTS["environment"]
+    union = UNIT_DRIVERS["kubernetes-manifests"].result_contract
+    raw = PROJECT.spec.profiles["authored"]
+
+    assert isinstance(typed, MashumaroContract)
+    assert isinstance(union, MashumaroUnionContract)
+    assert isinstance(raw, JsonSchemaResourceContract)
+
+    for contract in (typed, union):
+        first = contract.json_schema()
+        second = contract.json_schema()
+        assert first == second
+        assert first is not second
+        first["title"] = "mutated by caller"
+        assert contract.json_schema() == second
+        assert contract._validator is contract._validator
+
+    assert raw._validator is raw._validator
 
 
 def test_schema_cli_show_export_and_check_work_outside_a_git_repository(tmp_path):
