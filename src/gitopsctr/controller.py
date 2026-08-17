@@ -9408,7 +9408,7 @@ def _progress_deletion(args: argparse.Namespace) -> bool:
         if not args.dry and lease_acquisition is not None and outcome is None:
             release_effect_lease(
                 desired_ref,
-                resource.name,
+                args.name,
                 lease_acquisition.lease.token,
                 args.uid,
                 verify_snapshot=False,
@@ -9583,8 +9583,7 @@ def command_verify(args: argparse.Namespace) -> None:
         materialize_revision(desired_revision, desired)
         log_status("DESIRED", f"{style_branch(desired_ref)} at {describe_revision(desired_revision)}")
 
-        unit_paths = sorted(path for path in (desired / "units").glob("*") if path.suffix in {".json", ".yaml", ".yml"})
-        available = {path.stem: path for path in unit_paths}
+        available = _current_desired_unit_paths(desired)
         ensure_desired_units_materialized(desired)
         desired_resources = load_desired_resource_graph(desired)
         addresses = qualified_unit_name_map(desired_resources)

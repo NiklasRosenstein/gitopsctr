@@ -257,6 +257,45 @@ def test_converge_stack_deletion_is_child_first_and_writes_one_progressive_clean
         controller.serialize_unit_document(controller.mark_resource_for_deletion(child), profile="desired"),
     )
     calls: list[tuple[str, str | None]] = []
+    released_leases: list[str] = []
+    monkeypatch.setattr(controller, "effect_lease_ref", lambda *_args, **_kwargs: "deploy/dev")
+    monkeypatch.setattr(controller, "file_blob", lambda _path: "b" * 40)
+
+    def acquire_lease(_ref, revision, qualified_name, uid, **_kwargs):
+        assert qualified_name == child_name
+        return controller.EffectLeaseAcquisition(
+            lease=controller.EffectLease(
+                unit_name="preview-app",
+                qualified_name=qualified_name,
+                uid=uid,
+                token="lease-test",
+                owner="test-runner",
+                desired_revision=revision,
+                snapshot=controller.EffectLeaseSnapshot(
+                    unit_path="units/preview/preview-app.json",
+                    unit_blob="b" * 40,
+                    api_version=controller.UNIT_API_VERSION,
+                    kind="Terraform",
+                    driver="terraform",
+                    source_revision="a" * 40,
+                    cleanup_path=None,
+                    cleanup_blob=None,
+                ),
+            ),
+            revision=revision,
+        )
+
+    monkeypatch.setattr(controller, "acquire_effect_lease", acquire_lease)
+    monkeypatch.setattr(
+        controller,
+        "validate_effect_lease_head_for_store",
+        lambda *_args, **_kwargs: harness.desired_revision,
+    )
+    monkeypatch.setattr(
+        controller,
+        "release_effect_lease",
+        lambda _ref, qualified_name, *_args, **_kwargs: released_leases.append(qualified_name),
+    )
     monkeypatch.setattr(
         type(controller.UNIT_DRIVERS["terraform"]),
         "teardown",
@@ -266,6 +305,7 @@ def test_converge_stack_deletion_is_child_first_and_writes_one_progressive_clean
     controller.command_converge(harness.converge_args(unit=["preview/preview-app"]))
 
     assert calls == [("preview-app", "preview/preview-app")]
+    assert released_leases == ["preview/preview-app"]
     assert not (harness.desired / "units" / f"{child_name}.json").exists()
     assert not (harness.desired / "stacks/preview.json").exists()
     assert not (harness.desired / "stack-templates/preview.json").exists()
