@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any, cast
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
+from jsonschema.protocols import Validator
 
 from gitopsctr.api import GVK, ApiKind
 from gitopsctr.contracts import CORE_CONTRACTS
@@ -24,12 +26,16 @@ class JsonSchemaResourceContract(TypedDocumentContract[JsonObject]):
 
     schema: JsonObject
 
+    @cached_property
+    def _validator(self) -> Validator:
+        return Draft202012Validator(self.schema)
+
     def parse(self, document: object) -> JsonObject:
         try:
             value = require_json_value(document)
             if not isinstance(value, dict):
                 raise ValueError("expected a JSON object")
-            Draft202012Validator(self.schema).validate(value)
+            self._validator.validate(value)
             return value
         except (ValidationError, ValueError) as exc:
             detail = exc.message if isinstance(exc, ValidationError) else str(exc)
