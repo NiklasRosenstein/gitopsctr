@@ -9,7 +9,6 @@ from typing import cast
 import pytest
 
 import gitopsctr.inventory as inventory_module
-from gitopsctr.api import GVK
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
     DesiredResourceMetadata,
@@ -34,6 +33,7 @@ from gitopsctr.inventory import (
 from gitopsctr.operational import materialization_tree_digest
 from gitopsctr.plane_repositories import PlaneRepositorySession
 from gitopsctr.registry import RESOURCE_REGISTRY
+from gitopsctr.resource_api import GVK
 from gitopsctr.resource_model import ObservationDefinition, ResourcePlane, ResourceRegistry
 from gitopsctr.resources import desired_unit_binding_digest
 from gitopsctr.state import GitRefSnapshot, GitStateStore

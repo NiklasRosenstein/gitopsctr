@@ -20,7 +20,6 @@ from gitopsctr.contrib.drivers import (
     terraform,
     vite_oci_bundle,
 )
-from gitopsctr.document import ContractError
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -35,6 +34,7 @@ from gitopsctr.driver import (
     VerificationStatus,
 )
 from gitopsctr.execution import CommandOutput, DriverExecution, TextDriverOutput
+from gitopsctr.resource_api import ContractError
 
 DIGEST = "sha256:" + "1" * 64
 OTHER_DIGEST = "sha256:" + "2" * 64
@@ -893,7 +893,7 @@ def test_driver_semantics_select_only_driver_defined_result_fields(driver, resul
 
 def test_every_reconciliation_driver_defines_result_semantics():
     assert set(driver_registry.UNIT_DRIVERS) == set(driver_registry.RECONCILIATION_DRIVERS)
-    assert driver_registry.load_unit_drivers() == driver_registry.UNIT_DRIVERS
+    assert driver_registry.load_unit_drivers(driver_registry.API_KINDS) == driver_registry.UNIT_DRIVERS
 
 
 @pytest.mark.parametrize(

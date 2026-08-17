@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import controller
-from gitopsctr.api import GVK
 from gitopsctr.contracts import (
     AuthoredSource,
     DesiredSource,
@@ -23,6 +22,7 @@ from gitopsctr.driver import (
     UnitResolutionContext,
 )
 from gitopsctr.errors import ReferenceUnavailable
+from gitopsctr.resource_api import GVK
 from gitopsctr.resources import ResourceMetadata, UnitResource
 from tests.conftest import write_test_document
 

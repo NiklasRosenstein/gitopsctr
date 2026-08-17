@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from importlib.metadata import entry_points
 
-from gitopsctr.api import api_kinds
+from gitopsctr.api_discovery import api_kinds
 from gitopsctr.contracts import ArtifactDescriptor
 from gitopsctr.driver import (
     DriverError,

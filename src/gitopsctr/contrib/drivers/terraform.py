@@ -20,7 +20,7 @@ from gitopsctr.contracts import (
     StrictModel,
     schema_url,
 )
-from gitopsctr.document import JsonObject, JsonObjectValue, JsonValue, ResolvedJsonObjectValue, require_json_value
+from gitopsctr.document import JsonObjectValue, ResolvedJsonObjectValue
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -43,6 +43,7 @@ from gitopsctr.driver import (
     unit_driver_api,
 )
 from gitopsctr.execution import CommandOutput, CommandResult
+from gitopsctr.resource_api import JsonObject, JsonValue, require_json_value
 from gitopsctr.templates import TemplateObject
 
 from ._common import select_result_fields

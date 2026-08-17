@@ -30,3 +30,14 @@ The modes are a `StrEnum`; driver APIs should never pass untyped string modes.
 
 Commands that return credentials or other secrets must pass `sensitive=True`. Captured diagnostics stay on the raised
 command error. They are not copied to the human transcript.
+
+## Resource API imports
+
+The internal resource API kernel is the authoritative home for versioned kind
+and document-contract primitives. Drivers and other installed contributions
+must import `GVK`, `ApiKind`, JSON value aliases, and document contracts from
+`gitopsctr.resource_api`.
+
+The former `gitopsctr.api` module has been removed. `gitopsctr.document` now
+contains only GitOpsCtr's Mashumaro and authored-reference helpers; it no longer
+exports the generic contract interfaces.

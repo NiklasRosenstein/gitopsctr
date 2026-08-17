@@ -21,7 +21,7 @@ from gitopsctr.contracts import (
     InspectionResourceListDocument,
     InspectionResourceListMetadata,
 )
-from gitopsctr.document import JsonObject, JsonObjectValue
+from gitopsctr.document import JsonObjectValue
 from gitopsctr.errors import OperationError
 from gitopsctr.inventory import (
     InventoryRecord,
@@ -30,6 +30,7 @@ from gitopsctr.inventory import (
     evaluate_relationships,
 )
 from gitopsctr.registry import RESOURCE_REGISTRY
+from gitopsctr.resource_api import JsonObject
 from gitopsctr.resource_model import (
     IdentitySegmentDefinition,
     InspectionRelationshipRole,

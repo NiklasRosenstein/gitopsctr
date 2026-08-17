@@ -35,7 +35,6 @@ from typing import Any, Literal, TextIO, cast
 import yaml
 
 from gitopsctr import operational
-from gitopsctr.api import GVK, ApiError
 from gitopsctr.artifacts import require_artifact_api
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
@@ -86,7 +85,7 @@ from gitopsctr.dependencies import (
     desired_observation_reference_units,
     observation_reference_units,
 )
-from gitopsctr.document import ContractError, DocumentContract, JsonObject, JsonObjectValue, require_json_value
+from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import (
     DriverError,
     MaterializationContext,
@@ -155,6 +154,7 @@ from gitopsctr.resolution import (
 from gitopsctr.resolution import (
     resolve_template as resolve_template_value,
 )
+from gitopsctr.resource_api import GVK, ApiError, ContractError, DocumentContract, JsonObject, require_json_value
 from gitopsctr.resource_model import ResourcePlane
 from gitopsctr.resources import (
     CORE_API_VERSION,

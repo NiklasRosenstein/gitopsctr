@@ -28,7 +28,7 @@ from gitopsctr.contracts import (
     StrictModel,
     schema_url,
 )
-from gitopsctr.document import JsonObject, ResolvedJsonObjectValue
+from gitopsctr.document import ResolvedJsonObjectValue
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -44,6 +44,7 @@ from gitopsctr.driver import (
     unit_driver_api,
 )
 from gitopsctr.execution import CommandOutput, DriverExecution
+from gitopsctr.resource_api import JsonObject
 
 from ._oci import (
     FRONTEND_ARCHIVE,

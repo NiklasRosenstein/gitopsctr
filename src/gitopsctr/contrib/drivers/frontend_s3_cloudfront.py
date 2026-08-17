@@ -19,7 +19,6 @@ from gitopsctr.contracts import (
     StrictModel,
     schema_url,
 )
-from gitopsctr.document import JsonObject
 from gitopsctr.driver import (
     DriverError,
     PlanningCapability,
@@ -37,6 +36,7 @@ from gitopsctr.driver import (
 )
 from gitopsctr.errors import ReferenceUnavailable
 from gitopsctr.execution import CommandOutput
+from gitopsctr.resource_api import JsonObject
 from gitopsctr.templates import AuthoredValue
 
 from ._common import require_strings, select_result_fields
