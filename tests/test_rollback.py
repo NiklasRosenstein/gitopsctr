@@ -366,7 +366,6 @@ def _install_rollback_simulation(
                 if value == "current":
                     (payload / "stale.yaml").write_text("stale: true\n")
                 unit["spec"]["materialization"] = {
-                    "path": f"materialized/{name}",
                     "digest": deploy_release.materialization_tree_digest(payload),
                     "mediaType": "application/yaml",
                     "metadata": {
@@ -593,7 +592,7 @@ def test_rollback_copies_exact_historical_payloads_and_removes_stale_files(
         assert files[f"materialized/{name}/rendered.yaml"] == f"unit: {name}\nvalue: {expected_value}\n".encode()
         assert (f"materialized/{name}/stale.yaml" in files) is (name not in historical_units)
         unit = json.loads(files[f"units/{name}.json"])
-        assert unit["spec"]["materialization"]["path"] == f"materialized/{name}"
+        assert "path" not in unit["spec"]["materialization"]
         payload_root = tmp_path / name
         for path, content in files.items():
             prefix = f"materialized/{name}/"
@@ -772,7 +771,7 @@ def test_full_rollback_preserves_current_parseable_blocked_unit_and_materializat
             "base", "rollback-current-blocked", partition="application"
         ).uid
     )
-    assert base["spec"]["materialization"]["path"] == "materialized/base"
+    assert "path" not in base["spec"]["materialization"]
     assert files["materialized/base/rendered.yaml"] == b"unit: base\nvalue: current\n"
     assert ".gitopsctr/cleanup/units/unrelated.json" not in files
     assert json.loads(files[".gitopsctr/transition-blocks.json"]) == {

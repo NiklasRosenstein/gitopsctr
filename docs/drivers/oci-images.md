@@ -3,7 +3,7 @@
 The OCI images driver builds a Docker image once and exports it to one or more named targets. Registry targets
 publish immutable digests; kind and minikube targets load the deterministic local tag directly into a cluster. The
 driver publishes a versioned `ContainerImages` resource at
-`artifacts/<unit>/containers.yaml` (or `.json`) for downstream units.
+`artifacts/<qualified-unit>/containers.yaml` (or `.json`) for downstream units.
 
 **Kind:** `unit.gitopsctr.io/v1/OciImages`<br>
 **Capabilities:** planning, reconciliation

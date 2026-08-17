@@ -205,7 +205,6 @@ def test_converge_finalization_removes_a_completed_unit_materialization(tmp_path
     materialized.mkdir(parents=True)
     (materialized / "manifest.yaml").write_text("apiVersion: v1\nkind: ConfigMap\n")
     document["spec"]["materialization"] = {  # type: ignore[index]
-        "path": "materialized/application",
         "digest": controller.materialization_tree_digest(initial / "materialized/application"),
         "mediaType": "application/vnd.gitopsctr.kubernetes-manifests.v1",
         "metadata": {"renderer": "plain", "inventory": []},

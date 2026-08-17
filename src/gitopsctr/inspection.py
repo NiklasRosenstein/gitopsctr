@@ -586,7 +586,7 @@ def _artifact_results(
             allow_missing_ref=args.observed_ref is None and args.observed_revision is None,
             selection=ResourceSelection.segment(
                 description.producer_identity_segment,
-                frozenset((receipt_result.record.name,)),
+                frozenset((receipt_result.record.qualified_name,)),
             ),
         )
         by_path = {artifact.path: artifact for artifact in artifacts}

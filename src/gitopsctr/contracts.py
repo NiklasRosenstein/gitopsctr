@@ -1745,7 +1745,6 @@ class PromotionDocument(SchemaDocument):
 
 @dataclass(frozen=True, kw_only=True)
 class MaterializationDocument(SchemaDocument):
-    path: str
     mediaType: str
     digest: str
     metadata: JsonObjectValue

@@ -74,7 +74,6 @@ def desired_example(unit: UnitResource) -> UnitResource:
         desired = unit.driver.finalize_materialization(
             desired,
             MaterializationDocument(
-                path=f"materialized/{unit.name}",
                 digest=DIGEST,
                 mediaType="application/vnd.gitopsctr.kubernetes-manifests.v1",
                 metadata=JsonObjectValue(metadata),

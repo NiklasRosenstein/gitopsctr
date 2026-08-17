@@ -237,7 +237,6 @@ def build_repository(root: Path) -> Path:
                 "materialize": {"type": "plain"},
                 "delivery": {"mode": "external"},
                 "materialization": {
-                    "path": "materialized/external",
                     "digest": external_materialization_digest,
                     "mediaType": "application/yaml",
                     "metadata": {"renderer": "plain", "inventory": []},
@@ -993,7 +992,7 @@ def test_artifact_inventory_identity_is_qualified_by_producer(repository: Path):
                 "metadata": {"name": "shared"},
                 "spec": {"source": {"path": "."}},
             },
-            "must match filename stem",
+            "does not match address terminal",
         ),
         (
             "deployment/environments/dev/units/broken.yaml",
@@ -1088,7 +1087,7 @@ def test_environment_collection_requires_canonical_identity_and_document(reposit
     environment_path = repository / "deployment/environments/dev/environment.yaml"
     write_json(environment_path, environment_document("other"))
     with InventorySession(repository, RESOURCE_REGISTRY) as inventory:
-        with pytest.raises(InventoryError, match="must match directory"):
+        with pytest.raises(InventoryError, match="does not match directory address"):
             inventory.resources("environments")
 
     environment_path.unlink()

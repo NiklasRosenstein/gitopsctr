@@ -167,7 +167,6 @@ def test_advancement_materializes_and_reuses_an_unchanged_payload(tmp_path, monk
         "environment: dev\nrevision: " + "a" * 40 + "\n"
     )
     assert first_unit.spec.materialization == MaterializationDocument(
-        path="materialized/rendered",
         digest=controller.materialization_tree_digest(first / "materialized/rendered"),
         mediaType="application/yaml",
         metadata={"renderer": "test"},
@@ -220,7 +219,9 @@ def test_stack_owned_materialization_uses_the_qualified_storage_path(tmp_path, m
         candidate,
     )
 
-    assert desired.spec.materialization.path == "materialized/application/rendered"
+    assert desired.spec.materialization.digest == controller.materialization_tree_digest(
+        candidate / "materialized/application/rendered"
+    )
     assert (candidate / "materialized/application/rendered/rendered.yaml").is_file()
 
 

@@ -65,8 +65,8 @@ class IdentityConstraint:
     values: frozenset[str]
 
     def __post_init__(self) -> None:
-        if any(not value or "/" in value for value in self.values):
-            raise ResourceModelError(f"identity constraint {self.segment!r} requires safe values")
+        if any(not value for value in self.values):
+            raise ResourceModelError(f"identity constraint {self.segment!r} requires non-empty values")
 
 
 @dataclass(frozen=True)
@@ -410,18 +410,106 @@ class ObservationState(StrEnum):
     STALE = "STALE"
 
 
-class CollectionLayout(StrEnum):
-    PROJECT = "project"
-    ENVIRONMENTS = "environments"
-    SOURCE_UNITS = "source-units"
-    SOURCE_STACKS = "source-stacks"
-    SOURCE_STACKTEMPLATES = "source-stacktemplates"
-    DESIRED_UNITS = "desired-units"
-    DESIRED_STACKS = "desired-stacks"
-    DESIRED_STACKTEMPLATES = "desired-stacktemplates"
-    DESIRED_PROMOTION = "desired-promotion"
-    OBSERVED_RECEIPTS = "observed-receipts"
-    OBSERVED_ARTIFACTS = "observed-artifacts"
+class CollectionDocumentMode(StrEnum):
+    """How a filesystem collection derives its document key."""
+
+    ADDRESS = "address"
+    DOCUMENT_NAME = "document-name"
+    DIRECTORY_NAME = "directory-name"
+
+
+@runtime_checkable
+class FilesystemCollectionRoot(Protocol):
+    """Resolve one or more physical collection roots for a read context."""
+
+    def directories(self, context: CollectionReadContext) -> tuple[Path, ...]: ...
+
+
+@dataclass(frozen=True)
+class RepositoryRoot:
+    """The materialized repository root."""
+
+    def directories(self, context: CollectionReadContext) -> tuple[Path, ...]:
+        return (context.root,)
+
+
+@dataclass(frozen=True)
+class ProjectConfiguredDirectory:
+    """A directory selected by one of Project's relative path fields."""
+
+    field: str
+    child: str | None = None
+    environment_scoped: bool = False
+
+    def directories(self, context: CollectionReadContext) -> tuple[Path, ...]:
+        value = getattr(context.project, self.field, None)
+        if not isinstance(value, PurePosixPath):
+            raise ResourceModelError(f"Project has no relative path field {self.field!r}")
+        base = context.root.joinpath(*value.parts)
+        if self.environment_scoped:
+            if context.environment is None:
+                raise ResourceModelError(f"collection requires an environment for {self.field!r}")
+            base /= context.environment
+        if self.child is not None:
+            base /= self.child
+        return (base,)
+
+
+@dataclass(frozen=True)
+class EnvironmentDirectories:
+    """All configured Environment directories, or one selected directory."""
+
+    field: str = "environments_path"
+
+    def directories(self, context: CollectionReadContext) -> tuple[Path, ...]:
+        value = getattr(context.project, self.field, None)
+        if not isinstance(value, PurePosixPath):
+            raise ResourceModelError(f"Project has no relative path field {self.field!r}")
+        base = context.root.joinpath(*value.parts)
+        if context.environment is not None:
+            return (base / context.environment,)
+        if not base.is_dir():
+            return ()
+        selected = context.selection.values_for("name") if context.selection is not None else None
+        if selected is None and context.selection is not None and context.selection.exact is not None:
+            selected = frozenset((context.family.identity.value(context.selection.exact, "name"),))
+        return tuple(
+            sorted(path for path in base.iterdir() if path.is_dir() and (selected is None or path.name in selected))
+        )
+
+
+@dataclass(frozen=True)
+class SnapshotSubdirectory:
+    """A fixed subdirectory below a materialized desired/observed snapshot."""
+
+    child: str
+
+    def directories(self, context: CollectionReadContext) -> tuple[Path, ...]:
+        return (context.root / self.child,)
+
+
+@dataclass(frozen=True)
+class FilesystemDocumentLayout:
+    """Physical document naming policy independent of any resource family."""
+
+    mode: CollectionDocumentMode
+    stems: tuple[str, ...] = ()
+
+    @classmethod
+    def addressed(cls) -> FilesystemDocumentLayout:
+        return cls(CollectionDocumentMode.ADDRESS)
+
+    @classmethod
+    def fixed(cls, *stems: str) -> FilesystemDocumentLayout:
+        if not stems or any(not stem for stem in stems):
+            raise ResourceModelError("fixed document layout requires non-empty stems")
+        return cls(CollectionDocumentMode.DOCUMENT_NAME, tuple(stems))
+
+    @classmethod
+    def directory_keyed(cls, stem: str) -> FilesystemDocumentLayout:
+        if not stem:
+            raise ResourceModelError("directory-keyed document layout requires a stem")
+        return cls(CollectionDocumentMode.DIRECTORY_NAME, (stem,))
 
 
 @runtime_checkable
@@ -1117,7 +1205,8 @@ class ResourceCollectionProvider(Protocol):
 class FilesystemCollectionProvider:
     """Built-in Git tree layout adapter; inventory supplies a materialized plane root."""
 
-    layout: CollectionLayout
+    root: FilesystemCollectionRoot
+    documents: FilesystemDocumentLayout
     media_typed: bool = False
 
     def document_path(self, context: CollectionReadContext, qualified_name: str, suffix: str) -> Path:
@@ -1126,10 +1215,14 @@ class FilesystemCollectionProvider:
         context.family.addressing.validate(qualified_name)
         if suffix not in {".json", ".yaml", ".yml"}:
             raise ResourceModelError(f"unsupported resource document suffix: {suffix!r}")
-        directories = self._directories(context)
+        directories = self.root.directories(context)
         if len(directories) != 1:
             raise ResourceModelError(
                 f"collection {context.placement.collection!r} has {len(directories)} writable roots; expected one"
+            )
+        if self.documents.mode is not CollectionDocumentMode.ADDRESS:
+            raise ResourceModelError(
+                f"collection {context.placement.collection!r} does not support address-keyed document paths"
             )
         relative = PurePosixPath(qualified_name)
         return directories[0].joinpath(*relative.parts[:-1], f"{relative.name}{suffix}")
@@ -1147,50 +1240,8 @@ class FilesystemCollectionProvider:
             return None
         return frozenset((context.family.identity.value(context.selection.exact, segment),))
 
-    def _directories(self, context: CollectionReadContext) -> tuple[Path, ...]:
-        if self.layout is CollectionLayout.PROJECT:
-            return ()
-        if self.layout is CollectionLayout.ENVIRONMENTS:
-            base = context.root.joinpath(*context.project.environments_path.parts)
-            if context.environment is not None:
-                return (base / context.environment,)
-            return (
-                tuple(
-                    sorted(
-                        path
-                        for path in base.iterdir()
-                        if path.is_dir()
-                        and (
-                            self._selected_values(context, "name") is None
-                            or path.name in cast(frozenset[str], self._selected_values(context, "name"))
-                        )
-                    )
-                )
-                if base.is_dir()
-                else ()
-            )
-        if self.layout is CollectionLayout.SOURCE_STACKTEMPLATES:
-            return (context.root.joinpath(*context.project.stack_templates_path.parts),)
-        source_collection = {
-            CollectionLayout.SOURCE_UNITS: "units",
-            CollectionLayout.SOURCE_STACKS: "stacks",
-        }.get(self.layout)
-        if source_collection is not None:
-            if context.environment is None:
-                raise ResourceModelError(f"collection {self.layout} requires an environment")
-            environment_root = context.root.joinpath(*context.project.environments_path.parts, context.environment)
-            return (environment_root / source_collection,)
-        relative = {
-            CollectionLayout.DESIRED_UNITS: "units",
-            CollectionLayout.DESIRED_STACKS: "stacks",
-            CollectionLayout.DESIRED_STACKTEMPLATES: "stack-templates",
-            CollectionLayout.OBSERVED_RECEIPTS: "units",
-            CollectionLayout.OBSERVED_ARTIFACTS: "artifacts",
-        }.get(self.layout)
-        return (context.root / relative,) if relative is not None else ()
-
     @staticmethod
-    def _document_files(directory: Path, *, recursive: bool = False) -> tuple[Path, ...]:
+    def _document_files(directory: Path, *, recursive: bool = True) -> tuple[Path, ...]:
         if not directory.is_dir():
             return ()
         iterator = directory.rglob("*") if recursive else directory.iterdir()
@@ -1199,51 +1250,26 @@ class FilesystemCollectionProvider:
         )
 
     def _paths(self, context: CollectionReadContext) -> tuple[Path, ...]:
-        if self.layout is CollectionLayout.PROJECT:
-            return tuple(context.root / name for name in PROJECT_CONFIG_NAMES if (context.root / name).is_file())
-        if self.layout is CollectionLayout.ENVIRONMENTS:
+        directories = self.root.directories(context)
+        if self.documents.mode is CollectionDocumentMode.DOCUMENT_NAME:
+            return tuple(
+                path
+                for directory in directories
+                for stem in self.documents.stems
+                for path in self._fixed_candidates(directory, stem)
+            )
+        if self.documents.mode is CollectionDocumentMode.DIRECTORY_NAME:
+            stem = self.documents.stems[0]
             paths: list[Path] = []
-            for directory in self._directories(context):
-                candidates = self._stem_candidates(directory, "environment")
+            for directory in directories:
+                candidates = self._stem_candidates(directory, stem)
                 if not candidates:
-                    raise ResourceModelError(
-                        f"authored environment directory {directory} has no environment.yaml, environment.yml, "
-                        "or environment.json"
-                    )
+                    raise ResourceModelError(f"directory {directory} has no {stem}.yaml, {stem}.yml, or {stem}.json")
                 paths.extend(candidates)
             return tuple(paths)
-        if self.layout is CollectionLayout.DESIRED_PROMOTION:
-            return self._stem_candidates(context.root, "promotion")
-        recursive = self.layout in {
-            CollectionLayout.DESIRED_UNITS,
-            CollectionLayout.OBSERVED_RECEIPTS,
-            CollectionLayout.OBSERVED_ARTIFACTS,
-        }
-        paths = tuple(
-            path
-            for directory in self._directories(context)
-            for path in self._document_files(directory, recursive=recursive)
-        )
-        producer_names = self._selected_values(context, "producer")
+        paths = tuple(path for directory in directories for path in self._document_files(directory))
         selected_names = self._selected_values(context, "name")
-        if self.layout is CollectionLayout.OBSERVED_ARTIFACTS and producer_names is not None:
-            paths = tuple(
-                path
-                for path in paths
-                if len(path.relative_to(context.root).parts) >= 3
-                and "/".join(path.relative_to(context.root).parts[1:-1]) in producer_names
-            )
-        elif (
-            self.layout
-            not in {
-                CollectionLayout.PROJECT,
-                CollectionLayout.ENVIRONMENTS,
-                CollectionLayout.DESIRED_PROMOTION,
-            }
-            and selected_names is not None
-        ):
-            paths = tuple(path for path in paths if path.stem in selected_names)
-        return paths
+        return paths if selected_names is None else tuple(path for path in paths if path.stem in selected_names)
 
     @staticmethod
     def _stem_candidates(directory: Path, stem: str) -> tuple[Path, ...]:
@@ -1252,6 +1278,13 @@ class FilesystemCollectionProvider:
             for path in (directory / f"{stem}.yaml", directory / f"{stem}.yml", directory / f"{stem}.json")
             if path.is_file()
         )
+
+    @staticmethod
+    def _fixed_candidates(directory: Path, stem: str) -> tuple[Path, ...]:
+        if Path(stem).suffix.lower() in {".yaml", ".yml", ".json"}:
+            path = directory / stem
+            return (path,) if path.is_file() else ()
+        return FilesystemCollectionProvider._stem_candidates(directory, stem)
 
     def discover(self, context: CollectionReadContext) -> Iterable[DiscoveredResource]:
         for path in self._paths(context):
@@ -1279,13 +1312,11 @@ class FilesystemCollectionProvider:
                 parsed = contract.parse(document)
             except Exception as exc:
                 raise ResourceModelError(f"invalid {context.placement.plane} resource {path}: {exc}") from exc
-            relative = PurePosixPath(path.relative_to(context.root).as_posix())
-            identity_qualifier, storage_qualified_name = self._validate_canonical_identity(
-                context, path, relative, document, name
-            )
-            local_identity = context.family.identity.from_name(name, identity_qualifier)
+            storage_qualified_name = self._storage_qualified_name(context, path, name)
+            local_identity = self._local_identity(context, storage_qualified_name, name)
             if not context.family.identity.matches(local_identity, context.selection):
                 continue
+            relative = PurePosixPath(path.relative_to(context.root).as_posix())
             try:
                 raw = path.read_bytes()
             except OSError as exc:
@@ -1313,106 +1344,50 @@ class FilesystemCollectionProvider:
                 storage_qualified_name,
             )
 
-    def _validate_canonical_identity(
+    def _storage_qualified_name(
         self,
         context: CollectionReadContext,
         path: Path,
-        relative: PurePosixPath,
-        document: JsonObject,
         name: str,
-    ) -> tuple[tuple[str, ...], str]:
-        """Validate and decode the layout-owned local and qualified identity."""
+    ) -> str:
+        directory = self._directory_for_path(context, path)
+        if self.documents.mode is CollectionDocumentMode.ADDRESS:
+            relative = PurePosixPath(path.relative_to(directory).as_posix())
+            qualified_name = relative.with_suffix("").as_posix()
+            context.family.addressing.validate(qualified_name)
+            expected_name = context.family.addressing.filter_value(qualified_name, "name", context.family.identity)
+            if expected_name != name:
+                raise ResourceModelError(
+                    f"resource metadata.name {name!r} in {path} does not match address terminal {expected_name!r}"
+                )
+            return qualified_name
+        if self.documents.mode is CollectionDocumentMode.DIRECTORY_NAME:
+            qualified_name = directory.name
+            context.family.addressing.validate(qualified_name)
+            if name != qualified_name:
+                raise ResourceModelError(
+                    f"resource metadata.name {name!r} in {path} does not match directory address {qualified_name!r}"
+                )
+            return qualified_name
+        return name
 
-        if self.layout is CollectionLayout.ENVIRONMENTS:
-            directory_name = path.parent.name
-            if name != directory_name:
-                raise ResourceModelError(
-                    f"Environment metadata.name {name!r} in {path} must match directory {directory_name!r}"
-                )
-            return (), name
+    def _directory_for_path(self, context: CollectionReadContext, path: Path) -> Path:
+        directories = self.root.directories(context)
+        matches = tuple(directory for directory in directories if directory in path.parents or path == directory)
+        if len(matches) != 1:
+            raise ResourceModelError(f"resource path {path} is not under exactly one collection root")
+        return matches[0]
 
-        filename_owned = {
-            CollectionLayout.SOURCE_UNITS,
-            CollectionLayout.SOURCE_STACKS,
-            CollectionLayout.SOURCE_STACKTEMPLATES,
-            CollectionLayout.DESIRED_STACKS,
-            CollectionLayout.DESIRED_STACKTEMPLATES,
-        }
-        if self.layout in filename_owned:
-            if name != path.stem:
-                raise ResourceModelError(
-                    f"resource metadata.name {name!r} in {path} must match filename stem {path.stem!r}"
-                )
-            return (), name
-
-        if self.layout is CollectionLayout.DESIRED_UNITS:
-            if len(relative.parts) < 2 or relative.parts[0] != "units" or name != path.stem:
-                raise ResourceModelError(
-                    f"Unit {path} must use canonical path units/QUALIFIED-NAME.yaml|yml|json matching metadata.name"
-                )
-            parents = relative.parts[1:-1]
-            metadata = document.get("metadata")
-            owners = metadata.get("ownerReferences") if isinstance(metadata, dict) else None
-            stack_owner = (
-                owners[0]
-                if isinstance(owners, list)
-                and len(owners) == 1
-                and isinstance(owners[0], dict)
-                and owners[0].get("kind") == "Stack"
-                else None
-            )
-            expected = (stack_owner.get("name"),) if isinstance(stack_owner, dict) else ()
-            if parents != expected:
-                raise ResourceModelError(
-                    f"Unit {path} storage scope {parents!r} does not match its authenticated Stack owner"
-                )
-            return (), "/".join((*relative.parts[1:-1], path.stem))
-
-        if self.layout is CollectionLayout.OBSERVED_RECEIPTS:
-            if len(relative.parts) < 2 or relative.parts[0] != "units" or name != path.stem:
-                raise ResourceModelError(f"Receipt {path} must mirror a canonical Unit path under units/")
-            specification = document.get("spec")
-            subject = specification.get("subject") if isinstance(specification, dict) else None
-            qualified_name = subject.get("qualifiedName") if isinstance(subject, dict) else None
-            stored_name = "/".join((*relative.parts[1:-1], path.stem))
-            if qualified_name != stored_name:
-                raise ResourceModelError(f"Receipt {path} subject qualifiedName must match its canonical storage path")
-            return (), cast(str, qualified_name)
-
-        if self.layout is CollectionLayout.OBSERVED_ARTIFACTS:
-            if len(relative.parts) < 3 or relative.parts[0] != "artifacts":
-                raise ResourceModelError(
-                    f"Artifact {path} must use canonical path artifacts/PRODUCER-ADDRESS/NAME.yaml|yml|json"
-                )
-            producer_qualified_name = "/".join(relative.parts[1:-1])
-            if name != path.stem:
-                raise ResourceModelError(
-                    f"Artifact metadata.name {name!r} in {path} must match filename stem {path.stem!r}"
-                )
-            producer = document.get("producer")
-            if not isinstance(producer, dict):
-                raise ResourceModelError(f"Artifact {path} requires a producer identity")
-            values = producer.get("apiVersion"), producer.get("kind"), producer.get("name")
-            if not all(isinstance(value, str) and value for value in values):
-                raise ResourceModelError(f"Artifact {path} has an invalid producer identity")
-            try:
-                GVK(cast(str, values[0]), cast(str, values[1]))
-            except ValueError as exc:
-                raise ResourceModelError(f"Artifact {path} has an invalid producer API kind: {exc}") from exc
-            if values[2] != relative.parts[-2]:
-                raise ResourceModelError(
-                    f"Artifact producer name {values[2]!r} in {path} must match its local producer directory"
-                )
-            qualified_name = producer.get("qualifiedName")
-            if qualified_name != producer_qualified_name:
-                raise ResourceModelError(
-                    f"Artifact producer qualifiedName {qualified_name!r} in {path} must match its storage scope"
-                )
-            return (producer_qualified_name,), f"{producer_qualified_name}/{name}"
-
-        # Project and Promotion have fixed collection-owned filenames; their
-        # semantic identities are validated by their executable contracts.
-        return (), name
+    @staticmethod
+    def _local_identity(context: CollectionReadContext, qualified_name: str, name: str) -> LocalResourceIdentity:
+        values = tuple(
+            context.family.addressing.filter_value(qualified_name, segment.name, context.family.identity)
+            for segment in context.family.identity.segments
+        )
+        identity = context.family.identity.build(values)
+        if identity.values[-1] != name:
+            raise ResourceModelError(f"resource metadata.name {name!r} does not match its registered address identity")
+        return identity
 
 
 @dataclass(frozen=True)
@@ -2469,30 +2444,109 @@ def build_resource_registry(
         plane: ResourcePlane,
         scope: ResourceScope,
         profiles: tuple[str, ...],
-        layout: CollectionLayout,
+        root: FilesystemCollectionRoot,
+        documents: FilesystemDocumentLayout,
+        *,
+        media_typed: bool = False,
     ) -> ResourceCollection:
         return ResourceCollection(
             name,
             plane,
             scope,
             frozenset(profiles),
-            FilesystemCollectionProvider(layout, media_typed=layout is CollectionLayout.OBSERVED_ARTIFACTS),
+            FilesystemCollectionProvider(root, documents, media_typed=media_typed),
         )
 
     collections = (
-        collection("source-project", source, project, ("authored",), CollectionLayout.PROJECT),
-        collection("source-environments", source, project, ("authored",), CollectionLayout.ENVIRONMENTS),
-        collection("source-units", source, environment, ("authored",), CollectionLayout.SOURCE_UNITS),
-        collection("source-stacks", source, environment, ("authored",), CollectionLayout.SOURCE_STACKS),
-        collection("source-stacktemplates", source, project, ("authored",), CollectionLayout.SOURCE_STACKTEMPLATES),
-        collection("desired-units", desired, environment, ("desired",), CollectionLayout.DESIRED_UNITS),
-        collection("desired-stacks", desired, environment, ("desired",), CollectionLayout.DESIRED_STACKS),
         collection(
-            "desired-stacktemplates", desired, environment, ("desired",), CollectionLayout.DESIRED_STACKTEMPLATES
+            "source-project",
+            source,
+            project,
+            ("authored",),
+            RepositoryRoot(),
+            FilesystemDocumentLayout.fixed(*PROJECT_CONFIG_NAMES),
         ),
-        collection("desired-promotions", desired, environment, ("desired",), CollectionLayout.DESIRED_PROMOTION),
-        collection("observed-receipts", observed, environment, ("observed",), CollectionLayout.OBSERVED_RECEIPTS),
-        collection("observed-artifacts", observed, environment, ("observed",), CollectionLayout.OBSERVED_ARTIFACTS),
+        collection(
+            "source-environments",
+            source,
+            project,
+            ("authored",),
+            EnvironmentDirectories(),
+            FilesystemDocumentLayout.directory_keyed("environment"),
+        ),
+        collection(
+            "source-units",
+            source,
+            environment,
+            ("authored",),
+            ProjectConfiguredDirectory("environments_path", "units", True),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "source-stacks",
+            source,
+            environment,
+            ("authored",),
+            ProjectConfiguredDirectory("environments_path", "stacks", True),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "source-stacktemplates",
+            source,
+            project,
+            ("authored",),
+            ProjectConfiguredDirectory("stack_templates_path"),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "desired-units",
+            desired,
+            environment,
+            ("desired",),
+            SnapshotSubdirectory("units"),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "desired-stacks",
+            desired,
+            environment,
+            ("desired",),
+            SnapshotSubdirectory("stacks"),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "desired-stacktemplates",
+            desired,
+            environment,
+            ("desired",),
+            SnapshotSubdirectory("stack-templates"),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "desired-promotions",
+            desired,
+            environment,
+            ("desired",),
+            RepositoryRoot(),
+            FilesystemDocumentLayout.fixed("promotion"),
+        ),
+        collection(
+            "observed-receipts",
+            observed,
+            environment,
+            ("observed",),
+            SnapshotSubdirectory("units"),
+            FilesystemDocumentLayout.addressed(),
+        ),
+        collection(
+            "observed-artifacts",
+            observed,
+            environment,
+            ("observed",),
+            SnapshotSubdirectory("artifacts"),
+            FilesystemDocumentLayout.addressed(),
+            media_typed=True,
+        ),
     )
 
     def core(kind: str) -> tuple[ApiKindMembership, ...]:

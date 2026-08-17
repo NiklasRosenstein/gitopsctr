@@ -101,6 +101,7 @@ from gitopsctr.driver import (
     UnitResolutionContext,
     VerificationContext,
     VerificationStatus,
+    unit_materialization_path,
 )
 from gitopsctr.errors import OperationError, ReferenceUnavailable
 from gitopsctr.execution import DriverExecution
@@ -1131,7 +1132,7 @@ def validate_unit_materialization(desired_root: Path, unit_name: str, unit: Unit
 def copy_unit_materialization(source: Path, destination: Path, unit_name: str, unit: UnitResource[Any]) -> None:
     validate_unit_materialization(source, unit_name, unit)
     descriptor = getattr(unit.spec, "materialization", None)
-    relative_path = descriptor.path if descriptor is not None else f"materialized/{unit_name}"
+    relative_path = unit_materialization_path(unit_name)
     target = destination / relative_path
     if target.exists():
         shutil.rmtree(target)
@@ -3176,7 +3177,7 @@ def _bind_active_stack_projections(
                         extra_path.unlink()
                     materialization = getattr(resource.spec, "materialization", None)
                     if materialization is not None:
-                        materialized_path = candidate / materialization.path
+                        materialized_path = candidate / unit_materialization_path(resource_key[2])
                         if materialized_path.is_dir():
                             shutil.rmtree(materialized_path)
             for binding in retained_bindings:
@@ -3270,7 +3271,7 @@ def _bind_active_stack_projections(
                     unit = candidate_resources.get((UNIT_API_VERSION, structural.units[logical_name].kind, unit_name))
                     materialization = getattr(getattr(unit, "spec", None), "materialization", None)
                     if materialization is not None:
-                        materialized_path = candidate / materialization.path
+                        materialized_path = candidate / unit_materialization_path(unit_name)
                         if materialized_path.is_dir():
                             shutil.rmtree(materialized_path)
             active = StackActiveProjection.build(
@@ -4974,7 +4975,6 @@ def materialize_resolved_unit(
             previous_descriptor = previous.spec.materialization
             previous_metadata = previous_descriptor.metadata
             descriptor = MaterializationDocument(
-                path=previous_descriptor.path,
                 digest=previous_descriptor.digest,
                 mediaType=previous_descriptor.mediaType,
                 metadata=JsonObjectValue(
@@ -4983,7 +4983,7 @@ def materialize_resolved_unit(
             )
             return resolved.with_spec(plugin.finalize_materialization(resolved.spec, descriptor))
 
-    output_root = candidate / "materialized" / unit_name
+    output_root = candidate / unit_materialization_path(unit_name)
     if output_root.exists():
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True)
@@ -5021,7 +5021,6 @@ def materialize_resolved_unit(
     if not result.media_type:
         raise DriverError(f"{plugin_name} returned an empty materialization media type")
     descriptor = MaterializationDocument(
-        path=f"materialized/{unit_name}",
         digest=materialization_tree_digest(output_root),
         mediaType=result.media_type,
         metadata=JsonObjectValue(result.metadata),
@@ -8930,7 +8929,7 @@ def _remove_finalized_resource(
     if isinstance(resource, UnitResource):
         materialization = getattr(resource.spec, "materialization", None)
         if materialization is not None:
-            materialized_path = candidate / materialization.path
+            materialized_path = candidate / unit_materialization_path(qualified_name)
             if materialized_path.is_dir():
                 shutil.rmtree(materialized_path)
         remove_effect_lease(candidate, qualified_name)

@@ -3,7 +3,7 @@
 The Vite OCI bundle driver installs dependencies, builds a Vite application,
 archives `dist/` deterministically, and publishes the archive as an OCI
 artifact. The driver publishes a versioned `FrontendBundle` resource at
-`artifacts/<unit>/frontend.yaml` (or `.json`) for downstream units.
+`artifacts/<qualified-unit>/frontend.yaml` (or `.json`) for downstream units.
 
 **Kind:** `unit.gitopsctr.io/v1/ViteOciBundle`<br>
 **Capabilities:** planning, reconciliation

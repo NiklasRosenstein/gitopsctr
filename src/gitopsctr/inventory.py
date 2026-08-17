@@ -334,6 +334,10 @@ class InventorySession:
             location = f"environment {environment!r}, " if environment is not None else ""
             raise InventoryError(f"{location}{placement.plane} {family.plural}: {exc}") from exc
         records = tuple(self._record(item, family, snapshot, environment) for item in discovered)
+        # A collection path is a storage claim.  Relationship-derived address
+        # authentication is performed by presenters and relationship joins
+        # when a record is used; discovery itself must remain able to surface
+        # orphaned or transition-state records for diagnostics.
         identities: dict[ResourceAddress, InventoryRecord] = {}
         for record in records:
             previous = identities.get(record.logical_identity)

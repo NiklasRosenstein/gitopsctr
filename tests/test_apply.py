@@ -592,7 +592,6 @@ def test_converge_defaults_to_all_units_and_partition_is_unit_selection(
                     "materialize": {"type": "plain"},
                     "delivery": {"mode": "external"},
                     "materialization": {
-                        "path": f"materialized/{name}",
                         "digest": "sha256:" + "0" * 64,
                         "mediaType": "application/yaml",
                         "metadata": {"renderer": "plain", "inventory": []},
