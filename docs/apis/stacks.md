@@ -162,9 +162,8 @@ must remain available in the desired snapshot.
 
 Generated Units keep their StackTemplate-local name in `metadata.name` and carry an owner reference fenced by the exact
 Stack `apiVersion`, kind, name, and UID. The registry combines that placement with the local name to derive both the
-operator address and the persisted collection path: `application/deploy` is stored at `units/application/deploy.yaml`.
-Its Receipt mirrors that path and an Artifact named `containers` is stored at
-`artifacts/application/deploy/containers.yaml`. Partition never participates in the address. Missing, stale, cyclic,
+The registry combines that placement with the local name to derive both the operator address and the persisted collection path: `application/deploy` is stored at `units/application/deploy.yaml`.
+Its Receipt mirrors that path. Any artifacts published by the Unit are stored under `artifacts/application/deploy/<artifact-name>.yaml|yml|json`. Partition never participates in the address. Missing, stale, cyclic,
 or unknown dependencies and unsupported unresolved dynamic artifact/receipt/promotion evidence fail before desired
 publication.
 
