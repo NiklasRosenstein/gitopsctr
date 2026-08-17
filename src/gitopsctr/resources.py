@@ -1047,9 +1047,15 @@ class ResourceCatalog:
         return any((root / name).is_file() for name in PROJECT_CONFIG_NAMES)
 
     def unit_document_path(self, root: Path, unit_name: str, project_root: Path | None = None) -> Path:
-        parts = PurePosixPath(unit_name).parts
-        if not parts or any(part in {"", ".", ".."} for part in parts) or PurePosixPath(unit_name).is_absolute():
+        posix = PurePosixPath(unit_name)
+        if (
+            not posix.parts
+            or unit_name != posix.as_posix()
+            or any(part in {".", ".."} for part in posix.parts)
+            or posix.is_absolute()
+        ):
             raise OperationError(f"invalid Unit qualified name {unit_name!r}")
+        parts = posix.parts
         directory = root / "units" / Path(*parts[:-1])
         local_name = parts[-1]
         candidates = document_candidates(directory, local_name)
