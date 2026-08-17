@@ -179,6 +179,7 @@ from gitopsctr.state import (
     GitStateStore,
     PublishedTree,
     canonical_publication_ref,
+    remote_ref_snapshot_scope,
 )
 from gitopsctr.templates import (
     ArtifactReference as ArtifactReferenceExpression,
@@ -934,7 +935,7 @@ def _desired_graph_cache_scope():
 def _cached_desired_graph_operation[ReturnT](operation: Callable[..., ReturnT]) -> Callable[..., ReturnT]:
     @wraps(operation)
     def wrapped(*args: Any, **kwargs: Any) -> ReturnT:
-        with _desired_graph_cache_scope():
+        with _desired_graph_cache_scope(), remote_ref_snapshot_scope():
             return operation(*args, **kwargs)
 
     return wrapped
@@ -13302,7 +13303,7 @@ def main() -> int:
     try:
         if args.command != "schemas":
             REPOSITORY_ROOT = resolve_repository_root(args.repository)
-        with _desired_graph_cache_scope():
+        with _desired_graph_cache_scope(), remote_ref_snapshot_scope():
             args.handler(args)
     except SourceRevisionUnavailableError as exc:
         log_status(

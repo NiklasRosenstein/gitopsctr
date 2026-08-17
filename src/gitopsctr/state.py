@@ -11,8 +11,11 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import MappingProxyType
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from gitopsctr.errors import OperationError
@@ -137,6 +140,95 @@ def _repository_transport(repository: str | Path, *, root: Path) -> str:
 class GitRefSnapshot:
     ref: str
     revision: str | None
+
+
+def _canonical_remote_ref(ref: str) -> str:
+    if ref.startswith("refs/heads/"):
+        return ref
+    if ref.startswith("refs/"):
+        return ref
+    return f"refs/heads/{ref}"
+
+
+@dataclass(frozen=True)
+class RemoteRefQuery:
+    """A declared, closed set of exact refs and ref prefixes to inspect."""
+
+    exact_refs: frozenset[str] = frozenset()
+    prefixes: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "exact_refs", frozenset(_canonical_remote_ref(ref) for ref in self.exact_refs))
+        object.__setattr__(self, "prefixes", frozenset(_canonical_remote_ref(prefix) for prefix in self.prefixes))
+        if not self.exact_refs and not self.prefixes:
+            raise OperationError("remote ref query is empty")
+
+    def covers_ref(self, ref: str) -> bool:
+        canonical = _canonical_remote_ref(ref)
+        return canonical in self.exact_refs or any(canonical.startswith(prefix) for prefix in self.prefixes)
+
+    def covers(self, other: RemoteRefQuery) -> bool:
+        return all(self.covers_ref(ref) for ref in other.exact_refs) and all(
+            any(prefix.startswith(candidate) for candidate in self.prefixes) for prefix in other.prefixes
+        )
+
+
+@dataclass(frozen=True)
+class RemoteRefSnapshot:
+    """Remote revisions proven only within the query's declared coverage."""
+
+    query: RemoteRefQuery
+    revisions: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        normalized = {_canonical_remote_ref(ref): revision for ref, revision in self.revisions.items()}
+        if any(
+            not self.query.covers_ref(ref) or _COMMIT_RE.fullmatch(revision) is None
+            for ref, revision in normalized.items()
+        ):
+            raise OperationError("remote ref snapshot contains an invalid or undeclared ref")
+        object.__setattr__(self, "revisions", MappingProxyType(normalized))
+
+    def revision(self, ref: str) -> str | None:
+        canonical = _canonical_remote_ref(ref)
+        if not self.query.covers_ref(canonical):
+            raise OperationError(f"remote ref {ref!r} is outside snapshot coverage")
+        return self.revisions.get(canonical)
+
+
+@dataclass(frozen=True)
+class RemoteRefUpdate:
+    """One compare-and-swap update in an atomic remote transaction."""
+
+    ref: str
+    new_revision: str | None
+    expected_previous: str | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "ref", _canonical_remote_ref(self.ref))
+        for revision in (self.new_revision, self.expected_previous):
+            if revision is not None and _COMMIT_RE.fullmatch(revision) is None:
+                raise OperationError("remote ref update revision is invalid")
+
+
+_REMOTE_REF_SNAPSHOTS: ContextVar[dict[Path, list[RemoteRefSnapshot]] | None] = ContextVar(
+    "gitopsctr_remote_ref_snapshots", default=None
+)
+
+
+@contextmanager
+def remote_ref_snapshot_scope():
+    """Reuse declared remote observations for one re-entrant controller operation."""
+
+    existing = _REMOTE_REF_SNAPSHOTS.get()
+    if existing is not None:
+        yield
+        return
+    token = _REMOTE_REF_SNAPSHOTS.set({})
+    try:
+        yield
+    finally:
+        _REMOTE_REF_SNAPSHOTS.reset(token)
 
 
 @dataclass(frozen=True)
@@ -269,6 +361,56 @@ class GitStateStore:
             cwd=root,
             capture_output=True,
         )
+
+    def remote_ref_snapshot(self, query: RemoteRefQuery, *, fresh: bool = False) -> RemoteRefSnapshot:
+        """Inspect a declared ref set with one remote request."""
+
+        cache = _REMOTE_REF_SNAPSHOTS.get()
+        repository = self.root.resolve()
+        if cache is not None and not fresh:
+            for snapshot in cache.get(repository, ()):
+                if snapshot.query.covers(query):
+                    return snapshot
+
+        patterns = [*sorted(query.exact_refs), *(f"{prefix}*" for prefix in sorted(query.prefixes))]
+        result = self.git("ls-remote", "--refs", "origin", *patterns, check=False)
+        if result.returncode != 0:
+            detail = _redact_credentials(result.stderr.strip())
+            raise OperationError(detail or "could not inspect remote refs")
+        revisions: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 2:
+                raise OperationError("remote ref inspection returned an invalid result")
+            revision, ref = fields
+            if _COMMIT_RE.fullmatch(revision) is None or not query.covers_ref(ref) or ref in revisions:
+                raise OperationError("remote ref inspection returned an invalid or undeclared ref")
+            revisions[ref] = revision
+        snapshot = RemoteRefSnapshot(query, revisions)
+        if cache is not None:
+            snapshots = cache.setdefault(repository, [])
+            if fresh:
+                snapshots.clear()
+            snapshots.append(snapshot)
+        return snapshot
+
+    def _invalidate_remote_ref_snapshots(self) -> None:
+        cache = _REMOTE_REF_SNAPSHOTS.get()
+        if cache is not None:
+            cache.pop(self.root.resolve(), None)
+
+    def update_remote_refs(self, updates: tuple[RemoteRefUpdate, ...]) -> subprocess.CompletedProcess[str]:
+        """Apply typed compare-and-swap ref updates as one atomic push."""
+
+        if not updates:
+            raise OperationError("remote ref update transaction is empty")
+        if len({update.ref for update in updates}) != len(updates):
+            raise OperationError("remote ref update transaction contains duplicate refs")
+        leases = [f"--force-with-lease={update.ref}:{update.expected_previous or ''}" for update in updates]
+        refspecs = [f"{update.new_revision or ''}:{update.ref}" for update in updates]
+        result = self.git("push", "--atomic", *leases, "origin", *refspecs, check=False)
+        self._invalidate_remote_ref_snapshots()
+        return result
 
     @staticmethod
     def _source_ref(ref: str) -> _SourceRef:
@@ -442,16 +584,9 @@ class GitStateStore:
         if source_ref.full_ref == "HEAD" or source_ref.is_commit:
             raise OperationError("remote fetch requires a named branch or tag ref")
         remote_ref = source_ref.full_ref
-        result = self.git("ls-remote", "--exit-code", "--refs", "origin", remote_ref, check=False)
-        if result.returncode == 2:
+        revision = self.remote_ref_snapshot(RemoteRefQuery(exact_refs=frozenset((remote_ref,)))).revision(remote_ref)
+        if revision is None:
             return GitRefSnapshot(ref, None)
-        if result.returncode != 0:
-            detail = _redact_credentials(result.stderr.strip())
-            raise OperationError(detail or f"could not inspect {ref}")
-        fields = result.stdout.split()
-        if not fields or not _COMMIT_RE.fullmatch(fields[0]):
-            raise OperationError(f"could not inspect {ref}")
-        revision = fields[0]
         destination_name = source_ref.name.removeprefix("refs/heads/")
         if destination_name == source_ref.name:
             destination_name = f"gitopsctr/fetch/{hashlib.sha256(remote_ref.encode()).hexdigest()}"
@@ -601,9 +736,12 @@ class GitStateStore:
         if not requested:
             return ()
         for _attempt in range(3):
+            snapshot = self.remote_ref_snapshot(
+                RemoteRefQuery(exact_refs=frozenset(pin_ref for _name, pin_ref, _revision in requested))
+            )
             missing: list[tuple[str, str, str]] = []
             for name, pin_ref, revision in requested:
-                existing_revision = self._remote_ref_revision(pin_ref)
+                existing_revision = snapshot.revision(pin_ref)
                 if existing_revision is None:
                     missing.append((name, pin_ref, revision))
                 elif existing_revision != revision:
@@ -614,17 +752,16 @@ class GitStateStore:
             if not missing:
                 return tuple(ControllerPin(name, pin_ref, revision) for name, pin_ref, revision in requested)
 
-            pushed = self.git(
-                "push",
-                "--atomic",
-                "origin",
-                *(f"{revision}:{pin_ref}" for _name, pin_ref, revision in missing),
-                check=False,
+            pushed = self.update_remote_refs(
+                tuple(RemoteRefUpdate(pin_ref, revision, None) for _name, pin_ref, revision in missing)
+            )
+            verified = self.remote_ref_snapshot(
+                RemoteRefQuery(exact_refs=frozenset(pin_ref for _name, pin_ref, _revision in requested)), fresh=True
             )
             remaining = [
                 (name, pin_ref, revision)
                 for name, pin_ref, revision in requested
-                if self._remote_ref_revision(pin_ref) != revision
+                if verified.revision(pin_ref) != revision
             ]
             if not remaining:
                 return tuple(ControllerPin(name, pin_ref, revision) for name, pin_ref, revision in requested)
@@ -682,14 +819,10 @@ class GitStateStore:
                 f"controller pin {name!r} is fenced at {existing_revision}, not expected revision {expected_revision}"
             )
 
-        released = self.git(
-            "push",
-            f"--force-with-lease={pin_ref}:{expected_revision}",
-            "origin",
-            f":{pin_ref}",
-            check=False,
-        )
-        remaining_revision = self._remote_ref_revision(pin_ref)
+        released = self.update_remote_refs((RemoteRefUpdate(pin_ref, None, expected_revision),))
+        remaining_revision = self.remote_ref_snapshot(
+            RemoteRefQuery(exact_refs=frozenset((pin_ref,))), fresh=True
+        ).revision(pin_ref)
         if remaining_revision is None:
             return True
         if remaining_revision != expected_revision:
@@ -714,19 +847,21 @@ class GitStateStore:
 
         lock_ref = self._publication_lock_ref(owner.publication_ref)
         canonical_ref = self._controller_pin_ref(owner.source_pin_name)
-        accepted_target_revision = (
-            self._remote_ref_revision(accepted_target.ref) if accepted_target is not None else None
-        )
+        observation_refs = {owner.ref, lock_ref, canonical_ref, _canonical_remote_ref(owner.publication_ref)}
+        if accepted_target is not None:
+            observation_refs.add(_canonical_remote_ref(accepted_target.ref))
+        snapshot = self.remote_ref_snapshot(RemoteRefQuery(exact_refs=frozenset(observation_refs)))
+        accepted_target_revision = snapshot.revision(accepted_target.ref) if accepted_target is not None else None
         publication_revision = (
             accepted_target_revision
             if accepted_target is not None and owner.publication_ref == accepted_target.ref
-            else self._remote_ref_revision(owner.publication_ref)
+            else snapshot.revision(owner.publication_ref)
         )
         observation = _PublicationOwnerCleanupObservation(
-            owner_revision=self._remote_ref_revision(owner.ref),
+            owner_revision=snapshot.revision(owner.ref),
             publication_revision=publication_revision,
-            lock_revision=self._remote_ref_revision(lock_ref),
-            canonical_revision=self._remote_ref_revision(canonical_ref),
+            lock_revision=snapshot.revision(lock_ref),
+            canonical_revision=snapshot.revision(canonical_ref),
             accepted_target_revision=accepted_target_revision,
         )
         if (
@@ -761,40 +896,36 @@ class GitStateStore:
             for candidate in owners
             if candidate.source_pin_name == owner.source_pin_name and candidate.ref != owner.ref
         )
-        updates = [f":{owner.ref}"]
-        leases = [f"--force-with-lease={owner.ref}:{owner.revision}"]
+        updates = [RemoteRefUpdate(owner.ref, None, owner.revision)]
         if not other_source_owners:
-            updates.append(f":{canonical_ref}")
-            leases.append(f"--force-with-lease={canonical_ref}:{observation.canonical_revision}")
+            updates.append(RemoteRefUpdate(canonical_ref, None, observation.canonical_revision))
 
         publication_branch = self._publication_branch(owner.publication_ref)
         publication_head_ref = f"refs/heads/{publication_branch}"
         retained_publication = observation.publication_revision is not None
         if retained_publication:
-            updates.append(f"{observation.publication_revision}:{publication_head_ref}")
-            leases.append(f"--force-with-lease={publication_head_ref}:{observation.publication_revision}")
+            updates.append(
+                RemoteRefUpdate(
+                    publication_head_ref, observation.publication_revision, observation.publication_revision
+                )
+            )
         else:
-            updates.append(f":{publication_head_ref}")
-            leases.append(f"--force-with-lease={publication_head_ref}:")
+            updates.append(RemoteRefUpdate(publication_head_ref, None, None))
         if accepted_target is not None and owner.publication_ref != accepted_target.ref:
             target_branch = self._publication_branch(accepted_target.ref)
-            updates.append(f"{accepted_target.revision}:refs/heads/{target_branch}")
-            leases.append(f"--force-with-lease=refs/heads/{target_branch}:{accepted_target.revision}")
+            updates.append(
+                RemoteRefUpdate(f"refs/heads/{target_branch}", accepted_target.revision, accepted_target.revision)
+            )
 
         if retained_publication or other_publication_owners:
-            updates.append(f"{observation.lock_revision}:{lock_ref}")
+            updates.append(RemoteRefUpdate(lock_ref, observation.lock_revision, observation.lock_revision))
         else:
-            updates.append(f":{lock_ref}")
-        leases.append(f"--force-with-lease={lock_ref}:{observation.lock_revision}")
-        result = self.git(
-            "push",
-            "--atomic",
-            *leases,
-            "origin",
-            *updates,
-            check=False,
-        )
-        if self._remote_ref_revision(owner.ref) is None:
+            updates.append(RemoteRefUpdate(lock_ref, None, observation.lock_revision))
+        result = self.update_remote_refs(tuple(updates))
+        if (
+            self.remote_ref_snapshot(RemoteRefQuery(exact_refs=frozenset((owner.ref,))), fresh=True).revision(owner.ref)
+            is None
+        ):
             return True
         raise OperationError(result.stderr.strip() or "could not release publication owner")
 
@@ -802,17 +933,11 @@ class GitStateStore:
         """List controller-owned pins from the remote without mutating refs."""
 
         prefix = "refs/heads/gitopsctr/pins/"
-        result = self.git("ls-remote", "--refs", "origin", f"{prefix}*", check=False)
-        if result.returncode != 0:
-            raise OperationError(result.stderr.strip() or "could not inspect controller pins")
+        snapshot = self.remote_ref_snapshot(RemoteRefQuery(prefixes=frozenset((prefix,))))
         pins: list[ControllerPin] = []
-        for line in result.stdout.splitlines():
-            fields = line.split()
-            if len(fields) != 2:
-                raise OperationError("controller pin inspection returned an invalid result")
-            revision, ref = fields
-            if not re.fullmatch(r"[0-9a-f]{40}", revision) or not ref.startswith(prefix):
-                raise OperationError("controller pin inspection returned an invalid ref")
+        for ref, revision in snapshot.revisions.items():
+            if not ref.startswith(prefix):
+                continue
             name = ref.removeprefix(prefix)
             self._controller_pin_ref(name)
             pins.append(ControllerPin(name, ref, revision))
@@ -822,17 +947,15 @@ class GitStateStore:
         """List and validate all durable publication-owner refs."""
 
         prefix = "refs/heads/gitopsctr/owners/"
-        result = self.git("ls-remote", "--refs", "origin", f"{prefix}*", check=False)
-        if result.returncode != 0:
-            raise OperationError(result.stderr.strip() or "could not inspect publication owners")
+        lock_prefix = "refs/heads/gitopsctr/locks/"
+        snapshot = self.remote_ref_snapshot(RemoteRefQuery(prefixes=frozenset((prefix, lock_prefix))))
         owners: list[PublicationOwner] = []
-        for line in result.stdout.splitlines():
-            fields = line.split()
-            if len(fields) != 2 or not _COMMIT_RE.fullmatch(fields[0]) or not fields[1].startswith(prefix):
-                raise OperationError("publication owner inspection returned an invalid result")
-            name = fields[1].removeprefix(prefix)
-            owner = self._parse_publication_owner(name, fields[0], fields[1])
-            marker = self._remote_ref_revision(self._publication_lock_ref(owner.publication_ref))
+        for ref, revision in snapshot.revisions.items():
+            if not ref.startswith(prefix):
+                continue
+            name = ref.removeprefix(prefix)
+            owner = self._parse_publication_owner(name, revision, ref)
+            marker = snapshot.revision(self._publication_lock_ref(owner.publication_ref))
             owners.append(replace(owner, publication_marker=marker))
         return tuple(sorted(owners, key=lambda owner: owner.name))
 
@@ -880,8 +1003,11 @@ class GitStateStore:
 
         if owner.publication_ref == accepted_target.ref:
             return False
-        publication_revision = self._remote_ref_revision(owner.publication_ref)
-        accepted_target_revision = self._remote_ref_revision(accepted_target.ref)
+        snapshot = self.remote_ref_snapshot(
+            RemoteRefQuery(exact_refs=frozenset((owner.publication_ref, accepted_target.ref)))
+        )
+        publication_revision = snapshot.revision(owner.publication_ref)
+        accepted_target_revision = snapshot.revision(accepted_target.ref)
         return self._is_live_candidate_revision(owner, accepted_target, publication_revision, accepted_target_revision)
 
     def _is_live_candidate_revision(
@@ -998,36 +1124,15 @@ class GitStateStore:
         """List remote branch heads without changing local or remote state."""
 
         prefix = "refs/heads/"
-        result = self.git("ls-remote", "--refs", "origin", f"{prefix}*", check=False)
-        if result.returncode != 0:
-            raise OperationError(result.stderr.strip() or "could not inspect remote refs")
+        snapshot = self.remote_ref_snapshot(RemoteRefQuery(prefixes=frozenset((prefix,))))
         refs: list[GitRefSnapshot] = []
-        for line in result.stdout.splitlines():
-            fields = line.split()
-            if len(fields) != 2:
-                raise OperationError("remote ref inspection returned an invalid result")
-            revision, ref = fields
-            if not re.fullmatch(r"[0-9a-f]{40}", revision) or not ref.startswith(prefix):
-                raise OperationError("remote ref inspection returned an invalid result")
+        for ref, revision in snapshot.revisions.items():
             refs.append(GitRefSnapshot(ref.removeprefix(prefix), revision))
         return tuple(sorted(refs, key=lambda snapshot: snapshot.ref))
 
     def _remote_ref_snapshot(self, ref: str) -> GitRefSnapshot:
-        remote_ref = ref if ref.startswith("refs/heads/") else f"refs/heads/{ref}"
-        result = self.git("ls-remote", "--exit-code", "--refs", "origin", remote_ref, check=False)
-        if result.returncode == 2:
-            return GitRefSnapshot(ref, None)
-        if result.returncode != 0:
-            detail = _redact_credentials(result.stderr.strip())
-            raise OperationError(detail or f"could not inspect {ref}")
-        lines = result.stdout.splitlines()
-        if len(lines) != 1 or len(lines[0].split()) != 2:
-            raise OperationError(f"remote ref inspection returned an invalid result for {ref}")
-        revision, remote_ref = lines[0].split()
-        if remote_ref != (ref if ref.startswith("refs/heads/") else f"refs/heads/{ref}") or not re.fullmatch(
-            r"[0-9a-f]{40}", revision
-        ):
-            raise OperationError(f"remote ref inspection returned an invalid result for {ref}")
+        remote_ref = _canonical_remote_ref(ref)
+        revision = self.remote_ref_snapshot(RemoteRefQuery(exact_refs=frozenset((remote_ref,)))).revision(remote_ref)
         return GitRefSnapshot(ref, revision)
 
     def _controller_pin_ref(self, name: str) -> str:
@@ -1054,14 +1159,14 @@ class GitStateStore:
         if not self._has_origin() or not _COMMIT_RE.fullmatch(revision):
             return False
         prefix = "refs/heads/gitopsctr/pins/"
-        result = self.git("ls-remote", "--refs", "origin", f"{prefix}*", check=False)
-        if result.returncode != 0:
+        try:
+            snapshot = self.remote_ref_snapshot(RemoteRefQuery(prefixes=frozenset((prefix,))))
+        except OperationError:
             return False
-        for line in result.stdout.splitlines():
-            fields = line.split()
-            if len(fields) != 2 or fields[0] != revision or not fields[1].startswith(prefix):
+        for ref, remote_revision in snapshot.revisions.items():
+            if remote_revision != revision:
                 continue
-            name = fields[1].removeprefix(prefix)
+            name = ref.removeprefix(prefix)
             if name.startswith("claims/") and not self._valid_source_claim_name(name, revision):
                 continue
             local_ref = f"refs/remotes/origin/gitopsctr/pins/{name}"
@@ -1070,7 +1175,7 @@ class GitStateStore:
                 "--no-tags",
                 "--no-write-fetch-head",
                 "origin",
-                f"+{fields[1]}:{local_ref}",
+                f"+{ref}:{local_ref}",
                 check=False,
             )
             if fetched.returncode == 0 and self._local_ref_revision(local_ref) == revision:
@@ -1078,16 +1183,8 @@ class GitStateStore:
         return False
 
     def _remote_ref_revision(self, ref: str) -> str | None:
-        result = self.git("ls-remote", "--exit-code", "--refs", "origin", ref, check=False)
-        if result.returncode == 2:
-            return None
-        if result.returncode != 0:
-            detail = _redact_credentials(result.stderr.strip())
-            raise OperationError(detail or f"could not inspect {ref}")
-        lines = result.stdout.splitlines()
-        if len(lines) != 1 or len(lines[0].split()) != 2:
-            raise OperationError(f"remote ref inspection returned an invalid result for {ref}")
-        return lines[0].split()[0]
+        remote_ref = _canonical_remote_ref(ref)
+        return self.remote_ref_snapshot(RemoteRefQuery(exact_refs=frozenset((remote_ref,)))).revision(remote_ref)
 
     def hydrate_controller_pin(self, name: str, revision: str) -> None:
         """Fetch one exact canonical controller pin into the local object store.
@@ -1274,7 +1371,13 @@ class GitStateStore:
         owner_updates = self._expected_publication_owners(publication_ref, revision, source_pins or {})
         lock_ref = self._publication_lock_ref(publication_ref)
         publication_head_ref = f"refs/heads/{publication_ref}"
-        previous_lock = self._remote_ref_revision(lock_ref)
+        observation_refs = {
+            publication_head_ref,
+            lock_ref,
+            *(owner_ref for _name, owner_ref, _revision in owner_updates),
+        }
+        observation = self.remote_ref_snapshot(RemoteRefQuery(exact_refs=frozenset(observation_refs)))
+        previous_lock = observation.revision(lock_ref)
         # A marker is deliberately a new commit even when the publication
         # tree/revision is recreated. The marker, rather than the publication
         # object ID, is the finalization fence.
@@ -1285,25 +1388,21 @@ class GitStateStore:
             input_text=f"publication fence {uuid.uuid4().hex}\n",
             env=identity,
         ).stdout.strip()
-        updates = [f"{revision}:refs/heads/{publication_ref}"] + [
-            f"{source_revision}:{owner_ref}" for _name, owner_ref, source_revision in owner_updates
-        ]
+        updates = [RemoteRefUpdate(publication_head_ref, revision, expected_publication_head)]
+        for _name, owner_ref, source_revision in owner_updates:
+            previous_owner = observation.revision(owner_ref)
+            if previous_owner not in {None, source_revision}:
+                raise OperationError("publication owner already points to an unexpected source revision")
+            updates.append(RemoteRefUpdate(owner_ref, source_revision, previous_owner))
         # Keep lock refs only for publications that carry source ownership, or
         # when a previously owned publication is being recreated. This avoids
         # producing unrelated lock refs for ordinary publications while still
         # fencing an old owner during an ownership-dropping recreation.
         if source_pins or previous_lock is not None:
-            updates.append(f"{marker}:{lock_ref}")
-        push_args = ["push", "--atomic"]
-        if source_pins or previous_lock is not None:
-            push_args.append(f"--force-with-lease={lock_ref}:{previous_lock or ''}")
-        # Fence every publication to the caller-authorized snapshot, including
-        # an expected-absent head. An internal observation here would turn a
-        # concurrent ref change into authorization.
-        push_args.append(f"--force-with-lease={publication_head_ref}:{expected_publication_head or ''}")
-        push_args.extend(("origin", *updates))
+            updates.append(RemoteRefUpdate(lock_ref, marker, previous_lock))
         try:
-            self.git(*push_args)
+            pushed = self.update_remote_refs(tuple(updates))
+            pushed.check_returncode()
         except BaseException:
             try:
                 published = self.verify_published_tree(ref, directory, parent)
