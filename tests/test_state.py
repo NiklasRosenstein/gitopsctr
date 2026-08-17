@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from gitopsctr.errors import OperationError
+from gitopsctr.git_local import DulwichLocalRepository
 from gitopsctr.state import (
     AcceptedDesiredTarget,
     ControllerPin,
@@ -1148,10 +1149,15 @@ def test_repository_identity_strips_credentials_and_preserves_local_dot():
 
 def test_local_dot_source_resolution_does_not_require_origin(repository: Path):
     revision = _commit(repository, "source", "local\n", "local")
+    store = GitStateStore(repository)
 
-    source = GitStateStore(repository).resolve_source(".", "main")
+    source = store.resolve_source(".", "main")
 
     assert source == GitSourceRevision(".", "main", revision, local=True, _transport=".")
+    opened = store._local._repository
+    assert opened is not None
+    assert store.resolve_source(".", "HEAD").revision == revision
+    assert store._local._repository is opened
 
 
 def test_source_resolution_supports_branches_tags_full_refs_head_and_short_commits(repository: Path):
@@ -1219,6 +1225,28 @@ def test_external_source_resolution_supports_tags_full_refs_and_head(
 
     assert store.resolve_source(str(source_repository.remote), "refs/tags/v1").revision == first
     assert store.resolve_source(str(source_repository.remote), "HEAD").revision == first
+
+
+def test_external_source_resolution_closes_transient_repository(
+    source_repository: BareRepository,
+    bare_repository: BareRepository,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    revision = _git(source_repository.working, "rev-parse", "HEAD")
+    closed: list[DulwichLocalRepository] = []
+    original_close = DulwichLocalRepository.close
+
+    def recording_close(repository: DulwichLocalRepository) -> None:
+        original_close(repository)
+        closed.append(repository)
+
+    monkeypatch.setattr(DulwichLocalRepository, "close", recording_close)
+    store = GitStateStore(bare_repository.working)
+
+    assert store.resolve_source(str(source_repository.remote), "main", revision).revision == revision
+    assert len(closed) == 1
+    assert closed[0]._repository is None
+    assert closed[0].root != store.root
 
 
 @pytest.mark.parametrize(

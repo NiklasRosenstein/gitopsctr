@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -490,14 +490,17 @@ class GitStateStore:
             raise OperationError(message)
         return revision
 
-    def _resolve_commit_at(self, root: Path, revision: str, message: str = "source revision is invalid") -> str:
-        return DulwichLocalRepository(root).resolve_commit(revision, message)
+    @contextmanager
+    def _local_repository_at(self, root: Path) -> Iterator[DulwichLocalRepository]:
+        if root.resolve() == self.root.resolve():
+            yield self._local
+            return
 
-    def _source_head_at(self, root: Path, ref: str) -> str:
-        return self._resolve_commit_at(root, ref, "source ref does not exist")
-
-    def _is_ancestor_at(self, root: Path, ancestor: str, descendant: str) -> bool:
-        return DulwichLocalRepository(root).is_ancestor(ancestor, descendant)
+        repository = DulwichLocalRepository(root)
+        try:
+            yield repository
+        finally:
+            repository.close()
 
     def resolve_source(self, repository: str | Path, ref: str, revision: str | None = None) -> GitSourceRevision:
         """Resolve a source ref once and return its exact commit.
@@ -512,10 +515,15 @@ class GitStateStore:
         source_ref = self._local_source_ref(ref) if identity == "." else self._source_ref(ref)
         if identity == ".":
             head_ref = "HEAD" if source_ref.full_ref == "HEAD" else source_ref.full_ref
-            head = self._source_head_at(self.root, head_ref)
-            resolved = head if revision is None else self._resolve_commit_at(self.root, revision)
-            if revision is not None and not self._is_ancestor_at(self.root, resolved, head):
-                raise OperationError("requested source revision is not part of the source ref history")
+            with self._local_repository_at(self.root) as local_repository:
+                head = local_repository.resolve_commit(head_ref, "source ref does not exist")
+                resolved = (
+                    head
+                    if revision is None
+                    else local_repository.resolve_commit(revision, "source revision is invalid")
+                )
+                if revision is not None and not local_repository.is_ancestor(resolved, head):
+                    raise OperationError("requested source revision is not part of the source ref history")
             return GitSourceRevision(identity, source_ref.name, resolved, local=True, _transport=".")
 
         transport = _repository_transport(repository, root=self.root)
@@ -558,10 +566,15 @@ class GitStateStore:
                     raise OperationError("source ref does not exist")
                 detail = _redact_credentials(fetched.stderr.strip())
                 raise OperationError(detail or "could not fetch source repository")
-            head = self._source_head_at(temporary_root, destination)
-            resolved = head if revision is None else self._resolve_commit_at(temporary_root, revision)
-            if revision is not None and not self._is_ancestor_at(temporary_root, resolved, head):
-                raise OperationError("requested source revision is not part of the source ref history")
+            with self._local_repository_at(temporary_root) as local_repository:
+                head = local_repository.resolve_commit(destination, "source ref does not exist")
+                resolved = (
+                    head
+                    if revision is None
+                    else local_repository.resolve_commit(revision, "source revision is invalid")
+                )
+                if revision is not None and not local_repository.is_ancestor(resolved, head):
+                    raise OperationError("requested source revision is not part of the source ref history")
             return GitSourceRevision(identity, source_ref.name, resolved, _transport=transport)
 
     def _local_ref_revision(self, ref: str) -> str | None:
