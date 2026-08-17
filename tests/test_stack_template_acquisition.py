@@ -131,11 +131,11 @@ def test_external_git_template_is_acquired_with_exact_lineage_and_clean_import_r
         "sha256:"
         + hashlib.sha256((tmp_path / "external/source-working/templates/preview.yaml").read_bytes()).hexdigest()
     )
-    assert not store.git("ls-remote", "--refs", "origin", "refs/heads/gitopsctr/source-retention/*", check=False).stdout
+    assert not git(source, "ls-remote", "--refs", "origin", "refs/heads/gitopsctr/source-retention/*")
 
     shutil.rmtree(tmp_path / "external/source.git")
-    store.git("reflog", "expire", "--expire=now", "--all")
-    store.git("gc", "--prune=now")
+    git(source, "reflog", "expire", "--expire=now", "--all")
+    git(source, "gc", "--prune=now")
     stack_only_args = [
         "apply",
         "--environment",
@@ -183,8 +183,7 @@ def test_git_template_expected_digest_and_recursive_source_fail_without_retentio
 
     with pytest.raises(OperationError, match="documentDigest mismatch"):
         _apply(source, controller_revision, selector)
-    store = GitStateStore(source)
-    assert not store.git("ls-remote", "--refs", "origin", "refs/heads/gitopsctr/source-retention/*", check=False).stdout
+    assert not git(source, "ls-remote", "--refs", "origin", "refs/heads/gitopsctr/source-retention/*")
 
     recursive = external / "templates/recursive.yaml"
     recursive.write_text(
@@ -208,7 +207,7 @@ def test_git_template_expected_digest_and_recursive_source_fail_without_retentio
     controller_revision = commit(source, "remove invalid digest")
     with pytest.raises(OperationError, match="recursively"):
         _apply(source, controller_revision, selector)
-    assert not store.git("ls-remote", "--refs", "origin", "refs/heads/gitopsctr/source-retention/*", check=False).stdout
+    assert not git(source, "ls-remote", "--refs", "origin", "refs/heads/gitopsctr/source-retention/*")
 
 
 def test_dry_external_acquisition_is_remote_ref_pure_for_changed_and_noop_runs(
@@ -247,7 +246,7 @@ def test_dry_external_acquisition_is_remote_ref_pure_for_changed_and_noop_runs(
     assert _apply(source, controller_revision, selector, stack, dry=True) == (store.fetch("deploy/dev").revision or "")
     assert store.list_remote_refs() == before
     assert not store.list_controller_pins()
-    assert not store.git("ls-remote", "--refs", "origin", "refs/heads/gitopsctr/source-retention/*").stdout
+    assert not git(source, "ls-remote", "--refs", "origin", "refs/heads/gitopsctr/source-retention/*")
 
     published = _apply(source, controller_revision, selector, stack)
     after_publish = store.list_remote_refs()

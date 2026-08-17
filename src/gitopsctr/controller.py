@@ -470,7 +470,7 @@ def describe_revision(revision: str | None, stream: TextIO | None = None) -> str
 
 
 def git(*args: str, check: bool = True, input_text: str | None = None, env=None):
-    return state_store().git(*args, check=check, input_text=input_text, env=env)
+    return state_store()._run_git(*args, check=check, input_text=input_text, env=env)
 
 
 def working_tree_has_uncommitted_changes() -> bool:
@@ -2788,8 +2788,11 @@ def _materialize_template_source_context(
             else:
                 # Compatibility for small test doubles; production hydration
                 # uses canonical, publication-owner, then validated claim refs.
+                runner = getattr(store, "git", None)
+                if not callable(runner):
+                    raise OperationError("StackTemplate source pin hydration is unavailable") from original
                 pin_ref = f"refs/heads/gitopsctr/pins/{pin_name}"
-                canonical = store.git("ls-remote", "--exit-code", "--refs", "origin", pin_ref, check=False)
+                canonical = runner("ls-remote", "--exit-code", "--refs", "origin", pin_ref, check=False)
                 if canonical.returncode == 2:
                     list_pins = getattr(store, "list_controller_pins", None)
                     if callable(list_pins):
@@ -2805,7 +2808,7 @@ def _materialize_template_source_context(
                         )
                         if matching_claim is not None:
                             pin_ref = matching_claim.ref
-                fetched = store.git(
+                fetched = runner(
                     "fetch", "origin", f"{pin_ref}:refs/remotes/origin/gitopsctr/pins/{pin_name}", check=False
                 )
                 if fetched.returncode != 0:
@@ -2979,14 +2982,17 @@ def _hydrate_stack_template_source_pin(environment: str, name: str, uid: str, re
     if callable(hydrate):
         hydrate(pin_name, revision)
         return
+    runner = getattr(store, "git", None)
+    if not callable(runner):
+        raise OperationError("StackTemplate source pin hydration is unavailable")
     pin_ref = f"refs/heads/gitopsctr/pins/{pin_name}"
-    remote = store.git("ls-remote", "--exit-code", "--refs", "origin", pin_ref, check=False)
+    remote = runner("ls-remote", "--exit-code", "--refs", "origin", pin_ref, check=False)
     if remote.returncode != 0 or not any(
         fields == [revision, pin_ref] for fields in (line.split() for line in remote.stdout.splitlines())
     ):
         raise OperationError("StackTemplate source pin is missing or points to an unexpected revision")
     local_ref = f"refs/remotes/origin/gitopsctr/pins/{pin_name}"
-    fetched = store.git("fetch", "--no-tags", "--no-write-fetch-head", "origin", f"+{pin_ref}:{local_ref}", check=False)
+    fetched = runner("fetch", "--no-tags", "--no-write-fetch-head", "origin", f"+{pin_ref}:{local_ref}", check=False)
     if fetched.returncode != 0:
         raise OperationError("could not hydrate StackTemplate source pin")
 
@@ -3128,15 +3134,7 @@ def _acquire_promoted_stack_template(
             # present; a fresh runner must use the canonical pin.
             if (
                 source_template.spec.sourceContext.repository != "."
-                or state_store()
-                .git(
-                    "rev-parse",
-                    "--verify",
-                    f"{source_template.spec.sourceContext.revision}^{{commit}}",
-                    check=False,
-                )
-                .returncode
-                != 0
+                or state_store().local_commit(source_template.spec.sourceContext.revision) is None
             ):
                 raise
     resolved = StackTemplateResolvedFromPromotion(
