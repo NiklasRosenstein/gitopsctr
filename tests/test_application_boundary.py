@@ -10,8 +10,10 @@ ISSUANCE_NAMES = {
     "_issue_sealed_candidate",
     "_issue_publication_proof",
     "_issue_retained_source",
+    "_issue_historical_retained_source_evidence",
     "_issue_authored_document",
     "_new_publication_proof_issuer",
+    "_open_publication_proof_issuer",
 }
 MARKER_NAMES = {
     "_ACCEPTED_DESIRED_ISSUANCE",
@@ -25,6 +27,7 @@ TRUSTED_ISSUERS = {
     Path("adapters/authority.py"),
     Path("adapters/effect_fencing.py"),
     Path("adapters/git/apply.py"),
+    Path("adapters/git/publication.py"),
     Path("adapters/memory/authority.py"),
     Path("adapters/memory/effect_fencing.py"),
     Path("adapters/git/sources.py"),
