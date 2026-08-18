@@ -12,10 +12,9 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from jsonschema.protocols import Validator
 
-from gitopsctr.api import GVK, ApiKind
 from gitopsctr.contracts import CORE_CONTRACTS
-from gitopsctr.document import ContractError, JsonObject, TypedDocumentContract, require_json_value
 from gitopsctr.formats import PROJECT_RESOURCE_SCHEMA
+from gitopsctr.resource_api import GVK, ApiKind, ContractError, JsonObject, TypedDocumentContract, require_json_value
 
 CORE_API_VERSION = "gitopsctr.io/v1"
 

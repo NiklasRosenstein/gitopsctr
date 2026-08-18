@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import cast
 
 from gitopsctr.artifacts import ArtifactProducer
-from gitopsctr.document import JsonObject
 from gitopsctr.driver import DriverError, UnitExecutionContext
 from gitopsctr.execution import CommandOutput, DriverExecution
+from gitopsctr.resource_api import JsonObject
 
 OCI_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 FRONTEND_ARCHIVE = "frontend-bundle.tar.gz"

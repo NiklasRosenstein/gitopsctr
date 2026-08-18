@@ -10,10 +10,10 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
-from gitopsctr.document import JsonObject
 from gitopsctr.driver import DriverError, MaterializationCapability, ReconciliationCapability
 from gitopsctr.errors import OperationError
 from gitopsctr.formats import load_document
+from gitopsctr.resource_api import JsonObject
 from gitopsctr.resources import UnitResource
 from gitopsctr.templates import TemplateError, contains_reference, parse_template_value
 

@@ -10,7 +10,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 from uuid import uuid4
 
-from gitopsctr.api import GVK
 from gitopsctr.artifacts import ArtifactApi
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
@@ -35,7 +34,7 @@ from gitopsctr.contracts import (
     StrictModel,
     stack_generated_unit_name,
 )
-from gitopsctr.document import ContractError, JsonObject, JsonObjectValue, TypedDocumentContract
+from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import InstalledUnitDriver
 from gitopsctr.errors import OperationError
 from gitopsctr.formats import (
@@ -46,6 +45,7 @@ from gitopsctr.formats import (
     load_project_config,
     write_document,
 )
+from gitopsctr.resource_api import GVK, ContractError, JsonObject, TypedDocumentContract
 from gitopsctr.schemas import receipt_resource_schema, resource_schema_url
 from gitopsctr.templates import TemplateValue, dump_template_value
 

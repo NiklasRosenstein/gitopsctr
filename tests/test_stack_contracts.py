@@ -38,7 +38,8 @@ from gitopsctr.contracts import (
     StackTemplateResolvedFromPromotionSource,
     StackTemplateSourceContext,
 )
-from gitopsctr.document import ContractError, JsonObjectValue
+from gitopsctr.document import JsonObjectValue
+from gitopsctr.resource_api import ContractError
 from gitopsctr.templates import (
     ProjectionObject,
     PromotionReference,

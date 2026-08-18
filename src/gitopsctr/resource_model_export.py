@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from gitopsctr.api import GVK, ApiKind
+from gitopsctr.resource_api import GVK, ApiKind
 from gitopsctr.resource_model import (
     ResourceFamilyDefinition,
     ResourcePlane,

@@ -12,9 +12,16 @@ from types import MappingProxyType
 from typing import Any, Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 
-from gitopsctr.api import GVK, ApiKind
-from gitopsctr.document import ContractError, JsonObject, JsonValue, TypedDocumentContract, require_json_value
 from gitopsctr.formats import PROJECT_CONFIG_NAMES, Project, load_document
+from gitopsctr.resource_api import (
+    GVK,
+    ApiKind,
+    ContractError,
+    JsonObject,
+    JsonValue,
+    TypedDocumentContract,
+    require_json_value,
+)
 
 
 class ResourceModelError(ValueError):

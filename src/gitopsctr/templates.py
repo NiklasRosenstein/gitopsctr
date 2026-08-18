@@ -15,9 +15,8 @@ from mashumaro.jsonschema.annotations import Pattern
 from mashumaro.mixins.dict import DataClassDictMixin
 from mashumaro.types import SerializableType
 
-from gitopsctr.api import GVK
 from gitopsctr.document import REFERENCE_KEYS as DOCUMENT_REFERENCE_KEYS
-from gitopsctr.document import JsonObject, JsonScalar, JsonValue, require_json_value
+from gitopsctr.resource_api import GVK, JsonObject, JsonScalar, JsonValue, require_json_value
 
 # ``fromEnvironment`` is a value lookup, not a template-source reference.
 # Keep it in this module's expression language without changing the lower-level

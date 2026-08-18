@@ -8,7 +8,6 @@ from typing import cast
 import pytest
 import yaml
 
-from gitopsctr.api import GVK, ApiKind
 from gitopsctr.artifacts import CONTAINER_IMAGES
 from gitopsctr.contracts import (
     DesiredStackSpec,
@@ -24,11 +23,12 @@ from gitopsctr.contracts import (
     StackTemplateUnitTemplate,
 )
 from gitopsctr.core_api import CORE_API_VERSION, CoreResourceApi
-from gitopsctr.document import ContractError, JsonObject, JsonObjectValue
+from gitopsctr.document import JsonObjectValue
 from gitopsctr.driver import UnitDriver
 from gitopsctr.formats import Project
 from gitopsctr.inspection_api import InspectionOutputApi
 from gitopsctr.registry import API_KINDS, RESOURCE_REGISTRY
+from gitopsctr.resource_api import GVK, ApiKind, ContractError, JsonObject
 from gitopsctr.resource_model import (
     ArtifactResolutionContext,
     CollectionReadContext,

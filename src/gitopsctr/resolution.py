@@ -6,8 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
-from gitopsctr.document import JsonObject, JsonValue
 from gitopsctr.errors import OperationError, ReferenceUnavailable
+from gitopsctr.resource_api import JsonObject, JsonValue
 from gitopsctr.templates import (
     ArtifactReference,
     ArtifactReferenceTarget,

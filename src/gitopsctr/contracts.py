@@ -22,16 +22,9 @@ from mashumaro.jsonschema.plugins import BasePlugin
 from mashumaro.jsonschema.schema import Instance
 from mashumaro.mixins.dict import DataClassDictMixin
 
-from gitopsctr.document import (
-    ContractError,
-    DocumentContract,
-    JsonObject,
-    JsonObjectValue,
-    JsonValue,
-    ResolvedJsonObjectValue,
-    TypedDocumentContract,
-)
+from gitopsctr.document import JsonObjectValue, ResolvedJsonObjectValue
 from gitopsctr.formats import CANDIDATE_REF_TEMPLATE_PATTERN
+from gitopsctr.resource_api import ContractError, DocumentContract, JsonObject, JsonValue, TypedDocumentContract
 from gitopsctr.templates import (
     REFERENCE_KEYS,
     ArtifactReference,

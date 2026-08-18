@@ -7,9 +7,7 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import cast
 
-from gitopsctr.api import GVK
 from gitopsctr.contracts import StackProjectionUnitBinding
-from gitopsctr.document import JsonObject
 from gitopsctr.errors import OperationError
 from gitopsctr.formats import DocumentFormatError, load_document, load_project_config
 from gitopsctr.operational import (
@@ -20,6 +18,7 @@ from gitopsctr.operational import (
     load_desired_transition_blocks,
 )
 from gitopsctr.plane_repositories import PlaneRepositorySession, PlaneSnapshot
+from gitopsctr.resource_api import GVK, JsonObject
 from gitopsctr.resource_model import (
     ArtifactDescriptionDefinition,
     ArtifactLink,

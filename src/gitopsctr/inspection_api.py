@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from gitopsctr.api import GVK, ApiKind
 from gitopsctr.contracts import INSPECTION_RESOURCE_LIST_CONTRACT
-from gitopsctr.document import DocumentContract
+from gitopsctr.resource_api import GVK, ApiKind, DocumentContract
 
 INSPECTION_API_VERSION = "inspection.gitopsctr.io/v1"
 

@@ -7,7 +7,6 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
 
-from gitopsctr.api import GVK
 from gitopsctr.artifacts import ArtifactApi, require_artifact_api
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
@@ -22,10 +21,10 @@ from gitopsctr.contracts import (
     StackTemplateDocumentSpec,
     artifact_descriptors_schema,
 )
-from gitopsctr.document import DocumentContract, JsonObject
 from gitopsctr.driver import UnitDriver
 from gitopsctr.formats import PROJECT_RESOURCE_SCHEMA
 from gitopsctr.registry import API_KINDS, UNIT_DRIVERS
+from gitopsctr.resource_api import GVK, DocumentContract, JsonObject
 
 
 def _driver_schema_id(driver: str, plugin: UnitDriver, kind: str) -> str:

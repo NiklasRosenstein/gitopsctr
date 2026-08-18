@@ -5,9 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
-from gitopsctr.api import GVK, ApiError, ApiKind, require_api_spec
 from gitopsctr.contracts import SCHEMA_ROOT, MashumaroContract, QualifiedResourceName, SchemaDocument, StrictModel
-from gitopsctr.document import JsonObject, TypedDocumentContract
+from gitopsctr.resource_api import GVK, ApiError, ApiKind, JsonObject, TypedDocumentContract, require_api_spec
 
 ARTIFACT_API_VERSION = "artifact.gitopsctr.io/v1"
 

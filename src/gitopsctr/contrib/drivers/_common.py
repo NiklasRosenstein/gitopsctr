@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from gitopsctr.document import JsonObject
 from gitopsctr.driver import DriverError, ReconciliationResult, SemanticResultSelector
+from gitopsctr.resource_api import JsonObject
 
 
 def require_strings(values: JsonObject, names: tuple[str, ...], contract: str) -> None:

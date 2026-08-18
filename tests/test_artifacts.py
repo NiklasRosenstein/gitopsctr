@@ -12,14 +12,12 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from gitopsctr import api as api_registry
+import gitopsctr.api_discovery as api_registry
 from gitopsctr import controller
 from gitopsctr import registry as driver_registry
-from gitopsctr.api import GVK, ApiError, ApiKind
 from gitopsctr.artifacts import CONTAINER_IMAGES, ArtifactApi, ContainerImagesResource, require_artifact_api
 from gitopsctr.contracts import DesiredSource, MashumaroContract
 from gitopsctr.contrib.drivers.oci_images import OciImagesDesiredUnit
-from gitopsctr.document import DocumentContract, JsonObject
 from gitopsctr.driver import (
     DriverError,
     ReconciliationCapability,
@@ -29,6 +27,7 @@ from gitopsctr.driver import (
     UnitDriver,
     unit_driver_api,
 )
+from gitopsctr.resource_api import GVK, ApiError, ApiKind, DocumentContract, JsonObject
 from gitopsctr.resources import ResourceMetadata, UnitResource
 from tests.conftest import receipt_document, receipt_resource
 

@@ -13,12 +13,12 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from gitopsctr.api import GVK, ApiKind, api_kinds
 from gitopsctr.artifacts import ArtifactApi, require_artifact_api
 from gitopsctr.contracts import DesiredSource, MaterializationDocument, ResolvedInputs, StrictModel
-from gitopsctr.document import JsonObject, JsonObjectValue, TypedDocumentContract
+from gitopsctr.document import JsonObjectValue
 from gitopsctr.execution import DriverExecution, default_driver_execution
 from gitopsctr.resolution import TemplateResolution
+from gitopsctr.resource_api import GVK, ApiKind, JsonObject, TypedDocumentContract
 
 if TYPE_CHECKING:
     from gitopsctr.resources import ReceiptResource
@@ -318,10 +318,10 @@ SemanticResultSelector = Callable[[object], ReconciliationResult]
 
 
 def load_unit_drivers(
-    installed_api_kinds: Mapping[GVK, ApiKind[object]] | None = None,
+    installed_api_kinds: Mapping[GVK, ApiKind[object]],
 ) -> dict[str, InstalledUnitDriver]:
     drivers: dict[str, InstalledUnitDriver] = {}
-    installed = api_kinds() if installed_api_kinds is None else installed_api_kinds
+    installed = installed_api_kinds
     for api_kind in installed.values():
         if isinstance(api_kind.spec, ArtifactApi):
             require_artifact_api(api_kind)

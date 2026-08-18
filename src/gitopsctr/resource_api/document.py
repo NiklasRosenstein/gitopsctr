@@ -1,0 +1,55 @@
+"""Library-neutral JSON values and versioned document contracts."""
+
+from __future__ import annotations
+
+import math
+from abc import ABC, abstractmethod
+from typing import cast
+
+type JsonScalar = None | bool | int | float | str
+type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
+type JsonObject = dict[str, JsonValue]
+
+
+def require_json_value(value: object) -> JsonValue:
+    """Validate an arbitrary Python value as JSON without coercing it."""
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("expected a finite JSON number")
+        return value
+    if isinstance(value, list):
+        return [require_json_value(item) for item in value]
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return {cast(str, key): require_json_value(item) for key, item in value.items()}
+    raise ValueError(f"expected a JSON value, got {type(value).__name__}")
+
+
+class ContractError(ValueError):
+    """A JSON document does not satisfy its public structural contract."""
+
+
+class DocumentContract(ABC):
+    """Validation and JSON Schema generation without imposing a model library."""
+
+    @abstractmethod
+    def validate(self, document: object) -> JsonObject:
+        """Validate and return a JSON object without trusting its ``$schema`` hint."""
+
+    @abstractmethod
+    def json_schema(self) -> JsonObject:
+        """Return this contract's Draft 2020-12 JSON Schema."""
+
+
+class TypedDocumentContract[T](DocumentContract):
+    """A contract that validates documents into a well-typed Python value."""
+
+    @abstractmethod
+    def parse(self, document: object) -> T:
+        """Validate and deserialize an untrusted document."""
+
+    @abstractmethod
+    def dump(self, value: T) -> JsonObject:
+        """Serialize a typed value into its public document representation."""
