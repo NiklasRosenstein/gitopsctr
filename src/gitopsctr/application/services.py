@@ -11,7 +11,8 @@ from gitopsctr.application.model import (
     ValidateCommand,
     ValidationResult,
 )
-from gitopsctr.application.ports import ResourceInspector, SnapshotReader, SpecificationValidator
+from gitopsctr.application.ports import ResourceInspector, SnapshotReader, SpecificationValidator, StatusInspector
+from gitopsctr.application.status import StatusCommand, StatusResult
 
 
 @dataclass(slots=True)
@@ -21,6 +22,7 @@ class ApplicationServices:
     snapshot_reader: SnapshotReader
     specification_validator: SpecificationValidator
     resource_inspector: ResourceInspector
+    status_inspector: StatusInspector
     _closed: bool = field(default=False, init=False, repr=False)
 
     def validate(self, command: ValidateCommand) -> ValidationResult:
@@ -39,6 +41,11 @@ class ApplicationServices:
 
         return self.resource_inspector.inspect(command)
 
+    def status(self, command: StatusCommand) -> StatusResult:
+        """Read environment status through the configured typed status adapter."""
+
+        return self.status_inspector.status(command)
+
     def close(self) -> None:
         """Close both explicit dependencies exactly once."""
 
@@ -46,12 +53,15 @@ class ApplicationServices:
             return
         self._closed = True
         try:
-            self.resource_inspector.close()
+            self.status_inspector.close()
         finally:
             try:
-                self.specification_validator.close()
+                self.resource_inspector.close()
             finally:
-                self.snapshot_reader.close()
+                try:
+                    self.specification_validator.close()
+                finally:
+                    self.snapshot_reader.close()
 
     def __enter__(self) -> ApplicationServices:
         return self

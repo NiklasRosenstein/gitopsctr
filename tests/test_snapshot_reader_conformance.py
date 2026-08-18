@@ -50,6 +50,14 @@ class NoopResourceInspector:
         """No resources are owned."""
 
 
+class NoopStatusInspector:
+    def status(self, _command: object) -> object:
+        raise AssertionError("status inspection is not expected")
+
+    def close(self) -> None:
+        """No resources are owned."""
+
+
 def _git(path: Path, *arguments: str) -> str:
     return subprocess.run(
         ("git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", *arguments),
@@ -113,6 +121,7 @@ def test_application_inspection_uses_the_injected_snapshot_reader(snapshot_reade
         snapshot_reader.reader,
         NoopSpecificationValidator(),
         NoopResourceInspector(),
+        NoopStatusInspector(),
     ) as services:
         result = services.inspect_snapshot(SnapshotInspectionCommand(snapshot_reader.snapshot_id))
 

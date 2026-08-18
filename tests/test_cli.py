@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 from gitopsctr import controller as deploy_release
+from gitopsctr.application import StatusCommand, StatusEntry, StatusExplanation, StatusResult, StatusState
 from gitopsctr.resources import ResourceMetadata
 from tests.conftest import receipt_document, receipt_resource, write_test_document
 
@@ -1349,12 +1350,22 @@ def test_describe_revision_includes_cached_subject_and_preserves_dry_prefix(tmp_
 
 
 def test_status_includes_commit_subjects(tmp_path, monkeypatch, capsys):
-    revisions = {"deploy/dev": "a" * 40, "observed/dev": "b" * 40}
     subjects = {"a" * 40: "Prepare desired state", "b" * 40: "Observe frontend"}
+    calls = []
+
+    class Application:
+        def status(self, command):
+            calls.append(command)
+            return StatusResult("dev", "deploy/dev", "a" * 40, "observed/dev", "b" * 40, ())
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
     monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
-    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
-    monkeypatch.setattr(deploy_release, "observed_tree", lambda ref, _output: revisions[ref])
-    monkeypatch.setattr(deploy_release, "load_environment_specifications", lambda *_args: {})
+    monkeypatch.setattr("gitopsctr.composition.create_default_application", lambda _root: Application())
     monkeypatch.setattr(deploy_release, "commit_subject", lambda _root, revision: subjects.get(revision))
     args = deploy_release.build_parser().parse_args(["status", "--environment", "dev"])
 
@@ -1362,6 +1373,7 @@ def test_status_includes_commit_subjects(tmp_path, monkeypatch, capsys):
 
     output = capsys.readouterr()
     assert output.out == ""
+    assert calls == [StatusCommand("dev")]
     assert "DESIRED  deploy/dev at aaaaaaaaaaaa (Prepare desired state)" in output.err
     assert "OBSERVED observed/dev at bbbbbbbbbbbb (Observe frontend)" in output.err
 
@@ -1596,19 +1608,27 @@ def test_status_without_environment_delegates_to_get_orchestrator(monkeypatch):
 
 def test_status_can_focus_on_one_unit(tmp_path, monkeypatch):
     captured = []
+
+    class Application:
+        def status(self, command):
+            assert command == StatusCommand("dev", unit="web")
+            return StatusResult(
+                "dev",
+                "deploy/dev",
+                "a" * 40,
+                "observed/dev",
+                None,
+                (StatusEntry("web", StatusState.READY, "inputs changed"),),
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
     monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
-    monkeypatch.setattr(deploy_release, "deployment_refs", lambda *_args, **_kwargs: ("deploy/dev", "observed/dev"))
-    monkeypatch.setattr(deploy_release, "observed_tree", lambda _ref, output: output.mkdir() or "a" * 40)
-    monkeypatch.setattr(
-        deploy_release,
-        "load_environment_specifications",
-        lambda *_args: {"web": {}, "api": {}},
-    )
-    monkeypatch.setattr(
-        deploy_release,
-        "reconciliation_statuses",
-        lambda *_args: [("api", "CLEAN", "observation matches desired state"), ("web", "READY", "inputs changed")],
-    )
+    monkeypatch.setattr("gitopsctr.composition.create_default_application", lambda _root: Application())
     monkeypatch.setattr(
         deploy_release,
         "log_reconciliation_status",
@@ -1619,6 +1639,91 @@ def test_status_can_focus_on_one_unit(tmp_path, monkeypatch):
     args.handler(args)
 
     assert captured == [("dev", [("web", "READY", "inputs changed")])]
+
+
+def test_status_renders_closed_explanation_in_normal_mode(tmp_path, monkeypatch, capsys):
+    explanation = StatusExplanation(
+        "b" * 40,
+        "c" * 40,
+        "d" * 40,
+        ("reviewed promotion inputs changed: staging",),
+        ("abc1234 change",),
+        ("M\tinfra/main.tf",),
+        ("/terraform/variables/name",),
+    )
+
+    class Application:
+        def status(self, _command):
+            return StatusResult(
+                "dev",
+                "desired/dev",
+                "a" * 40,
+                "observed/dev",
+                "e" * 40,
+                (StatusEntry("web", StatusState.READY, "changed", explanation),),
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr("gitopsctr.composition.create_default_application", lambda _root: Application())
+    args = deploy_release.build_parser().parse_args(["status", "--environment", "dev"])
+
+    args.handler(args)
+
+    output = capsys.readouterr().err
+    assert "LAST" in output and "CURRENT" in output
+    assert "CAUSE    reviewed promotion inputs changed: staging" in output
+    assert "COMMIT   abc1234 change" in output
+    assert "FILE     M\tinfra/main.tf" in output
+    assert "FIELD    /terraform/variables/name" in output
+
+
+def test_status_explanation_bounds_normal_output_and_expands_verbose(tmp_path, monkeypatch, capsys):
+    evidence = tuple(f"abc{i:04x} change {i}" for i in range(6))
+
+    class Application:
+        def status(self, _command):
+            return StatusResult(
+                "dev",
+                "desired/dev",
+                "a" * 40,
+                "observed/dev",
+                "b" * 40,
+                (
+                    StatusEntry(
+                        "web",
+                        StatusState.READY,
+                        "changed",
+                        StatusExplanation("c" * 40, None, None, (), evidence, (), ()),
+                    ),
+                    StatusEntry("new", StatusState.READY, "new inputs"),
+                ),
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr("gitopsctr.composition.create_default_application", lambda _root: Application())
+    deploy_release.command_status(deploy_release.build_parser().parse_args(["status", "--environment", "dev"]))
+    normal = capsys.readouterr().err
+    deploy_release.command_status(
+        deploy_release.build_parser().parse_args(["status", "--environment", "dev", "--verbose"])
+    )
+    verbose = capsys.readouterr().err
+
+    assert "... and 1 more; use --verbose to show all" in normal
+    assert "abc0005 change 5" not in normal
+    assert "abc0005 change 5" in verbose
+    assert "CAUSE    no prior desired unit is available for comparison" in normal
 
 
 def test_environment_refs_use_project_defaults_and_allow_environment_and_cli_overrides(tmp_path):

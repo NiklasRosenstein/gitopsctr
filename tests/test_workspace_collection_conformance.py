@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -13,6 +14,7 @@ from gitopsctr.adapters.git.workspace_inspection import inspect_workspace_provid
 from gitopsctr.adapters.git.workspace_planes import GitWorkspacePlaneSession
 from gitopsctr.application.inspection import InspectionOutputFormat, ResourceInspectionCommand
 from gitopsctr.application.model import ContentId, SnapshotId
+from gitopsctr.application.status import StatusCommand
 from gitopsctr.application.workspace import InMemoryWorkspace, WorkspaceCapabilities, WorkspaceEntry
 from gitopsctr.errors import OperationError
 from gitopsctr.formats import validate_project_document
@@ -20,6 +22,7 @@ from gitopsctr.registry import RESOURCE_REGISTRY
 from gitopsctr.resource_model import ResourcePlane
 from gitopsctr.workspace_collections import WorkspaceCollectionReadContext, discover_workspace_collection
 from gitopsctr.workspace_inspection import WorkspaceSnapshot
+from gitopsctr.workspace_status import _status_entries, status_workspace_provider
 from tests import test_inventory as inventory_support
 
 pytest_plugins = ("tests.test_inventory",)
@@ -324,6 +327,274 @@ def test_resource_inspector_conformance_uses_independent_memory_planes(repositor
         inspect_workspace_provider(
             _memory_provider(duplicate=True), RESOURCE_REGISTRY, ResourceInspectionCommand("units", environment="dev")
         )
+
+
+def test_status_uses_identical_logical_snapshot_semantics_for_git_and_memory(repository) -> None:
+    command = StatusCommand("dev")
+    git_provider = GitWorkspacePlaneSession(repository, GitSnapshotReader.from_path(repository))
+    desired = git_provider.snapshot(ResourcePlane.DESIRED, "gitopsctr/desired/dev")
+    observed = git_provider.snapshot(ResourcePlane.OBSERVED, "gitopsctr/observed/dev")
+    memory = MemoryPlaneProvider(
+        git_provider.project(),
+        InMemoryWorkspace(git_provider.source().workspace.list_entries(), mutable=False),
+        {
+            (ResourcePlane.DESIRED, desired.reference, None): WorkspaceSnapshot(
+                ResourcePlane.DESIRED,
+                desired.reference,
+                desired.revision,
+                desired.snapshot_id,
+                InMemoryWorkspace(desired.workspace.list_entries(), mutable=False),
+                desired.workspace.entry_content_ids(),
+            ),
+            (ResourcePlane.OBSERVED, observed.reference, None): WorkspaceSnapshot(
+                ResourcePlane.OBSERVED,
+                observed.reference,
+                observed.revision,
+                observed.snapshot_id,
+                InMemoryWorkspace(observed.workspace.list_entries(), mutable=False),
+                observed.workspace.entry_content_ids(),
+            ),
+        },
+    )
+    git = status_workspace_provider(git_provider, RESOURCE_REGISTRY, command)
+    memory_result = status_workspace_provider(memory, RESOURCE_REGISTRY, command)
+
+    assert [(item.name, item.state, item.reason) for item in git.entries] == [
+        (item.name, item.state, item.reason) for item in memory_result.entries
+    ]
+    assert git.entries[0].name == memory_result.entries[0].name == "application"
+    assert git.entries[0].state == memory_result.entries[0].state == "CLEAN"
+    assert [(entry.name, entry.state.value) for entry in git.entries] == [
+        ("application", "CLEAN"),
+        ("deleting", "WAIT"),
+        ("external", "MATERIALIZED"),
+        ("shared", "WAIT"),
+    ]
+
+    with pytest.raises(OperationError, match="missing-observed"):
+        status_workspace_provider(
+            _memory_provider(),
+            RESOURCE_REGISTRY,
+            StatusCommand("dev", observed_reference="missing-observed"),
+        )
+    with pytest.raises(OperationError, match="gitopsctr/observed/dev"):
+        status_workspace_provider(
+            _memory_provider(),
+            RESOURCE_REGISTRY,
+            StatusCommand("dev", observed_snapshot="missing-observed-snapshot"),
+        )
+
+    missing = status_workspace_provider(_memory_provider(missing_default=True), RESOURCE_REGISTRY, command)
+    assert missing.desired_revision is None and missing.observed_revision is None
+
+
+def test_status_git_memory_historical_and_custom_ref_matrix(repository) -> None:
+    inventory_support.git(repository, "checkout", "desired")
+    historical = inventory_support.git(repository, "rev-parse", "HEAD")
+    inventory_support.write_json(repository / "units/candidate.json", inventory_support.desired_terraform("candidate"))
+    current = inventory_support.commit(repository, "candidate desired")
+    inventory_support.git(repository, "push", "origin", f"{current}:refs/heads/gitopsctr/candidate/dev")
+    inventory_support.git(repository, "checkout", "main")
+
+    git_provider = GitWorkspacePlaneSession(repository, GitSnapshotReader.from_path(repository))
+    desired_current = git_provider.snapshot(ResourcePlane.DESIRED, "gitopsctr/candidate/dev")
+    desired_historical = git_provider.snapshot(ResourcePlane.DESIRED, "gitopsctr/candidate/dev", historical)
+    observed = git_provider.snapshot(ResourcePlane.OBSERVED, "gitopsctr/observed/dev")
+
+    def copy(snapshot):
+        workspace = InMemoryWorkspace(snapshot.workspace.list_entries(), mutable=False)
+        return WorkspaceSnapshot(
+            snapshot.plane,
+            snapshot.reference,
+            snapshot.revision,
+            snapshot.snapshot_id,
+            workspace,
+            workspace.entry_content_ids(),
+        )
+
+    memory = MemoryPlaneProvider(
+        git_provider.project(),
+        InMemoryWorkspace(git_provider.source().workspace.list_entries(), mutable=False),
+        {
+            (ResourcePlane.DESIRED, "gitopsctr/candidate/dev", None): copy(desired_current),
+            (ResourcePlane.DESIRED, "gitopsctr/candidate/dev", historical): copy(desired_historical),
+            (ResourcePlane.OBSERVED, "gitopsctr/observed/dev", None): copy(observed),
+            (ResourcePlane.OBSERVED, "gitopsctr/observed/dev", observed.revision): copy(observed),
+        },
+    )
+    current_command = StatusCommand(
+        "dev", desired_reference="gitopsctr/candidate/dev", observed_reference="gitopsctr/observed/dev"
+    )
+    historical_command = StatusCommand(
+        "dev",
+        desired_reference="gitopsctr/candidate/dev",
+        desired_snapshot=historical,
+        observed_reference="gitopsctr/observed/dev",
+        observed_snapshot=observed.revision,
+    )
+
+    git_current = status_workspace_provider(git_provider, RESOURCE_REGISTRY, current_command)
+    memory_current = status_workspace_provider(memory, RESOURCE_REGISTRY, current_command)
+    git_historical = status_workspace_provider(git_provider, RESOURCE_REGISTRY, historical_command)
+    memory_historical = status_workspace_provider(memory, RESOURCE_REGISTRY, historical_command)
+
+    assert git_current == memory_current
+    assert git_historical == memory_historical
+    assert git_current.desired_reference == "gitopsctr/candidate/dev"
+    assert git_current.desired_revision == current
+    assert git_historical.desired_revision == historical
+    assert git_current.observed_reference == git_historical.observed_reference == "gitopsctr/observed/dev"
+    assert git_historical.observed_revision == observed.revision
+    assert "candidate" in {entry.name for entry in git_current.entries}
+    assert "candidate" not in {entry.name for entry in git_historical.entries}
+
+
+def test_status_resolves_each_selected_plane_once_without_priming() -> None:
+    base = _memory_provider()
+
+    class CountingPlanes:
+        def __init__(self) -> None:
+            self.source_calls = 0
+            self.snapshot_calls: list[tuple[ResourcePlane, str, str | None]] = []
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        def project(self):
+            return base.project()
+
+        def source(self):
+            self.source_calls += 1
+            return base.source()
+
+        def snapshot(self, plane, reference, revision=None, *, allow_missing=False):
+            self.snapshot_calls.append((plane, reference, revision))
+            return base.snapshot(plane, reference, revision, allow_missing=allow_missing)
+
+    planes = CountingPlanes()
+    result = status_workspace_provider(planes, RESOURCE_REGISTRY, StatusCommand("dev"))
+
+    assert result.entries[0].name == "application"
+    assert planes.source_calls == 1
+    assert planes.snapshot_calls == [
+        (ResourcePlane.DESIRED, "gitopsctr/desired/dev", None),
+        (ResourcePlane.OBSERVED, "gitopsctr/observed/dev", None),
+    ]
+    assert planes.close_calls == 1
+
+
+def test_status_reports_transition_and_opaque_cleanup_from_logical_desired_content() -> None:
+    base = _memory_provider()
+    selected_desired = base.snapshot(ResourcePlane.DESIRED, "gitopsctr/desired/dev")
+    desired = InMemoryWorkspace(
+        (
+            *selected_desired.workspace.list_entries(),
+            WorkspaceEntry.file(
+                ".gitopsctr/transition-blocks.json", b'{"blocks":{"application":"transition pending"}}'
+            ),
+            WorkspaceEntry.file(".gitopsctr/cleanup/units/orphan.json", b"{}"),
+        ),
+        mutable=False,
+    )
+    observed = base.snapshot(ResourcePlane.OBSERVED, "gitopsctr/observed/dev")
+    provider = MemoryPlaneProvider(
+        base.project(),
+        base.source().workspace,
+        {
+            (ResourcePlane.DESIRED, "gitopsctr/desired/dev", None): WorkspaceSnapshot(
+                ResourcePlane.DESIRED,
+                "gitopsctr/desired/dev",
+                "transition",
+                SnapshotId("transition"),
+                desired,
+                desired.entry_content_ids(),
+            ),
+            (ResourcePlane.OBSERVED, "gitopsctr/observed/dev", None): observed,
+        },
+    )
+
+    result = status_workspace_provider(provider, RESOURCE_REGISTRY, StatusCommand("dev"))
+
+    assert [(entry.name, entry.state.value, entry.reason) for entry in result.entries] == [
+        ("application", "WAIT", "transition pending"),
+        ("orphan", "WAIT", "desired inputs are not materialized"),
+    ]
+
+
+def test_status_closes_original_provider_once_when_plane_selection_fails() -> None:
+    base = _memory_provider()
+
+    class FailingPlanes:
+        close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        def project(self):
+            return base.project()
+
+        def source(self):
+            return base.source()
+
+        def snapshot(self, plane, reference, revision=None, *, allow_missing=False):
+            if plane is ResourcePlane.OBSERVED:
+                raise OperationError("observed moved")
+            return base.snapshot(plane, reference, revision, allow_missing=allow_missing)
+
+    planes = FailingPlanes()
+    with pytest.raises(OperationError, match="observed moved"):
+        status_workspace_provider(planes, RESOURCE_REGISTRY, StatusCommand("dev"))
+    assert planes.close_calls == 1
+
+
+def test_status_closes_original_provider_once_when_project_construction_fails() -> None:
+    class FailingProjectPlanes:
+        close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        def project(self):
+            raise OperationError("project unreadable")
+
+        def source(self):
+            raise AssertionError("source must not be read after project failure")
+
+        def snapshot(self, plane, reference, revision=None, *, allow_missing=False):
+            raise AssertionError("snapshot must not be read after project failure")
+
+    planes = FailingProjectPlanes()
+    with pytest.raises(OperationError, match="project unreadable"):
+        status_workspace_provider(planes, RESOURCE_REGISTRY, StatusCommand("dev"))
+    assert planes.close_calls == 1
+
+
+def test_status_keeps_same_terminal_stack_units_by_qualified_identity_and_selector() -> None:
+    desired = _memory_provider().snapshot(ResourcePlane.DESIRED, "gitopsctr/desired/dev")
+    evaluation = SimpleNamespace(
+        units=(
+            SimpleNamespace(
+                unit=SimpleNamespace(name="image", qualified_name="application/image"),
+                reconciliation=SimpleNamespace(value="CLEAN"),
+                reason="application clean",
+            ),
+            SimpleNamespace(
+                unit=SimpleNamespace(name="image", qualified_name="backend/image"),
+                reconciliation=SimpleNamespace(value="READY"),
+                reason="backend changed",
+            ),
+        )
+    )
+
+    entries = _status_entries(evaluation, (), desired, StatusCommand("dev"))
+    selected = _status_entries(evaluation, (), desired, StatusCommand("dev", unit="backend/image"))
+
+    assert [(entry.name, entry.state.value) for entry in entries] == [
+        ("application/image", "CLEAN"),
+        ("backend/image", "READY"),
+    ]
+    assert [(entry.name, entry.reason) for entry in selected] == [("backend/image", "backend changed")]
 
 
 def test_git_and_memory_providers_share_current_and_historical_command_matrix(repository) -> None:
