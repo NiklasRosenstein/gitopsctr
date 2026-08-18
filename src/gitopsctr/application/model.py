@@ -13,6 +13,7 @@ import json
 from dataclasses import dataclass, field
 from enum import StrEnum
 from secrets import token_bytes, token_hex
+from threading import RLock
 from typing import Any, SupportsIndex
 
 
@@ -543,6 +544,23 @@ def _issue_retained_source(
     return retained
 
 
+def _issue_historical_retained_source_evidence(
+    handle: RetainedSourceHandle,
+    retention_store_id: RetentionStoreId,
+    source_snapshot_id: SourceSnapshotId,
+    content_id: ContentId,
+) -> RetainedSource:
+    """Issue immutable *historical* retention evidence for a committed proof.
+
+    This deliberately does not recover, reserve, or revive a released source.
+    It is only suitable for reconstructing a proof whose authenticated journal
+    has already recorded the exact source identity.  New execution/retry paths
+    must obtain a live capability through ``SourceRepository.reissue``.
+    """
+
+    return _issue_retained_source(handle, retention_store_id, source_snapshot_id, content_id)
+
+
 @dataclass(frozen=True)
 class OwnershipObservation:
     """One exact ownership incarnation, including observed absence.
@@ -831,6 +849,7 @@ class _PublicationProofIssuer:
 
 
 _PUBLICATION_PROOF_ISSUERS: dict[str, _PublicationProofIssuer] = {}
+_PUBLICATION_PROOF_ISSUER_LOCK = RLock()
 
 
 def _new_publication_proof_issuer(publication_store_id: PublicationStoreId) -> object:
@@ -842,18 +861,43 @@ def _new_publication_proof_issuer(publication_store_id: PublicationStoreId) -> o
     """
 
     _require_instance(publication_store_id, PublicationStoreId, "publication_store_id")
-    if publication_store_id.value in _PUBLICATION_PROOF_ISSUERS:
-        raise ValueError("publication store ID already has a proof issuer")
-    token = object()
-    _PUBLICATION_PROOF_ISSUERS[publication_store_id.value] = _PublicationProofIssuer(token, token_bytes(32))
-    return token
+    with _PUBLICATION_PROOF_ISSUER_LOCK:
+        if publication_store_id.value in _PUBLICATION_PROOF_ISSUERS:
+            raise ValueError("publication store ID already has a proof issuer")
+        token = object()
+        _PUBLICATION_PROOF_ISSUERS[publication_store_id.value] = _PublicationProofIssuer(token, token_bytes(32))
+        return token
+
+
+def _open_publication_proof_issuer(publication_store_id: PublicationStoreId, secret: bytes) -> object:
+    """Open a durable transaction-store issuer without exposing its secret.
+
+    Trusted durable adapters persist a random 32-byte secret in private
+    metadata. Reopening the same store with that exact secret returns its
+    original issuer token; a mismatched secret fails closed. The lock makes
+    concurrent first-open registration deterministic.
+    """
+
+    _require_instance(publication_store_id, PublicationStoreId, "publication_store_id")
+    if type(secret) is not bytes or len(secret) != 32:
+        raise ValueError("publication proof issuer secret must be exactly 32 bytes")
+    with _PUBLICATION_PROOF_ISSUER_LOCK:
+        existing = _PUBLICATION_PROOF_ISSUERS.get(publication_store_id.value)
+        if existing is not None:
+            if not hmac.compare_digest(existing.secret, secret):
+                raise ValueError("publication store issuer secret does not match durable store identity")
+            return existing.token
+        token = object()
+        _PUBLICATION_PROOF_ISSUERS[publication_store_id.value] = _PublicationProofIssuer(token, secret)
+        return token
 
 
 def _publication_proof_issuer(publication_store_id: PublicationStoreId, issuer: object) -> _PublicationProofIssuer:
     """Return the one registered issuer only when its private token matches."""
 
     _require_instance(publication_store_id, PublicationStoreId, "publication_store_id")
-    record = _PUBLICATION_PROOF_ISSUERS.get(publication_store_id.value)
+    with _PUBLICATION_PROOF_ISSUER_LOCK:
+        record = _PUBLICATION_PROOF_ISSUERS.get(publication_store_id.value)
     if record is None or issuer is not record.token:
         raise TypeError("PublicationProof has no valid transaction-store issuance proof")
     return record
@@ -994,6 +1038,7 @@ def _issue_publication_proof(
     resulting_head: HeadObservation,
     ownership_results: tuple[SourceOwnershipResult, ...],
     coordination_results: tuple[CoordinationResult, ...],
+    proof_id: PublicationProofId | None = None,
 ) -> PublicationProof:
     """Issue proof for an adapter implementing ``PublicationTransaction``."""
 
@@ -1001,7 +1046,11 @@ def _issue_publication_proof(
     issuer_record = _publication_proof_issuer(publication_store_id, issuer)
     object.__setattr__(proof, "intent", intent)
     object.__setattr__(proof, "publication_store_id", publication_store_id)
-    object.__setattr__(proof, "proof_id", PublicationProofId(f"publication-proof:{token_hex(32)}"))
+    object.__setattr__(
+        proof,
+        "proof_id",
+        proof_id if proof_id is not None else PublicationProofId(f"publication-proof:{token_hex(32)}"),
+    )
     object.__setattr__(proof, "resulting_head", resulting_head)
     object.__setattr__(proof, "ownership_results", ownership_results)
     object.__setattr__(proof, "coordination_results", coordination_results)
