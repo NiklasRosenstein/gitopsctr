@@ -17,15 +17,34 @@ from gitopsctr.resource_api import (
     GVK,
     ApiKind,
     ContractError,
+    IdentityConstraint,
+    IdentitySegmentDefinition,
+    InspectionRecord,
+    JsonFieldPath,
     JsonObject,
     JsonValue,
+    LocalResourceIdentity,
+    PersistedQualifiedNameAddressing,
+    ResourceAddressing,
+    ResourceAddressRuntime,
+    ResourceApiError,
+    ResourceApiFamily,
+    ResourceApiRegistry,
+    ResourceApiRelationship,
+    ResourceIdentityDefinition,
+    ResourceSelection,
+    RootResourceAddressing,
     TypedDocumentContract,
+    address_segments,
+    build_resource_api_registry,
     require_json_value,
 )
+from gitopsctr.resource_api import (
+    ApiKindMembership as ResourceApiKindMembership,
+)
 
-
-class ResourceModelError(ValueError):
-    """A resource-model definition or persisted relationship is inconsistent."""
+ResourceModelError = ResourceApiError
+_address_segments = address_segments
 
 
 class ResourcePlane(StrEnum):
@@ -40,117 +59,6 @@ class ResourceScope(StrEnum):
 
 
 @dataclass(frozen=True)
-class IdentitySegmentDefinition:
-    """One named segment in a family-local resource identity."""
-
-    name: str
-    filter_option: str | None = None
-
-    def __post_init__(self) -> None:
-        if re.fullmatch(r"[a-z][a-z0-9-]*", self.name) is None:
-            raise ResourceModelError(f"invalid resource identity segment {self.name!r}")
-        if self.filter_option is not None and re.fullmatch(r"--[a-z][a-z0-9-]*", self.filter_option) is None:
-            raise ResourceModelError(f"invalid resource identity filter option {self.filter_option!r}")
-
-    @property
-    def option_destination(self) -> str | None:
-        return self.filter_option[2:].replace("-", "_") if self.filter_option is not None else None
-
-
-@dataclass(frozen=True)
-class LocalResourceIdentity:
-    """Validated family-local identity values in registry-declared segment order."""
-
-    values: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class IdentityConstraint:
-    """Allowed values for one named family-local identity segment."""
-
-    segment: str
-    values: frozenset[str]
-
-    def __post_init__(self) -> None:
-        if any(not value for value in self.values):
-            raise ResourceModelError(f"identity constraint {self.segment!r} requires non-empty values")
-
-
-@dataclass(frozen=True)
-class ResourceSelection:
-    """Generic exact or segment-constrained family-local resource selection."""
-
-    exact: LocalResourceIdentity | None = None
-    constraints: tuple[IdentityConstraint, ...] = ()
-
-    @classmethod
-    def segment(cls, name: str, values: frozenset[str]) -> ResourceSelection:
-        return cls(constraints=(IdentityConstraint(name, values),))
-
-    def values_for(self, segment: str) -> frozenset[str] | None:
-        values = tuple(item.values for item in self.constraints if item.segment == segment)
-        if len(values) > 1:
-            raise ResourceModelError(f"resource selection repeats identity segment {segment!r}")
-        return values[0] if values else None
-
-
-@dataclass(frozen=True)
-class ResourceIdentityDefinition:
-    """Parse, render, and match one resource family's local identities."""
-
-    segments: tuple[IdentitySegmentDefinition, ...] = (IdentitySegmentDefinition("name"),)
-    separator: str = "/"
-
-    def __post_init__(self) -> None:
-        names = tuple(segment.name for segment in self.segments)
-        if not names or len(set(names)) != len(names) or names[-1] != "name":
-            raise ResourceModelError("resource identity segments must be unique, non-empty, and end with 'name'")
-        if not self.separator:
-            raise ResourceModelError("resource identity separator must not be empty")
-
-    def build(self, values: tuple[str, ...]) -> LocalResourceIdentity:
-        if len(values) != len(self.segments):
-            raise ResourceModelError(
-                f"resource identity requires {len(self.segments)} segments, received {len(values)}"
-            )
-        if any(not value for value in values) or self.separator in values[-1]:
-            raise ResourceModelError("resource identity values must be non-empty and the local name cannot nest")
-        for value in values[:-1]:
-            _address_segments(value)
-        return LocalResourceIdentity(values)
-
-    def from_name(self, name: str, qualifiers: tuple[str, ...] = ()) -> LocalResourceIdentity:
-        return self.build((*qualifiers, name))
-
-    def parse(self, value: str) -> LocalResourceIdentity:
-        return self.build(tuple(value.split(self.separator)))
-
-    def render(self, identity: LocalResourceIdentity) -> str:
-        return self.separator.join(self.build(identity.values).values)
-
-    def value(self, identity: LocalResourceIdentity, segment: str) -> str:
-        try:
-            index = tuple(item.name for item in self.segments).index(segment)
-        except ValueError as exc:
-            raise ResourceModelError(f"resource identity has no segment {segment!r}") from exc
-        return self.build(identity.values).values[index]
-
-    def matches(self, identity: LocalResourceIdentity, selection: ResourceSelection | None) -> bool:
-        identity = self.build(identity.values)
-        if selection is None:
-            return True
-        if selection.exact is not None and identity != self.build(selection.exact.values):
-            return False
-        segment_names = {item.name for item in self.segments}
-        for constraint in selection.constraints:
-            if constraint.segment not in segment_names:
-                raise ResourceModelError(f"resource identity has no segment {constraint.segment!r}")
-            if self.value(identity, constraint.segment) not in constraint.values:
-                return False
-        return True
-
-
-@dataclass(frozen=True)
 class ResourceAddress:
     """Complete inventory address with a canonical collection-qualified name."""
 
@@ -161,109 +69,6 @@ class ResourceAddress:
 
     def __post_init__(self) -> None:
         _address_segments(self.qualified_name)
-
-
-@runtime_checkable
-class InspectionRecord(Protocol):
-    """Persisted-record surface available to registry-owned presenters."""
-
-    @property
-    def document(self) -> JsonObject: ...
-
-    @property
-    def gvk(self) -> GVK: ...
-
-    @property
-    def name(self) -> str: ...
-
-    @property
-    def qualified_name(self) -> str: ...
-
-    @property
-    def blob_id(self) -> str | None: ...
-
-    @property
-    def parsed(self) -> object: ...
-
-
-@runtime_checkable
-class ResourceAddressRuntime(Protocol):
-    """Inventory services available to registry-owned address resolvers."""
-
-    def relationship_sources(self, relationship: str, target: InspectionRecord) -> tuple[InspectionRecord, ...]: ...
-
-    def resource_qualified_name(self, record: InspectionRecord) -> str: ...
-
-
-@runtime_checkable
-class ResourceAddressing(Protocol):
-    """Resolve and validate one family's operator-facing resource portion."""
-
-    @property
-    def parent_families(self) -> tuple[str, ...]: ...
-
-    @property
-    def relationships(self) -> tuple[str, ...]: ...
-
-    @property
-    def requires_relationship_authentication(self) -> bool: ...
-
-    def validate(self, value: str) -> None: ...
-
-    def storage_selection(self, value: str, identity: ResourceIdentityDefinition) -> ResourceSelection | None: ...
-
-    def storage_constraint(
-        self, segment: str, value: str, identity: ResourceIdentityDefinition
-    ) -> IdentityConstraint | None: ...
-
-    def filter_value(self, qualified_name: str, segment: str, identity: ResourceIdentityDefinition) -> str: ...
-
-    def documentation(self) -> str: ...
-
-    def qualified_name(self, record: InspectionRecord, runtime: ResourceAddressRuntime) -> str: ...
-
-
-def _address_segments(value: str) -> tuple[str, ...]:
-    segments = tuple(value.split("/"))
-    if not segments or any(not segment or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", segment) for segment in segments):
-        raise ResourceModelError(f"invalid qualified resource name: {value!r}")
-    return segments
-
-
-@dataclass(frozen=True)
-class RootResourceAddressing:
-    """Address a root resource by its persisted local name."""
-
-    parent_families: tuple[str, ...] = ()
-    relationships: tuple[str, ...] = ()
-    requires_relationship_authentication: bool = False
-
-    def validate(self, value: str) -> None:
-        if len(_address_segments(value)) != 1:
-            raise ResourceModelError("root resource addresses contain exactly one segment")
-
-    def qualified_name(self, record: InspectionRecord, runtime: ResourceAddressRuntime) -> str:
-        self.validate(record.name)
-        return record.name
-
-    def storage_selection(self, value: str, identity: ResourceIdentityDefinition) -> ResourceSelection:
-        self.validate(value)
-        return ResourceSelection(exact=identity.parse(value))
-
-    def storage_constraint(self, segment: str, value: str, identity: ResourceIdentityDefinition) -> IdentityConstraint:
-        if segment != "name":
-            raise ResourceModelError(f"root resource addressing has no filter segment {segment!r}")
-        self.validate(value)
-        return IdentityConstraint(segment, frozenset((value,)))
-
-    def filter_value(self, qualified_name: str, segment: str, identity: ResourceIdentityDefinition) -> str:
-        if segment != "name":
-            raise ResourceModelError(f"root resource addressing has no filter segment {segment!r}")
-        self.validate(qualified_name)
-        return qualified_name
-
-    def documentation(self) -> str:
-        return "`name` (root)"
 
 
 @dataclass(frozen=True)
@@ -520,10 +325,8 @@ class FilesystemDocumentLayout:
 
 
 @runtime_checkable
-class ApiKindMembership(Protocol):
-    """Executable family membership and representation-contract rule."""
-
-    def matches(self, api_kind: ApiKind[object]) -> bool: ...
+class ApiKindMembership(ResourceApiKindMembership, Protocol):
+    """GitOpsCtr family membership plus representation-contract selection."""
 
     def contract(self, api_kind: ApiKind[object], profile: str) -> TypedDocumentContract[Any] | None: ...
 
@@ -1168,6 +971,19 @@ class ResourceFamilyDefinition:
     def selectors(self) -> tuple[str, ...]:
         return (self.singular, self.plural, *self.aliases)
 
+    def resource_api_family(self) -> ResourceApiFamily:
+        """Return the dependency-clean definition consumed by the kernel registry."""
+
+        return ResourceApiFamily(
+            self.name,
+            self.singular,
+            self.plural,
+            self.membership_rules,
+            self.aliases,
+            self.identity,
+            self.addressing,
+        )
+
 
 @dataclass(frozen=True)
 class CollectionReadContext:
@@ -1546,98 +1362,6 @@ class ResourceGraphRelationship:
     binding: ResourceGraphBinding
 
 
-@dataclass(frozen=True)
-class JsonFieldPath:
-    parts: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        if not self.parts or any(not part for part in self.parts):
-            raise ResourceModelError("JSON field path must contain non-empty components")
-
-    def get(self, document: JsonObject) -> JsonValue:
-        value: JsonValue = document
-        for part in self.parts:
-            if not isinstance(value, dict) or part not in value:
-                raise ResourceModelError(f"missing relationship field {self}")
-            value = value[part]
-        return value
-
-    def get_optional(self, document: JsonObject) -> JsonValue | None:
-        value: JsonValue = document
-        for part in self.parts:
-            if not isinstance(value, dict) or part not in value:
-                return None
-            value = value[part]
-        return value
-
-    def __str__(self) -> str:
-        return "/" + "/".join(self.parts)
-
-
-@dataclass(frozen=True)
-class PersistedQualifiedNameAddressing:
-    """Use a qualified parent or subject name persisted in relationship evidence."""
-
-    path: JsonFieldPath
-    parent_family: str
-    relationship: str
-    append_local_name: bool = False
-    requires_relationship_authentication: bool = True
-
-    @property
-    def parent_families(self) -> tuple[str, ...]:
-        return (self.parent_family,)
-
-    @property
-    def relationships(self) -> tuple[str, ...]:
-        return (self.relationship,)
-
-    def validate(self, value: str) -> None:
-        count = len(_address_segments(value))
-        minimum = 2 if self.append_local_name else 1
-        if count < minimum:
-            raise ResourceModelError(f"resource address requires at least {minimum} segment(s)")
-
-    def qualified_name(self, record: InspectionRecord, runtime: ResourceAddressRuntime) -> str:
-        parent = self.path.get(record.document)
-        if not isinstance(parent, str):
-            raise ResourceModelError(f"resource {record.name!r} has no persisted qualified parent name")
-        value = f"{parent}/{record.name}" if self.append_local_name else parent
-        self.validate(value)
-        return value
-
-    def storage_selection(self, value: str, identity: ResourceIdentityDefinition) -> ResourceSelection | None:
-        self.validate(value)
-        if not self.append_local_name and "/" not in value:
-            return ResourceSelection(exact=identity.parse(value))
-        return None
-
-    def storage_constraint(
-        self, segment: str, value: str, identity: ResourceIdentityDefinition
-    ) -> IdentityConstraint | None:
-        segment_names = tuple(item.name for item in identity.segments)
-        if segment not in segment_names:
-            raise ResourceModelError(f"resource addressing has no filter segment {segment!r}")
-        _address_segments(value)
-        return IdentityConstraint(segment, frozenset((value,))) if "/" not in value else None
-
-    def filter_value(self, qualified_name: str, segment: str, identity: ResourceIdentityDefinition) -> str:
-        parts = _address_segments(qualified_name)
-        segment_names = tuple(item.name for item in identity.segments)
-        if segment not in segment_names:
-            raise ResourceModelError(f"resource addressing has no filter segment {segment!r}")
-        if segment == "name":
-            return parts[-1]
-        if self.append_local_name and segment == segment_names[-2]:
-            return "/".join(parts[:-1])
-        raise ResourceModelError(f"resource addressing cannot derive filter segment {segment!r}")
-
-    def documentation(self) -> str:
-        if self.append_local_name:
-            return f"`parent-qualified-name/name` (child via `{self.relationship}`)"
-        return f"`subject-qualified-name` (mirror via `{self.relationship}`)"
-
-
 @runtime_checkable
 class ObservationBinding(Protocol):
     def subject_identity(self, observer: RelationshipResource) -> ResourceIdentity: ...
@@ -1920,23 +1644,42 @@ class ResourceRegistry:
     _namespace_family: ResourceFamilyDefinition = field(init=False, repr=False)
     _contracts: Mapping[tuple[GVK, str], TypedDocumentContract[Any]] = field(init=False, repr=False)
     _artifact_outputs: Mapping[GVK, Mapping[str, GVK]] = field(init=False, repr=False)
+    _resource_api: ResourceApiRegistry = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        def api_relationship(name: str, source: str, target: str) -> ResourceApiRelationship:
+            addressers = tuple(family for family in self.families if name in family.addressing.relationships)
+            if len(addressers) > 1:
+                raise ResourceModelError(f"relationship {name!r} is used by multiple addressing families")
+            parents = (set(addressers[0].addressing.parent_families) & {source, target}) if addressers else set()
+            child = addressers[0].name if len(parents) == 1 else None
+            return ResourceApiRelationship(name, source, target, child, next(iter(parents)) if parents else None)
+
+        api_relationships = (
+            *(api_relationship(item.name, item.observer_family, item.subject_family) for item in self.observations),
+            *(
+                api_relationship(item.name, item.artifact_family, item.producer_family)
+                for item in self.artifact_descriptions
+            ),
+            *(api_relationship(item.name, item.source_family, item.target_family) for item in self.graph_relationships),
+        )
+        resource_api = build_resource_api_registry(
+            self.api_kinds,
+            tuple(family.resource_api_family() for family in self.families),
+            api_relationships,
+        )
+        object.__setattr__(self, "_resource_api", resource_api)
+
         collections = self._unique(self.collections, "collection")
         families = self._unique(self.families, "family")
-        selectors: dict[str, ResourceFamilyDefinition] = {}
+        selectors = {
+            selector: families[api_family.name]
+            for api_family in resource_api.families
+            for selector in api_family.selectors
+        }
         for collection in self.collections:
             self._validate_collection(collection)
         for family in self.families:
-            self._validate_name(family.name, "family")
-            for selector in family.selectors:
-                self._validate_name(selector, "resource selector")
-                previous = selectors.get(selector)
-                if previous is not None:
-                    raise ResourceModelError(
-                        f"duplicate resource selector {selector!r}: {previous.name!r} and {family.name!r}"
-                    )
-                selectors[selector] = family
             self._validate_family(family, collections)
 
         namespace_families = tuple(family for family in self.families if family.namespace_boundary)
@@ -1947,58 +1690,12 @@ class ResourceRegistry:
             raise ResourceModelError("environment namespace family must be project-scoped")
 
         family_by_gvk, contracts = self._resolve_api_membership(families)
-        relationship_names: set[str] = set()
         for observation in self.observations:
-            self._claim_relationship_name(observation.name, relationship_names)
             self._validate_observation(observation, families)
         for description in self.artifact_descriptions:
-            self._claim_relationship_name(description.name, relationship_names)
             self._validate_artifact_description(description, families)
         for relationship in self.graph_relationships:
-            self._claim_relationship_name(relationship.name, relationship_names)
             self._validate_graph_relationship(relationship, families)
-        address_edges = {
-            **{item.name: (item.observer_family, item.subject_family) for item in self.observations},
-            **{item.name: (item.artifact_family, item.producer_family) for item in self.artifact_descriptions},
-            **{item.name: (item.target_family, item.source_family) for item in self.graph_relationships},
-        }
-        for family in self.families:
-            missing_families = set(family.addressing.parent_families) - set(families)
-            missing_relationships = set(family.addressing.relationships) - relationship_names
-            if missing_families:
-                raise ResourceModelError(
-                    f"resource family {family.name!r} addressing references unknown families: "
-                    f"{', '.join(sorted(missing_families))}"
-                )
-            if missing_relationships:
-                raise ResourceModelError(
-                    f"resource family {family.name!r} addressing references unknown relationships: "
-                    f"{', '.join(sorted(missing_relationships))}"
-                )
-            for relationship_name in family.addressing.relationships:
-                child_family, parent_family = address_edges[relationship_name]
-                if child_family != family.name or parent_family not in family.addressing.parent_families:
-                    raise ResourceModelError(
-                        f"resource family {family.name!r} addressing relationship {relationship_name!r} "
-                        f"must connect it to one of its declared parent families"
-                    )
-
-        visiting: set[str] = set()
-        visited: set[str] = set()
-
-        def visit_addressing(name: str) -> None:
-            if name in visiting:
-                raise ResourceModelError("resource addressing relationships must be acyclic")
-            if name in visited:
-                return
-            visiting.add(name)
-            for parent in families[name].addressing.parent_families:
-                visit_addressing(parent)
-            visiting.remove(name)
-            visited.add(name)
-
-        for name in families:
-            visit_addressing(name)
         self._validate_inspection_relationships(families)
         artifact_outputs = self._validate_driver_artifact_outputs(family_by_gvk)
 
@@ -2029,13 +1726,6 @@ class ResourceRegistry:
         return result
 
     @staticmethod
-    def _claim_relationship_name(name: str, claimed: set[str]) -> None:
-        ResourceRegistry._validate_name(name, "relationship")
-        if name in claimed:
-            raise ResourceModelError(f"duplicate relationship: {name!r}")
-        claimed.add(name)
-
-    @staticmethod
     def _validate_collection(collection: ResourceCollection) -> None:
         ResourceRegistry._validate_name(collection.name, "collection")
         if not collection.contract_profiles:
@@ -2050,16 +1740,6 @@ class ResourceRegistry:
     ) -> None:
         if not family.placements:
             raise ResourceModelError(f"resource family {family.name!r} has no placements")
-        if not family.membership_rules or any(
-            not isinstance(rule, ApiKindMembership) for rule in family.membership_rules
-        ):
-            raise ResourceModelError(f"resource family {family.name!r} has no executable API membership rule")
-        if not isinstance(family.addressing, ResourceAddressing):
-            raise ResourceModelError(f"resource family {family.name!r} has no executable address resolver")
-        if family.identity.separator != "/":
-            raise ResourceModelError(
-                f"resource family {family.name!r} identity must use the canonical '/' address separator"
-            )
         placement_keys: set[tuple[ResourcePlane, ResourceScope, str]] = set()
         defaults = 0
         for placement in family.placements:
@@ -2115,30 +1795,17 @@ class ResourceRegistry:
     ) -> tuple[dict[GVK, ResourceFamilyDefinition], dict[tuple[GVK, str], TypedDocumentContract[Any]]]:
         family_by_gvk: dict[GVK, ResourceFamilyDefinition] = {}
         contracts: dict[tuple[GVK, str], TypedDocumentContract[Any]] = {}
-        members_by_family = {name: 0 for name in families}
         for gvk, api_kind in self.api_kinds.items():
             if api_kind.gvk != gvk:
                 raise ResourceModelError(f"API kind mapping key {gvk} does not match registration {api_kind.gvk}")
-            matches = [
-                (family, rule)
-                for family in families.values()
-                for rule in family.membership_rules
-                if rule.matches(api_kind)
-            ]
-            if len(matches) != 1:
-                names = sorted({family.name for family, _ in matches})
-                raise ResourceModelError(f"API kind {gvk} matches {len(matches)} family membership rules: {names}")
-            family, rule = matches[0]
+            family = families[self._resource_api.family_for_api_kind(gvk).name]
+            rule = next(rule for rule in family.membership_rules if rule.matches(api_kind))
             family_by_gvk[gvk] = family
-            members_by_family[family.name] += 1
             for profile in {placement.contract_profile for placement in family.placements}:
                 contract = rule.contract(api_kind, profile)
                 if contract is None:
                     raise ResourceModelError(f"API kind {gvk} has no executable {profile!r} contract")
                 contracts[(gvk, profile)] = contract
-        for family, count in members_by_family.items():
-            if count == 0:
-                raise ResourceModelError(f"resource family {family!r} has no installed API kinds")
         return family_by_gvk, contracts
 
     @staticmethod
@@ -2309,6 +1976,11 @@ class ResourceRegistry:
                     )
             result[api_kind.gvk] = MappingProxyType({name: kind.gvk for name, kind in outputs.items()})
         return result
+
+    @property
+    def resource_api(self) -> ResourceApiRegistry:
+        """The dependency-clean kind, family, identity, and topology registry."""
+        return self._resource_api
 
     def family(self, name_or_selector: str) -> ResourceFamilyDefinition:
         try:
