@@ -51,5 +51,5 @@ class ResolvedJsonObjectValue(dict[str, _JsonValue], SerializableType):
     def _deserialize(cls, value: object) -> ResolvedJsonObjectValue:
         parsed = require_resolved_json_value(value)
         if not isinstance(parsed, dict):
-            raise ValueError("expected a JSON object")
+            raise ValueError("expected a resolved JSON object")
         return cls(parsed)
