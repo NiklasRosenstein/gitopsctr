@@ -119,7 +119,7 @@ class FilesystemWorkspaceAdapter:
 
         return _CAPABILITIES
 
-    def read(self, root: Path) -> ImmutableWorkspace:
+    def read(self, root: Path, *, excluded_top_level: frozenset[str] = frozenset()) -> ImmutableWorkspace:
         """Read ``root`` without following any physical symbolic link.
 
         Explicit directories, regular-file bytes, executable mode, and safe
@@ -128,10 +128,17 @@ class FilesystemWorkspaceAdapter:
         """
 
         _require_secure_primitives()
+        if not isinstance(excluded_top_level, frozenset) or any(
+            not isinstance(name, str) or not name or "/" in name for name in excluded_top_level
+        ):
+            raise TypeError("excluded_top_level must be a frozenset of non-empty entry names")
         _absolute, directories = _open_absolute_directory_chain(root, "workspace root")
         try:
             entries: list[WorkspaceEntry] = []
-            _read_directory(directories[-1].descriptor, "", entries)
+            if excluded_top_level:
+                _read_directory(directories[-1].descriptor, "", entries, excluded_top_level)
+            else:
+                _read_directory(directories[-1].descriptor, "", entries)
             _validate_symlink_graph(entries)
             try:
                 workspace = InMemoryWorkspace(entries, capabilities=self.capabilities, mutable=False)
@@ -142,10 +149,10 @@ class FilesystemWorkspaceAdapter:
         finally:
             _close_anchored_directories(directories)
 
-    def read_workspace(self, root: Path) -> ImmutableWorkspace:
+    def read_workspace(self, root: Path, *, excluded_top_level: frozenset[str] = frozenset()) -> ImmutableWorkspace:
         """Read a physical root; named for callers that distinguish both boundaries."""
 
-        return self.read(root)
+        return self.read(root, excluded_top_level=excluded_top_level)
 
     def materialize(self, workspace: ImmutableWorkspace, destination: Path) -> None:
         """Atomically install an immutable workspace at an absent destination.
@@ -457,12 +464,19 @@ def _directory_open_flags() -> int:
     return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
-def _read_directory(directory_fd: int, prefix: str, entries: list[WorkspaceEntry]) -> None:
+def _read_directory(
+    directory_fd: int,
+    prefix: str,
+    entries: list[WorkspaceEntry],
+    excluded_top_level: frozenset[str] = frozenset(),
+) -> None:
     try:
         names = sorted(os.listdir(directory_fd))
     except OSError as exc:
         raise FilesystemWorkspaceError(f"could not scan workspace directory {prefix or '.'!r}") from exc
     for name in names:
+        if not prefix and name in excluded_top_level:
+            continue
         key = name if not prefix else f"{prefix}/{name}"
         try:
             validate_workspace_key(key)
@@ -474,7 +488,7 @@ def _read_directory(directory_fd: int, prefix: str, entries: list[WorkspaceEntry
             child_fd = _open_checked_entry(directory_fd, name, metadata, key, directory=True)
             try:
                 entries.append(WorkspaceEntry.directory(key))
-                _read_directory(child_fd, key, entries)
+                _read_directory(child_fd, key, entries, excluded_top_level)
                 _require_path_still_entry(directory_fd, name, os.fstat(child_fd), key)
             finally:
                 os.close(child_fd)

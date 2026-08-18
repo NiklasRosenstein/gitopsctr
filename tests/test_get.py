@@ -8,8 +8,8 @@ import pytest
 
 from gitopsctr import controller
 from gitopsctr.errors import OperationError
-from gitopsctr.inventory import InventoryRecord, InventorySession
 from gitopsctr.resource_model import StackInspectionSummary
+from gitopsctr.workspace_inventory import WorkspaceInventoryRecord, WorkspaceInventorySession
 from tests import test_inventory as inventory_support
 
 pytest_plugins = ("tests.test_inventory",)
@@ -474,11 +474,11 @@ def test_get_stack_table_prepares_with_explicit_observed_snapshot(
     observed_ref = "gitopsctr/observed/staging"
     observed_revision = inventory_support.git(repository, "rev-parse", f"refs/remotes/origin/{observed_ref}")
     calls: list[tuple[tuple[str, ...], str, str | None]] = []
-    original = InventorySession.prepare_stack_inspection
+    original = WorkspaceInventorySession.prepare_stack_inspection
 
     def record_prepare(
-        inventory: InventorySession,
-        records: tuple[InventoryRecord, ...],
+        inventory: WorkspaceInventorySession,
+        records: tuple[WorkspaceInventoryRecord, ...],
         *,
         observed_ref: str,
         observed_revision: str | None,
@@ -493,7 +493,7 @@ def test_get_stack_table_prepares_with_explicit_observed_snapshot(
             allow_missing_observed_ref=allow_missing_observed_ref,
         )
 
-    monkeypatch.setattr(InventorySession, "prepare_stack_inspection", record_prepare)
+    monkeypatch.setattr(WorkspaceInventorySession, "prepare_stack_inspection", record_prepare)
 
     output = run_get(
         repository,
@@ -535,11 +535,11 @@ def test_get_stack_tables_batch_inspection_preparation(
     inventory_support.git(repository, "checkout", "main")
 
     batches: list[tuple[str, ...]] = []
-    original = InventorySession._build_stack_inspection_summaries
+    original = WorkspaceInventorySession._build_stack_inspection_summaries
 
     def record_batch(
-        inventory: InventorySession,
-        records: tuple[InventoryRecord, ...],
+        inventory: WorkspaceInventorySession,
+        records: tuple[WorkspaceInventoryRecord, ...],
         *,
         observed_ref: str,
         observed_revision: str | None,
@@ -554,7 +554,7 @@ def test_get_stack_tables_batch_inspection_preparation(
             allow_missing_observed_ref=allow_missing_observed_ref,
         )
 
-    monkeypatch.setattr(InventorySession, "_build_stack_inspection_summaries", record_batch)
+    monkeypatch.setattr(WorkspaceInventorySession, "_build_stack_inspection_summaries", record_batch)
 
     stacks = run_get(
         repository,
