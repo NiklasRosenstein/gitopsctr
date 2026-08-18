@@ -88,6 +88,8 @@ from gitopsctr.state import canonical_publication_ref
 
 _DEFAULT_GIT_SOURCE_ID = SourceId("default-git-source")
 _RETENTION_SUFFIX = ".gitopsctr-source-retention"
+
+
 _IDENTITY_KEY_SUFFIX = ".gitopsctr-apply-key"
 _EXACT_GIT_REVISION = re.compile(r"[0-9a-f]{40}$")
 
@@ -180,14 +182,17 @@ class GitApplyEnvironmentResolver:
         environment = self.catalog.normalize_environment(environment_document, command.environment_id.value)
         refs = environment.get("refs")
         refs = refs if isinstance(refs, dict) else {}
-        desired = ChannelId(
-            canonical_publication_ref(command.desired_channel.value)
-            if command.desired_channel is not None
-            else canonical_publication_ref(
+        configured_desired = ChannelId(
+            canonical_publication_ref(
                 cast(str, refs.get("desired") or project.environment_defaults.refs.desired).replace(
                     "{environment}", command.environment_id.value
                 )
             )
+        )
+        desired = ChannelId(
+            canonical_publication_ref(command.desired_channel.value)
+            if command.desired_channel is not None
+            else configured_desired.value
         )
         observed = ChannelId(
             canonical_publication_ref(command.observed_channel.value)

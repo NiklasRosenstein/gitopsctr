@@ -33,6 +33,10 @@ class PublicationExecutionUnknownError(RuntimeError):
     """Execution crossed a possible commit point and requires exact verification."""
 
 
+class PublicationRecoveryNotFoundError(ValueError):
+    """A well-formed recovery locator has no durable publication attempt."""
+
+
 class SnapshotReader(Protocol):
     """Open an exact immutable snapshot as a logical content view."""
 

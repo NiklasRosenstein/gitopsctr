@@ -418,6 +418,7 @@ class PublicationMode(StrEnum):
 
     DIRECT_ACCEPTED = "direct-accepted"
     REVIEW_REQUIRED = "review-required"
+    REVIEW_ADOPTION = "review-adoption"
     FENCED_CONTINUATION = "fenced-continuation"
 
 
@@ -669,6 +670,169 @@ class CoordinationChange:
             raise ValueError("coordination changes must change their value")
 
 
+def _review_acceptance_binding(
+    publication_store_id: PublicationStoreId,
+    review_publication: PublicationRecoveryLocator,
+    review_proof_id: PublicationProofId,
+    desired_channel: ChannelId,
+    accepted_base_head: HeadObservation,
+    candidate_snapshot_id: SnapshotId,
+    candidate_content_id: ContentId,
+    environment_id: EnvironmentId,
+    incarnation: str,
+) -> dict[str, object]:
+    return {
+        "accepted_base": accepted_base_head._wire_data(),
+        "candidate_content": candidate_content_id.value,
+        "candidate_snapshot": candidate_snapshot_id.value,
+        "desired_channel": desired_channel.value,
+        "environment": environment_id.value,
+        "incarnation": incarnation,
+        "proof": review_proof_id.value,
+        "review_attempt": review_publication.attempt_id.value,
+        "store": publication_store_id.value,
+    }
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ReviewAcceptanceObservation:
+    """Store-issued observation that an external review accepted one candidate.
+
+    The observation is evidence to a specialized adoption transaction, never
+    authority by itself. The transaction must re-observe all of these facts
+    atomically before advancing accepted desired state.
+    """
+
+    publication_store_id: PublicationStoreId
+    review_publication: PublicationRecoveryLocator
+    review_proof_id: PublicationProofId
+    desired_channel: ChannelId
+    accepted_base_head: HeadObservation
+    candidate_snapshot_id: SnapshotId
+    candidate_content_id: ContentId
+    environment_id: EnvironmentId
+    incarnation: str
+    _signature: str
+    _issuance: object
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("ReviewAcceptanceObservation must be issued by a publication authority")
+
+    def __copy__(self) -> ReviewAcceptanceObservation:
+        raise TypeError("ReviewAcceptanceObservation must not be copied")
+
+    def __deepcopy__(self, _memo: object) -> ReviewAcceptanceObservation:
+        raise TypeError("ReviewAcceptanceObservation must not be copied")
+
+    def __reduce_ex__(self, _protocol: SupportsIndex, /) -> str | tuple[Any, ...]:
+        raise TypeError("ReviewAcceptanceObservation must not be serialized")
+
+    def _validate(self) -> None:
+        if type(self) is not ReviewAcceptanceObservation:
+            raise TypeError("review acceptance observation has no valid authority issuance proof")
+        _require_instance(self.publication_store_id, PublicationStoreId, "publication_store_id")
+        _require_instance(self.review_publication, PublicationRecoveryLocator, "review_publication")
+        _require_instance(self.review_proof_id, PublicationProofId, "review_proof_id")
+        _require_instance(self.desired_channel, ChannelId, "desired_channel")
+        _require_instance(self.accepted_base_head, HeadObservation, "accepted_base_head")
+        self.accepted_base_head._validate()
+        _require_instance(self.candidate_snapshot_id, SnapshotId, "candidate_snapshot_id")
+        _require_instance(self.candidate_content_id, ContentId, "candidate_content_id")
+        _require_instance(self.environment_id, EnvironmentId, "environment_id")
+        _require_opaque_value(self.incarnation, "review acceptance incarnation")
+        issuer = _publication_proof_issuer(self.publication_store_id, getattr(self, "_issuance", None))
+        expected = hmac.new(
+            issuer.secret,
+            _canonical_wire(
+                _review_acceptance_binding(
+                    self.publication_store_id,
+                    self.review_publication,
+                    self.review_proof_id,
+                    self.desired_channel,
+                    self.accepted_base_head,
+                    self.candidate_snapshot_id,
+                    self.candidate_content_id,
+                    self.environment_id,
+                    self.incarnation,
+                )
+            ).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if not isinstance(self._signature, str) or not hmac.compare_digest(self._signature, expected):
+            raise TypeError("review acceptance observation was modified after issuance")
+        if self.review_publication.publication_store_id != self.publication_store_id:
+            raise ValueError("review acceptance locator belongs to another publication store")
+        if self.accepted_base_head.channel_id != self.desired_channel:
+            raise ValueError("review acceptance base belongs to another desired channel")
+
+
+def _issue_review_acceptance_observation(
+    publication_store_id: PublicationStoreId,
+    review_publication: PublicationRecoveryLocator,
+    review_proof_id: PublicationProofId,
+    desired_channel: ChannelId,
+    accepted_base_head: HeadObservation,
+    candidate_snapshot_id: SnapshotId,
+    candidate_content_id: ContentId,
+    environment_id: EnvironmentId,
+    incarnation: str,
+    issuer: object,
+) -> ReviewAcceptanceObservation:
+    observation = object.__new__(ReviewAcceptanceObservation)
+    values = (
+        publication_store_id,
+        review_publication,
+        review_proof_id,
+        desired_channel,
+        accepted_base_head,
+        candidate_snapshot_id,
+        candidate_content_id,
+        environment_id,
+        incarnation,
+    )
+    for name, value in zip(
+        (
+            "publication_store_id",
+            "review_publication",
+            "review_proof_id",
+            "desired_channel",
+            "accepted_base_head",
+            "candidate_snapshot_id",
+            "candidate_content_id",
+            "environment_id",
+            "incarnation",
+        ),
+        values,
+        strict=True,
+    ):
+        object.__setattr__(observation, name, value)
+    issuer_record = _publication_proof_issuer(publication_store_id, issuer)
+    object.__setattr__(observation, "_issuance", issuer)
+    object.__setattr__(
+        observation,
+        "_signature",
+        hmac.new(
+            issuer_record.secret,
+            _canonical_wire(
+                _review_acceptance_binding(
+                    publication_store_id,
+                    review_publication,
+                    review_proof_id,
+                    desired_channel,
+                    accepted_base_head,
+                    candidate_snapshot_id,
+                    candidate_content_id,
+                    environment_id,
+                    incarnation,
+                )
+            ).encode(),
+            hashlib.sha256,
+        ).hexdigest(),
+    )
+    observation._validate()
+    return observation
+
+
 @dataclass(frozen=True)
 class PublicationIntent:
     """Durable request to publish a sealed candidate and transfer its sources.
@@ -689,6 +853,8 @@ class PublicationIntent:
     mode: PublicationMode
     effect_authorization: EffectAuthorization | None = None
     review_base_head: HeadObservation | None = None
+    review_acceptance: ReviewAcceptanceObservation | None = None
+    environment_id: EnvironmentId | None = None
 
     def __post_init__(self) -> None:
         self._validate()
@@ -707,6 +873,8 @@ class PublicationIntent:
         _require_instance(self.publication_owner, OwnershipId, "publication_owner")
         _require_instance(self.target, PublicationTarget, "target")
         _require_instance(self.mode, PublicationMode, "mode")
+        if self.environment_id is not None:
+            _require_instance(self.environment_id, EnvironmentId, "environment_id")
         if self.expected_head.channel_id != self.channel_id:
             raise ValueError("publication channel must match the expected head channel")
         if not isinstance(self.source_ownership_changes, tuple):
@@ -743,6 +911,8 @@ class PublicationIntent:
         elif self.effect_authorization is not None:
             raise ValueError("only fenced continuation publication may include an effect authorization")
         if self.mode is PublicationMode.REVIEW_REQUIRED:
+            if not isinstance(self.environment_id, EnvironmentId):
+                raise ValueError("review-required publication must bind its environment")
             if not isinstance(self.review_base_head, HeadObservation):
                 raise ValueError("review-required publication must bind its accepted desired base head")
             self.review_base_head._validate()
@@ -750,6 +920,22 @@ class PublicationIntent:
                 raise ValueError("review candidate and accepted desired channels must differ")
         elif self.review_base_head is not None:
             raise ValueError("only review-required publication may include a review base head")
+        if self.mode is PublicationMode.REVIEW_ADOPTION:
+            if not isinstance(self.environment_id, EnvironmentId):
+                raise ValueError("review adoption publication must bind its environment")
+            if not isinstance(self.review_acceptance, ReviewAcceptanceObservation):
+                raise ValueError("review adoption publication requires issued external acceptance evidence")
+            self.review_acceptance._validate()
+            if (
+                self.review_acceptance.desired_channel != self.channel_id
+                or self.review_acceptance.accepted_base_head != self.expected_head
+                or self.review_acceptance.candidate_snapshot_id != self.candidate.snapshot_id
+                or self.review_acceptance.candidate_content_id != self.candidate.content_id
+                or self.review_acceptance.environment_id != self.environment_id
+            ):
+                raise ValueError("review adoption evidence does not bind its accepted intent")
+        elif self.review_acceptance is not None:
+            raise ValueError("only review adoption publication may include external acceptance evidence")
 
     def _wire_data(self) -> dict[str, object]:
         """Return canonical full-intent evidence for a transaction proof."""
@@ -774,9 +960,25 @@ class PublicationIntent:
             ],
             "effect_authorization": _effect_authorization_wire_data(self.effect_authorization),
             "expected_head": self.expected_head._wire_data(),
+            "environment": self.environment_id.to_wire() if self.environment_id is not None else None,
             "mode": self.mode.value,
             "owner": self.publication_owner.to_wire(),
             "review_base_head": self.review_base_head._wire_data() if self.review_base_head is not None else None,
+            "review_acceptance": (
+                {
+                    "accepted_base": self.review_acceptance.accepted_base_head._wire_data(),
+                    "candidate_content": self.review_acceptance.candidate_content_id.to_wire(),
+                    "candidate_snapshot": self.review_acceptance.candidate_snapshot_id.to_wire(),
+                    "desired_channel": self.review_acceptance.desired_channel.to_wire(),
+                    "environment": self.review_acceptance.environment_id.to_wire(),
+                    "incarnation": self.review_acceptance.incarnation,
+                    "proof": self.review_acceptance.review_proof_id.to_wire(),
+                    "review_attempt": self.review_acceptance.review_publication.attempt_id.to_wire(),
+                    "store": self.review_acceptance.publication_store_id.to_wire(),
+                }
+                if self.review_acceptance is not None
+                else None
+            ),
             "ownership": [
                 {
                     "expected": {
@@ -990,7 +1192,9 @@ class PublicationProof:
                 issuer.secret, _canonical_wire(self._authenticated_wire_data()).encode(), hashlib.sha256
             ).hexdigest(),
         ):
-            raise ValueError("publication proof authentication does not match its issued evidence")
+            raise ValueError(
+                "publication proof candidate/intent binding authentication does not match its issued evidence"
+            )
 
     def _authenticated_wire_data(self) -> dict[str, object]:
         """Canonical complete evidence authenticated by the private store key."""

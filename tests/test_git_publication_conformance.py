@@ -28,6 +28,7 @@ from gitopsctr.adapters.memory.sources import MemorySourceRepository
 from gitopsctr.application import (
     ChannelId,
     CoordinationChange,
+    EnvironmentId,
     OwnershipId,
     PublicationAttemptId,
     PublicationIntent,
@@ -116,6 +117,7 @@ def _intent(
         target,
         mode,
         review_base_head=review_base,
+        environment_id=EnvironmentId("dev") if mode is PublicationMode.REVIEW_REQUIRED else None,
     )
 
 

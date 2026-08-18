@@ -8,6 +8,7 @@ from gitopsctr.application.apply import ApplyCommand, ApplyResult, AuthoredChang
 from gitopsctr.application.dependencies import DependencyCommand, DependencyResult
 from gitopsctr.application.inspection import ResourceInspectionCommand, ResourceInspectionResult
 from gitopsctr.application.model import (
+    PublicationRecoveryLocator,
     SnapshotInspectionCommand,
     SnapshotInspectionResult,
     ValidateCommand,
@@ -21,6 +22,11 @@ from gitopsctr.application.ports import (
     SnapshotReader,
     SpecificationValidator,
     StatusInspector,
+)
+from gitopsctr.application.review_adoption import (
+    ReviewAdoptionCommand,
+    ReviewAdoptionResult,
+    ReviewAdoptionService,
 )
 from gitopsctr.application.status import StatusCommand, StatusResult
 
@@ -36,6 +42,7 @@ class ApplicationServices:
     dependency_inspector: DependencyInspector
     apply_service: ApplyService | None = None
     authored_change_decoder: AuthoredChangeDecoder | None = None
+    review_adoption_service: ReviewAdoptionService | None = None
     _closed: bool = field(default=False, init=False, repr=False)
 
     def validate(self, command: ValidateCommand) -> ValidationResult:
@@ -75,6 +82,16 @@ class ApplicationServices:
             changes = self.authored_change_decoder.decode(command)
         return self.apply_service.apply(command, changes)
 
+    def adopt_review(self, command: ReviewAdoptionCommand) -> ReviewAdoptionResult:
+        if self.review_adoption_service is None:
+            raise RuntimeError("the configured application does not provide review adoption")
+        return self.review_adoption_service.adopt(command)
+
+    def recover_review_adoption(self, locator: PublicationRecoveryLocator) -> ReviewAdoptionResult:
+        if self.review_adoption_service is None:
+            raise RuntimeError("the configured application does not provide review adoption")
+        return self.review_adoption_service.recover(locator)
+
     def close(self) -> None:
         """Close both explicit dependencies exactly once."""
 
@@ -82,26 +99,30 @@ class ApplicationServices:
             return
         self._closed = True
         try:
-            if self.authored_change_decoder is not None:
-                self.authored_change_decoder.close()
+            if self.review_adoption_service is not None:
+                self.review_adoption_service.close()
         finally:
             try:
-                if self.apply_service is not None:
-                    self.apply_service.close()
+                if self.authored_change_decoder is not None:
+                    self.authored_change_decoder.close()
             finally:
                 try:
-                    self.dependency_inspector.close()
+                    if self.apply_service is not None:
+                        self.apply_service.close()
                 finally:
                     try:
-                        self.status_inspector.close()
+                        self.dependency_inspector.close()
                     finally:
                         try:
-                            self.resource_inspector.close()
+                            self.status_inspector.close()
                         finally:
                             try:
-                                self.specification_validator.close()
+                                self.resource_inspector.close()
                             finally:
-                                self.snapshot_reader.close()
+                                try:
+                                    self.specification_validator.close()
+                                finally:
+                                    self.snapshot_reader.close()
 
     def __enter__(self) -> ApplicationServices:
         return self
