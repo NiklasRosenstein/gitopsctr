@@ -104,6 +104,7 @@ def _intent(
 ):
     channel = ChannelId("desired-dev" if target is PublicationTarget.ACCEPTED_DESIRED else "review-dev")
     candidate = candidate or _sealed(store)
+    review_base = store.resolve_head(ChannelId("desired-dev")) if mode is PublicationMode.REVIEW_REQUIRED else None
     return PublicationIntent(
         PublicationAttemptId(attempt),
         channel,
@@ -114,6 +115,7 @@ def _intent(
         tuple(coordination),
         target,
         mode,
+        review_base_head=review_base,
     )
 
 
@@ -206,7 +208,7 @@ def test_git_publication_fences_absence_head_aba_and_candidate_disappearance(tmp
         assert repository.refs.set_if_equals(channel_ref, current, alternate)
     finally:
         repository.close()
-    with pytest.raises(GitPublicationError, match="non-authoritative raw mirror drift"):
+    with pytest.raises(GitPublicationError, match="channel mirror drift"):
         store.resolve_head(first.channel_id)
     repository = Repo(tmp_path / "repository")
     try:
@@ -454,13 +456,25 @@ def test_git_publication_recovers_crash_after_authority_promotion_idempotently(t
     assert fresh.resolve_head(intent.channel_id).snapshot_id == intent.candidate.snapshot_id
 
 
-@pytest.mark.parametrize("tamper", ("delete-marker", "substitute-marker", "delete-object", "raw-mirror"))
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "delete-marker",
+        "substitute-marker",
+        "delete-object",
+        "raw-mirror",
+        "delete-public",
+        "substitute-public",
+    ),
+)
 def test_git_preparing_tamper_preserves_old_authority_without_adoption(tmp_path: Path, tamper: str):
     root = tmp_path / tamper
-    store = _store(root)
+    source = _retained(f"source-{tamper}")
+    store = _store(root, _AvailableSource())
     intent = _intent(
         store,
         attempt=f"prepare-{tamper}",
+        source_changes=(SourceOwnershipChange(source, store.ownership(source.source_snapshot_id), _OWNER),),
         coordination=(CoordinationChange("gate", store.coordination("gate"), "adopted"),),
     )
     store.make_next_publication_crash_after_ref()
@@ -474,6 +488,7 @@ def test_git_preparing_tamper_preserves_old_authority_without_adoption(tmp_path:
         )
         marker_id = repository.refs[marker_ref]
         channel_ref = Ref(git_publication._channel_ref(intent.channel_id).encode())
+        public_ref = Ref(git_publication._public_channel_ref(intent.channel_id).encode())
         candidate_id = intent.candidate.snapshot_id.value.removeprefix("git-commit:").encode()
         if tamper == "delete-marker":
             assert repository.refs.remove_if_equals(marker_ref, marker_id)
@@ -484,15 +499,21 @@ def test_git_preparing_tamper_preserves_old_authority_without_adoption(tmp_path:
             encoded = marker_id.decode()
             marker_path = Path(repository.controldir()) / "objects" / encoded[:2] / encoded[2:]
             marker_path.unlink()
-        else:
+        elif tamper == "raw-mirror":
             alternate = _sealed(store, b"raw-drift").snapshot_id.value.removeprefix("git-commit:").encode()
             assert repository.refs.set_if_equals(channel_ref, candidate_id, alternate)
+        elif tamper == "delete-public":
+            assert repository.refs.remove_if_equals(public_ref, candidate_id)
+        else:
+            alternate = _sealed(store, b"public-drift").snapshot_id.value.removeprefix("git-commit:").encode()
+            assert repository.refs.set_if_equals(public_ref, candidate_id, alternate)
     finally:
         repository.close()
 
     fresh = GitPublicationStore(root, _empty_source())
     assert fresh.resolve_head(intent.channel_id) == intent.expected_head
     assert fresh.verify(intent).state is PublicationOutcomeState.UNKNOWN
+    assert fresh.ownership(source.source_snapshot_id).is_absent
     assert fresh.coordination("gate").value is None
 
 

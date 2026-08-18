@@ -42,6 +42,7 @@ from gitopsctr.application import (
     EnvironmentId,
     InspectionFilter,
     InspectionOutputFormat,
+    PublicationOutcomeState,
     ResourceInspectionCommand,
     StatusCommand,
     ValidateCommand,
@@ -757,6 +758,18 @@ def write_unit(path: Path, unit: UnitResource[Any], project_root: Path) -> Path:
 def write_desired_candidate_unit(path: Path, unit: UnitResource[Any], project_root: Path) -> Path:
     """Write a canonical desired Unit using the configured repository format."""
 
+    existing_documents = document_candidates(path.parent, path.stem)
+    for existing in existing_documents:
+        try:
+            persisted = RESOURCE_CATALOG.parse_unit(
+                RESOURCE_CATALOG.load_document(existing), profile="desired", expected_name=unit.name
+            )
+        except (OperationError, TypeError, ValueError):
+            continue
+        if persisted == unit:
+            return existing
+    for existing in existing_documents:
+        existing.unlink()
     if resource_documents_enabled(project_root):
         return write_unit(path, unit, project_root)
     selected = DocumentFormat.YAML if path.suffix in {".yaml", ".yml"} else DocumentFormat.JSON
@@ -10289,6 +10302,43 @@ def _validate_durable_publication_policies(
     return common_digest, context_sources[common_digest]
 
 
+def _preserve_durable_semantic_noops(current: Path, candidate: Path) -> None:
+    """Keep exact paths and bytes when legacy progression changes no resource semantics."""
+
+    current_resources = load_desired_resource_graph(current, validate=False)
+    candidate_resources = load_desired_resource_graph(candidate, validate=False)
+    for identity, previous in current_resources.items():
+        projected = candidate_resources.get(identity)
+        if projected != previous:
+            continue
+        previous_path = _desired_resource_path(current, previous)
+        projected_path = _desired_resource_path(candidate, projected)
+        exact_target = candidate / previous_path.relative_to(current)
+        if projected_path != exact_target and projected_path.is_file():
+            projected_path.unlink()
+        exact_target.parent.mkdir(parents=True, exist_ok=True)
+        if not exact_target.is_file() or exact_target.read_bytes() != previous_path.read_bytes():
+            shutil.copy2(previous_path, exact_target)
+
+
+def _copy_missing_durable_payload(current: Path, candidate: Path) -> None:
+    """Carry opaque desired payload that durable Stack progression does not own."""
+
+    excluded_roots = {"units", "stacks", "stack-templates", "materialized"}
+    for source in current.rglob("*"):
+        relative = source.relative_to(current)
+        if relative.parts[0] in excluded_roots or relative == DESIRED_TRANSITION_BLOCKS_PATH:
+            continue
+        target = candidate / relative
+        if source.is_symlink():
+            raise OperationError(f"durable desired payload contains a symbolic link: {relative}")
+        if source.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif source.is_file() and not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+
 @_cached_desired_graph_operation
 def progress_durable_stack_projection(
     environment_name: str,
@@ -10363,7 +10413,7 @@ def progress_durable_stack_projection(
                     # resolved.  The resulting tree is complete before it
                     # becomes the next group's immutable baseline.
                     for unit_name, baseline_path in _current_desired_unit_paths(baseline).items():
-                        target_path = unit_document_path(next_candidate, unit_name, context_source)
+                        target_path = next_candidate / baseline_path.relative_to(baseline)
                         target_path.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(baseline_path, target_path)
                         baseline_unit = load_desired_unit(baseline_path, baseline_path.stem)
@@ -10385,6 +10435,8 @@ def progress_durable_stack_projection(
                     # materializations, contexts, tombstones, and retained
                     # transition/active state, before advancing.
                     _copy_unrelated_desired_resources(baseline, next_candidate, frozenset(), None)
+                    _preserve_durable_semantic_noops(baseline, next_candidate)
+                    _copy_missing_durable_payload(baseline, next_candidate)
                     for baseline_path in document_candidates(baseline, "promotion"):
                         target_path = next_candidate / baseline_path.name
                         shutil.copy2(baseline_path, target_path)
@@ -10446,29 +10498,41 @@ def progress_durable_stack_projection(
                     "apply",
                     candidate_id,
                 )
-                revision, outcome = publish_desired_change(
+                from gitopsctr.adapters.git.apply import publish_durable_candidate
+
+                review_required = change_gate(source_root, environment_name) == "pullRequest"
+                result = publish_durable_candidate(
+                    REPOSITORY_ROOT,
                     environment_name,
-                    candidate,
-                    desired_ref,
+                    ChannelId(canonical_publication_ref(desired_ref)),
                     current_revision,
-                    candidate_ref,
-                    f"Advance durable Stack projections in {environment_name}",
-                    f"Advance durable Stack projections in {environment_name}",
-                    "Re-project persisted StackTemplate and Stack inputs after new observation evidence.",
-                    False,
-                    current,
-                    request_change=False,
-                    configuration_root=source_root,
-                    conflicting_refs=(observed_ref,),
+                    candidate,
+                    candidate_channel=(
+                        ChannelId(canonical_publication_ref(candidate_ref)) if review_required else None
+                    ),
                 )
-                if outcome is not None:
+                if result.publication_outcome is None:
+                    raise OperationError("durable projection publication returned no outcome")
+                if result.publication_outcome.state is PublicationOutcomeState.UNKNOWN:
+                    locator = result.recovery_locator.to_wire() if result.recovery_locator is not None else "unknown"
+                    raise OperationError(f"durable projection publication is unknown; recover attempt {locator}")
+                if result.publication_outcome.state is PublicationOutcomeState.NOT_COMMITTED:
+                    if attempt == 4:
+                        raise OperationError(
+                            f"could not advance durable Stack projection on {desired_ref} after concurrent updates"
+                        )
+                    continue
+                if review_required:
+                    assert result.snapshot_id is not None
                     log_status(
                         "CANDIDATE",
-                        f"{style_branch(candidate_ref)} at {describe_revision(revision)} targets "
+                        f"{style_branch(candidate_ref)} at "
+                        f"{describe_revision(result.snapshot_id.value.removeprefix('git-commit:'))} targets "
                         f"{style_branch(desired_ref)}",
                     )
                     return current_revision
-                return revision
+                assert result.snapshot_id is not None
+                return result.snapshot_id.value.removeprefix("git-commit:")
         except subprocess.CalledProcessError as exc:
             if attempt == 4 or not retryable_push_failure(exc):
                 raise
@@ -12384,6 +12448,7 @@ def command_apply(args: argparse.Namespace) -> str | None:
     """Translate CLI arguments and delegate apply to the composed application."""
 
     from gitopsctr.adapters.git import source_request_for_git
+    from gitopsctr.application.apply_projection import ApplyProjectionError
     from gitopsctr.composition import create_default_application
 
     command = ApplyCommand(
@@ -12397,11 +12462,24 @@ def command_apply(args: argparse.Namespace) -> str | None:
         args.dry,
         getattr(args, "verbose", False),
     )
-    with create_default_application(REPOSITORY_ROOT) as application:
-        result = application.apply(command)
+    try:
+        with create_default_application(REPOSITORY_ROOT) as application:
+            result = application.apply(command)
+    except (ApplyProjectionError, ValueError) as exc:
+        message = str(exc).replace("duplicate authored resource", "duplicate apply resource")
+        raise OperationError(message) from exc
+    if result.publication_outcome is not None:
+        if result.publication_outcome.state is PublicationOutcomeState.UNKNOWN:
+            locator = result.recovery_locator.to_wire() if result.recovery_locator is not None else "unavailable"
+            raise OperationError(f"apply publication outcome is unknown; recover attempt {locator}")
+        if result.publication_outcome.state is PublicationOutcomeState.NOT_COMMITTED:
+            raise OperationError("apply publication was not committed")
     if result.snapshot_id is None:
         return None
-    return result.snapshot_id.value.removeprefix("git-commit:")
+    revision = result.snapshot_id.value.removeprefix("git-commit:")
+    if result.publication_outcome is not None:
+        print(revision)
+    return revision
 
 
 def command_create_stacktemplate(args: argparse.Namespace) -> None:

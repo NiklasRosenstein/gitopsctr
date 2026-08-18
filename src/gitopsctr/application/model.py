@@ -688,6 +688,7 @@ class PublicationIntent:
     target: PublicationTarget
     mode: PublicationMode
     effect_authorization: EffectAuthorization | None = None
+    review_base_head: HeadObservation | None = None
 
     def __post_init__(self) -> None:
         self._validate()
@@ -741,6 +742,14 @@ class PublicationIntent:
             self.effect_authorization._validate()
         elif self.effect_authorization is not None:
             raise ValueError("only fenced continuation publication may include an effect authorization")
+        if self.mode is PublicationMode.REVIEW_REQUIRED:
+            if not isinstance(self.review_base_head, HeadObservation):
+                raise ValueError("review-required publication must bind its accepted desired base head")
+            self.review_base_head._validate()
+            if self.review_base_head.channel_id == self.channel_id:
+                raise ValueError("review candidate and accepted desired channels must differ")
+        elif self.review_base_head is not None:
+            raise ValueError("only review-required publication may include a review base head")
 
     def _wire_data(self) -> dict[str, object]:
         """Return canonical full-intent evidence for a transaction proof."""
@@ -767,6 +776,7 @@ class PublicationIntent:
             "expected_head": self.expected_head._wire_data(),
             "mode": self.mode.value,
             "owner": self.publication_owner.to_wire(),
+            "review_base_head": self.review_base_head._wire_data() if self.review_base_head is not None else None,
             "ownership": [
                 {
                     "expected": {
@@ -1074,6 +1084,11 @@ class PublicationOutcome:
     proof: PublicationProof | None = None
 
     def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
+        """Revalidate nested proof evidence at every orchestration boundary."""
+
         _require_instance(self.state, PublicationOutcomeState, "state")
         if self.proof is not None:
             _require_instance(self.proof, PublicationProof, "proof")
@@ -1082,6 +1097,45 @@ class PublicationOutcome:
             raise ValueError("a committed publication outcome requires a proof")
         if self.state is not PublicationOutcomeState.COMMITTED and self.proof is not None:
             raise ValueError("only a committed publication outcome may include a proof")
+
+
+@dataclass(frozen=True)
+class PublicationRecoveryLocator:
+    """Persistable selector for one durable publication attempt."""
+
+    publication_store_id: PublicationStoreId
+    attempt_id: PublicationAttemptId
+
+    def __post_init__(self) -> None:
+        _require_instance(self.publication_store_id, PublicationStoreId, "publication_store_id")
+        _require_instance(self.attempt_id, PublicationAttemptId, "attempt_id")
+
+    def to_wire(self) -> str:
+        return _canonical_wire({"attempt": self.attempt_id.value, "store": self.publication_store_id.value})
+
+    @classmethod
+    def from_wire(cls, value: str) -> PublicationRecoveryLocator:
+        try:
+            data = json.loads(value)
+            if not isinstance(data, dict) or set(data) != {"attempt", "store"}:
+                raise ValueError
+            return cls(PublicationStoreId(data["store"]), PublicationAttemptId(data["attempt"]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("publication recovery locator is invalid") from exc
+
+
+@dataclass(frozen=True)
+class PublicationRecovery:
+    """Reissued intent plus its current definite-or-ambiguous outcome."""
+
+    intent: PublicationIntent
+    outcome: PublicationOutcome
+
+    def __post_init__(self) -> None:
+        self.intent._validate()
+        self.outcome._validate()
+        if self.outcome.proof is not None and self.outcome.proof.intent != self.intent:
+            raise ValueError("publication recovery proof does not bind its reissued intent")
 
 
 def _logical_input_label(value: object, description: str) -> str:

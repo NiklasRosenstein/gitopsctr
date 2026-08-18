@@ -60,6 +60,7 @@ def _intent(
     channel = ChannelId("desired-dev" if target is PublicationTarget.ACCEPTED_DESIRED else "review-dev")
     candidate = candidate or _sealed(store)
     expected_head = expected_head or store.resolve_head(channel)
+    review_base = store.resolve_head(ChannelId("desired-dev")) if mode is PublicationMode.REVIEW_REQUIRED else None
     return PublicationIntent(
         PublicationAttemptId(attempt),
         channel,
@@ -70,6 +71,7 @@ def _intent(
         tuple(coordination),
         target,
         mode,
+        review_base_head=review_base,
     )
 
 

@@ -150,7 +150,7 @@ def _retained_template(raw: bytes) -> RetainedSourcePlane:
     )
     descriptor = _issue_retained_source_descriptor(
         retained,
-        "template-source",
+        "template",
         SourceBindingRole.STACK_TEMPLATE,
         "templates/template.json",
         ContentId("sha256:" + "c" * 64),

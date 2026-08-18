@@ -48,6 +48,8 @@ from gitopsctr.application.model import (
     PublicationOutcomeState,
     PublicationProof,
     PublicationProofId,
+    PublicationRecovery,
+    PublicationRecoveryLocator,
     PublicationStoreId,
     PublicationTarget,
     RetainedSourceHandle,
@@ -64,6 +66,7 @@ from gitopsctr.application.model import (
     _issue_sealed_candidate,
     _open_publication_proof_issuer,
 )
+from gitopsctr.application.ports import PublicationExecutionUnknownError
 from gitopsctr.application.sources import RetainedSourceLocator, SourceRepository
 from gitopsctr.application.workspace import (
     ImmutableWorkspace,
@@ -73,6 +76,7 @@ from gitopsctr.application.workspace import (
     WorkspaceEntry,
     WorkspaceEntryKind,
 )
+from gitopsctr.git_local import DulwichLocalRepository
 
 _STATE_VERSION = 2
 _STATE_DIRECTORY = "gitopsctr-publication-v1"
@@ -87,12 +91,17 @@ class GitPublicationError(ValueError):
     """The local Git publication boundary cannot complete safely."""
 
 
+class GitPublicationExecutionUnknownError(GitPublicationError, PublicationExecutionUnknownError):
+    """Git crossed a durable publication boundary before execution returned."""
+
+
 class GitCandidateWorkspace(MutableWorkspace):
     """A mutable logical candidate that only its issuing store may seal."""
 
-    def __init__(self, token: object, workspace: InMemoryWorkspace) -> None:
+    def __init__(self, token: object, workspace: InMemoryWorkspace, parent_snapshot_id: SnapshotId | None) -> None:
         self._token = token
         self._workspace = workspace
+        self._parent_snapshot_id = parent_snapshot_id
 
     @property
     def capabilities(self):  # type: ignore[no-untyped-def]
@@ -255,13 +264,18 @@ class GitPublicationStore:
     def close(self) -> None:
         """Close no proof state: issuer metadata deliberately outlives adapters."""
 
-    def begin_candidate(self, base: ImmutableWorkspace | None = None) -> GitCandidateWorkspace:
+    def begin_candidate(
+        self, base: ImmutableWorkspace | None = None, parent_snapshot_id: SnapshotId | None = None
+    ) -> GitCandidateWorkspace:
         if base is not None and not isinstance(base, ImmutableWorkspace):
             raise TypeError("candidate base must implement ImmutableWorkspace")
         if base is not None and any(entry.kind is not WorkspaceEntryKind.FILE for entry in base.list_entries()):
             raise GitPublicationError(
                 "Git candidate workspaces cannot represent explicit directories or symbolic links"
             )
+        if parent_snapshot_id is not None:
+            _revision(parent_snapshot_id)
+            self._validate_commit_tree(_revision(parent_snapshot_id))
         token = object()
         self._candidate_tokens.add(token)
         return GitCandidateWorkspace(
@@ -271,9 +285,10 @@ class GitPublicationStore:
                 capabilities=WorkspaceCapabilities(executable_mode=True),
                 mutable=True,
             ),
+            parent_snapshot_id,
         )
 
-    def seal_candidate(self, workspace: GitCandidateWorkspace) -> SealedCandidate:
+    def seal_candidate(self, workspace: MutableWorkspace) -> SealedCandidate:
         if not isinstance(workspace, GitCandidateWorkspace) or workspace._token not in self._candidate_tokens:
             raise ValueError("candidate workspace was not issued by this store or is already sealed")
         self._candidate_tokens.remove(workspace._token)
@@ -281,7 +296,7 @@ class GitPublicationStore:
             handle = SealedCandidateHandle(f"git-candidate:{secrets.token_urlsafe(32)}")
             while handle.value in state["candidates"]:
                 handle = SealedCandidateHandle(f"git-candidate:{secrets.token_urlsafe(32)}")
-            revision = self._write_candidate_commit(workspace, handle)
+            revision = self._write_candidate_commit(workspace, handle, workspace._parent_snapshot_id)
             candidate = _issue_sealed_candidate(
                 handle,
                 CandidateStoreId(state["candidate_store_id"]),
@@ -322,6 +337,17 @@ class GitPublicationStore:
 
     def attempt_locator(self, intent: PublicationIntent) -> PublicationAttemptLocator:
         return PublicationAttemptLocator(self._store_id, intent.attempt_id)
+
+    def recovery_locator(self, intent: PublicationIntent) -> PublicationRecoveryLocator:
+        intent._validate()
+        return PublicationRecoveryLocator(self._store_id, intent.attempt_id)
+
+    def recover_publication(self, locator: PublicationRecoveryLocator) -> PublicationRecovery:
+        if not isinstance(locator, PublicationRecoveryLocator):
+            raise TypeError("locator must be a PublicationRecoveryLocator")
+        adapter_locator = PublicationAttemptLocator(locator.publication_store_id, locator.attempt_id)
+        intent = self.reissue_intent(adapter_locator)
+        return PublicationRecovery(intent, self.verify(intent))
 
     def reissue_intent(self, locator: PublicationAttemptLocator) -> PublicationIntent:
         """Reconstruct an exact intent only from authenticated durable evidence."""
@@ -365,6 +391,41 @@ class GitPublicationStore:
             raise TypeError("channel_id must be a ChannelId")
         with self._locked() as state:
             return self._current_head(state, channel_id)
+
+    def prepare_head(self, channel_id: ChannelId) -> HeadObservation:
+        return self.bootstrap_channel(channel_id)
+
+    def bootstrap_channel(self, channel_id: ChannelId) -> HeadObservation:
+        """Explicitly adopt one pre-transaction public ref as initial authority.
+
+        This migration-only operation verifies the public object ID while it
+        atomically creates the private mirror and authenticated authority
+        marker.  Once bootstrapped, any external public-ref drift fails closed
+        and is never silently adopted.
+        """
+
+        if not isinstance(channel_id, ChannelId):
+            raise TypeError("channel_id must be a ChannelId")
+        with self._locked() as state:
+            if channel_id.value in state["heads"]:
+                return self._current_head(state, channel_id)
+            public_revision = self._ref_revision(_public_channel_ref(channel_id))
+            if public_revision is None:
+                return self._current_head(state, channel_id)
+            if (
+                self._ref_revision(_channel_ref(channel_id)) is not None
+                or self._ref_revision(_authority_ref(channel_id)) is not None
+            ):
+                raise GitPublicationError("managed publication refs exist without bootstrapped authority")
+            snapshot = SnapshotId(f"{_SNAPSHOT_PREFIX}{public_revision}")
+            self._validate_commit_tree(public_revision)
+            expected = HeadObservation.absent(channel_id, "git:0")
+            marker = self._write_marker_commit(f"bootstrap:{channel_id.value}", snapshot, expected, "bootstrap")
+            if not self._atomic_bootstrap_refs(channel_id, public_revision, marker):
+                raise GitPublicationError("public channel changed during authority bootstrap")
+            head = self._advance_head(state, channel_id, snapshot, marker)
+            self._write_state(state)
+            return head
 
     def set_head(self, channel_id: ChannelId, snapshot_id: SnapshotId) -> HeadObservation:
         """Conformance hook that advances a channel incarnation intentionally."""
@@ -466,7 +527,7 @@ class GitPublicationStore:
                 return PublicationOutcome(PublicationOutcomeState.NOT_COMMITTED)
             if self._crash_after_ref_next:
                 self._crash_after_ref_next = False
-                raise GitPublicationError("simulated interruption after durable ref publication")
+                raise GitPublicationExecutionUnknownError("simulated interruption after durable ref publication")
             proof = self._commit_prepared(state, intent)
             if self._ambiguous_next:
                 self._ambiguous_next = False
@@ -518,6 +579,12 @@ class GitPublicationStore:
         self._validate_candidate_content(intent.candidate)
         if self._current_head(state, intent.channel_id, pending_attempt=pending_attempt) != intent.expected_head:
             raise ValueError("publication expected head is stale")
+        if (
+            intent.review_base_head is not None
+            and self._current_head(state, intent.review_base_head.channel_id, pending_attempt=pending_attempt)
+            != intent.review_base_head
+        ):
+            raise ValueError("review publication accepted desired base head is stale")
         for change in intent.source_ownership_changes:
             change._validate()
             self.source_repository.recover(change.retained_source)
@@ -623,6 +690,17 @@ class GitPublicationStore:
                 tuple(coordination),
                 PublicationTarget(wire["target"]),
                 PublicationMode(wire["mode"]),
+                review_base_head=(
+                    HeadObservation(
+                        ChannelId(wire["review_base_head"]["channel"]),
+                        SnapshotId(wire["review_base_head"]["snapshot"])
+                        if wire["review_base_head"]["snapshot"] is not None
+                        else None,
+                        wire["review_base_head"]["incarnation"],
+                    )
+                    if isinstance(wire.get("review_base_head"), dict)
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise GitPublicationError("authenticated publication intent record is malformed") from exc
@@ -638,7 +716,7 @@ class GitPublicationStore:
             raise GitPublicationError("managed authority marker changed during publication")
         if self._crash_after_authority_next:
             self._crash_after_authority_next = False
-            raise GitPublicationError("simulated interruption after authority marker promotion")
+            raise GitPublicationExecutionUnknownError("simulated interruption after authority marker promotion")
         head = self._advance_head(state, intent.channel_id, intent.candidate.snapshot_id, marker)
         ownership = tuple(
             SourceOwnershipResult(
@@ -709,6 +787,7 @@ class GitPublicationStore:
 
         record = state["heads"].get(channel_id.value)
         raw = self._ref_revision(_channel_ref(channel_id))
+        public = self._ref_revision(_public_channel_ref(channel_id))
         # The MACed preparing journal alone preserves the pre-transaction
         # authority. Marker/mirror integrity gates recovery and adoption, not
         # reads of the last committed head.
@@ -720,20 +799,25 @@ class GitPublicationStore:
             ):
                 return _head_observation(attempt["expected_head"])
         if record is None:
-            if raw is not None or self._ref_revision(_authority_ref(channel_id)) is not None:
+            if raw is not None or public is not None or self._ref_revision(_authority_ref(channel_id)) is not None:
                 raise GitPublicationError("unmanaged publication ref exists without committed authority")
             return HeadObservation.absent(channel_id, "git:0")
         snapshot = SnapshotId(record["snapshot"]) if record["snapshot"] is not None else None
         marker = record["marker"]
         if marker is None:
-            if snapshot is not None or raw is not None or self._ref_revision(_authority_ref(channel_id)) is not None:
+            if (
+                snapshot is not None
+                or raw is not None
+                or public is not None
+                or self._ref_revision(_authority_ref(channel_id)) is not None
+            ):
                 raise GitPublicationError("committed authority record is malformed")
         else:
             if self._ref_revision(_authority_ref(channel_id)) != marker:
                 raise GitPublicationError("managed authority marker is missing or drifted")
             self._validate_marker_object(marker, snapshot, record.get("attempt"))
-        if raw != _revision_or_none(snapshot):
-            raise GitPublicationError("non-authoritative raw mirror drift requires repair")
+        if raw != _revision_or_none(snapshot) or public != _revision_or_none(snapshot):
+            raise GitPublicationError("public or private channel mirror drift requires repair")
         if snapshot is not None:
             self._validate_commit_tree(_revision(snapshot))
         return HeadObservation(channel_id, snapshot, f"git:{record['version']}")
@@ -954,6 +1038,7 @@ class GitPublicationStore:
         lines = [
             "start",
             f"update {_channel_ref(channel)} {_revision(candidate)} {_revision_or_none(expected) or zero}",
+            f"update {_public_channel_ref(channel)} {_revision(candidate)} {_revision_or_none(expected) or zero}",
             (
                 f"update {marker_ref} {marker} {previous_marker or zero}"
                 if test_hook
@@ -976,10 +1061,37 @@ class GitPublicationStore:
             return False
         raise GitPublicationError("atomic publication ref transaction failed")
 
+    def _atomic_bootstrap_refs(self, channel: ChannelId, public_revision: str, marker: str) -> bool:
+        lines = [
+            "start",
+            f"verify {_public_channel_ref(channel)} {public_revision}",
+            f"create {_channel_ref(channel)} {public_revision}",
+            f"create {_authority_ref(channel)} {marker}",
+            "prepare",
+            "commit",
+            "",
+        ]
+        completed = subprocess.run(
+            ["git", "-C", str(self.repository), "update-ref", "--stdin"],
+            input="\n".join(lines),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode == 0:
+            return True
+        if "cannot lock ref" in completed.stderr or "reference already exists" in completed.stderr:
+            return False
+        raise GitPublicationError("atomic authority bootstrap failed")
+
     def _atomic_clear_refs(self, channel: ChannelId, expected: SnapshotId | None, record: object) -> bool:
         marker = record.get("marker") if isinstance(record, dict) else None
         zero = "0" * 40
-        lines = ["start", f"delete {_channel_ref(channel)} {_revision_or_none(expected) or zero}"]
+        lines = [
+            "start",
+            f"delete {_channel_ref(channel)} {_revision_or_none(expected) or zero}",
+            f"delete {_public_channel_ref(channel)} {_revision_or_none(expected) or zero}",
+        ]
         if isinstance(marker, str):
             lines.append(f"delete {_authority_ref(channel)} {marker}")
         lines.extend(("prepare", "commit", ""))
@@ -1087,8 +1199,11 @@ class GitPublicationStore:
             return False
         if intent is not None and data["intent"] != hashlib.sha256(_intent_wire(intent).encode()).hexdigest():
             return False
-        raw = self._ref_revision(_channel_ref(ChannelId(record["channel"])))
-        return raw == _revision(SnapshotId(record["candidate_snapshot"]))
+        channel = ChannelId(record["channel"])
+        candidate = _revision(SnapshotId(record["candidate_snapshot"]))
+        private = self._ref_revision(_channel_ref(channel))
+        public = self._ref_revision(_public_channel_ref(channel))
+        return private == candidate and public == candidate
 
     def _validate_commit_tree(self, revision: str) -> None:
         if not _is_object_id(revision):
@@ -1112,7 +1227,9 @@ class GitPublicationStore:
         except Exception as exc:
             raise GitPublicationError("managed publication snapshot tree is missing or invalid") from exc
 
-    def _write_candidate_commit(self, workspace: ImmutableWorkspace, handle: SealedCandidateHandle) -> str:
+    def _write_candidate_commit(
+        self, workspace: ImmutableWorkspace, handle: SealedCandidateHandle, parent_snapshot_id: SnapshotId | None
+    ) -> str:
         repository = Repo(self.repository)
         try:
             entries: list[tuple[bytes, ObjectID, int]] = []
@@ -1135,7 +1252,9 @@ class GitPublicationStore:
                 tree_id = empty.id
             commit = Commit()
             commit.tree = tree_id
-            commit.parents = []
+            commit.parents = (
+                [] if parent_snapshot_id is None else [cast(ObjectID, _revision(parent_snapshot_id).encode())]
+            )
             identity = b"gitopsctr publication <gitopsctr@invalid>"
             commit.author = identity
             commit.committer = identity
@@ -1260,6 +1379,16 @@ def _candidate_ref(handle: SealedCandidateHandle) -> str:
 def _channel_ref(channel: ChannelId) -> str:
     encoded = base64.urlsafe_b64encode(channel.value.encode()).decode().rstrip("=")
     return f"{_REF_PREFIX}/channels/{encoded}"
+
+
+def _public_channel_ref(channel: ChannelId) -> str:
+    value = channel.value.removeprefix("refs/heads/")
+    ref = f"refs/heads/{value}"
+    if channel.value.startswith("refs/") and not channel.value.startswith("refs/heads/"):
+        raise GitPublicationError("Git publication channel must name a branch")
+    if not DulwichLocalRepository.valid_ref(ref):
+        raise GitPublicationError("Git publication channel is not a valid branch")
+    return ref
 
 
 def _authority_ref(channel: ChannelId) -> str:

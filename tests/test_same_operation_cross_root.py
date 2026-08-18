@@ -18,7 +18,6 @@ from gitopsctr.application.apply_compilers import (
     CatalogLogicalUnitProjector,
     CatalogStackProjectionCompiler,
     CatalogUnitProjectionCompiler,
-    ProjectionCompilerError,
 )
 from gitopsctr.application.apply_projection import (
     ApplyProjectionContext,
@@ -321,20 +320,23 @@ def test_new_root_unit_is_exactly_visible_to_same_operation_stack() -> None:
     assert isinstance(stack.spec, DesiredStackSpec) and stack.spec.activeProjection is not None
 
 
-def test_changed_root_unit_rejects_the_old_same_operation_receipt() -> None:
+def test_changed_root_unit_blocks_the_consumer_of_its_old_receipt() -> None:
     source = _source()
     context = _context(source)
     old = _producer_projection(_producer(), source, context)
     current = _desired_workspace(old)
 
-    with pytest.raises(ProjectionCompilerError, match="stale for its current Unit"):
-        _apply(
-            _producer("producer-v2"),
-            source,
-            context,
-            current,
-            InMemoryWorkspace((_receipt(old.writes[0]),), mutable=False),
-        )
+    result = _apply(
+        _producer("producer-v2"),
+        source,
+        context,
+        current,
+        InMemoryWorkspace((_receipt(old.writes[0]),), mutable=False),
+    )
+
+    assert not any(entry.key == "units/consumer/deploy.json" for entry in result.candidate.list_entries())
+    blocks = json.loads(result.candidate.read(".gitopsctr/transition-blocks.json"))["blocks"]
+    assert blocks == {"consumer/deploy": "receipt producer 'producer' is stale for its current Unit"}
 
 
 def test_unchanged_root_unit_resolves_its_exact_current_receipt() -> None:

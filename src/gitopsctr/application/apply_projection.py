@@ -360,7 +360,10 @@ class RetainedSourceDescriptor:
         _binding_key(self.binding_key)
         if not isinstance(self.role, SourceBindingRole):
             raise TypeError("retained source role must be a SourceBindingRole")
-        validate_workspace_key(self.workspace_key)
+        # ``.`` is the canonical selector for the retained workspace root;
+        # every non-root selector remains an exact safe logical key.
+        if self.workspace_key != ".":
+            validate_workspace_key(self.workspace_key)
         if not isinstance(self.selector_evidence, ContentId):
             raise TypeError("retained source selector evidence must be a ContentId")
         current = (
@@ -1155,7 +1158,7 @@ def project_apply(
         _apply_transformation_payload(candidate, transformation)
         for key in transformation.deletes:
             candidate.delete(key)
-    _prune_partition(candidate, current_documents, applied, context.partition)
+    _prune_partition(candidate, current_documents, {_identity(document) for document in authored}, context.partition)
     candidate_documents = _load_desired_documents(candidate, validator)
     if not applied.issubset(candidate_documents):
         raise ApplyProjectionError("transformation removed a required applied resource identity")
@@ -1542,6 +1545,7 @@ def _validate_payload_ownership(
     }
     if allow_projection_contexts and authorized_roots:
         allowed_prefixes.add(".gitopsctr/projection-contexts")
+        allowed_prefixes.add(".gitopsctr/transition-blocks.json")
     if any(prefix not in allowed_prefixes for prefix in transformation.payload_prefixes):
         raise ApplyProjectionError("payload prefixes must be derived from emitted resource identities")
     materialized_prefixes = {

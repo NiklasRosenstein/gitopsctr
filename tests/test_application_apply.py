@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -109,38 +108,33 @@ def test_application_decodes_before_delegating_apply_and_closes_all_ports():
 
 def test_git_apply_uses_the_exact_source_snapshot_decoded_before_a_moving_ref_changes(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ):
     """A selector can move after decode without mixing source snapshots."""
 
-    from gitopsctr import controller
-    from gitopsctr.adapters.git.apply import GitApplyService, GitAuthoredChangeDecoder
+    from gitopsctr.adapters.git.apply import GitAuthoredChangeDecoder
+    from gitopsctr.adapters.memory.sources import MemorySourceRepository
+    from gitopsctr.application.workspace import InMemoryWorkspace, WorkspaceEntry
 
-    first_revision = "a" * 40
-    second_revision = "b" * 40
-    selected = {"revision": first_revision}
-
-    monkeypatch.setattr(
-        controller,
-        "git",
-        lambda *_args: SimpleNamespace(stdout=f"{selected['revision']}\n"),
+    source = MemorySourceRepository(SourceId("default-git-source"))
+    first = source.install(
+        SnapshotId("first"),
+        InMemoryWorkspace(
+            (
+                WorkspaceEntry.file(
+                    "unit.yaml",
+                    b"apiVersion: unit.gitopsctr.io/v1\nkind: Terraform\nmetadata:\n  name: app\nspec: {}\n",
+                ),
+            ),
+            mutable=False,
+        ),
     )
-    monkeypatch.setattr(controller, "_validate_apply_input_selection", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(controller, "materialize_revision", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        controller,
-        "_load_apply_documents",
-        lambda *_args, **_kwargs: [
-            SimpleNamespace(
-                origin="source:unit.yaml",
-                document={
-                    "apiVersion": "unit.gitopsctr.io/v1",
-                    "kind": "Terraform",
-                    "metadata": {"name": "app"},
-                },
-                document_digest="sha256:app",
-            )
-        ],
+    second = source.install(
+        SnapshotId("second"),
+        InMemoryWorkspace((WorkspaceEntry.file("unit.yaml", b"kind: changed\n"),), mutable=False),
     )
+    source.set_selector("refs/heads/main", first.source_snapshot_id.snapshot_id)
+    monkeypatch.chdir(tmp_path)
     command = ApplyCommand(
         EnvironmentId("dev"),
         ("unit.yaml",),
@@ -149,21 +143,13 @@ def test_git_apply_uses_the_exact_source_snapshot_decoded_before_a_moving_ref_ch
         None,
         SourceRequest(SourceId("default-git-source"), "refs/heads/main"),
     )
-    changes = GitAuthoredChangeDecoder(Path(".")).decode(command)
+    changes = GitAuthoredChangeDecoder(tmp_path, source_repository=source).decode(command)
     assert changes.source_snapshot_id is not None
-    assert changes.source_snapshot_id.snapshot_id == SnapshotId(first_revision)
+    assert changes.source_snapshot_id.snapshot_id == SnapshotId("first")
+    source.set_selector("refs/heads/main", second.source_snapshot_id.snapshot_id)
 
-    selected["revision"] = second_revision
-    observed: dict[str, str | None] = {}
-
-    def execute(arguments: SimpleNamespace, *, documents: object) -> None:
-        observed["source_revision"] = arguments.source_revision
-        return None
-
-    monkeypatch.setattr(controller, "_execute_git_apply", execute)
-    GitApplyService(Path(".")).apply(command, changes)
-
-    assert observed["source_revision"] == first_revision
+    assert changes.source_acquisition is not None
+    assert source.recover(changes.source_acquisition.retained).source_snapshot_id == first.source_snapshot_id
 
 
 def test_git_apply_rejects_a_source_request_from_another_source() -> None:

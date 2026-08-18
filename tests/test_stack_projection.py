@@ -12,6 +12,8 @@ import pytest
 import yaml
 
 from gitopsctr import controller
+from gitopsctr.adapters.git.apply import publish_durable_candidate
+from gitopsctr.application.model import ChannelId
 from gitopsctr.contracts import (
     DesiredStackSpec,
     DesiredStackTemplateSpec,
@@ -903,7 +905,16 @@ def test_durable_projection_progresses_saved_context_groups_cumulatively(
     later = "worker" if earlier == "web" else "web"
 
     def reset_refs() -> None:
-        git(source, "push", "--force", "origin", f"{published}:refs/heads/deploy/dev")
+        current_revision = store.fetch("deploy/dev").revision
+        assert current_revision is not None
+        reset = publish_durable_candidate(
+            source,
+            "dev",
+            ChannelId("deploy/dev"),
+            current_revision,
+            root,
+        )
+        assert reset.snapshot_id is not None
         if store.fetch("observed/dev").revision is not None:
             git(source, "push", "origin", "--delete", "observed/dev")
 
