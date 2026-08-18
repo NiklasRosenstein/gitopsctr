@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from gitopsctr.application.inspection import ResourceInspectionCommand, ResourceInspectionResult
 from gitopsctr.application.model import (
     SnapshotInspectionCommand,
     SnapshotInspectionResult,
     ValidateCommand,
     ValidationResult,
 )
-from gitopsctr.application.ports import SnapshotReader, SpecificationValidator
+from gitopsctr.application.ports import ResourceInspector, SnapshotReader, SpecificationValidator
 
 
 @dataclass(slots=True)
@@ -19,6 +20,7 @@ class ApplicationServices:
 
     snapshot_reader: SnapshotReader
     specification_validator: SpecificationValidator
+    resource_inspector: ResourceInspector
     _closed: bool = field(default=False, init=False, repr=False)
 
     def validate(self, command: ValidateCommand) -> ValidationResult:
@@ -32,6 +34,11 @@ class ApplicationServices:
         view = self.snapshot_reader.open_snapshot(command.snapshot_id)
         return SnapshotInspectionResult(view.snapshot_id, view.content_id)
 
+    def inspect_resources(self, command: ResourceInspectionCommand) -> ResourceInspectionResult:
+        """Inspect resources through the injected read adapter."""
+
+        return self.resource_inspector.inspect(command)
+
     def close(self) -> None:
         """Close both explicit dependencies exactly once."""
 
@@ -39,9 +46,12 @@ class ApplicationServices:
             return
         self._closed = True
         try:
-            self.specification_validator.close()
+            self.resource_inspector.close()
         finally:
-            self.snapshot_reader.close()
+            try:
+                self.specification_validator.close()
+            finally:
+                self.snapshot_reader.close()
 
     def __enter__(self) -> ApplicationServices:
         return self

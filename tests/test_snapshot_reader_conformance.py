@@ -10,6 +10,7 @@ import pytest
 
 from gitopsctr.adapters.git.snapshots import GitSnapshotReader
 from gitopsctr.adapters.memory.snapshots import InMemorySnapshotStore
+from gitopsctr.application.inspection import ResourceInspectionCommand, ResourceInspectionResult
 from gitopsctr.application.model import (
     ChannelId,
     SnapshotId,
@@ -36,6 +37,14 @@ class SnapshotReaderFixture:
 class NoopSpecificationValidator:
     def validate(self, command: ValidateCommand) -> ValidationResult:
         return ValidationResult()
+
+    def close(self) -> None:
+        """No resources are owned."""
+
+
+class NoopResourceInspector:
+    def inspect(self, command: ResourceInspectionCommand) -> ResourceInspectionResult:
+        raise AssertionError("resource inspection is not expected")
 
     def close(self) -> None:
         """No resources are owned."""
@@ -100,7 +109,11 @@ def test_missing_snapshot_fails_closed(snapshot_reader: SnapshotReaderFixture) -
 
 
 def test_application_inspection_uses_the_injected_snapshot_reader(snapshot_reader: SnapshotReaderFixture) -> None:
-    with ApplicationServices(snapshot_reader.reader, NoopSpecificationValidator()) as services:
+    with ApplicationServices(
+        snapshot_reader.reader,
+        NoopSpecificationValidator(),
+        NoopResourceInspector(),
+    ) as services:
         result = services.inspect_snapshot(SnapshotInspectionCommand(snapshot_reader.snapshot_id))
 
     assert result.snapshot_id == snapshot_reader.snapshot_id
