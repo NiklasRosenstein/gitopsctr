@@ -8,10 +8,11 @@ candidate content.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
+from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 from unicodedata import category, normalize
 
@@ -20,6 +21,7 @@ from gitopsctr.application.model import ContentId
 type WorkspaceKey = str
 
 _CONTENT_ID_DOMAIN = b"gitopsctr.logical-workspace.content.v1\0"
+_ENTRY_CONTENT_ID_DOMAIN = b"gitopsctr.logical-workspace.entry-content.v1\0"
 
 
 class WorkspaceError(ValueError):
@@ -172,6 +174,15 @@ def _canonical_entry_bytes(entry: WorkspaceEntry) -> bytes:
     )
 
 
+def entry_content_id(entry: WorkspaceEntry) -> ContentId:
+    """Return a domain-separated identity for one exact logical entry."""
+
+    digest = sha256()
+    digest.update(_ENTRY_CONTENT_ID_DOMAIN)
+    digest.update(_canonical_entry_bytes(entry))
+    return ContentId(f"sha256:{digest.hexdigest()}")
+
+
 @runtime_checkable
 class ImmutableWorkspace(Protocol):
     """Read-only view of one logical content tree."""
@@ -194,6 +205,8 @@ class ImmutableWorkspace(Protocol):
     def inspect(self, key: WorkspaceKey) -> WorkspaceEntry: ...
 
     def read(self, key: WorkspaceKey) -> bytes: ...
+
+    def entry_content_ids(self) -> Mapping[WorkspaceKey, ContentId]: ...
 
 
 @runtime_checkable
@@ -257,6 +270,17 @@ class InMemoryWorkspace:
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
         return ContentId(f"sha256:{digest.hexdigest()}")
+
+    def entry_content_ids(self) -> Mapping[WorkspaceKey, ContentId]:
+        """Return immutable provenance for every logical regular file."""
+
+        return MappingProxyType(
+            {
+                entry.key: entry_content_id(entry)
+                for entry in self._entries.values()
+                if entry.kind is WorkspaceEntryKind.FILE
+            }
+        )
 
     def list_entries(self, prefix: str | None = None) -> tuple[WorkspaceEntry, ...]:
         if prefix is not None:

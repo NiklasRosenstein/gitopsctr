@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import MutableMapping
+from typing import cast
+
 import pytest
 
+from gitopsctr.application.model import ContentId
 from gitopsctr.application.workspace import (
     InMemoryWorkspace,
     WorkspaceCapabilities,
@@ -10,6 +14,7 @@ from gitopsctr.application.workspace import (
     WorkspaceEntryNotFoundError,
     WorkspaceError,
     WorkspaceImmutableError,
+    entry_content_id,
     validate_relative_symlink_target,
     validate_workspace_key,
 )
@@ -242,3 +247,25 @@ def test_regular_file_reads_are_typed() -> None:
     with pytest.raises(WorkspaceError, match="not a regular file"):
         workspace.read("link")
     assert workspace.get_entry("link").kind is WorkspaceEntryKind.SYMLINK
+
+
+def test_entry_content_id_has_fixed_domain_separated_vectors() -> None:
+    assert (
+        str(entry_content_id(WorkspaceEntry.file("a", b"x")))
+        == "sha256:adfb611b5e89ebc01b170050ac9bf788df82ad32638aa5a14fc2becd04719533"
+    )
+    assert entry_content_id(WorkspaceEntry.file("a", b"x")) != entry_content_id(
+        WorkspaceEntry.file("a", b"x", executable=True)
+    )
+    assert entry_content_id(WorkspaceEntry.file("a", b"x")) != entry_content_id(WorkspaceEntry.file("b", b"x"))
+
+
+def test_workspace_entry_content_ids_are_immutable_and_file_only() -> None:
+    workspace = InMemoryWorkspace(
+        (WorkspaceEntry.file("a", b"x"), WorkspaceEntry.directory("directory")), mutable=False
+    )
+    assert dict(workspace.entry_content_ids()) == {"a": entry_content_id(WorkspaceEntry.file("a", b"x"))}
+    with pytest.raises(TypeError):
+        cast(MutableMapping[str, ContentId], workspace.entry_content_ids())["new"] = entry_content_id(
+            WorkspaceEntry.file("new", b"x")
+        )
