@@ -17,8 +17,13 @@ pytest_plugins = ("tests.test_inventory",)
 
 def run_get(repository: Path, capsys: pytest.CaptureFixture[str], *arguments: str) -> str:
     args = controller.build_parser().parse_args(["get", *arguments])
-    controller.inspect_resources(repository, args)
-    return capsys.readouterr().out
+    previous_repository = controller.REPOSITORY_ROOT
+    try:
+        controller.REPOSITORY_ROOT = repository
+        controller.command_get(args)
+        return capsys.readouterr().out
+    finally:
+        controller.REPOSITORY_ROOT = previous_repository
 
 
 def test_get_environments_and_units_vertical_slice(repository: Path, capsys: pytest.CaptureFixture[str]):

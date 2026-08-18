@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from gitopsctr.application.inspection import ResourceInspectionCommand, ResourceInspectionResult
 from gitopsctr.application.model import (
     AcceptedDesiredSnapshot,
     ChannelId,
@@ -92,6 +93,16 @@ class SpecificationValidator(Protocol):
         """Release owned resources; repeated calls must be safe."""
 
 
+class ResourceInspector(Protocol):
+    """Read persisted resources through adapter-owned snapshot/workspace access."""
+
+    def inspect(self, command: ResourceInspectionCommand) -> ResourceInspectionResult:
+        """Return structured data for an incoming adapter to render."""
+
+    def close(self) -> None:
+        """Release owned resources; repeated calls must be safe."""
+
+
 class Orchestrator(Protocol):
     """The incoming application port for the first typed use cases."""
 
@@ -100,3 +111,6 @@ class Orchestrator(Protocol):
 
     def inspect_snapshot(self, command: SnapshotInspectionCommand) -> SnapshotInspectionResult:
         """Inspect one immutable snapshot through the application boundary."""
+
+    def inspect_resources(self, command: ResourceInspectionCommand) -> ResourceInspectionResult:
+        """Inspect persisted resources through the configured read adapter."""

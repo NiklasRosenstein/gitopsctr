@@ -1,5 +1,12 @@
 """Backend-neutral application commands, values, and ports."""
 
+from gitopsctr.application.inspection import (
+    InspectionFilter,
+    InspectionOutputFormat,
+    InspectionTable,
+    ResourceInspectionCommand,
+    ResourceInspectionResult,
+)
 from gitopsctr.application.model import (
     AcceptedDesiredSnapshot,
     AuthorityIssuer,
@@ -39,6 +46,7 @@ from gitopsctr.application.ports import (
     DeploymentAuthority,
     EffectFencing,
     Orchestrator,
+    ResourceInspector,
     RuntimeIdentityProvider,
     SnapshotReader,
     SpecificationValidator,
@@ -71,6 +79,12 @@ __all__ = [
     "RetainedSource",
     "RetainedSourceHandle",
     "RuntimeIdentityProvider",
+    "ResourceInspector",
+    "ResourceInspectionCommand",
+    "ResourceInspectionResult",
+    "InspectionFilter",
+    "InspectionOutputFormat",
+    "InspectionTable",
     "SnapshotId",
     "SnapshotInspectionCommand",
     "SnapshotInspectionResult",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from gitopsctr.adapters.git import GitSnapshotReader
+from gitopsctr.adapters.git import GitResourceInspector, GitSnapshotReader
 from gitopsctr.adapters.source_authored import SourceAuthoredSpecificationValidator
 from gitopsctr.application.services import ApplicationServices
 
@@ -18,4 +18,5 @@ def create_default_application(repository: Path) -> ApplicationServices:
     return ApplicationServices(
         GitSnapshotReader.from_path(repository_root),
         SourceAuthoredSpecificationValidator(repository_root),
+        GitResourceInspector(repository_root),
     )

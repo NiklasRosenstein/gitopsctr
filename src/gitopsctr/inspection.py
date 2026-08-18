@@ -11,6 +11,11 @@ from typing import cast
 
 import yaml
 
+from gitopsctr.application.inspection import (
+    InspectionOutputFormat,
+    InspectionTable,
+    ResourceInspectionResult,
+)
 from gitopsctr.contracts import (
     INSPECTION_RESOURCE_LIST_CONTRACT,
     InspectionAddress,
@@ -549,6 +554,32 @@ def _print_documents(results: Sequence[InspectionResult], output: str, *, collec
         print(yaml.safe_dump(document, sort_keys=False, default_flow_style=False), end="")
 
 
+def _render_table(table: InspectionTable) -> None:
+    """Render a structured table at the CLI boundary."""
+
+    if table.heading is not None:
+        print(table.heading)
+    _print_table(table.headers, table.rows)
+
+
+def render_resource_inspection(result: ResourceInspectionResult, output: InspectionOutputFormat) -> None:
+    """Render application-owned inspection data without performing inspection."""
+
+    if result.tables:
+        for index, table in enumerate(result.tables):
+            if index:
+                print()
+            _render_table(table)
+        return
+    if result.document is None:
+        print("No resources found.")
+        return
+    if output is InspectionOutputFormat.JSON:
+        print(json.dumps(result.document, indent=2, sort_keys=False))
+    else:
+        print(yaml.safe_dump(result.document, sort_keys=False, default_flow_style=False), end="")
+
+
 def _artifact_results(
     inventory: InventorySession,
     receipt_results: Sequence[InspectionResult],
@@ -601,8 +632,17 @@ def _artifact_results(
     return tuple(selected)
 
 
-def command_get(repository_root: Path, args: argparse.Namespace) -> None:
-    """Inspect persisted resources through registry-defined collections and relationships."""
+def build_resource_inspection(
+    repository_root: Path,
+    args: argparse.Namespace,
+) -> ResourceInspectionResult:
+    """Build structured inspection output through registry-defined collections.
+
+    This compatibility implementation remains an infrastructure adapter while
+    collection discovery moves from materialized paths to logical workspaces.
+    It deliberately performs no rendering so every incoming adapter shares the
+    same typed application result.
+    """
 
     if args.as_list and args.output in {"table", "wide"}:
         raise OperationError("--as-list requires --output yaml or json")
@@ -628,12 +668,9 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
             if table:
                 populated = tuple((family, results) for family, results in selected if results)
                 if not populated:
-                    print("No resources found.")
-                    return
-                for index, (family, results) in enumerate(populated):
-                    if index:
-                        print()
-                    print(family.plural.upper())
+                    return ResourceInspectionResult()
+                tables: list[InspectionTable] = []
+                for family, results in populated:
                     assert family.inspection is not None
                     headers = list(family.inspection.columns_for(wide=args.output == "wide"))
                     if args.all_environments:
@@ -645,11 +682,17 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
                         inventory=inventory,
                         wide=args.output == "wide",
                     )
-                    _print_table(headers, rows)
+                    tables.append(
+                        InspectionTable(
+                            tuple(headers),
+                            tuple(tuple(value for value in row) for row in rows),
+                            family.plural.upper(),
+                        )
+                    )
+                return ResourceInspectionResult(tables=tuple(tables))
             else:
                 results = tuple(result for _family, family_results in selected for result in family_results)
-                _print_documents(results, args.output, collection_result=True)
-        return
+                return ResourceInspectionResult(document=_envelope(results))
 
     try:
         family = RESOURCE_REGISTRY.family(args.selector)
@@ -684,10 +727,20 @@ def command_get(repository_root: Path, args: argparse.Namespace) -> None:
             headers = list(family.inspection.columns_for(wide=args.output == "wide"))
             if args.all_environments and family is not inventory.registry.namespace_family:
                 headers.insert(0, "ENVIRONMENT")
-            _print_table(headers, rows)
-        else:
-            _print_documents(
-                results,
-                "yaml" if table_output else args.output,
-                collection_result=args.as_list or args.name is None or args.artifacts,
+            return ResourceInspectionResult(
+                tables=(InspectionTable(tuple(headers), tuple(tuple(value for value in row) for row in rows)),)
             )
+        else:
+            document = (
+                _envelope(results)
+                if args.as_list or args.name is None or args.artifacts
+                else (results[0].record.document if len(results) == 1 else _envelope(results))
+            )
+            return ResourceInspectionResult(document=document)
+
+
+def command_get(repository_root: Path, args: argparse.Namespace) -> None:
+    """Compatibility entry point for legacy callers of the local inspector."""
+
+    output = InspectionOutputFormat(args.output)
+    render_resource_inspection(build_resource_inspection(repository_root, args), output)

@@ -1582,14 +1582,14 @@ def test_compact_approval_card_shows_driver_change_evidence_and_write_boundary(t
     assert "WRITES   driver effects; receipt to observed/dev on success" in output
 
 
-def test_status_without_environment_delegates_to_registry_inventory(monkeypatch):
+def test_status_without_environment_delegates_to_get_orchestrator(monkeypatch):
     captured = []
-    monkeypatch.setattr(deploy_release, "inspect_resources", lambda root, args: captured.append((root, args.selector)))
+    monkeypatch.setattr(deploy_release, "command_get", lambda args: captured.append(args.selector))
 
     args = deploy_release.build_parser().parse_args(["status"])
     args.handler(args)
 
-    assert captured == [(deploy_release.REPOSITORY_ROOT, "environments")]
+    assert captured == ["environments"]
 
 
 def test_status_can_focus_on_one_unit(tmp_path, monkeypatch):

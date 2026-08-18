@@ -17,6 +17,8 @@ from gitopsctr.adapters.source_authored import SourceAuthoredSpecificationValida
 from gitopsctr.application import (
     EnvironmentId,
     Orchestrator,
+    ResourceInspectionCommand,
+    ResourceInspectionResult,
     SnapshotId,
     ValidateCommand,
     ValidationFailFastError,
@@ -66,6 +68,17 @@ class RecordingSnapshotReader:
 
 
 @dataclass
+class RecordingResourceInspector:
+    close_count: int = 0
+
+    def inspect(self, _command: ResourceInspectionCommand) -> ResourceInspectionResult:
+        raise AssertionError("resource inspection is not expected")
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+@dataclass
 class RecordingApplication:
     result: ValidationResult
     calls: list[ValidateCommand]
@@ -90,7 +103,8 @@ def test_application_services_uses_its_injected_specification_validator() -> Non
     expected = ValidationResult(validated_documents=("gitopsctr.yaml",), validated_environments=(EnvironmentId("dev"),))
     validator = RecordingValidator(expected, [], [])
     reader = RecordingSnapshotReader()
-    services = ApplicationServices(reader, validator)
+    inspector = RecordingResourceInspector()
+    services = ApplicationServices(reader, validator, inspector)
     orchestrator: Orchestrator = services
 
     assert orchestrator.validate(command) is expected
@@ -99,18 +113,21 @@ def test_application_services_uses_its_injected_specification_validator() -> Non
     services.close()
     assert len(validator.closes) == 1
     assert reader.close_count == 1
+    assert inspector.close_count == 1
 
 
 def test_application_services_context_closes_both_dependencies_after_an_exception() -> None:
     reader = RecordingSnapshotReader()
     validator = RecordingValidator(ValidationResult(), [], [])
+    inspector = RecordingResourceInspector()
 
     with pytest.raises(RuntimeError, match="operation failed"):
-        with ApplicationServices(reader, validator):
+        with ApplicationServices(reader, validator, inspector):
             raise RuntimeError("operation failed")
 
     assert reader.close_count == 1
     assert len(validator.closes) == 1
+    assert inspector.close_count == 1
 
 
 def test_source_authored_validator_returns_logical_counts_and_preserves_invalid_fail_fast_parity(

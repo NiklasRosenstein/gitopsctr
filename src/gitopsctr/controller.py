@@ -37,6 +37,9 @@ import yaml
 from gitopsctr import operational
 from gitopsctr.application import (
     EnvironmentId,
+    InspectionFilter,
+    InspectionOutputFormat,
+    ResourceInspectionCommand,
     ValidateCommand,
     ValidationFailFastError,
     ValidationIssue,
@@ -138,8 +141,7 @@ from gitopsctr.formats import (
     validate_project_document,
     write_document,
 )
-from gitopsctr.inspection import command_get as inspect_resources
-from gitopsctr.inspection import identity_filter_options, inspectable_selectors
+from gitopsctr.inspection import identity_filter_options, inspectable_selectors, render_resource_inspection
 from gitopsctr.registry import (
     API_KINDS,
     DRIVER_GVKS,
@@ -9631,8 +9633,7 @@ def command_status(args: argparse.Namespace) -> None:
     if args.environment is None:
         if args.unit or args.desired_ref or args.desired_revision or args.observed_ref or args.verbose:
             raise OperationError("status options other than --environment are only available for one environment")
-        inspect_resources(
-            REPOSITORY_ROOT,
+        command_get(
             argparse.Namespace(
                 selector="environments",
                 name=None,
@@ -9713,7 +9714,36 @@ def command_status(args: argparse.Namespace) -> None:
 
 
 def command_get(args: argparse.Namespace) -> None:
-    inspect_resources(REPOSITORY_ROOT, args)
+    """Translate CLI flags, invoke the application, and render its result."""
+
+    from gitopsctr.composition import create_default_application
+
+    try:
+        command = ResourceInspectionCommand(
+            selector=args.selector,
+            name=args.name,
+            environment=args.environment,
+            all_environments=args.all_environments,
+            desired_reference=args.desired_ref,
+            desired_snapshot=args.desired_revision,
+            observed_reference=args.observed_ref,
+            observed_snapshot=args.observed_revision,
+            output=InspectionOutputFormat(args.output),
+            filters=tuple(
+                InspectionFilter(segment.option_destination, value)
+                for segment in identity_filter_options()
+                if segment.option_destination is not None
+                and isinstance(value := getattr(args, segment.option_destination, None), str)
+            ),
+            artifact=args.artifact,
+            artifacts=args.artifacts,
+            as_list=args.as_list,
+        )
+    except (TypeError, ValueError) as exc:
+        raise OperationError(str(exc)) from exc
+    with create_default_application(REPOSITORY_ROOT) as application:
+        result = application.inspect_resources(command)
+    render_resource_inspection(result, command.output)
 
 
 def command_verify(args: argparse.Namespace) -> None:

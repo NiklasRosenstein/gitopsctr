@@ -1,0 +1,149 @@
+"""Focused phase-3a tests for the typed ``get`` application vertical."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+
+from gitopsctr import composition, controller
+from gitopsctr.application import (
+    InspectionOutputFormat,
+    InspectionTable,
+    ResourceInspectionCommand,
+    ResourceInspectionResult,
+    SnapshotId,
+    ValidationResult,
+)
+from gitopsctr.application.services import ApplicationServices
+from gitopsctr.application.snapshots import SnapshotView
+
+
+@dataclass
+class RecordingSnapshotReader:
+    close_count: int = 0
+
+    def open_snapshot(self, snapshot_id: SnapshotId) -> SnapshotView:
+        raise AssertionError("snapshot inspection is not expected")
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+@dataclass
+class RecordingValidator:
+    close_count: int = 0
+
+    def validate(self, _command: object) -> ValidationResult:
+        return ValidationResult()
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+@dataclass
+class RecordingInspector:
+    result: ResourceInspectionResult
+    calls: list[ResourceInspectionCommand]
+    close_count: int = 0
+
+    def inspect(self, command: ResourceInspectionCommand) -> ResourceInspectionResult:
+        self.calls.append(command)
+        return self.result
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+@dataclass
+class RecordingApplication:
+    result: ResourceInspectionResult
+    calls: list[ResourceInspectionCommand]
+    close_count: int = 0
+
+    def inspect_resources(self, command: ResourceInspectionCommand) -> ResourceInspectionResult:
+        self.calls.append(command)
+        return self.result
+
+    def __enter__(self) -> RecordingApplication:
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.close_count += 1
+
+
+def test_application_services_uses_injected_resource_inspector_and_closes_it() -> None:
+    expected = ResourceInspectionResult(tables=(InspectionTable(("NAME",), (("dev",),)),))
+    inspector = RecordingInspector(expected, [])
+    reader = RecordingSnapshotReader()
+    validator = RecordingValidator()
+    command = ResourceInspectionCommand("environments")
+
+    services = ApplicationServices(reader, validator, inspector)
+
+    assert services.inspect_resources(command) is expected
+    assert inspector.calls == [command]
+    services.close()
+    services.close()
+    assert inspector.close_count == 1
+    assert reader.close_count == 1
+    assert validator.close_count == 1
+
+
+def test_command_get_translates_to_orchestrator_and_renders_its_typed_result(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    expected = ResourceInspectionResult(tables=(InspectionTable(("NAME",), (("dev",),)),))
+    application = RecordingApplication(expected, [])
+    monkeypatch.setattr(composition, "create_default_application", lambda _repository: application)
+    controller.REPOSITORY_ROOT = tmp_path
+    args = controller.build_parser().parse_args(["get", "environments"])
+
+    controller.command_get(args)
+
+    assert application.calls == [ResourceInspectionCommand("environments", output=InspectionOutputFormat.TABLE)]
+    assert application.close_count == 1
+    assert capsys.readouterr().out.splitlines() == ["NAME", "dev"]
+
+
+def test_get_command_keeps_snapshot_selection_as_backend_neutral_hints() -> None:
+    command = ResourceInspectionCommand(
+        "units",
+        environment="dev",
+        desired_reference="desired-channel",
+        desired_snapshot="state-at-time-x",
+    )
+
+    assert command.desired_reference == "desired-channel"
+    assert command.desired_snapshot == "state-at-time-x"
+
+
+class InventoryHandle:
+    """A backend-owned value that must not cross the inspection result port."""
+
+
+def test_inspection_result_rejects_backend_objects_and_exposes_no_mutable_document() -> None:
+    with pytest.raises(TypeError, match="JSON-compatible"):
+        ResourceInspectionResult(document=InventoryHandle())
+    with pytest.raises(TypeError, match="JSON-compatible"):
+        ResourceInspectionResult(document=object())
+
+    source = {"items": [{"name": "original"}]}
+    result = ResourceInspectionResult(document=source)
+    source["items"][0]["name"] = "adapter mutation"
+    first_read = result.document
+    assert first_read == {"items": [{"name": "original"}]}
+
+    assert isinstance(first_read, dict)
+    first_read["items"][0]["name"] = "caller mutation"
+    assert result.document == {"items": [{"name": "original"}]}
+
+
+def test_inspection_table_requires_exact_immutable_tuple_storage() -> None:
+    with pytest.raises(TypeError, match="headers must be a tuple"):
+        InspectionTable(["NAME"], ())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="rows must be a tuple"):
+        InspectionTable(("NAME",), [])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="header width"):
+        InspectionTable(("NAME",), (("one", "two"),))
