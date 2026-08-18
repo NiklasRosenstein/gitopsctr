@@ -135,7 +135,7 @@ materialization descriptors while replacing only the source identity. Carry forw
 was resolved, and apply may update a downstream unit while its upstream receipt is stale. The blockage remains
 visible in the log as `CARRY`.
 
-The refreshed desired unit is a real desired-state change. Its source revision changes the unit blob, so the old receipt is
+The refreshed desired unit is a real desired-state change. Its source revision changes the Unit's logical entry `ContentId`, so the old receipt is
 stale and is never silently rebound; the downstream unit may perform a no-op reconciliation using the carried snapshot. Once
 the upstream receipt is current, a later application resolves the downstream unit again and replaces the carried-forward
 dependency fingerprints. Dependency-aware convergence still selects the stale upstream unit first.

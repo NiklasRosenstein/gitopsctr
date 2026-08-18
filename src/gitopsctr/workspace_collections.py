@@ -50,7 +50,6 @@ class WorkspaceCollectionReadContext:
     placement: ResourcePlacement
     api_kinds: Mapping[GVK, ApiKind[object]]
     contracts: Mapping[GVK, TypedDocumentContract[object]]
-    blob_ids: Mapping[PurePosixPath, str]
     selection: ResourceSelection | None = None
 
 
@@ -102,7 +101,7 @@ def discover_workspace_collection(
                 gvk,
                 name,
                 parsed,
-                context.blob_ids.get(path),
+                str(context.workspace.entry_content_ids()[key]),
                 f"sha256:{hashlib.sha256(raw).hexdigest()}",
                 media_type,
                 local_identity,

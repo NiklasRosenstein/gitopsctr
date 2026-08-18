@@ -180,7 +180,7 @@ def test_observation_reference_materializes_artifact_into_consumer(tmp_path):
         receipt_document(
             "oci-images",
             "application-images",
-            {"unitBlob": deploy_release.file_blob(producer)},
+            {"unitContentId": deploy_release.unit_content_id(candidate, producer)},
             artifacts={
                 "containers": {
                     "apiVersion": "artifact.gitopsctr.io/v1",
@@ -261,7 +261,7 @@ def test_receipt_reference_normalizes_resource_receipt_before_applying_pointer(t
             receipt_document(
                 "terraform",
                 "infrastructure",
-                {"revision": "d" * 40, "unitBlob": deploy_release.file_blob(producer)},
+                {"revision": "d" * 40, "unitContentId": deploy_release.unit_content_id(candidate, producer)},
                 {"applied": {"sourceRevision": "a" * 40}, "outputs": {"url": "https://example.invalid"}},
                 resolved_inputs={},
                 controller={

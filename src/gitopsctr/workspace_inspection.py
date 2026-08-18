@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Protocol
 
+from gitopsctr.application.model import ContentId
 from gitopsctr.application.snapshots import SnapshotId
 from gitopsctr.application.workspace import ImmutableWorkspace, WorkspaceEntryKind
 from gitopsctr.formats import Project
@@ -18,7 +19,7 @@ class WorkspaceSnapshot:
     """Exact logical content selected for one plane.
 
     ``snapshot_id`` is an opaque read identity, not a compare-and-swap fence.
-    ``content_ids`` retain raw-content provenance without exposing a filesystem.
+    ``content_ids`` retain the per-entry logical identities of the workspace.
     """
 
     plane: ResourcePlane
@@ -26,7 +27,7 @@ class WorkspaceSnapshot:
     revision: str | None
     snapshot_id: SnapshotId | None
     workspace: ImmutableWorkspace
-    content_ids: Mapping[str, str]
+    content_ids: Mapping[str, ContentId]
 
     def __post_init__(self) -> None:
         if not isinstance(self.plane, ResourcePlane):
@@ -40,15 +41,18 @@ class WorkspaceSnapshot:
 
         entries = self.workspace.list_entries()
         files = {entry.key for entry in entries if entry.kind is WorkspaceEntryKind.FILE}
-        copied: dict[str, str] = {}
+        expected_content_ids = self.workspace.entry_content_ids()
+        copied: dict[str, ContentId] = {}
         for key, value in self.content_ids.items():
             if not isinstance(key, str) or not key:
                 raise TypeError("workspace snapshot content provenance keys must be non-empty strings")
-            if not isinstance(value, str) or not value:
-                raise TypeError("workspace snapshot content provenance values must be non-empty strings")
+            if not isinstance(value, ContentId):
+                raise TypeError("workspace snapshot content provenance values must be ContentId instances")
             if key not in files:
                 raise ValueError("workspace snapshot provenance must name a logical file")
             copied[key] = value
+        if copied != dict(expected_content_ids):
+            raise ValueError("workspace snapshot provenance must equal its logical entry identities")
 
         if self.plane is ResourcePlane.SOURCE:
             if self.reference is not None or self.revision is not None or self.snapshot_id is not None:

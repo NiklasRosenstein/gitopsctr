@@ -15,7 +15,7 @@ spec:
     name: infrastructure
     qualifiedName: infrastructure
   desired:
-    unitBlob: 0123456789abcdef0123456789abcdef01234567
+    unitContentId: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
   resolvedInputs: {}
 status:
   controller: {}
@@ -26,7 +26,7 @@ status:
       api_url: https://api.example.test
 ```
 
-`spec.subject` identifies the unit kind, `spec.desired.unitBlob` binds the receipt to the serialized desired unit, and
+`spec.subject` identifies the unit kind, `spec.desired.unitContentId` binds the receipt to the exact logical desired unit entry, and
 `spec.resolvedInputs` records the reference fingerprints used by that unit. `status.result` follows the subject
 driver's typed result contract. Drivers that publish artifacts also add descriptors under `status.artifacts`.
 `spec.subject.qualifiedName` persists the operator address that was authenticated when the Receipt was written. It is
@@ -38,7 +38,7 @@ the Unit's local name in `metadata.name`.
 
 A Receipt is a separately stored observed resource, not the `status` field of its desired Unit. The two resources may
 come from different Git revisions, and a desired Unit may have a current Receipt, a stale Receipt for an older Unit
-blob, or no Receipt. Conversely, deleting a desired Unit can leave an orphaned Receipt in a selected observed
+logical entry `ContentId`, or no Receipt. Conversely, deleting a desired Unit can leave an orphaned Receipt in a selected observed
 snapshot.
 
 The default Unit table makes this relationship convenient without hiding it:
@@ -60,7 +60,7 @@ exact persisted Unit and Receipt documents; neither command synthesizes the Rece
 ```mermaid
 flowchart LR
   reference["fromReceipt<br/>unit + pointer"] --> receipt["Observed receipt<br/>units/&lt;unit&gt;"]
-  desired["Current desired unit<br/>units/&lt;unit&gt;"] --> freshness{"unitBlob matches?"}
+  desired["Current desired unit<br/>units/&lt;unit&gt;"] --> freshness{"unitContentId matches?"}
   receipt --> freshness
   freshness -->|yes| result["Validate typed<br/>status.result"]
   result --> pointer["Apply JSON Pointer"]
@@ -69,7 +69,7 @@ flowchart LR
 For `fromReceipt: {unit: infrastructure, pointer: /outputs/api_url}`, gitopsctr:
 
 1. Loads `units/infrastructure.*` from the current desired and observed trees.
-2. Requires the receipt's `spec.desired.unitBlob` to match the current desired unit blob.
+2. Requires the receipt's `spec.desired.unitContentId` to match the current desired unit logical content ID.
 3. Validates the receipt and its `status.result` against the Terraform receipt profile.
 4. Applies `/outputs/api_url` relative to `status.result` and fingerprints the receipt blob.
 

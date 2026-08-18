@@ -121,7 +121,7 @@ def render_resource_model(registry: ResourceRegistry) -> str:
         [
             "",
             "A Receipt is therefore a separately stored observation of a desired Unit. A missing Receipt is allowed;",
-            "matching `unitBlob` evidence is current, a different blob is stale, and more than one Receipt for the same",
+            "matching `unitContentId` evidence is current, a different logical content ID is stale, and more than one Receipt for the same",
             "subject violates the declared cardinality.",
             "",
             "## Artifact description relationships",

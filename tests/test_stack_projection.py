@@ -782,7 +782,7 @@ def test_stack_projection_wait_stages_ready_units_then_durable_evidence_switches
     receipt = receipt_resource(
         "terraform",
         "producer",
-        {"revision": first_revision, "unitBlob": controller.file_blob(producer_path)},
+        {"revision": first_revision, "unitContentId": controller.unit_content_id(second_root, producer_path)},
         result={"applied": {"sourceRevision": first_revision}, "outputs": {"value": "evidence"}},
     )
     controller.write_document(
@@ -855,7 +855,7 @@ def test_stack_source_update_stages_changed_producer_before_its_stale_receipt_co
     receipt = receipt_resource(
         "terraform",
         "web/image",
-        {"revision": first_revision, "unitBlob": controller.file_blob(image_path)},
+        {"revision": first_revision, "unitContentId": controller.unit_content_id(first_root, image_path)},
         result={"applied": {"sourceRevision": first_revision}, "outputs": {"value": "image-v1"}},
     )
     controller.write_document(
@@ -916,7 +916,7 @@ def test_durable_projection_progresses_saved_context_groups_cumulatively(
             receipt = receipt_resource(
                 "terraform",
                 producer,
-                {"revision": published, "unitBlob": controller.file_blob(producer_path)},
+                {"revision": published, "unitContentId": controller.unit_content_id(root, producer_path)},
                 result={"applied": {"sourceRevision": published}, "outputs": {"value": producer}},
             )
             controller.write_document(

@@ -82,9 +82,9 @@ whose name/UID/content-digest binding selects that template. `PARTITION` follows
 membership; `PARAMETERS` and `UNITS` are counts. These relationship and child observation facts are evaluated against
 the selected desired and observed snapshots at read time.
 
-For Units, `DESIRED` is the short Git blob identity of that exact persisted Unit document—the same identity used by a
-Receipt's freshness binding. It is intentionally per-resource rather than repeating the desired snapshot commit on
-every row.
+For Units, `DESIRED` is the shortened logical entry `ContentId` of that exact persisted Unit document—the same
+identity used by a Receipt's freshness binding. It is intentionally per-resource rather than repeating the desired
+snapshot commit on every row.
 
 Every environment-scoped table includes `PARTITION`. Desired resources resolve it through their UID-fenced ownership
 chain; Receipts and Artifacts inherit it from the exact desired Unit authenticated by their registered relationships.

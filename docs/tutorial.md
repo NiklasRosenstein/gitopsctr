@@ -72,8 +72,8 @@ $ cd .docker-demo-state/repository
 $ uv run gitopsctr get all --environment dev
 UNITS
 NAME                 KIND       PARTITION    DESIRED       OBSERVATION  RECONCILIATION  REASON
-application/deploy  Terraform  application  <blob>        CURRENT      CLEAN           observation matches desired state
-application/image   OciImages  application  <blob>        CURRENT      CLEAN           observation matches desired state
+application/deploy  Terraform  application  <content-id>  CURRENT      CLEAN           observation matches desired state
+application/image   OciImages  application  <content-id>  CURRENT      CLEAN           observation matches desired state
 
 ...
 
