@@ -2,6 +2,9 @@
 
 Status: phase 0 inventory captured alongside `PORTS_ADAPTERS.md`.
 
+The executable-behavior evidence and remaining backend-neutral acceptance gaps
+are tracked in `PORTS_ADAPTERS_CONFORMANCE.md`.
+
 This document records where the current implementation crosses the target
 architecture boundaries. It is an inventory, not a promise to preserve the
 current module layout or interfaces. Each category names its intended migration
