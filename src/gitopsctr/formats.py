@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import yaml
 from jsonschema import Draft202012Validator
@@ -21,6 +24,9 @@ CANDIDATE_REF_TEMPLATE_PATTERN = (
     r"(?:[^{}]|\{environment\}|\{id\}|\{operation\})*$"
 )
 EFFECT_LEASE_REF_TEMPLATE_PATTERN = r"^(?:[^{}]|\{environment\}|\{unit\})+$"
+PUBLICATION_AUTHORITY_ID_PATTERN = r"^[a-z0-9](?:[a-z0-9._/-]{0,251}[a-z0-9])?$"
+PUBLICATION_AUTHORITY_KEY_ID_PATTERN = r"^[a-z0-9](?:[a-z0-9._/-]{0,126}[a-z0-9])?$"
+ED25519_PUBLIC_KEY_PATTERN = r"^[A-Za-z0-9_-]{43}$"
 
 PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -125,6 +131,44 @@ PROJECT_RESOURCE_SCHEMA: dict[str, Any] = {
                     },
                     "additionalProperties": False,
                 },
+                "publicationAuthority": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"const": "controlled"},
+                        "endpoint": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": (
+                                "HTTPS endpoint for a controlled gitopsctr publication authority. "
+                                "This is not inferred from the Git origin."
+                            ),
+                        },
+                        "authorityId": {
+                            "type": "string",
+                            "pattern": PUBLICATION_AUTHORITY_ID_PATTERN,
+                            "description": "Stable authority identity required during the capability handshake.",
+                        },
+                        "verificationKey": {
+                            "type": "object",
+                            "properties": {
+                                "algorithm": {"const": "ed25519"},
+                                "keyId": {
+                                    "type": "string",
+                                    "pattern": PUBLICATION_AUTHORITY_KEY_ID_PATTERN,
+                                },
+                                "publicKey": {
+                                    "type": "string",
+                                    "pattern": ED25519_PUBLIC_KEY_PATTERN,
+                                    "description": "Unpadded base64url-encoded 32-byte Ed25519 public key.",
+                                },
+                            },
+                            "required": ["algorithm", "keyId", "publicKey"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "required": ["type", "endpoint", "authorityId", "verificationKey"],
+                    "additionalProperties": False,
+                },
                 "effectLease": {
                     "oneOf": [
                         {"type": "null"},
@@ -221,6 +265,23 @@ class SourceRevisionPolicy:
 
 
 @dataclass(frozen=True)
+class AuthorityVerificationKey:
+    """Pinned Ed25519 verification key for portable authority evidence."""
+
+    key_id: str
+    public_key: str
+
+
+@dataclass(frozen=True)
+class ControlledPublicationAuthority:
+    """Explicit endpoint and expected identity for one controlled authority."""
+
+    endpoint: str
+    authority_id: str
+    verification_key: AuthorityVerificationKey
+
+
+@dataclass(frozen=True)
 class Project:
     name: str
     write_format: DocumentFormat = DocumentFormat.YAML
@@ -229,6 +290,7 @@ class Project:
     environment_defaults: EnvironmentDefaults = EnvironmentDefaults()
     source_revision_policy: SourceRevisionPolicy = SourceRevisionPolicy()
     effect_lease_store: EffectLeaseBranch | None = None
+    publication_authority: ControlledPublicationAuthority | None = None
 
 
 def project_config_path(root: Path) -> Path:
@@ -273,6 +335,58 @@ def validate_project_document(value: object, path: Path | PurePosixPath) -> Proj
     environment_defaults_document = cast(dict[str, Any], specification.get("environmentDefaults", {}))
     refs_document = cast(dict[str, Any], environment_defaults_document.get("refs", {}))
     source_revision_policy_document = cast(dict[str, Any], specification.get("sourceRevisionPolicy", {}))
+    publication_authority_document = cast(dict[str, Any] | None, specification.get("publicationAuthority"))
+    publication_authority: ControlledPublicationAuthority | None = None
+    if publication_authority_document is not None:
+        endpoint = cast(str, publication_authority_document["endpoint"])
+        try:
+            parsed_endpoint = urlsplit(endpoint)
+            endpoint_host = parsed_endpoint.hostname
+            _endpoint_port = parsed_endpoint.port
+        except ValueError as exc:
+            raise DocumentFormatError(
+                f"invalid project config {path}: publicationAuthority.endpoint must be a canonical HTTPS URL"
+            ) from exc
+        if (
+            endpoint != endpoint.strip()
+            or any(ord(character) <= 0x20 or ord(character) == 0x7F for character in endpoint)
+            or "\\" in endpoint
+            or parsed_endpoint.scheme != "https"
+            or not parsed_endpoint.netloc
+            or endpoint_host is None
+            or parsed_endpoint.username is not None
+            or parsed_endpoint.password is not None
+            or parsed_endpoint.query
+            or parsed_endpoint.fragment
+        ):
+            raise DocumentFormatError(
+                f"invalid project config {path}: publicationAuthority.endpoint must be an HTTPS URL "
+                "without credentials, query, or fragment"
+            )
+        verification_key_document = cast(dict[str, Any], publication_authority_document["verificationKey"])
+        public_key = cast(str, verification_key_document["publicKey"])
+        try:
+            decoded_public_key = base64.b64decode(public_key + "=", altchars=b"-_", validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise DocumentFormatError(
+                f"invalid project config {path}: publicationAuthority.verificationKey.publicKey is invalid"
+            ) from exc
+        if (
+            len(decoded_public_key) != 32
+            or base64.urlsafe_b64encode(decoded_public_key).decode().rstrip("=") != public_key
+        ):
+            raise DocumentFormatError(
+                f"invalid project config {path}: publicationAuthority.verificationKey.publicKey must be "
+                "canonical unpadded base64url Ed25519 key bytes"
+            )
+        publication_authority = ControlledPublicationAuthority(
+            endpoint=endpoint.rstrip("/"),
+            authority_id=cast(str, publication_authority_document["authorityId"]),
+            verification_key=AuthorityVerificationKey(
+                key_id=cast(str, verification_key_document["keyId"]),
+                public_key=public_key,
+            ),
+        )
     effect_lease_document = specification["effectLease"]
     effect_lease_store: EffectLeaseBranch | None = None
     if effect_lease_document is not None:
@@ -308,6 +422,7 @@ def validate_project_document(value: object, path: Path | PurePosixPath) -> Proj
             ),
         ),
         effect_lease_store=effect_lease_store,
+        publication_authority=publication_authority,
     )
 
 

@@ -17,6 +17,7 @@ classifiers = [
   "Topic :: Software Development :: Build Tools",
 ]
 dependencies = [
+    "cryptography>=45",
     "dulwich>=0.25.2",
     "jsonschema>=4.25",
     "mashumaro>=3.17",

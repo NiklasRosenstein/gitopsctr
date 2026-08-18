@@ -6,13 +6,23 @@ import glob as globlib
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Protocol, cast
 
 from gitopsctr.adapters.git.snapshots import GitSnapshotReader
 from gitopsctr.adapters.git.workspace_planes import GitWorkspacePlaneProvider
+from gitopsctr.application.model import SnapshotId
+from gitopsctr.application.snapshots import SnapshotView
 from gitopsctr.application.status import StatusCommand, StatusEntry, StatusExplanation, StatusResult, StatusState
 from gitopsctr.formats import parse_document_bytes
 from gitopsctr.resource_model import ResourceRegistry
+from gitopsctr.workspace_inspection import WorkspacePlaneProvider
 from gitopsctr.workspace_status import status_workspace_provider
+
+
+class GitHistorySnapshotReader(Protocol):
+    def open_snapshot(self, snapshot_id: SnapshotId) -> SnapshotView: ...
+
+    def snapshot_id_for_revision(self, revision: str) -> SnapshotId: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,16 +30,25 @@ class GitStatusInspector:
     """Run status against exact Git workspaces selected for one command."""
 
     repository_root: Path
-    snapshot_reader: GitSnapshotReader
+    snapshot_reader: GitHistorySnapshotReader
     registry: ResourceRegistry
 
     def close(self) -> None:
         """Each request owns only a lightweight workspace provider."""
 
     def status(self, command: StatusCommand) -> StatusResult:
-        result = status_workspace_provider(
-            GitWorkspacePlaneProvider(self.repository_root, self.snapshot_reader), self.registry, command
+        return self.status_with_provider(
+            GitWorkspacePlaneProvider(
+                self.repository_root,
+                cast(GitSnapshotReader, self.snapshot_reader),
+            ),
+            command,
         )
+
+    def status_with_provider(self, provider: WorkspacePlaneProvider, command: StatusCommand) -> StatusResult:
+        """Run shared Git-shaped explanations over an injected logical plane provider."""
+
+        result = status_workspace_provider(provider, self.registry, command)
         if result.desired_revision is None or result.observed_revision is None:
             return result
         desired = self.snapshot_reader.open_snapshot(

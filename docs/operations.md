@@ -168,6 +168,64 @@ roots are its complete membership: members omitted from that application begin d
 unpartitioned roots are untouched. Without `--partition`, apply updates only the named inputs; an existing root keeps
 its partition, while a new root is unpartitioned. Owned resources inherit selection through `ownerReferences`.
 
+### Publication authority
+
+By default, a write operation uses a local bare Git `origin` as its publication authority. The authority performs the
+desired-branch update, private authority update, publication journal update, source-retention ownership changes, and
+coordination changes as one server-side transaction. A normal hosted Git URL is not treated as an authority merely
+because it is the repository's `origin`; writes fail closed when no supported authority is configured.
+
+A deployment with a controlled shared authority declares it explicitly in the Project:
+
+```yaml
+apiVersion: gitopsctr.io/v1
+kind: Project
+metadata:
+  name: example
+spec:
+  publicationAuthority:
+    type: controlled
+    endpoint: https://authority.example.com/gitopsctr
+    authorityId: example/production
+    verificationKey:
+      algorithm: ed25519
+      keyId: production-2026
+      publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+```
+
+The endpoint is a gitopsctr authority service with server-side transaction support, not a Git remote or a command to
+execute. `authorityId` is the expected stable service identity. The pinned Ed25519 public key authenticates the
+versioned handshake and every portable result or capability returned by the service; the corresponding private key
+remains on the service and must never be placed in the Project or client configuration. Key rotation is an explicit
+Project change.
+
+The controlled authority owns shared durable candidate storage and source retention, and exposes the same accepted
+desired snapshots to read operations. It must advertise those capabilities and matching stable store identities
+during the authenticated handshake. A missing capability, identity mismatch, invalid signature, or unavailable
+endpoint fails closed. Ordinary GitHub or GitLab origins therefore remain read-only for publication unless a separate
+controlled authority endpoint is configured.
+
+Client authentication is operator-owned and is never read from the Project or environment variables. The default CLI
+loads an mTLS identity from local, unversioned Git configuration:
+
+```console
+git config --local gitopsctr.authority.clientCertificate /absolute/path/client.pem
+git config --local gitopsctr.authority.clientKey /absolute/path/client.key
+git config --local gitopsctr.authority.caBundle /absolute/path/authority-ca.pem
+git config --local gitopsctr.authority.clientIdentity ci-production
+```
+
+The certificate and key are required; `caBundle` is optional when the system trust store already authenticates the
+authority. Credential paths must be absolute, canonical regular files with no symbolic links. The private key must
+not be readable or writable by group or other users. Missing or unsafe credentials fail before any authority
+handshake or upload.
+
+The HTTPS boundary passes the authenticated client identity to the authority host, which checks an operator-managed
+principal allowlist before dispatch. The allowlist and the server's source-repository registry are host configuration,
+not Project fields. A source upload is retained only after the host resolves the claimed exact Git commit from the
+registered `SourceId` and compares the full logical workspace and content identity. Unknown repositories and
+caller-asserted source payloads fail closed.
+
 Deletion is a two-phase lifecycle. `delete` and partition omission publish UID-/digest-fenced deletion intent only;
 they do not run external teardown. Reconcile a deleting Unit or run `converge` to let the controller process deleting
 resources child/dependent-first, perform idempotent teardown, record observed evidence, and publish the cleanup

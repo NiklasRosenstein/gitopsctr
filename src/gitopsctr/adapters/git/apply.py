@@ -319,8 +319,14 @@ class GitApplySourceEvidenceProvider:
                 self.lineage_registry.register(external_source_id, canonical_repository)
                 selected = external_selected.get((external_source_id, external_binding.revision))
                 if selected is None and _EXACT_GIT_REVISION.fullmatch(external_binding.revision) is not None:
-                    retained_snapshot = GitSourceRetentionStore(self.retention_root).retained_snapshot(
-                        SourceSnapshotId(external_source_id, SnapshotId(f"git-source:{external_binding.revision}"))
+                    source_snapshot_id = SourceSnapshotId(
+                        external_source_id, SnapshotId(f"git-source:{external_binding.revision}")
+                    )
+                    retained_lookup = getattr(self.source_repository, "retained_snapshot", None)
+                    retained_snapshot = (
+                        retained_lookup(source_snapshot_id)
+                        if callable(retained_lookup)
+                        else GitSourceRetentionStore(self.retention_root).retained_snapshot(source_snapshot_id)
                     )
                     if retained_snapshot is not None:
                         retained, snapshot = retained_snapshot
@@ -339,7 +345,11 @@ class GitApplySourceEvidenceProvider:
                         external = GitSourceRepository.from_path(external_source_id, checkout, self.retention_root)
                         try:
                             snapshot = external.resolve(SourceRequest(external_source_id, external_binding.revision))
-                            retained = external.retain(snapshot)
+                            retained = (
+                                self.source_repository.retain(snapshot)
+                                if getattr(self.source_repository, "accepts_external_sources", False) is True
+                                else external.retain(snapshot)
+                            )
                         finally:
                             external.close()
                     additional.append(retained)

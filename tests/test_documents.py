@@ -123,6 +123,67 @@ def test_project_ref_template_contract(tmp_path: Path, field: str, template: str
         assert config.environment_defaults.refs.candidate == "gitopsctr/candidates/{environment}/{id}"
 
 
+def test_project_configures_a_pinned_controlled_publication_authority(tmp_path: Path):
+    specification = {
+        "publicationAuthority": {
+            "type": "controlled",
+            "endpoint": "https://authority.example.invalid/gitopsctr/",
+            "authorityId": "acme/production",
+            "verificationKey": {
+                "algorithm": "ed25519",
+                "keyId": "production-2026",
+                "publicKey": "A" * 43,
+            },
+        }
+    }
+    (tmp_path / "gitopsctr.yaml").write_text(project_document(spec=json.dumps(specification)))
+
+    authority = load_project_config(tmp_path).publication_authority
+
+    assert authority is not None
+    assert authority.endpoint == "https://authority.example.invalid/gitopsctr"
+    assert authority.authority_id == "acme/production"
+    assert authority.verification_key.key_id == "production-2026"
+    assert authority.verification_key.public_key == "A" * 43
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("endpoint", "http://authority.example.invalid", "HTTPS URL"),
+        ("endpoint", "https://user@authority.example.invalid", "HTTPS URL"),
+        ("endpoint", "https://authority.example.invalid?store=other", "HTTPS URL"),
+        ("endpoint", "https://authority.example.invalid ", "HTTPS URL"),
+        ("endpoint", "https://authority.example.invalid\\other", "HTTPS URL"),
+        ("endpoint", "https://[::1", "canonical HTTPS URL"),
+        ("authorityId", "Uppercase", "authorityId"),
+        ("keyId", "Uppercase", "keyId"),
+        ("publicKey", "A" * 42, "publicKey"),
+        ("publicKey", "_" * 43, "canonical unpadded base64url"),
+    ],
+)
+def test_project_rejects_untrusted_publication_authority_configuration(
+    tmp_path: Path, field: str, value: str, message: str
+):
+    authority = {
+        "type": "controlled",
+        "endpoint": "https://authority.example.invalid/gitopsctr",
+        "authorityId": "acme/production",
+        "verificationKey": {
+            "algorithm": "ed25519",
+            "keyId": "production-2026",
+            "publicKey": "A" * 43,
+        },
+    }
+    target = authority["verificationKey"] if field in {"keyId", "publicKey"} else authority
+    assert isinstance(target, dict)
+    target[field] = value
+    (tmp_path / "gitopsctr.yaml").write_text(project_document(spec=json.dumps({"publicationAuthority": authority})))
+
+    with pytest.raises(DocumentFormatError, match=message):
+        load_project_config(tmp_path)
+
+
 def test_project_resource_schema_is_published_and_deterministic():
     schema = schemas.project_resource_schema()
     Draft202012Validator.check_schema(schema)

@@ -113,6 +113,54 @@
           "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$",
           "type": "string"
         },
+        "publicationAuthority": {
+          "additionalProperties": false,
+          "properties": {
+            "authorityId": {
+              "description": "Stable authority identity required during the capability handshake.",
+              "pattern": "^[a-z0-9](?:[a-z0-9._/-]{0,251}[a-z0-9])?$",
+              "type": "string"
+            },
+            "endpoint": {
+              "description": "HTTPS endpoint for a controlled gitopsctr publication authority. This is not inferred from the Git origin.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "controlled"
+            },
+            "verificationKey": {
+              "additionalProperties": false,
+              "properties": {
+                "algorithm": {
+                  "const": "ed25519"
+                },
+                "keyId": {
+                  "pattern": "^[a-z0-9](?:[a-z0-9._/-]{0,126}[a-z0-9])?$",
+                  "type": "string"
+                },
+                "publicKey": {
+                  "description": "Unpadded base64url-encoded 32-byte Ed25519 public key.",
+                  "pattern": "^[A-Za-z0-9_-]{43}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "algorithm",
+                "keyId",
+                "publicKey"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "type",
+            "endpoint",
+            "authorityId",
+            "verificationKey"
+          ],
+          "type": "object"
+        },
         "sourceRevisionPolicy": {
           "additionalProperties": false,
           "properties": {
