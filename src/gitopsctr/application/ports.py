@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from gitopsctr.application.apply import ApplyCommand, ApplyResult, AuthoredChangeSet
 from gitopsctr.application.dependencies import DependencyCommand, DependencyResult
 from gitopsctr.application.inspection import ResourceInspectionCommand, ResourceInspectionResult
 from gitopsctr.application.model import (
@@ -14,6 +15,8 @@ from gitopsctr.application.model import (
     EnvironmentId,
     ExecutionIdentity,
     HeadObservation,
+    PublicationIntent,
+    PublicationOutcome,
     SnapshotId,
     SnapshotInspectionCommand,
     SnapshotInspectionResult,
@@ -44,6 +47,16 @@ class ChannelReader(Protocol):
 
     def resolve_head(self, channel_id: ChannelId) -> HeadObservation:
         """Return the current presence-or-absence observation for a channel."""
+
+
+class PublicationTransaction(Protocol):
+    """Atomically seal/publish candidate state and transfer source ownership."""
+
+    def execute(self, intent: PublicationIntent) -> PublicationOutcome:
+        """Commit only when every head, ownership, and coordination fence holds."""
+
+    def verify(self, intent: PublicationIntent) -> PublicationOutcome:
+        """Recover proof, definite noncommit, or remaining ambiguity for one intent."""
 
 
 class DeploymentAuthority(Protocol):
@@ -125,6 +138,32 @@ class DependencyInspector(Protocol):
         """Release owned resources; repeated calls must be safe."""
 
 
+class ApplyService(Protocol):
+    """Coordinate one typed apply without leaking a source implementation upstream.
+
+    Implementations own source snapshot resolution, retention, candidate
+    workspace creation/sealing, and the all-or-recoverable publication
+    transaction.  The incoming adapter supplies only normalized authored
+    intent and opaque channel/snapshot selections.
+    """
+
+    def apply(self, command: ApplyCommand, changes: AuthoredChangeSet) -> ApplyResult:
+        """Project and publish the change set, or fail without a partial result."""
+
+    def close(self) -> None:
+        """Release owned resources; repeated calls must be safe."""
+
+
+class AuthoredChangeDecoder(Protocol):
+    """Incoming adapter that normalizes every authored-input form once."""
+
+    def decode(self, command: ApplyCommand) -> AuthoredChangeSet:
+        """Decode file, standard-input, or source-snapshot selections."""
+
+    def close(self) -> None:
+        """Release owned resources; repeated calls must be safe."""
+
+
 class Orchestrator(Protocol):
     """The incoming application port for the first typed use cases."""
 
@@ -142,3 +181,6 @@ class Orchestrator(Protocol):
 
     def dependencies(self, command: DependencyCommand) -> DependencyResult:
         """Read one exact source dependency graph."""
+
+    def apply(self, command: ApplyCommand, changes: AuthoredChangeSet) -> ApplyResult:
+        """Project and publish one normalized authored change set."""
