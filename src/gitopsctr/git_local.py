@@ -23,6 +23,27 @@ from gitopsctr.errors import OperationError
 _COMMIT_LENGTH = 40
 
 
+@dataclass(frozen=True)
+class GitTreeEntry:
+    """One recursively listed local Git tree entry and optional raw blob payload.
+
+    The type belongs to the generic local-Git boundary.  Callers remain
+    responsible for deciding which Git modes their own content model supports.
+    """
+
+    path: str
+    mode: int
+    data: bytes | None
+
+
+class GitTreeContentError(OperationError):
+    """A required Git tree path or regular-file blob cannot be read safely."""
+
+
+class GitRepositoryError(OperationError):
+    """The configured local Git repository cannot be opened."""
+
+
 @dataclass
 class DulwichLocalRepository:
     """Semantic local-repository adapter that never invokes the Git executable."""
@@ -36,7 +57,7 @@ class DulwichLocalRepository:
             try:
                 self._repository = Repo(self.root)
             except Exception as exc:
-                raise OperationError(f"could not open Git repository at {self.root}") from exc
+                raise GitRepositoryError(f"could not open Git repository at {self.root}") from exc
         yield self._repository
 
     def refresh(self) -> None:
@@ -46,7 +67,16 @@ class DulwichLocalRepository:
             self._repository.close()
             self._repository = None
 
-    close = refresh
+    def close(self) -> None:
+        """Release the cached local repository handle; repeated calls are safe."""
+
+        self.refresh()
+
+    def __enter__(self) -> DulwichLocalRepository:
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.close()
 
     @staticmethod
     def valid_ref(ref: str) -> bool:
@@ -180,6 +210,46 @@ class DulwichLocalRepository:
                 PurePosixPath(os.fsdecode(entry.path)): entry.sha.decode()
                 for entry in iter_tree_contents(repo.object_store, commit.tree)
             }
+
+    def tree_entries(self, revision: str) -> tuple[GitTreeEntry, ...]:
+        """Read all recursive tree leaves for an exact commit.
+
+        Paths use Git's slash-separated spelling.  Blob payloads are copied
+        into ordinary ``bytes``; non-blob leaves preserve their object type
+        without exposing Dulwich objects or object identifiers to consumers.
+        """
+
+        with self._repo() as repo:
+            commit = self._peel_commit(
+                repo,
+                self._named_object_id(repo, revision, "commit cannot be inspected"),
+                "commit cannot be inspected",
+            )
+            entries: list[GitTreeEntry] = []
+            try:
+                for entry in iter_tree_contents(repo.object_store, commit.tree):
+                    try:
+                        path = entry.path.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise GitTreeContentError("Git tree contains a path that is not UTF-8") from exc
+                    # A gitlink, symlink, or other non-regular mode must be handed
+                    # to the consuming content model without reading its target.
+                    # In particular, a gitlink's object can live in another repo.
+                    if stat.S_IFMT(entry.mode) != stat.S_IFREG:
+                        entries.append(GitTreeEntry(path, entry.mode, None))
+                        continue
+                    try:
+                        value = repo.get_object(entry.sha)
+                    except Exception as exc:
+                        raise GitTreeContentError(f"Git tree cannot read regular-file blob: {path}") from exc
+                    if not isinstance(value, Blob):
+                        raise GitTreeContentError(f"Git tree regular-file entry is not a blob: {path}")
+                    entries.append(GitTreeEntry(path, entry.mode, bytes(value.data)))
+            except GitTreeContentError:
+                raise
+            except Exception as exc:
+                raise GitTreeContentError("Git tree cannot be enumerated safely") from exc
+            return tuple(entries)
 
     def write_tree(self, directory: Path) -> str:
         files = sorted(path for path in directory.rglob("*") if path.is_file())

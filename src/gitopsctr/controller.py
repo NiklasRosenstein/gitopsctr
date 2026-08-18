@@ -35,6 +35,14 @@ from typing import Any, Literal, TextIO, cast
 import yaml
 
 from gitopsctr import operational
+from gitopsctr.application import (
+    EnvironmentId,
+    ValidateCommand,
+    ValidationFailFastError,
+    ValidationIssue,
+    ValidationResult,
+    ValidationSubject,
+)
 from gitopsctr.artifacts import require_artifact_api
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
@@ -12596,31 +12604,129 @@ def command_create_unit(args: argparse.Namespace) -> None:
     _print_created(written)
 
 
+class AuthoredPathViolation(ValueError):
+    """An authored path cannot be read without crossing the repository boundary."""
+
+
 @dataclass(frozen=True)
-class ValidationIssue:
-    target: str
-    detail: str
+class AuthoredPathPolicy:
+    """Reject every authored symlink and every path outside one fixed root.
+
+    Phase 2 intentionally rejects even in-root symlinks.  That gives authored
+    validation one simple, fail-closed policy until decoding consumes logical
+    workspaces instead of host filesystem paths.
+    """
+
+    root: Path
+
+    @classmethod
+    def from_repository(cls, repository_root: Path) -> AuthoredPathPolicy:
+        lexical_root = repository_root.absolute()
+        try:
+            if lexical_root.is_symlink():
+                raise AuthoredPathViolation("authored repository root must not be a symbolic link")
+            resolved_root = lexical_root.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise AuthoredPathViolation(f"could not resolve authored repository root safely: {exc}") from exc
+        return cls(resolved_root)
+
+    def ensure(self, path: Path, description: str) -> Path:
+        lexical_path = path.absolute()
+        try:
+            relative = lexical_path.relative_to(self.root)
+        except ValueError as exc:
+            raise AuthoredPathViolation(f"{description} escapes the repository root") from exc
+
+        current = self.root
+        try:
+            for segment in relative.parts:
+                current /= segment
+                if current.is_symlink():
+                    raise AuthoredPathViolation(f"{description} must not traverse a symbolic link: {current}")
+            resolved = lexical_path.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise AuthoredPathViolation(f"could not resolve {description} safely: {exc}") from exc
+        if not resolved.is_relative_to(self.root):
+            raise AuthoredPathViolation(f"{description} escapes the repository root")
+        return lexical_path
 
 
 class ValidationCollector:
-    def __init__(self, fail_fast: bool) -> None:
+    """Collect source-authored validation data into application values."""
+
+    def __init__(self, path_policy: AuthoredPathPolicy, fail_fast: bool) -> None:
+        self.path_policy = path_policy
+        self.repository_root = path_policy.root
         self.fail_fast = fail_fast
         self.issues: list[ValidationIssue] = []
-        self.documents: set[Path] = set()
-        self.environments: set[str] = set()
+        self.documents: set[str] = set()
+        self.environments: set[EnvironmentId] = set()
+
+    def logical_label(self, target: Path | str) -> str:
+        if isinstance(target, str):
+            return target
+        lexical_target = target.absolute()
+        try:
+            return lexical_target.relative_to(self.repository_root).as_posix()
+        except ValueError:
+            return str(target)
 
     def invalid(self, target: Path | str, exc: Exception | str) -> None:
         detail = str(exc)
-        label = str(target)
+        label = self.logical_label(target)
+        issue = ValidationIssue(ValidationSubject(label), detail)
         if self.fail_fast:
-            raise OperationError(f"{label}: {detail}")
-        self.issues.append(ValidationIssue(label, detail))
+            raise ValidationFailFastError(issue)
+        self.issues.append(issue)
+
+    def authored_path(self, path: Path, description: str) -> Path | None:
+        try:
+            return self.path_policy.ensure(path, description)
+        except AuthoredPathViolation as exc:
+            self.invalid(path, exc)
+            return None
 
     def valid_document(self, path: Path) -> None:
-        self.documents.add(path.resolve())
+        self.documents.add(self.logical_label(path))
+
+    def valid_environment(self, environment: EnvironmentId) -> None:
+        self.environments.add(environment)
+
+    def result(self) -> ValidationResult:
+        return ValidationResult(
+            tuple(self.issues),
+            tuple(sorted(self.documents)),
+            tuple(sorted(self.environments, key=lambda environment: environment.value)),
+        )
+
+
+def _validation_document_candidates(
+    directory: Path, stem: str, collector: ValidationCollector
+) -> tuple[Path, ...] | None:
+    candidates: list[Path] = []
+    for suffix in (".yaml", ".yml", ".json"):
+        path = directory / f"{stem}{suffix}"
+        if collector.authored_path(path, "authored document candidate") is None:
+            return None
+        if path.is_file():
+            candidates.append(path)
+    return tuple(candidates)
+
+
+def _validation_project_candidates(repository_root: Path, collector: ValidationCollector) -> tuple[Path, ...] | None:
+    candidates: list[Path] = []
+    for name in PROJECT_CONFIG_NAMES:
+        path = repository_root / name
+        if collector.authored_path(path, "project document candidate") is None:
+            return None
+        if path.is_file():
+            candidates.append(path)
+    return tuple(candidates)
 
 
 def _validate_project_file(path: Path, collector: ValidationCollector) -> None:
+    if collector.authored_path(path, "project document") is None:
+        return
     try:
         validate_project_document(load_document(path), path)
         collector.valid_document(path)
@@ -12629,6 +12735,8 @@ def _validate_project_file(path: Path, collector: ValidationCollector) -> None:
 
 
 def _validate_environment_file(path: Path, collector: ValidationCollector) -> None:
+    if collector.authored_path(path, "environment document") is None:
+        return
     try:
         environment = normalize_environment_document(load_json(path), path.parent.name)
         validate_document(CORE_CONTRACTS["environment"], environment, f"environment specification {path.parent.name}")
@@ -12638,6 +12746,8 @@ def _validate_environment_file(path: Path, collector: ValidationCollector) -> No
 
 
 def _validate_unit_file(path: Path, collector: ValidationCollector) -> UnitResource[Any] | None:
+    if collector.authored_path(path, "unit document") is None:
+        return None
     try:
         unit = parse_authored_unit_document(load_json(path), path.stem)
         require_unit_specification(unit, path.stem)
@@ -12649,6 +12759,8 @@ def _validate_unit_file(path: Path, collector: ValidationCollector) -> UnitResou
 
 
 def _validate_authored_file(path: Path, collector: ValidationCollector) -> None:
+    if collector.authored_path(path, "authored document") is None:
+        return
     if not path.is_file():
         collector.invalid(path, "file does not exist")
         return
@@ -12662,17 +12774,25 @@ def _validate_authored_file(path: Path, collector: ValidationCollector) -> None:
     if api_version == CORE_API_VERSION and kind == "Project":
         if path.name not in PROJECT_CONFIG_NAMES:
             collector.invalid(path, f"Project resource must use one of: {', '.join(PROJECT_CONFIG_NAMES)}")
-        elif len([path.parent / name for name in PROJECT_CONFIG_NAMES if (path.parent / name).is_file()]) != 1:
+        elif (project_candidates := _validation_project_candidates(path.parent, collector)) is None:
+            return
+        elif len(project_candidates) != 1:
             collector.invalid(path.parent, "multiple Project configuration files exist")
         else:
             _validate_project_file(path, collector)
     elif api_version == CORE_API_VERSION and kind == "Environment":
-        if len(document_candidates(path.parent, "environment")) != 1:
+        environment_candidates = _validation_document_candidates(path.parent, "environment", collector)
+        if environment_candidates is None:
+            return
+        if len(environment_candidates) != 1:
             collector.invalid(path.parent, "multiple document formats exist for environment")
         else:
             _validate_environment_file(path, collector)
     elif api_version == UNIT_API_VERSION:
-        if len(document_candidates(path.parent, path.stem)) != 1:
+        unit_candidates = _validation_document_candidates(path.parent, path.stem, collector)
+        if unit_candidates is None:
+            return
+        if len(unit_candidates) != 1:
             collector.invalid(path.parent / path.stem, f"multiple document formats exist for unit {path.stem}")
         else:
             _validate_unit_file(path, collector)
@@ -12680,18 +12800,27 @@ def _validate_authored_file(path: Path, collector: ValidationCollector) -> None:
         collector.invalid(path, f"unsupported authored resource {api_version}/{kind}")
 
 
-def _validate_environment(environment_name: str, collector: ValidationCollector) -> None:
+def _validate_environment(
+    repository_root: Path, environment_name: EnvironmentId, collector: ValidationCollector
+) -> None:
     if environment_name in collector.environments:
         return
-    collector.environments.add(environment_name)
     try:
-        _resource_name(environment_name, "environment name")
-        environment_root = project_environment_root(REPOSITORY_ROOT, environment_name)
+        _resource_name(environment_name.value, "environment name")
+        project_candidates = _validation_project_candidates(repository_root, collector)
+        if project_candidates is None:
+            return
+        environment_root = project_environment_root(repository_root, environment_name.value)
     except (DocumentFormatError, OperationError) as exc:
-        collector.invalid(environment_name, exc)
+        collector.invalid(environment_name.value, exc)
         return
+    if collector.authored_path(environment_root, "environment directory") is None:
+        return
+    collector.valid_environment(environment_name)
 
-    environment_paths = document_candidates(environment_root, "environment")
+    environment_paths = _validation_document_candidates(environment_root, "environment", collector)
+    if environment_paths is None:
+        return
     if len(environment_paths) != 1:
         collector.invalid(
             environment_root,
@@ -12701,13 +12830,17 @@ def _validate_environment(environment_name: str, collector: ValidationCollector)
         _validate_environment_file(environment_paths[0], collector)
 
     units_root = environment_root / "units"
+    if collector.authored_path(units_root, "units directory") is None:
+        return
     stems = sorted({path.stem for path in units_root.glob("*") if path.suffix in {".json", ".yaml", ".yml"}})
     if not stems:
         return
 
     specifications: dict[str, UnitResource[Any]] = {}
     for stem in stems:
-        paths = document_candidates(units_root, stem)
+        paths = _validation_document_candidates(units_root, stem, collector)
+        if paths is None:
+            continue
         if len(paths) != 1:
             collector.invalid(units_root / stem, f"multiple document formats exist for unit {stem}")
             continue
@@ -12757,43 +12890,103 @@ def _validate_environment(environment_name: str, collector: ValidationCollector)
                 )
 
 
-def command_validate(args: argparse.Namespace) -> None:
-    collector = ValidationCollector(args.fail_fast)
-    file_targets = list(dict.fromkeys(Path(value) for value in args.files))
-    environment_targets = list(dict.fromkeys(args.environment or []))
+def validate_authored_resources(repository_root: Path, command: ValidateCommand) -> ValidationResult:
+    """Validate source-authored resources without rendering or global state.
 
-    if file_targets or environment_targets:
-        for path in file_targets:
-            target = path if path.is_absolute() else REPOSITORY_ROOT / path
-            _validate_authored_file(target.resolve(), collector)
-        for environment_name in environment_targets:
-            _validate_environment(environment_name, collector)
+    This compatibility core remains beside the legacy decoder during phase 2.
+    Its repository dependency is explicit so the source-authored adapter can
+    be replaced without changing the application command or result contract.
+    """
+
+    try:
+        path_policy = AuthoredPathPolicy.from_repository(repository_root)
+    except AuthoredPathViolation as exc:
+        issue = ValidationIssue(ValidationSubject(str(repository_root)), str(exc))
+        if command.fail_fast:
+            raise ValidationFailFastError(issue) from exc
+        return ValidationResult((issue,))
+    repository_root = path_policy.root
+    collector = ValidationCollector(path_policy, command.fail_fast)
+
+    if command.targets or command.environments:
+        for logical_target in command.targets:
+            target = repository_root / logical_target
+            if collector.authored_path(target, "validation target") is None:
+                continue
+            _validate_authored_file(target, collector)
+        for environment_name in command.environments:
+            _validate_environment(repository_root, environment_name, collector)
     else:
+        project_candidates = _validation_project_candidates(repository_root, collector)
+        if project_candidates is None:
+            return collector.result()
         try:
-            project = load_project_config(REPOSITORY_ROOT)
-            project_path = next(
-                REPOSITORY_ROOT / name for name in PROJECT_CONFIG_NAMES if (REPOSITORY_ROOT / name).is_file()
-            )
+            project = load_project_config(repository_root)
+            project_path = next(iter(project_candidates))
             collector.valid_document(project_path)
         except (DocumentFormatError, StopIteration) as exc:
-            collector.invalid(REPOSITORY_ROOT / "gitopsctr.yaml", exc)
+            collector.invalid(repository_root / "gitopsctr.yaml", exc)
             project = None
         if project is not None:
-            environments_root = REPOSITORY_ROOT.joinpath(*project.environments_path.parts)
+            environments_root = repository_root.joinpath(*project.environments_path.parts)
+            if collector.authored_path(environments_root, "environments directory") is None:
+                return collector.result()
             for path in sorted(environments_root.iterdir()) if environments_root.is_dir() else []:
-                if path.is_dir():
-                    _validate_environment(path.name, collector)
+                if path.is_symlink():
+                    collector.authored_path(path, "environment discovery entry")
+                elif path.is_dir():
+                    try:
+                        environment = EnvironmentId(path.name)
+                    except ValueError as exc:
+                        collector.invalid(path.name, exc)
+                    else:
+                        _validate_environment(repository_root, environment, collector)
 
-    if collector.issues:
-        for issue in collector.issues:
-            log_status("INVALID", f"{issue.target}: {issue.detail}")
+    return collector.result()
+
+
+def command_validate(args: argparse.Namespace) -> None:
+    """Translate CLI input, invoke the composed application, and render it."""
+
+    from gitopsctr.composition import create_default_application
+
+    try:
+        logical_targets: list[str] = []
+        repository_root = REPOSITORY_ROOT.absolute()
+        for value in dict.fromkeys(args.files):
+            path = Path(value)
+            if path.is_absolute():
+                try:
+                    logical_target = path.absolute().relative_to(repository_root).as_posix()
+                except ValueError as exc:
+                    raise OperationError("validation target escapes the repository root") from exc
+            else:
+                logical_target = value
+            logical_targets.append(logical_target)
+        command = ValidateCommand(
+            tuple(logical_targets),
+            tuple(EnvironmentId(environment) for environment in dict.fromkeys(args.environment or [])),
+            args.fail_fast,
+        )
+    except (TypeError, ValueError) as exc:
+        raise OperationError(str(exc)) from exc
+    try:
+        with create_default_application(REPOSITORY_ROOT) as application:
+            result = application.validate(command)
+    except ValidationFailFastError as exc:
+        raise OperationError(str(exc)) from exc
+
+    if result.issues:
+        for issue in result.issues:
+            log_status("INVALID", f"{issue.subject}: {issue.message}")
         raise OperationError(
-            f"validation failed with {len(collector.issues)} error{'s' if len(collector.issues) != 1 else ''}"
+            f"validation failed with {len(result.issues)} error{'s' if len(result.issues) != 1 else ''}"
         )
     log_status(
         "VALID",
-        f"{len(collector.documents)} document{'s' if len(collector.documents) != 1 else ''}"
-        f" across {len(collector.environments)} environment{'s' if len(collector.environments) != 1 else ''}",
+        f"{len(result.validated_documents)} document{'s' if len(result.validated_documents) != 1 else ''}"
+        f" across {len(result.validated_environments)} environment"
+        f"{'s' if len(result.validated_environments) != 1 else ''}",
     )
 
 
