@@ -50,8 +50,10 @@ from gitopsctr.application.ports import (
     RuntimeIdentityProvider,
     SnapshotReader,
     SpecificationValidator,
+    StatusInspector,
 )
 from gitopsctr.application.snapshots import SnapshotNotFoundError, SnapshotView
+from gitopsctr.application.status import StatusCommand, StatusEntry, StatusExplanation, StatusResult, StatusState
 from gitopsctr.application.workspace import ImmutableWorkspace
 
 __all__ = [
@@ -91,6 +93,12 @@ __all__ = [
     "SnapshotNotFoundError",
     "SnapshotReader",
     "SpecificationValidator",
+    "StatusCommand",
+    "StatusEntry",
+    "StatusExplanation",
+    "StatusInspector",
+    "StatusResult",
+    "StatusState",
     "SnapshotView",
     "SourceId",
     "SourceOwnershipRequirement",

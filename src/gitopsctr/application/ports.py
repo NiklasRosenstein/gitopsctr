@@ -20,6 +20,7 @@ from gitopsctr.application.model import (
     ValidationResult,
 )
 from gitopsctr.application.snapshots import SnapshotView
+from gitopsctr.application.status import StatusCommand, StatusResult
 
 
 class SnapshotReader(Protocol):
@@ -103,6 +104,16 @@ class ResourceInspector(Protocol):
         """Release owned resources; repeated calls must be safe."""
 
 
+class StatusInspector(Protocol):
+    """Read one coherent environment status through adapter-owned snapshots."""
+
+    def status(self, command: StatusCommand) -> StatusResult:
+        """Return closed status data for the requested environment."""
+
+    def close(self) -> None:
+        """Release owned resources; repeated calls must be safe."""
+
+
 class Orchestrator(Protocol):
     """The incoming application port for the first typed use cases."""
 
@@ -114,3 +125,6 @@ class Orchestrator(Protocol):
 
     def inspect_resources(self, command: ResourceInspectionCommand) -> ResourceInspectionResult:
         """Inspect persisted resources through the configured read adapter."""
+
+    def status(self, command: StatusCommand) -> StatusResult:
+        """Read one coherent environment reconciliation status."""

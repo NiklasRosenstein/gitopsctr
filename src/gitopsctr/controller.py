@@ -40,6 +40,7 @@ from gitopsctr.application import (
     InspectionFilter,
     InspectionOutputFormat,
     ResourceInspectionCommand,
+    StatusCommand,
     ValidateCommand,
     ValidationFailFastError,
     ValidationIssue,
@@ -5057,12 +5058,35 @@ def log_reconciliation_status(
     desired: Path | None = None,
     observed: Path | None = None,
     verbose: bool = False,
+    explanations: Mapping[str, object] | None = None,
 ) -> None:
     log_heading(f"Reconciliation status for {style_environment(environment_name)}")
     for unit_name, status, reason in statuses:
         log_status(status, f"{style_unit(unit_name)}: {reason}")
         if status == "READY" and desired_revision is not None and desired is not None and observed is not None:
             log_unit_change_explanation(unit_name, desired_revision, desired, observed, verbose)
+        explanation = explanations.get(unit_name) if explanations is not None else None
+        if status == "READY" and explanations is not None and explanation is None:
+            log_status("CAUSE", "no prior desired unit is available for comparison")
+        if status == "READY" and explanation is not None:
+            previous_desired = getattr(explanation, "previous_desired_revision", None)
+            previous_source = getattr(explanation, "previous_source_revision", None)
+            current_source = getattr(explanation, "current_source_revision", None)
+            if not isinstance(previous_desired, str):
+                continue
+            log_status(
+                "LAST",
+                f"desired {describe_revision(previous_desired)}; source {describe_revision(previous_source)}",
+            )
+            log_status(
+                "CURRENT",
+                f"desired {describe_revision(desired_revision)}; source {describe_revision(current_source)}",
+            )
+            for cause in getattr(explanation, "causes", ()):
+                log_status("CAUSE", cause)
+            log_bounded_items("COMMIT", getattr(explanation, "commits", ()), verbose, style_commit_evidence)
+            log_bounded_items("FILE", getattr(explanation, "files", ()), verbose)
+            log_bounded_items("FIELD", getattr(explanation, "specification_paths", ()), verbose)
     ready = [unit_name for unit_name, status, _ in statuses if status == "READY"]
     if ready:
         log_status("NEXT", style_units(ready))
@@ -9666,68 +9690,39 @@ def command_status(args: argparse.Namespace) -> None:
             ),
         )
         return
-    desired_ref, observed_ref = deployment_refs(
-        REPOSITORY_ROOT,
-        args.environment,
-        args.desired_ref,
-        args.observed_ref,
+    from gitopsctr.composition import create_default_application
+
+    command = StatusCommand(
+        environment=args.environment,
+        desired_reference=args.desired_ref,
+        desired_snapshot=args.desired_revision,
+        observed_reference=args.observed_ref,
+        observed_snapshot=getattr(args, "observed_revision", None),
+        unit=args.unit,
+        verbose=args.verbose,
     )
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        temporary = Path(temporary_directory)
-        desired = temporary / "desired"
-        observed = temporary / "observed"
-        if args.desired_revision:
-            desired_revision = resolve_ref(desired_ref, args.desired_revision)
-            materialize_revision(desired_revision, desired)
-        else:
-            desired_revision = observed_tree(desired_ref, desired)
-        observed_revision = observed_tree(observed_ref, observed)
-        log_heading(f"Deployment status for {style_environment(args.environment)}")
-        log_status(
-            "DESIRED",
-            f"{style_branch(desired_ref)} at {describe_revision(desired_revision)}"
-            if desired_revision
-            else f"{style_branch(desired_ref)} does not exist",
-        )
-        log_status(
-            "OBSERVED",
-            f"{style_branch(observed_ref)} at {describe_revision(observed_revision)}"
-            if observed_revision
-            else f"{style_branch(observed_ref)} has no receipts yet",
-        )
-        specifications = load_environment_specifications(REPOSITORY_ROOT, args.environment)
-        statuses = reconciliation_statuses(
-            sorted(set(specifications) | set(desired_unit_names(desired))),
-            desired,
-            observed,
-        )
-        desired_resources = load_desired_resource_graph(desired)
-        display_names = {
-            concrete: qualified for qualified, concrete in qualified_unit_name_map(desired_resources).items()
-        }
-        for concrete in set(specifications) | set(desired_unit_names(desired)):
-            display_names.setdefault(concrete, concrete)
-        if args.unit is not None:
-            selector = args.unit
-            concrete = resolve_qualified_unit_values(
-                (selector,), {qualified: concrete for concrete, qualified in display_names.items()}
-            )[0]
-            status_names = {unit_name for unit_name, _status, _reason in statuses}
-            if concrete not in status_names:
-                available = ", ".join(sorted(display_names.get(name, name) for name in status_names)) or "none"
-                raise OperationError(
-                    f"unknown unit {selector!r} for environment {args.environment!r}; available units: {available}"
-                )
-            statuses = [item for item in statuses if item[0] == concrete]
-        display_statuses = [(display_names.get(name, name), status, reason) for name, status, reason in statuses]
-        log_reconciliation_status(
-            args.environment,
-            display_statuses,
-            desired_revision,
-            desired,
-            observed,
-            args.verbose,
-        )
+    with create_default_application(REPOSITORY_ROOT) as application:
+        result = application.status(command)
+    log_heading(f"Deployment status for {style_environment(result.environment)}")
+    log_status(
+        "DESIRED",
+        f"{style_branch(result.desired_reference)} at {describe_revision(result.desired_revision)}"
+        if result.desired_revision
+        else f"{style_branch(result.desired_reference)} does not exist",
+    )
+    log_status(
+        "OBSERVED",
+        f"{style_branch(result.observed_reference)} at {describe_revision(result.observed_revision)}"
+        if result.observed_revision
+        else f"{style_branch(result.observed_reference)} has no receipts yet",
+    )
+    log_reconciliation_status(
+        result.environment,
+        [(entry.name, entry.state.value, entry.reason) for entry in result.entries],
+        result.desired_revision,
+        verbose=command.verbose,
+        explanations={entry.name: entry.explanation for entry in result.entries if entry.explanation is not None},
+    )
 
 
 def command_get(args: argparse.Namespace) -> None:

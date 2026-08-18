@@ -147,7 +147,9 @@ def test_workspace_get_helper_chain_has_no_legacy_inventory_or_plane_import() ->
 
     modules = (
         "adapters/git/workspace_inspection.py",
+        "adapters/git/status.py",
         "workspace_get.py",
+        "workspace_status.py",
         "workspace_inventory.py",
         "workspace_collections.py",
         "workspace_inspection.py",
@@ -186,6 +188,7 @@ def _logical_workspace_path_imports(tree: ast.AST) -> set[str]:
 def test_logical_workspace_modules_cannot_import_filesystem_path_api() -> None:
     modules = (
         "workspace_get.py",
+        "workspace_status.py",
         "workspace_inventory.py",
         "workspace_collections.py",
         "workspace_inspection.py",

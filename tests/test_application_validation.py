@@ -79,6 +79,17 @@ class RecordingResourceInspector:
 
 
 @dataclass
+class RecordingStatusInspector:
+    close_count: int = 0
+
+    def status(self, _command: object) -> object:
+        raise AssertionError("status inspection is not expected")
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+@dataclass
 class RecordingApplication:
     result: ValidationResult
     calls: list[ValidateCommand]
@@ -104,7 +115,8 @@ def test_application_services_uses_its_injected_specification_validator() -> Non
     validator = RecordingValidator(expected, [], [])
     reader = RecordingSnapshotReader()
     inspector = RecordingResourceInspector()
-    services = ApplicationServices(reader, validator, inspector)
+    status = RecordingStatusInspector()
+    services = ApplicationServices(reader, validator, inspector, status)
     orchestrator: Orchestrator = services
 
     assert orchestrator.validate(command) is expected
@@ -114,20 +126,23 @@ def test_application_services_uses_its_injected_specification_validator() -> Non
     assert len(validator.closes) == 1
     assert reader.close_count == 1
     assert inspector.close_count == 1
+    assert status.close_count == 1
 
 
 def test_application_services_context_closes_both_dependencies_after_an_exception() -> None:
     reader = RecordingSnapshotReader()
     validator = RecordingValidator(ValidationResult(), [], [])
     inspector = RecordingResourceInspector()
+    status = RecordingStatusInspector()
 
     with pytest.raises(RuntimeError, match="operation failed"):
-        with ApplicationServices(reader, validator, inspector):
+        with ApplicationServices(reader, validator, inspector, status):
             raise RuntimeError("operation failed")
 
     assert reader.close_count == 1
     assert len(validator.closes) == 1
     assert inspector.close_count == 1
+    assert status.close_count == 1
 
 
 def test_source_authored_validator_returns_logical_counts_and_preserves_invalid_fail_fast_parity(

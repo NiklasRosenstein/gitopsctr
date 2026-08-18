@@ -8,12 +8,17 @@ from pathlib import Path
 import pytest
 
 from gitopsctr import composition, controller
+from gitopsctr.adapters.git.status import GitStatusInspector
 from gitopsctr.application import (
     InspectionOutputFormat,
     InspectionTable,
     ResourceInspectionCommand,
     ResourceInspectionResult,
     SnapshotId,
+    StatusCommand,
+    StatusEntry,
+    StatusResult,
+    StatusState,
     ValidationResult,
 )
 from gitopsctr.application.services import ApplicationServices
@@ -57,6 +62,20 @@ class RecordingInspector:
 
 
 @dataclass
+class RecordingStatusInspector:
+    result: StatusResult
+    calls: list[StatusCommand]
+    close_count: int = 0
+
+    def status(self, command: StatusCommand) -> StatusResult:
+        self.calls.append(command)
+        return self.result
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+@dataclass
 class RecordingApplication:
     result: ResourceInspectionResult
     calls: list[ResourceInspectionCommand]
@@ -80,7 +99,12 @@ def test_application_services_uses_injected_resource_inspector_and_closes_it() -
     validator = RecordingValidator()
     command = ResourceInspectionCommand("environments")
 
-    services = ApplicationServices(reader, validator, inspector)
+    services = ApplicationServices(
+        reader,
+        validator,
+        inspector,
+        RecordingStatusInspector(StatusResult("dev", "desired/dev", None, "observed/dev", None, ()), []),
+    )
 
     assert services.inspect_resources(command) is expected
     assert inspector.calls == [command]
@@ -89,6 +113,50 @@ def test_application_services_uses_injected_resource_inspector_and_closes_it() -
     assert inspector.close_count == 1
     assert reader.close_count == 1
     assert validator.close_count == 1
+
+
+def test_application_services_uses_closed_status_port_and_closes_it() -> None:
+    inspector = RecordingInspector(ResourceInspectionResult(), [])
+    status = RecordingStatusInspector(
+        StatusResult(
+            "dev", "desired/dev", "a" * 40, "observed/dev", None, (StatusEntry("web", StatusState.READY, "new"),)
+        ),
+        [],
+    )
+    services = ApplicationServices(RecordingSnapshotReader(), RecordingValidator(), inspector, status)
+    command = StatusCommand("dev")
+
+    assert services.status(command) is status.result
+    assert status.calls == [command]
+    services.close()
+    assert status.close_count == 1
+
+
+def test_status_entry_rejects_unclosed_string_states() -> None:
+    with pytest.raises(TypeError, match="StatusState"):
+        StatusEntry("web", "READY", "new")  # type: ignore[arg-type]
+
+
+def test_git_status_evidence_preserves_glob_pathspecs(monkeypatch, tmp_path: Path) -> None:
+    calls = []
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+
+    monkeypatch.setattr(
+        "gitopsctr.adapters.git.status.subprocess.run",
+        lambda args, **_kwargs: calls.append(args) or Completed(),
+    )
+    inspector = GitStatusInspector(tmp_path, object(), object())  # type: ignore[arg-type]
+
+    inspector._source_evidence(
+        {"revision": "a" * 40},
+        {"revision": "b" * 40, "path": "infra", "inputs": ["*.tf", "README.md"]},
+    )
+
+    assert all(":(glob)infra/*.tf" in call for call in calls)
+    assert all("infra/README.md" in call for call in calls)
 
 
 def test_command_get_translates_to_orchestrator_and_renders_its_typed_result(
