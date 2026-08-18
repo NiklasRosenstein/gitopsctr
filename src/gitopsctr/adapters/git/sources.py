@@ -108,6 +108,37 @@ class GitSourceRetentionStore:
                 source.content_id,
             )
 
+    def retained_snapshot(self, source_snapshot_id: SourceSnapshotId) -> tuple[RetainedSource, SourceSnapshot] | None:
+        """Recover one already-retained exact snapshot without consulting its source.
+
+        Multiple publication owners may retain the same immutable snapshot under
+        different handles.  They are interchangeable only when their copied
+        payloads have the same exact ContentId; divergent records fail closed.
+        """
+
+        if not isinstance(source_snapshot_id, SourceSnapshotId):
+            raise TypeError("source_snapshot_id must be a SourceSnapshotId")
+        with self._locked():
+            store = self._load()
+            matches: list[tuple[str, SourceSnapshot]] = []
+            for handle, record in store["records"].items():
+                source = _source_from_record(record)
+                if source.source_snapshot_id == source_snapshot_id:
+                    matches.append((handle, source))
+            if not matches:
+                return None
+            content_ids = {source.content_id for _, source in matches}
+            if len(content_ids) != 1:
+                raise SourceRetentionError("retained source snapshot has inconsistent copied payloads")
+            handle, source = min(matches, key=lambda item: item[0])
+            retained = _issue_retained_source(
+                RetainedSourceHandle(handle),
+                RetentionStoreId(store["store_id"]),
+                source.source_snapshot_id,
+                source.content_id,
+            )
+            return retained, source
+
     @contextmanager
     def _locked(self) -> Iterator[None]:
         """Serialize in-process and cross-process read-modify-write operations."""
@@ -294,19 +325,27 @@ class GitSourceRepository(SourceRepository):
         """Recover a durable source copy without consulting Git or its refs."""
 
         assert self.retention_store is not None
-        return self.retention_store.recover(retained, self.source_id)
+        try:
+            retained._validate()
+        except (TypeError, ValueError) as exc:
+            raise SourceRetentionError("retained source has no valid Git retention issuance") from exc
+        return self.retention_store.recover(retained, retained.source_snapshot_id.source_id)
 
     def release(self, retained: RetainedSource) -> None:
         """Release only the exact store-issued retention value."""
 
         assert self.retention_store is not None
-        self.retention_store.release(retained, self.source_id)
+        try:
+            retained._validate()
+        except (TypeError, ValueError) as exc:
+            raise SourceRetentionError("retained source has no valid Git retention issuance") from exc
+        self.retention_store.release(retained, retained.source_snapshot_id.source_id)
 
     def reissue(self, locator: RetainedSourceLocator) -> RetainedSource:
         """Reissue a capability from untrusted persisted retention evidence."""
 
         assert self.retention_store is not None
-        return self.retention_store.reissue(locator, self.source_id)
+        return self.retention_store.reissue(locator, locator.source_snapshot_id.source_id)
 
     def _canonical_resolved(self, source: SourceSnapshot) -> SourceSnapshot:
         if not isinstance(source, SourceSnapshot):

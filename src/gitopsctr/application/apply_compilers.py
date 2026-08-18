@@ -71,7 +71,11 @@ from gitopsctr.contracts import (
 )
 from gitopsctr.document import JsonObjectValue
 from gitopsctr.errors import OperationError, ReferenceUnavailable
-from gitopsctr.operational import validate_workspace_unit_materialization
+from gitopsctr.operational import (
+    DESIRED_TRANSITION_BLOCKS_PATH,
+    load_workspace_transition_blocks,
+    validate_workspace_unit_materialization,
+)
 from gitopsctr.resolution import FingerprintedValue, ResolutionContext, TemplateResolution, resolve_template
 from gitopsctr.resource_api import ApiError, JsonObject
 from gitopsctr.resources import (
@@ -98,6 +102,18 @@ class PendingTemplateReference(ReferenceUnavailable):
     """A reference names a producer selected in this operation but not ready."""
 
 
+class PendingObservedEvidence(PendingTemplateReference):
+    """A projected producer needs a future observation before its consumer can exist."""
+
+
+@dataclass(frozen=True, slots=True)
+class _StackCompilation:
+    projected: ProjectedDocument
+    units: tuple[tuple[UnitResource[Any], UnitProjection], ...]
+    active_identities: frozenset[tuple[str, str, str]]
+    blocks: Mapping[str, str]
+
+
 @dataclass(frozen=True, slots=True)
 class CatalogApplyDocumentValidator:
     """Production catalog/driver validator for pure apply candidates."""
@@ -105,7 +121,16 @@ class CatalogApplyDocumentValidator:
     catalog: ResourceCatalog
 
     def validate_authored(self, document: JsonObject) -> None:
-        self._parse(document, "authored")
+        try:
+            self._parse(document, "authored")
+        except ProjectionCompilerError:
+            metadata = document.get("metadata")
+            if not isinstance(metadata, Mapping) or "uid" not in metadata:
+                raise
+            # A canonical desired resource may be reapplied. Its
+            # controller-owned metadata/projection is parsed strictly but
+            # replaced by the current root incarnation and a fresh projection.
+            self._parse(document, "desired")
 
     def validate_desired(self, document: JsonObject) -> None:
         self._parse(document, "desired")
@@ -575,13 +600,16 @@ class RoleBoundUnitSourceSelector:
             descriptor._validate()
         for plane in request.retained_sources:
             plane._validate()
-        descriptors = (
-            tuple(item for item in request.named if item.role is SourceBindingRole.WORKLOAD)
-            if request.prior_source is not None or request.source_request.get("revision") is not None
-            else (request.primary,)
-            if request.primary is not None
-            else ()
+        qualified = tuple(
+            item
+            for item in request.named
+            if item.role is SourceBindingRole.WORKLOAD and item.binding_key == request.qualified_name
         )
+        # An adapter-issued qualified workload binding is always more specific
+        # than the operation's authored-source binding.  This includes external
+        # templates whose Unit source omits an explicit revision and inherits
+        # the exact acquired template snapshot.
+        descriptors = qualified or ((request.primary,) if request.primary is not None else ())
         descriptors = tuple(item for item in descriptors if item is not None)
         if len(descriptors) != 1:
             raise ProjectionCompilerError("Unit source selection requires one explicit primary or workload source")
@@ -693,9 +721,28 @@ class TemplateResolutionSession:
         def unavailable(_target: object) -> FingerprintedValue:
             raise ReferenceUnavailable(f"reference for Unit {unit.name!r} is unavailable")
 
+        def environment(pointer: str) -> FingerprintedValue:
+            projection = context.projection_context
+            if projection is None:
+                raise ReferenceUnavailable("Environment resource is unavailable")
+            document = _decode_source_document(projection.environment_document, "environment.yaml")
+            try:
+                normalized = self.catalog.normalize_environment(document, context.environment_id.value)
+            except (OperationError, TypeError, ValueError) as exc:
+                raise ReferenceUnavailable(f"Environment resource is invalid: {exc}") from exc
+            raw = _canonical(normalized)
+            return FingerprintedValue(_json_pointer(normalized, pointer), _digest(raw))
+
         return resolve_template(
             value,
-            ResolutionContext(receipt, artifact, unavailable, unit=unit.name, dry=context.dry_run),
+            ResolutionContext(
+                receipt,
+                artifact,
+                unavailable,
+                environment=environment,
+                unit=unit.name,
+                dry=context.dry_run,
+            ),
             pointer,
         )
 
@@ -712,7 +759,7 @@ class TemplateResolutionSession:
             document, raw, _ = self._observed_resource(f"units/{candidate.qualified_name}")
         except _ObservedResourceAbsent:
             if candidate.selected:
-                raise PendingTemplateReference(
+                raise PendingObservedEvidence(
                     f"receipt producer {candidate.qualified_name!r} is pending observed evidence"
                 ) from None
             raise ReferenceUnavailable(
@@ -738,9 +785,7 @@ class TemplateResolutionSession:
             )
         if receipt.spec.desired.unitContentId != candidate.content_id.value:
             if candidate.selected:
-                raise PendingTemplateReference(
-                    f"receipt producer {candidate.qualified_name!r} is stale for its projected Unit"
-                )
+                raise PendingObservedEvidence(f"receipt is stale: {candidate.qualified_name}")
             raise ReferenceUnavailable(f"receipt producer {candidate.qualified_name!r} is stale for its current Unit")
         return receipt, raw
 
@@ -1114,20 +1159,30 @@ class CatalogUnitProjectionCompiler:
         replacements: list[PayloadPrefixReplacement] = []
         prefixes: set[str] = set()
         for frozen in documents:
-            authored = _catalog(self.catalog.parse_unit, frozen.document, "authored")
+            raw_metadata = frozen.document.get("metadata")
+            canonical_desired = isinstance(raw_metadata, Mapping) and "uid" in raw_metadata
+            authored = _catalog(
+                self.catalog.parse_unit,
+                frozen.document,
+                "desired" if canonical_desired else "authored",
+            )
             assert isinstance(authored, UnitResource)
             previous = current_desired.get((authored.gvk.api_version, authored.gvk.kind, authored.name))
             metadata = _root_metadata(
                 authored.gvk.api_version, authored.gvk.kind, authored.name, frozen.content_id, previous, context
             )
-            projected = self.projector.project_unit(
-                authored,
-                metadata=metadata,
-                previous=previous,
-                current_workspace=current_workspace,
-                retained_sources=retained_sources,
-                observed=observed,
-                context=context,
+            projected = (
+                UnitProjection(authored.with_metadata(metadata))
+                if canonical_desired
+                else self.projector.project_unit(
+                    authored,
+                    metadata=metadata,
+                    previous=previous,
+                    current_workspace=current_workspace,
+                    retained_sources=retained_sources,
+                    observed=observed,
+                    context=context,
+                )
             )
             _validate_projected_unit(self.catalog, projected, authored, metadata)
             document = self.catalog.serialize_unit(projected.unit, profile="desired")
@@ -1178,13 +1233,43 @@ class CatalogStackProjectionCompiler:
         for frozen in documents:
             document = frozen.document
             kind = document.get("kind")
+            metadata = document.get("metadata")
+            canonical_desired = isinstance(metadata, Mapping) and "uid" in metadata
             if kind == "StackTemplate":
-                parsed = _catalog(self.catalog.parse_stack_template, document, "authored")
+                parsed = _catalog(
+                    self.catalog.parse_stack_template,
+                    document,
+                    "desired" if canonical_desired else "authored",
+                )
                 assert isinstance(parsed, StackResource)
+                if isinstance(parsed.spec, DesiredStackTemplateSpec):
+                    parsed = StackResource(
+                        parsed.gvk,
+                        ResourceMetadata(name=parsed.name),
+                        StackTemplateInlineSpec(
+                            parameters=list(parsed.spec.parameters),
+                            unitTemplates=dict(parsed.spec.unitTemplates),
+                        ),
+                    )
                 authored_templates[parsed.name] = (parsed, frozen)
             elif kind == "Stack":
-                parsed = _catalog(self.catalog.parse_stack, document, "authored")
+                parsed = _catalog(
+                    self.catalog.parse_stack,
+                    document,
+                    "desired" if canonical_desired else "authored",
+                )
                 assert isinstance(parsed, StackResource)
+                if isinstance(parsed.spec, DesiredStackSpec):
+                    parsed = StackResource(
+                        parsed.gvk,
+                        ResourceMetadata(name=parsed.name),
+                        StackSpec(
+                            template=parsed.spec.templateRef.name,
+                            parameters=parsed.spec.parameters,
+                            units=parsed.spec.units,
+                            artifactImports=parsed.spec.artifactImports,
+                        ),
+                    )
                 authored_stacks[parsed.name] = (parsed, frozen)
             else:
                 raise ProjectionCompilerError("Stack compiler received a non-Stack document")
@@ -1224,19 +1309,33 @@ class CatalogStackProjectionCompiler:
         payload_deletes: list[str] = []
         replacements: list[PayloadPrefixReplacement] = []
         prefixes: set[str] = {_CONTEXT_PREFIX}
+        transition_blocks = load_workspace_transition_blocks(current_workspace)
         for name in sorted(reproject):
             stack = desired_stacks[name]
             if stack.metadata.deletion is not None:
                 continue
-            projected, units = self._stack(
-                stack, desired_templates, current_desired, current_workspace, retained_sources, observed, context
+            compiled = self._stack(
+                stack,
+                desired_templates,
+                current_desired,
+                current_workspace,
+                retained_sources,
+                observed,
+                context,
+                previous_stack=current_stacks.get(name),
             )
-            writes.append(projected)
-            for unit, output in units:
+            writes.append(compiled.projected)
+            generated.update(compiled.active_identities)
+            transition_blocks = {
+                qualified_name: reason
+                for qualified_name, reason in transition_blocks.items()
+                if not qualified_name.startswith(f"{name}/")
+            }
+            transition_blocks.update(compiled.blocks)
+            for unit, output in compiled.units:
                 document = self.catalog.serialize_unit(unit, profile="desired")
                 child = ProjectedDocument(f"units/{name}/{unit.name}.json", document)
                 writes.append(child)
-                generated.add(child.identity)
                 payload_writes.extend(output.payload_writes)
                 payload_deletes.extend(output.payload_deletes)
                 prefixes.update(output.payload_prefixes)
@@ -1252,6 +1351,19 @@ class CatalogStackProjectionCompiler:
 
         deletes = _obsolete_owned_keys(current_desired, reproject, generated)
         payload_writes.extend(context_writes.values())
+        transition_key = DESIRED_TRANSITION_BLOCKS_PATH.as_posix()
+        had_transition_entry = any(entry.key == transition_key for entry in current_workspace.list_entries())
+        if transition_blocks:
+            prefixes.add(transition_key)
+            payload_writes.append(
+                WorkspaceEntry.file(
+                    transition_key,
+                    _canonical({"schema": 1, "blocks": dict(sorted(transition_blocks.items()))}),
+                )
+            )
+        elif had_transition_entry:
+            prefixes.add(transition_key)
+            payload_deletes.append(transition_key)
         return CandidateTransformation(
             tuple(_coalesce_documents(writes, current_desired)),
             deletes=deletes,
@@ -1280,23 +1392,26 @@ class CatalogStackProjectionCompiler:
             )
         elif isinstance(authored.spec, StackTemplateGitSpec):
             request = authored.spec.source.fromGit
-            plane, descriptor = _retained_template_source(retained_sources, context, request.path)
+            plane, descriptor = _retained_template_source(retained_sources, context, authored.name, request.path)
             source = _source_lineage(self.source_encoder, descriptor, plane)
-            if request.repository != source.repository:
+            if request.repository != source.repository and not _same_local_repository(
+                request.repository, source.repository
+            ):
                 raise ProjectionCompilerError(
                     "StackTemplate Git source repository does not match issued source lineage"
                 )
+            request = replace(request, repository=source.repository)
             raw = plane.plane.workspace.read(descriptor.workspace_key)
             digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
             if request.documentDigest is not None and request.documentDigest != digest:
-                raise ProjectionCompilerError(
-                    "StackTemplate source documentDigest does not match the retained document"
-                )
+                raise ProjectionCompilerError("StackTemplate source documentDigest mismatch")
             document = _decode_source_document(raw, descriptor.workspace_key)
             selected = _catalog(self.catalog.parse_stack_template, document, "authored")
             assert isinstance(selected, StackResource)
             if not isinstance(selected.spec, StackTemplateInlineSpec):
-                raise ProjectionCompilerError("repository StackTemplate source must contain inline content")
+                raise ProjectionCompilerError(
+                    "repository StackTemplate source cannot select another source recursively"
+                )
             inline = selected.spec
             source_context = StackTemplateSourceContext(repository=source.repository, revision=source.revision)
             acquisition = StackTemplateAcquisition(
@@ -1310,7 +1425,7 @@ class CatalogStackProjectionCompiler:
             )
         elif isinstance(authored.spec, StackTemplatePromotionSpec):
             if self.promotion_encoder is None:
-                raise ProjectionCompilerError("StackTemplate promotion needs an explicit PromotionLineageEncoder")
+                raise ProjectionCompilerError("StackTemplate fromPromotion requires an explicit promote transaction")
             frozen = context.projection_context
             descriptor = frozen.promotion_source if frozen is not None else None
             if descriptor is None:
@@ -1375,13 +1490,17 @@ class CatalogStackProjectionCompiler:
         retained_sources: tuple[RetainedSourcePlane, ...],
         observed: ImmutableWorkspace,
         context: ApplyProjectionContext,
-    ) -> tuple[ProjectedDocument, tuple[tuple[UnitResource[Any], UnitProjection], ...]]:
+        *,
+        previous_stack: StackResource | None = None,
+    ) -> _StackCompilation:
         if not isinstance(stack.spec, (StackSpec, DesiredStackSpec)):
             raise ProjectionCompilerError(f"Stack {stack.name!r} has an invalid specification")
         template_name = stack.spec.template if isinstance(stack.spec, StackSpec) else stack.spec.templateRef.name
         template = templates.get(template_name)
         if template is None:
-            raise ProjectionCompilerError(f"Stack {stack.name!r} references missing StackTemplate {template_name!r}")
+            raise ProjectionCompilerError(
+                f"Stack {stack.name!r} references missing desired StackTemplate {template_name!r}"
+            )
         if template.metadata.deletion is not None:
             raise ProjectionCompilerError(f"Stack {stack.name!r} references deleting StackTemplate {template_name!r}")
         if (
@@ -1493,11 +1612,16 @@ class CatalogStackProjectionCompiler:
         for resource in resources:
             session.declare(f"{stack.name}/{resource.name}")
         blocked: list[str] = []
+        unavailable: dict[str, str] = {}
         while pending:
             next_pending: list[StackTemplateResource] = []
             progressed = False
             blocked.clear()
             for resource in pending:
+                if any(dependency in unavailable for dependency in resource.dependsOn):
+                    unavailable[resource.name] = "dependency inputs are unavailable"
+                    progressed = True
+                    continue
                 document: JsonObject = {
                     "apiVersion": resource.apiVersion,
                     "kind": resource.kind,
@@ -1507,7 +1631,9 @@ class CatalogStackProjectionCompiler:
                 authored = _catalog(self.catalog.parse_unit, document, "authored")
                 assert isinstance(authored, UnitResource)
                 metadata = ResourceMetadata(
-                    name=resource.name, uid=_owned_uid(stack.metadata.uid, resource.name), ownerReferences=[owner]
+                    name=resource.name,
+                    uid=_owned_uid(stack.name, stack.metadata.uid, resource.name),
+                    ownerReferences=[owner],
                 )
                 try:
                     output = self.unit_projector.project_unit(
@@ -1523,6 +1649,10 @@ class CatalogStackProjectionCompiler:
                         session=session,
                     )
                 except (ReferenceUnavailable, ProjectionCompilerError) as exc:
+                    if _contains_unavailable_reference(exc):
+                        unavailable[resource.name] = str(exc)
+                        progressed = True
+                        continue
                     if _contains_pending_reference(exc):
                         next_pending.append(resource)
                         blocked.append(f"{resource.name}: {exc}")
@@ -1544,8 +1674,38 @@ class CatalogStackProjectionCompiler:
                 )
             pending = next_pending
         projected_units = {unit.name: unit for unit, _ in units}
-        bindings: dict[str, StackProjectionUnitBinding] = {}
+        resolved_projection_units: dict[str, StackProjectionUnit] = {}
         for resource in resources:
+            projected_unit = projected_units.get(resource.name)
+            original = projection_units[resource.name]
+            specification = dict(cast(Mapping[str, object], original.spec))
+            if projected_unit is not None:
+                desired_document = self.catalog.serialize_unit(projected_unit, profile="desired")
+                desired_spec = desired_document.get("spec")
+                original_source = specification.get("source")
+                desired_source = desired_spec.get("source") if isinstance(desired_spec, Mapping) else None
+                if isinstance(original_source, Mapping) and isinstance(desired_source, Mapping):
+                    specification["source"] = {
+                        **original_source,
+                        "revision": desired_source.get("revision"),
+                    }
+            resolved_projection_units[resource.name] = StackProjectionUnit(
+                apiVersion=original.apiVersion,
+                kind=original.kind,
+                spec=ProjectionObject(cast(Any, specification)),
+                dependsOn=list(original.dependsOn),
+            )
+        structural = StackProjection.build(
+            stack_uid=stack.metadata.uid,
+            template_uid=template.metadata.uid,
+            template_content_digest=template.spec.contentDigest,
+            units=resolved_projection_units,
+            context_digest=context_digest,
+        )
+        assert isinstance(desired.spec, DesiredStackSpec)
+        desired = StackResource(desired.gvk, desired.metadata, replace(desired.spec, structuralProjection=structural))
+        bindings: dict[str, StackProjectionUnitBinding] = {}
+        for resource in (item for item in resources if item.name in projected_units):
             unit = projected_units[resource.name]
             if unit.metadata.uid is None:
                 raise ProjectionCompilerError(f"Stack projected Unit {stack.name}/{resource.name} has no issued UID")
@@ -1559,15 +1719,73 @@ class CatalogStackProjectionCompiler:
                 projectionContextDigest=structural.identity.projectionContextDigest,
                 dependsOn=list(resource.dependsOn),
             )
+        new_bindings = bindings
+        prior = previous_stack if previous_stack is not None else stack
+        previous_active = prior.spec.activeProjection if isinstance(prior.spec, DesiredStackSpec) else None
+        waiting = bool(unavailable)
+        staged = False
+        if waiting and previous_active is not None:
+            staged = all(
+                logical_name in structural.units
+                and structural.units[logical_name].apiVersion == binding.apiVersion
+                and structural.units[logical_name].kind == binding.kind
+                and logical_name == binding.name
+                and sorted(binding.dependsOn) == sorted(structural.units[logical_name].dependsOn)
+                for logical_name, binding in previous_active.units.items()
+            )
+            if staged:
+                bindings = dict(new_bindings)
+                for logical_name in unavailable:
+                    previous_binding = previous_active.units.get(logical_name)
+                    if previous_binding is not None:
+                        bindings[logical_name] = previous_binding
+            else:
+                bindings = dict(previous_active.units)
+        else:
+            bindings = dict(new_bindings)
+
+        if waiting and (previous_active is None or staged):
+            changed = True
+            while changed:
+                changed = False
+                active_names = set(bindings)
+                for logical_name, binding in tuple(bindings.items()):
+                    if any(dependency not in active_names for dependency in binding.dependsOn):
+                        bindings.pop(logical_name)
+                        changed = True
+
+        source_projection_digest = (
+            previous_active.sourceProjectionDigest
+            if waiting and previous_active is not None and not staged
+            else structural.identity.projectionDigest
+        )
+        projection_context_digest = (
+            previous_active.projectionContextDigest
+            if waiting and previous_active is not None and not staged
+            else structural.identity.projectionContextDigest
+        )
         active = StackActiveProjection.build(
-            source_projection_digest=structural.identity.projectionDigest,
-            projection_context_digest=structural.identity.projectionContextDigest,
+            source_projection_digest=source_projection_digest,
+            projection_context_digest=projection_context_digest,
             units=bindings,
         )
         desired = StackResource(desired.gvk, desired.metadata, replace(desired.spec, activeProjection=active))
-        return ProjectedDocument(
-            f"stacks/{stack.name}.json", self.catalog.serialize_stack_resource(desired, profile="desired")
-        ), tuple(units)
+        emitted_units = tuple(
+            (unit, output)
+            for unit, output in units
+            if unit.name in bindings and bindings[unit.name] == new_bindings.get(unit.name)
+        )
+        active_identities = frozenset(
+            (binding.apiVersion, binding.kind, f"{stack.name}/{binding.name}") for binding in bindings.values()
+        )
+        return _StackCompilation(
+            ProjectedDocument(
+                f"stacks/{stack.name}.json", self.catalog.serialize_stack_resource(desired, profile="desired")
+            ),
+            emitted_units,
+            active_identities,
+            {f"{stack.name}/{name}": reason for name, reason in unavailable.items()},
+        )
 
 
 def _catalog(call: Any, document: JsonObject, profile: str) -> object:
@@ -1580,7 +1798,18 @@ def _catalog(call: Any, document: JsonObject, profile: str) -> object:
 def _contains_pending_reference(error: BaseException) -> bool:
     current: BaseException | None = error
     while current is not None:
-        if isinstance(current, PendingTemplateReference):
+        if isinstance(current, ReferenceUnavailable):
+            return True
+        current = current.__cause__
+    return False
+
+
+def _contains_unavailable_reference(error: BaseException) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, PendingObservedEvidence) or (
+            isinstance(current, ReferenceUnavailable) and not isinstance(current, PendingTemplateReference)
+        ):
             return True
         current = current.__cause__
     return False
@@ -1749,6 +1978,12 @@ def _workspace_input_matches(
 
     glob = any(character in pattern for character in "*?[")
     matches: dict[str, WorkspaceEntry] = {}
+    if pattern == ".":
+        return {
+            entry.key.removeprefix(root_prefix): entry
+            for entry in entries
+            if entry.kind in {WorkspaceEntryKind.FILE, WorkspaceEntryKind.SYMLINK} and entry.key.startswith(root_prefix)
+        }
     candidate_prefix = f"{root_prefix}{pattern}".rstrip("/")
     for entry in entries:
         if entry.kind not in {WorkspaceEntryKind.FILE, WorkspaceEntryKind.SYMLINK}:
@@ -1942,7 +2177,7 @@ def _validate_promotion_lineage(lineage: PromotionLineage, descriptor: Promotion
 
 
 def _retained_template_source(
-    sources: tuple[RetainedSourcePlane, ...], context: ApplyProjectionContext, path: str
+    sources: tuple[RetainedSourcePlane, ...], context: ApplyProjectionContext, binding_key: str, path: str
 ) -> tuple[RetainedSourcePlane, RetainedSourceDescriptor]:
     """Find the explicitly named StackTemplate source by role and path."""
 
@@ -1953,12 +2188,27 @@ def _retained_template_source(
         if (
             descriptor in context.named_sources
             and descriptor.role is SourceBindingRole.STACK_TEMPLATE
+            and descriptor.binding_key == binding_key
             and descriptor.workspace_key == path
         )
     ]
     if len(matches) != 1:
         raise ProjectionCompilerError("StackTemplate Git source requires one exact retained source descriptor")
     return matches[0]
+
+
+def _same_local_repository(left: str, right: str) -> bool:
+    """Compare an absolute POSIX path with its canonical file-URI spelling."""
+
+    from urllib.parse import unquote, urlsplit
+
+    left_uri = urlsplit(left)
+    right_uri = urlsplit(right)
+    if left_uri.scheme == "file" and left_uri.netloc in {"", "localhost"}:
+        return right_uri.scheme == "" and right.startswith("/") and unquote(left_uri.path) == right
+    if right_uri.scheme == "file" and right_uri.netloc in {"", "localhost"}:
+        return left_uri.scheme == "" and left.startswith("/") and unquote(right_uri.path) == left
+    return False
 
 
 def _inherited_source_context(
@@ -2038,36 +2288,46 @@ def _normalized_stack_unit_spec(
 
 
 def _projection_context_digest(context: ApplyProjectionContext) -> str:
-    frozen = context.projection_context
-    if frozen is None:
-        raise ProjectionCompilerError("Stack projection requires a frozen Project/Environment context")
-    payload = {
-        "environment": str(context.environment_id),
-        "environmentBytes": base64.b64encode(frozen.environment_document).decode(),
-        "kind": "ProjectionContext",
-        "projectBytes": base64.b64encode(frozen.project_document).decode(),
-        "schema": 1,
-    }
+    payload = _projection_context_payload(context)
     return f"sha256:{hashlib.sha256(_canonical(payload)).hexdigest()}"
 
 
 def _projection_context_entry(context: ApplyProjectionContext) -> WorkspaceEntry:
-    frozen = context.projection_context
-    assert frozen is not None
     digest = _projection_context_digest(context)
-    payload = {
-        "schema": 1,
-        "kind": "ProjectionContext",
-        "digest": digest,
-        "environment": str(context.environment_id),
-        "projectBytes": base64.b64encode(frozen.project_document).decode(),
-        "environmentBytes": base64.b64encode(frozen.environment_document).decode(),
-    }
+    payload = {**_projection_context_payload(context), "digest": digest}
     return WorkspaceEntry.file(f"{_CONTEXT_PREFIX}/{digest.removeprefix('sha256:')}.json", _canonical(payload))
 
 
-def _owned_uid(stack_uid: str, name: str) -> str:
-    return f"d1-{hashlib.sha256(f'gitopsctr/stack-unit/v1\\0{stack_uid}\\0{name}'.encode()).hexdigest()[:32]}"
+def _projection_context_payload(context: ApplyProjectionContext) -> dict[str, object]:
+    frozen = context.projection_context
+    if frozen is None:
+        raise ProjectionCompilerError("Stack projection requires a frozen Project/Environment context")
+    return {
+        "schema": 1,
+        "kind": "ProjectionContext",
+        "environment": str(context.environment_id),
+        "projectFile": "gitopsctr.yaml",
+        "environmentFile": "environment.yaml",
+        "projectDocument": _decode_source_document(frozen.project_document, "gitopsctr.yaml"),
+        "environmentDocument": _decode_source_document(frozen.environment_document, "environment.yaml"),
+        "projectBytes": base64.b64encode(frozen.project_document).decode(),
+        "environmentBytes": base64.b64encode(frozen.environment_document).decode(),
+    }
+
+
+def _owned_uid(stack_name: str, stack_uid: str, name: str) -> str:
+    provenance = json.dumps(
+        {
+            "apiVersion": "unit.gitopsctr.io/v1",
+            "kind": "generated",
+            "name": name,
+            "stack": stack_name,
+            "stackUid": stack_uid,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"d1-{hashlib.sha256(f'gitopsctr/desired-uid/v1\0{provenance}'.encode()).hexdigest()[:32]}"
 
 
 def _obsolete_owned_keys(

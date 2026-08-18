@@ -20,6 +20,8 @@ from gitopsctr.application.model import (
     PublicationOutcome,
     PublicationOutcomeState,
     PublicationProof,
+    PublicationRecovery,
+    PublicationRecoveryLocator,
     PublicationStoreId,
     RetainedSource,
     RetainedSourceHandle,
@@ -176,18 +178,38 @@ class InMemorySnapshotStore:
             else HeadObservation.present(channel_id, snapshot_id, f"memory:{version}")
         )
 
-    def begin_candidate(self, base: ImmutableWorkspace | None = None) -> CandidateWorkspace:
+    def prepare_head(self, channel_id: ChannelId) -> HeadObservation:
+        return self.resolve_head(channel_id)
+
+    def recovery_locator(self, intent: PublicationIntent) -> PublicationRecoveryLocator:
+        intent._validate()
+        return PublicationRecoveryLocator(self._publication_store_id, intent.attempt_id)
+
+    def recover_publication(self, locator: PublicationRecoveryLocator) -> PublicationRecovery:
+        if locator.publication_store_id != self._publication_store_id:
+            raise ValueError("publication recovery locator belongs to another transaction store")
+        try:
+            intent = self._intent_by_attempt[locator.attempt_id]
+        except KeyError as exc:
+            raise ValueError("publication recovery locator is unknown") from exc
+        return PublicationRecovery(intent, self.verify(intent))
+
+    def begin_candidate(
+        self, base: ImmutableWorkspace | None = None, parent_snapshot_id: SnapshotId | None = None
+    ) -> CandidateWorkspace:
         """Create an adapter-owned mutable candidate from an optional immutable base."""
 
         if base is not None and not isinstance(base, ImmutableWorkspace):
             raise TypeError("candidate base must implement ImmutableWorkspace")
+        if parent_snapshot_id is not None:
+            self.open_snapshot(parent_snapshot_id)
         entries = () if base is None else base.list_entries()
         capabilities = None if base is None else base.capabilities
         token = object()
         self._candidate_tokens.add(token)
         return CandidateWorkspace(token, InMemoryWorkspace(entries, capabilities=capabilities, mutable=True))
 
-    def seal_candidate(self, workspace: CandidateWorkspace) -> SealedCandidate:
+    def seal_candidate(self, workspace: MutableWorkspace) -> SealedCandidate:
         """Seal only a workspace this store issued, with fresh opaque identities."""
 
         if not isinstance(workspace, CandidateWorkspace):
@@ -320,6 +342,11 @@ class InMemorySnapshotStore:
             raise ValueError("publication candidate was not sealed by this store")
         if self.resolve_head(intent.channel_id) != intent.expected_head:
             raise ValueError("publication expected head is stale")
+        if (
+            intent.review_base_head is not None
+            and self.resolve_head(intent.review_base_head.channel_id) != intent.review_base_head
+        ):
+            raise ValueError("review publication accepted desired base head is stale")
         for change in intent.source_ownership_changes:
             change.retained_source._validate()
             if change.retained_source.retention_store_id != self._retention_store_id:

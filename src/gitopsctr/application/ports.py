@@ -17,6 +17,7 @@ from gitopsctr.application.model import (
     HeadObservation,
     PublicationIntent,
     PublicationOutcome,
+    SealedCandidate,
     SnapshotId,
     SnapshotInspectionCommand,
     SnapshotInspectionResult,
@@ -25,6 +26,11 @@ from gitopsctr.application.model import (
 )
 from gitopsctr.application.snapshots import SnapshotView
 from gitopsctr.application.status import StatusCommand, StatusResult
+from gitopsctr.application.workspace import ImmutableWorkspace, MutableWorkspace
+
+
+class PublicationExecutionUnknownError(RuntimeError):
+    """Execution crossed a possible commit point and requires exact verification."""
 
 
 class SnapshotReader(Protocol):
@@ -57,6 +63,18 @@ class PublicationTransaction(Protocol):
 
     def verify(self, intent: PublicationIntent) -> PublicationOutcome:
         """Recover proof, definite noncommit, or remaining ambiguity for one intent."""
+
+
+class CandidateStore(Protocol):
+    """Create and seal one exact logical publication candidate."""
+
+    def begin_candidate(
+        self, base: ImmutableWorkspace | None = None, parent_snapshot_id: SnapshotId | None = None
+    ) -> MutableWorkspace:
+        """Return a store-issued mutable candidate initialized from ``base``."""
+
+    def seal_candidate(self, workspace: MutableWorkspace) -> SealedCandidate:
+        """Freeze a candidate and issue its authenticated snapshot identity."""
 
 
 class DeploymentAuthority(Protocol):

@@ -17,10 +17,14 @@ from gitopsctr.application.model import (
     ContentId,
     EnvironmentId,
     PublicationMode,
+    PublicationOutcome,
+    PublicationOutcomeState,
+    PublicationRecoveryLocator,
+    RetainedSource,
     SnapshotId,
     SourceSnapshotId,
 )
-from gitopsctr.application.sources import SourceRequest
+from gitopsctr.application.sources import SourceRequest, SourceSnapshot
 from gitopsctr.resource_api import JsonObject
 
 if TYPE_CHECKING:
@@ -34,6 +38,7 @@ def _label(value: object, description: str) -> str:
 
 
 _AUTHORED_DOCUMENT_ISSUANCE = object()
+_AUTHORED_SOURCE_BINDINGS: dict[object, tuple[object, ...]] = {}
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -84,6 +89,75 @@ def _issue_authored_document(origin: str, document: JsonObject, content_id: Cont
     return issued
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class AuthoredSourceAcquisition:
+    """One selector resolution retained before source-backed input is decoded.
+
+    The decoder issues this value from the exact immutable source workspace it
+    used to read authored bytes.  Apply orchestration can therefore recover and
+    retain that same snapshot without resolving a moving selector a second
+    time.
+    """
+
+    snapshot: SourceSnapshot
+    retained: RetainedSource
+    _issuance: object
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("AuthoredSourceAcquisition must be issued by an AuthoredChangeDecoder")
+
+    def _validate(self) -> None:
+        if type(self) is not AuthoredSourceAcquisition:
+            raise TypeError("authored source acquisition has no valid decoder issuance proof")
+        if not isinstance(self.snapshot, SourceSnapshot):
+            raise TypeError("authored source snapshot must be a SourceSnapshot")
+        if self.snapshot.workspace.is_mutable or self.snapshot.workspace.content_id != self.snapshot.content_id:
+            raise ValueError("authored source snapshot must bind an immutable exact workspace")
+        if not isinstance(self.retained, RetainedSource):
+            raise TypeError("authored retained source must be a RetainedSource")
+        self.retained._validate()
+        if (
+            self.snapshot.source_snapshot_id != self.retained.source_snapshot_id
+            or self.snapshot.content_id != self.retained.content_id
+        ):
+            raise ValueError("authored source snapshot does not match its retained capability")
+        binding = (
+            self.snapshot.source_snapshot_id,
+            self.snapshot.content_id,
+            self.snapshot.workspace.list_entries(),
+            self.retained.handle,
+            self.retained.retention_store_id,
+            self.retained.source_snapshot_id,
+            self.retained.content_id,
+        )
+        if _AUTHORED_SOURCE_BINDINGS.get(self._issuance) != binding:
+            raise TypeError("authored source acquisition was modified after issuance")
+
+
+def _issue_authored_source_acquisition(snapshot: SourceSnapshot, retained: RetainedSource) -> AuthoredSourceAcquisition:
+    """Issue exact source/retention evidence at the decoder boundary."""
+
+    if not isinstance(snapshot, SourceSnapshot) or not isinstance(retained, RetainedSource):
+        raise TypeError("authored source acquisition requires SourceSnapshot and RetainedSource values")
+    retained._validate()
+    acquired = object.__new__(AuthoredSourceAcquisition)
+    issuance = object()
+    object.__setattr__(acquired, "snapshot", snapshot)
+    object.__setattr__(acquired, "retained", retained)
+    object.__setattr__(acquired, "_issuance", issuance)
+    _AUTHORED_SOURCE_BINDINGS[issuance] = (
+        snapshot.source_snapshot_id,
+        snapshot.content_id,
+        snapshot.workspace.list_entries(),
+        retained.handle,
+        retained.retention_store_id,
+        retained.source_snapshot_id,
+        retained.content_id,
+    )
+    acquired._validate()
+    return acquired
+
+
 @dataclass(frozen=True, slots=True)
 class AuthoredChangeSet:
     """One fully decoded, duplicate-free explicit authoring operation.
@@ -95,12 +169,21 @@ class AuthoredChangeSet:
 
     documents: tuple[AuthoredDocument, ...]
     source_snapshot_id: SourceSnapshotId | None = None
+    source_acquisition: AuthoredSourceAcquisition | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.documents, tuple):
             raise TypeError("authored documents must be a tuple")
         if self.source_snapshot_id is not None and not isinstance(self.source_snapshot_id, SourceSnapshotId):
             raise TypeError("source_snapshot_id must be a SourceSnapshotId or None")
+        if self.source_acquisition is not None:
+            if not isinstance(self.source_acquisition, AuthoredSourceAcquisition):
+                raise TypeError("source_acquisition must be an AuthoredSourceAcquisition or None")
+            self.source_acquisition._validate()
+            if self.source_snapshot_id != self.source_acquisition.snapshot.source_snapshot_id:
+                raise ValueError("source acquisition must match source_snapshot_id")
+        elif self.source_snapshot_id is None:
+            pass
         if any(not isinstance(document, AuthoredDocument) for document in self.documents):
             raise TypeError("authored documents must contain AuthoredDocument values")
         identities: set[tuple[str, str]] = set()
@@ -163,6 +246,8 @@ class ApplyResult:
     snapshot_id: SnapshotId | None
     publication_mode: PublicationMode | None
     publication: PublicationIntent | None = None
+    publication_outcome: PublicationOutcome | None = None
+    recovery_locator: PublicationRecoveryLocator | None = None
 
     def __post_init__(self) -> None:
         if self.snapshot_id is not None and not isinstance(self.snapshot_id, SnapshotId):
@@ -175,9 +260,28 @@ class ApplyResult:
 
             if not isinstance(self.publication, PublicationIntent):
                 raise TypeError("publication must be a PublicationIntent or None")
-            if self.snapshot_id != self.publication.candidate.snapshot_id:
-                raise ValueError("apply result snapshot must be the sealed publication candidate")
+            self.publication._validate()
             if self.publication_mode != self.publication.mode:
                 raise ValueError("apply result publication mode must match the publication intent")
+            if not isinstance(self.publication_outcome, PublicationOutcome):
+                raise ValueError("a publication intent requires its exact publication outcome")
+            if not isinstance(self.recovery_locator, PublicationRecoveryLocator):
+                raise ValueError("a publication intent requires a durable recovery locator")
+            if self.recovery_locator.attempt_id != self.publication.attempt_id:
+                raise ValueError("publication recovery locator must bind the exact attempt")
+            self.publication_outcome._validate()
+            if self.publication_outcome.state is PublicationOutcomeState.COMMITTED:
+                proof = self.publication_outcome.proof
+                assert proof is not None
+                if proof.intent != self.publication:
+                    raise ValueError("committed apply result proof must bind the exact publication intent")
+                if self.snapshot_id != self.publication.candidate.snapshot_id:
+                    raise ValueError("committed apply result snapshot must be the sealed publication candidate")
+            elif self.snapshot_id is not None:
+                raise ValueError("an uncommitted or unknown publication cannot return an accepted snapshot")
         elif self.publication_mode is not None:
             raise ValueError("an apply result publication mode requires a publication intent")
+        elif self.publication_outcome is not None:
+            raise ValueError("a publication outcome requires its exact publication intent")
+        elif self.recovery_locator is not None:
+            raise ValueError("a publication recovery locator requires its exact publication intent")

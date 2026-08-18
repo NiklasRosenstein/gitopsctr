@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from gitopsctr.application.apply_compilers import SourceLineage
@@ -53,3 +53,21 @@ class GitSourceLineageEncoder:
         except KeyError as exc:
             raise GitSourceLineageError("Git source has no configured SourceId-to-repository mapping") from exc
         return SourceLineage(repository=repository, revision=match.group(1))
+
+
+@dataclass(slots=True)
+class GitSourceLineageRegistry:
+    """Operation-composition registry for dynamically acquired Git sources."""
+
+    repositories: dict[SourceId, str] = field(default_factory=dict)
+
+    def register(self, source_id: SourceId, repository: str) -> None:
+        if not isinstance(source_id, SourceId) or not isinstance(repository, str) or not repository:
+            raise GitSourceLineageError("Git source repository registration is invalid")
+        existing = self.repositories.get(source_id)
+        if existing is not None and existing != repository:
+            raise GitSourceLineageError("Git SourceId is already bound to another repository")
+        self.repositories[source_id] = repository
+
+    def encode(self, descriptor: RetainedSourceDescriptor, plane: RetainedSourcePlane) -> SourceLineage:
+        return GitSourceLineageEncoder(self.repositories).encode(descriptor, plane)

@@ -183,10 +183,35 @@ def _publication_intent() -> PublicationIntent:
 def test_apply_result_binds_the_sealed_candidate_snapshot_and_publication_mode() -> None:
     intent = _publication_intent()
 
-    result = ApplyResult(intent.candidate.snapshot_id, intent.mode, intent)
-    assert result.publication is intent
+    with pytest.raises(ValueError, match="exact publication outcome"):
+        ApplyResult(intent.candidate.snapshot_id, intent.mode, intent)
     with pytest.raises(ValueError, match="sealed publication candidate"):
-        ApplyResult(SnapshotId("other-snapshot"), intent.mode, intent)
+        from gitopsctr.adapters.memory.snapshots import InMemorySnapshotStore
+
+        store = InMemorySnapshotStore()
+        candidate_workspace = store.begin_candidate()
+        candidate_workspace.write("unit", b"value")
+        candidate = store.seal_candidate(candidate_workspace)
+        channel = ChannelId("desired/dev")
+        published = PublicationIntent(
+            PublicationAttemptId("published-attempt"),
+            channel,
+            store.resolve_head(channel),
+            candidate,
+            (),
+            OwnershipId("apply-owner"),
+            (),
+            PublicationTarget.ACCEPTED_DESIRED,
+            PublicationMode.DIRECT_ACCEPTED,
+        )
+        outcome = store.execute(published)
+        ApplyResult(
+            SnapshotId("other-snapshot"),
+            published.mode,
+            published,
+            outcome,
+            store.recovery_locator(published),
+        )
     with pytest.raises(ValueError, match="publication mode"):
         ApplyResult(intent.candidate.snapshot_id, PublicationMode.REVIEW_REQUIRED, intent)
     with pytest.raises(TypeError, match="SnapshotId"):

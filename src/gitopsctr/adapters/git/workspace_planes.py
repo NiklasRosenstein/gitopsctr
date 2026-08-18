@@ -68,8 +68,18 @@ class GitWorkspacePlaneProvider(WorkspacePlaneProvider):
                 raise OperationError(f"{plane} ref {reference!r} does not exist")
             return cached
         try:
-            head_id = self._snapshot_reader.snapshot_id_for_revision(reference)
-            snapshot_id = self._snapshot_reader.snapshot_id_for_revision(revision) if revision is not None else head_id
+            try:
+                snapshot_id = self._snapshot_reader.snapshot_id_for_revision(revision) if revision is not None else None
+            except SnapshotNotFoundError as exc:
+                raise OperationError(f"requested revision is not part of {reference} history") from exc
+            try:
+                head_id = self._snapshot_reader.snapshot_id_for_revision(reference)
+            except SnapshotNotFoundError as exc:
+                if revision is not None:
+                    raise OperationError(f"requested revision is not part of {reference} history") from exc
+                raise
+            if snapshot_id is None:
+                snapshot_id = head_id
             if revision is not None and not self._snapshot_reader.is_ancestor_snapshot(snapshot_id, head_id):
                 raise OperationError(f"requested revision is not part of {reference} history")
             view = self._snapshot_reader.open_snapshot(snapshot_id)
