@@ -458,8 +458,8 @@
                     "pattern": "^[A-Z][A-Za-z0-9]*$",
                     "type": "string"
                   },
-                  "receiptUnitBlob": {
-                    "pattern": "^[0-9a-f]{40}$",
+                  "receiptUnitContentId": {
+                    "pattern": "^sha256:[0-9a-f]{64}$",
                     "type": "string"
                   },
                   "sourceDesiredRevision": {
@@ -498,7 +498,7 @@
                   "sourceUnitUid",
                   "sourceDesiredRevision",
                   "sourceObservedRevision",
-                  "receiptUnitBlob",
+                  "receiptUnitContentId",
                   "artifactName",
                   "apiVersion",
                   "kind",

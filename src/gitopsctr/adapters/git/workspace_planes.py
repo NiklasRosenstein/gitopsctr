@@ -26,7 +26,7 @@ class GitWorkspacePlaneProvider(WorkspacePlaneProvider):
         """The application service owns the shared snapshot-reader lifecycle."""
 
     def source(self) -> WorkspaceSnapshot:
-        return WorkspaceSnapshot(ResourcePlane.SOURCE, None, None, None, self._source, {})
+        return WorkspaceSnapshot(ResourcePlane.SOURCE, None, None, None, self._source, self._source.entry_content_ids())
 
     def project(self) -> Project:
         candidates = tuple(key for key in ("gitopsctr.yaml", "gitopsctr.yml", "gitopsctr.json") if self._has_file(key))
@@ -71,12 +71,13 @@ class GitWorkspacePlaneProvider(WorkspacePlaneProvider):
                 selected,
                 snapshot_id,
                 view.workspace,
-                {str(path): value for path, value in self._snapshot_reader.blob_ids_for_snapshot(snapshot_id).items()},
+                view.workspace.entry_content_ids(),
             )
         except SnapshotNotFoundError as exc:
             if revision is not None or not allow_missing:
                 raise OperationError(f"{plane} ref {reference!r} does not exist") from exc
-            result = WorkspaceSnapshot(plane, reference, None, None, InMemoryWorkspace(mutable=False), {})
+            empty = InMemoryWorkspace(mutable=False)
+            result = WorkspaceSnapshot(plane, reference, None, None, empty, empty.entry_content_ids())
         self._snapshots[key] = result
         return result
 

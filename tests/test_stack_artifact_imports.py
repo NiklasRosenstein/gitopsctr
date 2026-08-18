@@ -163,7 +163,7 @@ def _source_observation(
     receipt = receipt_resource(
         "oci-images",
         "application/image",
-        {"unitBlob": controller.file_blob(image_path)},
+        {"unitContentId": controller.unit_content_id(desired_root, image_path)},
         artifacts=descriptors,
         qualified_name="application/image",
     )
@@ -291,14 +291,16 @@ def test_promoted_artifact_import_rejects_invalid_lineage(
     elif failure == "stale-receipt":
         _mutate(
             _source_receipt_path(fixture),
-            lambda document: document["spec"]["desired"].__setitem__("unitBlob", "stale-unit-blob"),
+            lambda document: document["spec"]["desired"].__setitem__("unitContentId", "sha256:" + "f" * 64),
         )
     elif failure == "wrong-desired-revision":
         unit_path = controller.unit_document_path(fixture.desired, "application/image")
         _mutate(unit_path, lambda document: document["spec"]["source"].__setitem__("revision", "a" * 40))
         _mutate(
             _source_receipt_path(fixture),
-            lambda document: document["spec"]["desired"].__setitem__("unitBlob", controller.file_blob(unit_path)),
+            lambda document: document["spec"]["desired"].__setitem__(
+                "unitContentId", controller.unit_content_id(fixture.desired, unit_path)
+            ),
         )
     elif failure == "missing-observed-revision":
         fixture = replace(fixture, promotion=replace(fixture.promotion, observed_revision=None))

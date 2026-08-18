@@ -184,6 +184,10 @@ def receipt_resource_schema(driver: str) -> JsonObject:
             }
         )
         status_required.append("artifacts")
+    core_receipt = CORE_CONTRACTS["receipt"].json_schema()
+    core_properties = cast(dict[str, Any], core_receipt["properties"])
+    core_specification = cast(dict[str, Any], core_properties["spec"])
+    desired_schema = deepcopy(cast(JsonObject, core_specification["properties"]["desired"]))
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": resource_schema_url(driver_instance.api_version, driver_instance.kind, "receipt"),
@@ -216,7 +220,7 @@ def receipt_resource_schema(driver: str) -> JsonObject:
                         "required": ["apiVersion", "kind", "name", "qualifiedName"],
                         "additionalProperties": False,
                     },
-                    "desired": {"type": "object"},
+                    "desired": desired_schema,
                     "resolvedInputs": _resolved_inputs_schema(),
                 },
                 "required": ["subject", "desired"],

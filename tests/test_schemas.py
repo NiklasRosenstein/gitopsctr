@@ -256,7 +256,7 @@ def test_result_contracts_and_receipt_resource_schemas(driver):
                 "name": "example",
                 "qualifiedName": "example",
             },
-            "desired": {"revision": REVISION, "unitBlob": "f" * 40},
+            "desired": {"revision": REVISION, "unitContentId": "sha256:" + "f" * 64},
             "resolvedInputs": {},
         },
         "status": {
@@ -285,6 +285,18 @@ def test_result_contracts_and_receipt_resource_schemas(driver):
     }
     with pytest.raises(ValidationError):
         Draft202012Validator(receipt_schema).validate(invalid_receipt)
+    obsolete_receipt = {
+        **receipt,
+        "spec": {
+            **receipt["spec"],
+            "desired": {"revision": REVISION, "unitBlob": "f" * 40},
+        },
+    }
+    with pytest.raises(ValidationError):
+        Draft202012Validator(receipt_schema).validate(obsolete_receipt)
+    desired_schema = receipt_schema["properties"]["spec"]["properties"]["desired"]
+    assert "unitBlob" not in desired_schema["properties"]
+    assert desired_schema["required"] == ["unitContentId"]
 
 
 def test_generated_schemas_and_examples_validate_from_the_local_catalog():

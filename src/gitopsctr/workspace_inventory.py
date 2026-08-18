@@ -74,7 +74,7 @@ class WorkspaceInventoryRecord:
     gvk: GVK
     name: str
     parsed: object
-    blob_id: str | None
+    content_id: str
     content_digest: str
     media_type: str | None
     local_identity: LocalResourceIdentity
@@ -106,7 +106,7 @@ class WorkspaceInventoryRecord:
             self.document,
             self.parsed,
             self.path,
-            self.blob_id,
+            self.content_id,
             self.content_digest,
             self.media_type,
         )
@@ -322,7 +322,6 @@ class WorkspaceInventorySession:
                     placement,
                     self.registry.api_kinds,
                     self.registry.contracts_for(family.name, placement.contract_profile),
-                    {PurePosixPath(path): value for path, value in snapshot.content_ids.items()},
                     selection,
                 ),
             )
@@ -367,7 +366,7 @@ class WorkspaceInventorySession:
             item.gvk,
             item.name,
             item.parsed,
-            item.blob_id,
+            item.content_id,
             item.content_digest,
             item.media_type,
             item.local_identity,

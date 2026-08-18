@@ -1388,7 +1388,7 @@ class ResolvedArtifactImport(StrictModel):
     sourceUnitUid: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
     sourceDesiredRevision: Annotated[str, Pattern(r"^[0-9a-f]{40}$")]
     sourceObservedRevision: Annotated[str, Pattern(r"^[0-9a-f]{40}$")]
-    receiptUnitBlob: Annotated[str, Pattern(r"^[0-9a-f]{40}$")]
+    receiptUnitContentId: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
     artifactName: Annotated[str, Pattern(DESIRED_UID_PATTERN)]
     apiVersion: Annotated[str, Pattern(r"^[^/]+/[^/]+$")]
     kind: Annotated[str, Pattern(r"^[A-Z][A-Za-z0-9]*$")]
@@ -1819,7 +1819,7 @@ class AwsEcrCredentialProvider(StrictModel):
 
 @dataclass(frozen=True, kw_only=True)
 class ReceiptDesired(StrictModel):
-    unitBlob: str
+    unitContentId: Annotated[str, Pattern(CONTENT_DIGEST_PATTERN)]
     revision: str | None = None
 
 

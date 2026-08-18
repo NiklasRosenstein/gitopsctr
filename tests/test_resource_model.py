@@ -85,7 +85,7 @@ def relationship_resource(
     document: JsonObject,
     *,
     path: str,
-    blob_id: str | None = None,
+    content_id: str | None = None,
     content_digest: str | None = None,
     media_type: str | None = None,
 ) -> RelationshipResource:
@@ -94,7 +94,7 @@ def relationship_resource(
         document,
         document,
         PurePosixPath(path),
-        blob_id,
+        content_id,
         content_digest,
         media_type,
     )
@@ -324,7 +324,7 @@ def test_receipt_contract_dispatches_to_subject_driver_result_and_artifacts():
                 "name": "infrastructure",
                 "qualifiedName": "infrastructure",
             },
-            "desired": {"unitBlob": "blob"},
+            "desired": {"unitContentId": "sha256:" + "a" * 64},
         },
         "status": {
             "controller": {},
@@ -354,13 +354,12 @@ def test_collection_provider_discovers_and_parses_registered_family(tmp_path: Pa
         placement=placement,
         api_kinds=RESOURCE_REGISTRY.api_kinds,
         contracts=RESOURCE_REGISTRY.contracts_for(family.name, placement.contract_profile),
-        blob_ids={PurePosixPath("deployment/environments/dev/environment.yaml"): "blob-1"},
     )
     resources = tuple(collection.provider.discover(context))
     assert len(resources) == 1
     assert resources[0].name == "dev"
     assert resources[0].gvk == GVK(CORE_API_VERSION, "Environment")
-    assert resources[0].blob_id == "blob-1"
+    assert resources[0].content_id.startswith("sha256:")
     assert resources[0].content_digest.startswith("sha256:")
 
 
@@ -449,7 +448,7 @@ def test_receipt_observation_binding_executes_identity_and_freshness():
                     "name": "application",
                     "qualifiedName": "application",
                 },
-                "desired": {"unitBlob": "blob-a"},
+                "desired": {"unitContentId": "sha256:" + "a" * 64},
             },
             "status": {"controller": {}, "result": {}},
         },
@@ -466,11 +465,13 @@ def test_receipt_observation_binding_executes_identity_and_freshness():
             "spec": {},
         },
         path="units/application.yaml",
-        blob_id="blob-a",
+        content_id="sha256:" + "a" * 64,
     )
     assert definition.binding.subject_identity(receipt) == unit.identity
     assert definition.binding.evaluate(receipt, unit) is ObservationState.CURRENT
-    assert definition.binding.evaluate(receipt, replace(unit, blob_id="blob-b")) is ObservationState.STALE
+    assert (
+        definition.binding.evaluate(receipt, replace(unit, content_id="sha256:" + "b" * 64)) is ObservationState.STALE
+    )
     mismatched = replace(receipt, identity=ResourceIdentity(CORE_API_VERSION, "Receipt", "another-name"))
     with pytest.raises(ResourceModelError, match="subject name must match"):
         definition.binding.subject_identity(mismatched)
@@ -522,7 +523,7 @@ def test_receipt_artifact_binding_executes_identity_digest_media_and_producer_in
                     "name": "application",
                     "qualifiedName": "application",
                 },
-                "desired": {"unitBlob": "blob"},
+                "desired": {"unitContentId": "sha256:" + "a" * 64},
             },
             "status": {
                 "controller": {},

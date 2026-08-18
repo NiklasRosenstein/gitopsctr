@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import Any, Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 
+from gitopsctr.application.workspace import WorkspaceEntry, entry_content_id
 from gitopsctr.formats import PROJECT_CONFIG_NAMES, Project, load_document
 from gitopsctr.resource_api import (
     GVK,
@@ -753,7 +754,7 @@ class UnitInspectionPresenter:
             runtime.resource_qualified_name(record),
             record.gvk.kind,
             runtime.resource_partition(record) or "-",
-            _short_revision(record.blob_id),
+            _short_revision(record.content_id),
             observation,
             reconciliation,
             reason,
@@ -997,7 +998,6 @@ class CollectionReadContext:
     placement: ResourcePlacement
     api_kinds: Mapping[GVK, ApiKind[object]]
     contracts: Mapping[GVK, TypedDocumentContract[Any]]
-    blob_ids: Mapping[PurePosixPath, str] = field(default_factory=dict)
     selection: ResourceSelection | None = None
 
 
@@ -1010,7 +1010,7 @@ class DiscoveredResource:
     gvk: GVK
     name: str
     parsed: object
-    blob_id: str | None
+    content_id: str
     content_digest: str
     media_type: str | None
     local_identity: LocalResourceIdentity
@@ -1142,6 +1142,7 @@ class FilesystemCollectionProvider:
             relative = PurePosixPath(path.relative_to(context.root).as_posix())
             try:
                 raw = path.read_bytes()
+                executable = bool(path.stat().st_mode & 0o111)
             except OSError as exc:
                 raise ResourceModelError(f"could not read {context.placement.plane} resource {path}: {exc}") from exc
             media_type = None
@@ -1160,7 +1161,7 @@ class FilesystemCollectionProvider:
                 gvk,
                 name,
                 parsed,
-                context.blob_ids.get(relative),
+                str(entry_content_id(WorkspaceEntry.file(relative.as_posix(), raw, executable=executable))),
                 "sha256:" + hashlib.sha256(raw).hexdigest(),
                 media_type,
                 local_identity,
@@ -1243,7 +1244,7 @@ class RelationshipResource:
     document: JsonObject
     parsed: object
     path: PurePosixPath
-    blob_id: str | None = None
+    content_id: str | None = None
     content_digest: str | None = None
     media_type: str | None = None
 
@@ -1380,12 +1381,12 @@ class ObservationBindingDocumentation:
 
 @dataclass(frozen=True)
 class ReceiptObservationBinding:
-    """Executable Receipt subject identity and desired-blob freshness invariant."""
+    """Executable Receipt subject identity and logical-content freshness invariant."""
 
     subject_api_version: JsonFieldPath
     subject_kind: JsonFieldPath
     subject_name: JsonFieldPath
-    desired_blob: JsonFieldPath
+    desired_content_id: JsonFieldPath
 
     def subject_identity(self, observer: RelationshipResource) -> ResourceIdentity:
         values = tuple(
@@ -1403,18 +1404,18 @@ class ReceiptObservationBinding:
     def evaluate(self, observer: RelationshipResource, subject: RelationshipResource) -> ObservationState:
         if self.subject_identity(observer) != subject.identity:
             raise ResourceModelError(f"Receipt {observer.identity.name!r} observes a different Unit")
-        expected = self.desired_blob.get(observer.document)
+        expected = self.desired_content_id.get(observer.document)
         if not isinstance(expected, str) or not expected:
-            raise ResourceModelError(f"Receipt {observer.identity.name!r} has an invalid desired Unit blob")
-        if subject.blob_id is None:
-            raise ResourceModelError(f"desired Unit {subject.identity.name!r} has no Git blob identity")
-        return ObservationState.CURRENT if expected == subject.blob_id else ObservationState.STALE
+            raise ResourceModelError(f"Receipt {observer.identity.name!r} has an invalid desired Unit content ID")
+        if subject.content_id is None:
+            raise ResourceModelError(f"desired Unit {subject.identity.name!r} has no logical content identity")
+        return ObservationState.CURRENT if expected == subject.content_id else ObservationState.STALE
 
     def documentation(self) -> ObservationBindingDocumentation:
         return ObservationBindingDocumentation(
             (self.subject_api_version, self.subject_kind, self.subject_name),
-            self.desired_blob,
-            "subject Git blob",
+            self.desired_content_id,
+            "subject logical content ID",
         )
 
 
@@ -2422,7 +2423,7 @@ def build_resource_registry(
                 JsonFieldPath(("spec", "subject", "apiVersion")),
                 JsonFieldPath(("spec", "subject", "kind")),
                 JsonFieldPath(("spec", "subject", "name")),
-                JsonFieldPath(("spec", "desired", "unitBlob")),
+                JsonFieldPath(("spec", "desired", "unitContentId")),
             ),
         ),
     )

@@ -50,12 +50,13 @@
               ],
               "default": null
             },
-            "unitBlob": {
+            "unitContentId": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
               "type": "string"
             }
           },
           "required": [
-            "unitBlob"
+            "unitContentId"
           ],
           "title": "ReceiptDesired",
           "type": "object"

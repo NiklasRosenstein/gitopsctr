@@ -56,8 +56,8 @@ collections, families, observations, artifact descriptions, graph relationships,
 Selectors and filter options are derived only after the combined registry validates successfully.
 
 Relationship definitions connect otherwise independent resources. In particular, a Receipt observes a desired Unit
-by subject identity and desired-unit blob, while its artifact descriptors refer to separately stored Artifact
-resources. Those definitions are invariants; each YAML or JSON document is a concrete instance. See the generated
+by subject identity and the desired Unit's logical entry `ContentId`, while its artifact descriptors refer to
+separately stored Artifact resources. Those definitions are invariants; each YAML or JSON document is a concrete instance. See the generated
 [resource model](resource-model.md) for the complete built-in placement matrix and relationships.
 
 ## Controller resources

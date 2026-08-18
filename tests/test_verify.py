@@ -281,7 +281,7 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
             receipt_document(
                 "terraform",
                 "infrastructure",
-                {"revision": DESIRED_REVISION, "unitBlob": "same-unit"},
+                {"revision": DESIRED_REVISION, "unitContentId": "sha256:" + "a" * 64},
                 {"applied": {"sourceRevision": "a" * 40}, "outputs": {}},
                 resolved_inputs={},
                 controller={"revision": "c" * 40},
@@ -309,7 +309,7 @@ def test_reapply_only_bypasses_the_clean_receipt_shortcut(monkeypatch, reapply, 
     monkeypatch.setattr(deploy_release, "observed_tree", observed_tree)
     monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
     monkeypatch.setattr(deploy_release, "fetch_ref", lambda _ref: DESIRED_REVISION)
-    monkeypatch.setattr(deploy_release, "file_blob", lambda _path: "same-unit")
+    monkeypatch.setattr(deploy_release, "unit_content_id", lambda *_args: "sha256:" + "a" * 64)
     monkeypatch.setattr(deploy_release, "controller_evidence", lambda: {"revision": "c" * 40})
     monkeypatch.setattr(
         deploy_release,

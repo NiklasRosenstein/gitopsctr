@@ -12,7 +12,7 @@ from gitopsctr.adapters.git import GitSnapshotReader
 from gitopsctr.adapters.git.workspace_inspection import inspect_workspace_provider
 from gitopsctr.adapters.git.workspace_planes import GitWorkspacePlaneSession
 from gitopsctr.application.inspection import InspectionOutputFormat, ResourceInspectionCommand
-from gitopsctr.application.model import SnapshotId
+from gitopsctr.application.model import ContentId, SnapshotId
 from gitopsctr.application.workspace import InMemoryWorkspace, WorkspaceCapabilities, WorkspaceEntry
 from gitopsctr.errors import OperationError
 from gitopsctr.formats import validate_project_document
@@ -25,7 +25,7 @@ from tests import test_inventory as inventory_support
 pytest_plugins = ("tests.test_inventory",)
 
 
-def _unit_discovery(workspace, blob_ids, project):
+def _unit_discovery(workspace, project):
     family = RESOURCE_REGISTRY.family("unit")
     placement = next(item for item in family.placements if item.plane is ResourcePlane.DESIRED)
     collection = RESOURCE_REGISTRY.collection(placement.collection)
@@ -39,7 +39,6 @@ def _unit_discovery(workspace, blob_ids, project):
             placement,
             RESOURCE_REGISTRY.api_kinds,
             RESOURCE_REGISTRY.contracts_for(family.name, placement.contract_profile),
-            blob_ids,
         ),
     )
 
@@ -51,7 +50,7 @@ def _observable_records(records):
             record.document,
             record.gvk,
             record.name,
-            record.blob_id,
+            record.content_id,
             record.content_digest,
             record.media_type,
             record.local_identity,
@@ -69,12 +68,8 @@ def test_git_and_memory_workspaces_discover_identical_collection_records(reposit
         snapshot.workspace.list_entries(), capabilities=snapshot.workspace.capabilities, mutable=False
     )
 
-    git_records = _unit_discovery(
-        snapshot.workspace, {PurePosixPath(key): value for key, value in snapshot.content_ids.items()}, planes.project()
-    )
-    memory_records = _unit_discovery(
-        memory, {PurePosixPath(key): value for key, value in snapshot.content_ids.items()}, planes.project()
-    )
+    git_records = _unit_discovery(snapshot.workspace, planes.project())
+    memory_records = _unit_discovery(memory, planes.project())
 
     assert _observable_records(memory_records) == _observable_records(git_records)
     assert all(record.path == PurePosixPath(record.path.as_posix()) for record in git_records)
@@ -100,7 +95,7 @@ class MemoryPlaneProvider:
         return self._project
 
     def source(self) -> WorkspaceSnapshot:
-        return WorkspaceSnapshot(ResourcePlane.SOURCE, None, None, None, self._source, {})
+        return WorkspaceSnapshot(ResourcePlane.SOURCE, None, None, None, self._source, self._source.entry_content_ids())
 
     def snapshot(
         self,
@@ -118,7 +113,8 @@ class MemoryPlaneProvider:
             selected = current if current is not None and current.revision == revision else None
         if selected is None:
             if allow_missing and revision is None:
-                return WorkspaceSnapshot(plane, reference, None, None, InMemoryWorkspace(mutable=False), {})
+                empty = InMemoryWorkspace(mutable=False)
+                return WorkspaceSnapshot(plane, reference, None, None, empty, empty.entry_content_ids())
             raise OperationError(f"{plane} ref {reference!r} does not exist")
         return selected
 
@@ -131,7 +127,7 @@ def _memory_workspace(documents: dict[str, dict[str, object]]) -> InMemoryWorksp
 
 def test_workspace_snapshot_rejects_inconsistent_or_mutable_content() -> None:
     immutable = _memory_workspace({"units/application.json": inventory_support.desired_terraform("application")})
-    values = {"units/application.json": "raw-id"}
+    values = dict(immutable.entry_content_ids())
     snapshot = WorkspaceSnapshot(
         ResourcePlane.DESIRED,
         "desired/dev",
@@ -140,8 +136,8 @@ def test_workspace_snapshot_rejects_inconsistent_or_mutable_content() -> None:
         immutable,
         values,
     )
-    values["units/changed.json"] = "changed"
-    assert dict(snapshot.content_ids) == {"units/application.json": "raw-id"}
+    values["units/changed.json"] = ContentId("sha256:" + "b" * 64)
+    assert dict(snapshot.content_ids) == dict(immutable.entry_content_ids())
 
     with pytest.raises(TypeError, match="ResourcePlane"):
         WorkspaceSnapshot(
@@ -166,9 +162,11 @@ def test_workspace_snapshot_rejects_inconsistent_or_mutable_content() -> None:
             {},
         )
     with pytest.raises(ValueError, match="both revision and snapshot_id"):
-        WorkspaceSnapshot(ResourcePlane.DESIRED, "desired/dev", None, SnapshotId("snapshot"), immutable, {})
+        WorkspaceSnapshot(
+            ResourcePlane.DESIRED, "desired/dev", None, SnapshotId("snapshot"), immutable, immutable.entry_content_ids()
+        )
     with pytest.raises(ValueError, match="source"):
-        WorkspaceSnapshot(ResourcePlane.SOURCE, "source", None, None, immutable, {})
+        WorkspaceSnapshot(ResourcePlane.SOURCE, "source", None, None, immutable, immutable.entry_content_ids())
     with pytest.raises(ValueError, match="logical file"):
         WorkspaceSnapshot(
             ResourcePlane.DESIRED,
@@ -176,7 +174,7 @@ def test_workspace_snapshot_rejects_inconsistent_or_mutable_content() -> None:
             "revision",
             SnapshotId("snapshot"),
             immutable,
-            {"missing.json": "raw-id"},
+            {"missing.json": ContentId("sha256:" + "a" * 64)},
         )
     with pytest.raises(ValueError, match="empty content"):
         WorkspaceSnapshot(
@@ -185,7 +183,7 @@ def test_workspace_snapshot_rejects_inconsistent_or_mutable_content() -> None:
             None,
             None,
             immutable,
-            {},
+            immutable.entry_content_ids(),
         )
     for nonempty in (
         InMemoryWorkspace((WorkspaceEntry.directory("ghost"),), mutable=False),
@@ -196,7 +194,9 @@ def test_workspace_snapshot_rejects_inconsistent_or_mutable_content() -> None:
         ),
     ):
         with pytest.raises(ValueError, match="empty content"):
-            WorkspaceSnapshot(ResourcePlane.OBSERVED, "observed/dev", None, None, nonempty, {})
+            WorkspaceSnapshot(
+                ResourcePlane.OBSERVED, "observed/dev", None, None, nonempty, nonempty.entry_content_ids()
+            )
 
 
 def _memory_provider(*, duplicate: bool = False, missing_default: bool = False) -> MemoryPlaneProvider:
@@ -216,7 +216,9 @@ def _memory_provider(*, duplicate: bool = False, missing_default: bool = False) 
     if duplicate:
         desired_documents["units/application.yaml"] = desired
     desired_workspace = _memory_workspace(desired_documents)
-    receipt = inventory_support.receipt("application", "memory-desired-blob")
+    receipt = inventory_support.receipt(
+        "application", str(desired_workspace.entry_content_ids()["units/application.json"])
+    )
     observed_workspace = _memory_workspace({"units/application.json": receipt})
     return MemoryPlaneProvider(
         project,
@@ -228,7 +230,7 @@ def _memory_provider(*, duplicate: bool = False, missing_default: bool = False) 
                 "memory-current",
                 SnapshotId("memory-current"),
                 desired_workspace,
-                {"units/application.json": "memory-desired-blob"},
+                desired_workspace.entry_content_ids(),
             ),
             (ResourcePlane.OBSERVED, "gitopsctr/observed/dev", None): WorkspaceSnapshot(
                 ResourcePlane.OBSERVED,
@@ -236,7 +238,7 @@ def _memory_provider(*, duplicate: bool = False, missing_default: bool = False) 
                 "memory-observed",
                 SnapshotId("memory-observed"),
                 observed_workspace,
-                {"units/application.json": "memory-observed-blob"},
+                observed_workspace.entry_content_ids(),
             ),
         },
     )
@@ -258,7 +260,7 @@ def _matrix_memory_provider(old_revision: str, current_revision: str) -> MemoryP
         old_revision,
         SnapshotId(old_revision),
         old_workspace,
-        {"units/application.yaml": "memory-desired-blob"},
+        old_workspace.entry_content_ids(),
     )
     snapshots[(ResourcePlane.DESIRED, "gitopsctr/desired/matrix", None)] = WorkspaceSnapshot(
         ResourcePlane.DESIRED,
@@ -266,7 +268,7 @@ def _matrix_memory_provider(old_revision: str, current_revision: str) -> MemoryP
         current_revision,
         SnapshotId(current_revision),
         current_workspace,
-        {"units/application.yaml": "memory-desired-blob", "units/current.yaml": "memory-current-blob"},
+        current_workspace.entry_content_ids(),
     )
     return MemoryPlaneProvider(base._project, base._source, snapshots)
 
@@ -368,7 +370,6 @@ def test_git_and_memory_providers_share_current_and_historical_command_matrix(re
         record
         for record in _unit_discovery(
             git_snapshot.workspace,
-            {PurePosixPath(key): value for key, value in git_snapshot.content_ids.items()},
             git_provider.project(),
         )
         if record.name == "application"
@@ -377,7 +378,6 @@ def test_git_and_memory_providers_share_current_and_historical_command_matrix(re
         record
         for record in _unit_discovery(
             memory_snapshot.workspace,
-            {PurePosixPath(key): value for key, value in memory_snapshot.content_ids.items()},
             memory_provider.project(),
         )
         if record.name == "application"
@@ -387,8 +387,9 @@ def test_git_and_memory_providers_share_current_and_historical_command_matrix(re
         memory_record.document,
         memory_record.media_type,
     )
-    assert git_record.blob_id is not None
-    assert memory_record.blob_id == "memory-desired-blob"
+    # The matrix deliberately uses different YAML and JSON serializations;
+    # logical entry identities remain byte- and path-exact.
+    assert git_record.content_id != memory_record.content_id
     assert git_record.content_digest != memory_record.content_digest
 
     inventory_support.git(repository, "checkout", "desired")

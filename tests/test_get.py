@@ -584,11 +584,11 @@ def test_get_stack_tables_batch_inspection_preparation(
     assert len(batches) == 2
 
 
-def test_get_unit_desired_column_is_the_resource_blob(repository: Path, capsys: pytest.CaptureFixture[str]):
+def test_get_unit_desired_column_is_the_logical_content_id(repository: Path, capsys: pytest.CaptureFixture[str]):
     output = run_get(repository, capsys, "unit", "application", "--environment", "dev")
     desired = output.splitlines()[1].split()[3]
     assert len(desired) == 12
-    assert all(character in "0123456789abcdef" for character in desired)
+    assert desired.startswith("sha256:")
 
 
 def test_get_desired_unit_table_uses_explicit_observed_snapshot(repository: Path, capsys: pytest.CaptureFixture[str]):
@@ -766,7 +766,7 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
     )
     desired_revision = inventory_support.commit(repository, "desired artifact producer")
     inventory_support.git(repository, "push", "origin", f"{desired_revision}:refs/heads/gitopsctr/desired/dev")
-    desired_blob = inventory_support.git(repository, "rev-parse", f"{desired_revision}:units/images.yaml")
+    desired_content_id = controller.unit_content_id(repository, repository / "units/images.yaml")
 
     inventory_support.git(repository, "checkout", "observed")
     artifact_path = repository / "artifacts/images/containers.yaml"
@@ -801,7 +801,7 @@ def test_get_receipt_artifact_returns_validated_persisted_resource(
                     "name": "images",
                     "qualifiedName": "images",
                 },
-                "desired": {"unitBlob": desired_blob},
+                "desired": {"unitContentId": desired_content_id},
             },
             "status": {
                 "controller": {},

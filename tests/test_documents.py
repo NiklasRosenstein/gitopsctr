@@ -262,7 +262,7 @@ def test_receipt_result_cannot_override_envelope_identity():
                         "name": "terraform",
                         "qualifiedName": "terraform",
                     },
-                    "desired": {"unitBlob": "f" * 40},
+                    "desired": {"unitContentId": "sha256:" + "f" * 64},
                 },
                 "status": {"controller": {}, "result": {"driver": "oci-images"}},
             }

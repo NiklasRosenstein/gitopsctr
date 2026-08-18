@@ -765,7 +765,7 @@ def test_observation_publication_rebases_after_unrelated_lease_renewal(tmp_path,
     receipt = receipt_resource(
         "terraform",
         "application",
-        {"revision": "a" * 40, "unitBlob": "application-blob"},
+        {"revision": "a" * 40, "unitContentId": "sha256:" + "a" * 64},
     )
     result = deploy_release.publish_observation_cas(
         "observed/dev",
@@ -1186,7 +1186,7 @@ def test_promotion_requires_every_source_unit_to_be_clean(tmp_path):
     _write_json(second, _terraform_desired_document("second"))
     _write_json(
         observed / "units/first.json",
-        receipt_document("terraform", "first", {"unitBlob": deploy_release.file_blob(first)}),
+        receipt_document("terraform", "first", {"unitContentId": deploy_release.unit_content_id(desired, first)}),
     )
 
     with pytest.raises(deploy_release.OperationError, match=r"second \(ready\)"):
@@ -1194,7 +1194,7 @@ def test_promotion_requires_every_source_unit_to_be_clean(tmp_path):
 
     _write_json(
         observed / "units/second.json",
-        receipt_document("terraform", "second", {"unitBlob": deploy_release.file_blob(second)}),
+        receipt_document("terraform", "second", {"unitContentId": deploy_release.unit_content_id(desired, second)}),
     )
     deploy_release.require_clean_source(desired, observed)
 
@@ -1374,7 +1374,9 @@ def test_reconciliation_statuses_identify_clean_ready_and_waiting_units(tmp_path
     _write_json(desired / "units/aws-application.json", _terraform_desired_document("aws-application"))
     _write_json(
         observed / "units/application-images.json",
-        receipt_document("terraform", "application-images", {"unitBlob": deploy_release.file_blob(clean_unit)}),
+        receipt_document(
+            "terraform", "application-images", {"unitContentId": deploy_release.unit_content_id(desired, clean_unit)}
+        ),
     )
 
     statuses = deploy_release.reconciliation_statuses(
@@ -1400,7 +1402,7 @@ def test_duplicate_receipt_reuses_identical_semantic_result_without_writing(tmp_
     existing = receipt_document(
         "terraform",
         "aws-application",
-        {"unitBlob": "same"},
+        {"unitContentId": "sha256:" + "a" * 64},
         {"applied": {"sourceRevision": "a" * 40}, "outputs": {"url": "https://example.test"}},
         controller={"run": "old"},
     )
@@ -1418,7 +1420,7 @@ def test_duplicate_receipt_reuses_identical_semantic_result_without_writing(tmp_
     candidate = receipt_resource(
         "terraform",
         "aws-application",
-        {"unitBlob": "same"},
+        {"unitContentId": "sha256:" + "a" * 64},
         {"applied": {"sourceRevision": "a" * 40}, "outputs": {"url": "https://example.test"}},
         controller={"run": "new"},
     )
@@ -1440,7 +1442,7 @@ def test_duplicate_receipt_rejects_a_different_semantic_result(tmp_path, monkeyp
     existing = receipt_document(
         "terraform",
         "aws-application",
-        {"unitBlob": "same"},
+        {"unitContentId": "sha256:" + "a" * 64},
         {"applied": {"sourceRevision": "a" * 40}, "outputs": {"url": "https://old.example.test"}},
     )
 
@@ -1452,7 +1454,7 @@ def test_duplicate_receipt_rejects_a_different_semantic_result(tmp_path, monkeyp
     candidate = receipt_resource(
         "terraform",
         "aws-application",
-        {"unitBlob": "same"},
+        {"unitContentId": "sha256:" + "a" * 64},
         {"applied": {"sourceRevision": "a" * 40}, "outputs": {"url": "https://new.example.test"}},
     )
 

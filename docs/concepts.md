@@ -102,9 +102,9 @@ that override from the same acquired-ref history; it is not a direct-Unit field.
 in the structural projection and desired Unit.
 
 Successful reconciliation writes a **Receipt** to the observed ref. A Receipt is a separate observed resource, not a
-Unit's embedded `status`. Its subject identifies a desired Unit, and its desired-unit blob identifies the exact Unit
-document that the driver reconciled. Comparing the separately stored documents derives whether the observation is
-current or stale; a Unit can also have no Receipt. Raw Unit output therefore remains the exact desired document, while
+Unit's embedded `status`. Its subject identifies a desired Unit, and its desired-unit logical entry `ContentId`
+identifies the exact Unit document that the driver reconciled. Comparing the separately stored documents derives
+whether the observation is current or stale; a Unit can also have no Receipt. Raw Unit output therefore remains the exact desired document, while
 the default Unit table can join that document with its Receipt to present operational state.
 
 Drivers may publish typed **artifacts** alongside their receipt, for example a `ContainerImages` resource containing

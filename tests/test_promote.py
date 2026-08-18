@@ -257,7 +257,7 @@ def test_command_promote_resolves_unit_and_direct_inline_stack_inputs(tmp_path: 
     receipt = receipt_resource(
         "terraform",
         "producer",
-        {"revision": target_revision, "unitBlob": controller.file_blob(producer_path)},
+        {"revision": target_revision, "unitContentId": controller.unit_content_id(target, producer_path)},
         result={"applied": {"sourceRevision": specification_revision}, "outputs": {"value": "evidence"}},
     )
     controller.write_document(

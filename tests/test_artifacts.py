@@ -368,7 +368,7 @@ def test_artifact_validation_rejects_tampering_and_extra_files(
         "oci-images",
         {"containers": container_images()},
     )
-    receipt = receipt_resource("oci-images", "images", {"unitBlob": "unit-blob"}, artifacts=descriptors)
+    receipt = receipt_resource("oci-images", "images", {"unitContentId": "sha256:" + "a" * 64}, artifacts=descriptors)
     artifact_path = observed / "artifacts/images/containers.json"
 
     controller.validate_receipt_artifacts(observed, unit, receipt)
@@ -382,7 +382,7 @@ def test_artifact_validation_rejects_tampering_and_extra_files(
         "oci-images",
         {"containers": container_images()},
     )
-    receipt = receipt_resource("oci-images", "images", {"unitBlob": "unit-blob"}, artifacts=descriptors)
+    receipt = receipt_resource("oci-images", "images", {"unitContentId": "sha256:" + "a" * 64}, artifacts=descriptors)
     (observed / "artifacts/images/extra.json").write_text("{}\n")
     with pytest.raises(controller.OperationError, match="complete contract set"):
         controller.validate_receipt_artifacts(observed, unit, receipt)
@@ -428,7 +428,7 @@ def test_stale_artifact_receipt_does_not_block_reconciliation_status(tmp_path: P
             receipt_document(
                 "oci-images",
                 "images",
-                {"unitBlob": "stale-unit-blob"},
+                {"unitContentId": "sha256:" + "b" * 64},
                 artifacts={
                     "containers": {
                         "apiVersion": "artifact.gitopsctr.io/v1",
@@ -470,7 +470,7 @@ def test_observation_publication_writes_receipt_and_artifact_atomically(
     revision = controller.publish_observation_cas(
         "observed/dev",
         "images",
-        receipt_resource("oci-images", "images", {"revision": "e" * 40, "unitBlob": "unit-blob"}),
+        receipt_resource("oci-images", "images", {"revision": "e" * 40, "unitContentId": "sha256:" + "a" * 64}),
         desired_images_unit(),
         {"containers": container_images()},
         "e" * 40,
@@ -521,7 +521,7 @@ def test_observation_publication_retries_without_losing_concurrent_state(
     revision = controller.publish_observation_cas(
         "observed/dev",
         "images",
-        receipt_resource("oci-images", "images", {"revision": "e" * 40, "unitBlob": "unit-blob"}),
+        receipt_resource("oci-images", "images", {"revision": "e" * 40, "unitContentId": "sha256:" + "a" * 64}),
         desired_images_unit(),
         {"containers": container_images()},
         "e" * 40,

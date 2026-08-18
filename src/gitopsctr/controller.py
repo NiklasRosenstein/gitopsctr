@@ -46,6 +46,7 @@ from gitopsctr.application import (
     ValidationResult,
     ValidationSubject,
 )
+from gitopsctr.application.workspace import WorkspaceEntry, entry_content_id
 from gitopsctr.artifacts import require_artifact_api
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
@@ -1367,6 +1368,22 @@ def file_blob(path: Path) -> str:
     return git("hash-object", str(path)).stdout.strip()
 
 
+def unit_content_id(root: Path, path: Path) -> str:
+    """Return the backend-neutral identity of one desired Unit document."""
+
+    try:
+        key = path.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise OperationError(f"desired Unit {path} is outside its logical root {root}") from exc
+    try:
+        metadata = path.stat()
+        content = path.read_bytes()
+    except OSError as exc:
+        raise OperationError(f"could not read desired Unit {path}") from exc
+    entry = WorkspaceEntry.file(key, content, executable=bool(metadata.st_mode & 0o111))
+    return str(entry_content_id(entry))
+
+
 def sha256_file(path: Path) -> str:
     return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
 
@@ -1768,7 +1785,7 @@ def current_receipt(observed: Path, candidate_units: Path, unit_name: str) -> Re
     if not receipt_path.is_file() or not unit_path.is_file():
         return None
     receipt = load_receipt(receipt_path, unit_name)
-    if receipt.spec.desired.unitBlob != file_blob(unit_path):
+    if receipt.spec.desired.unitContentId != unit_content_id(candidate_units.parent, unit_path):
         return None
     validate_receipt_artifacts(observed, load_desired_unit(unit_path, unit_name), receipt)
     return receipt
@@ -1980,7 +1997,7 @@ def resolve_template(
                     sourceUnitUid=source_unit.metadata.uid,
                     sourceDesiredRevision=promotion.desired_revision,
                     sourceObservedRevision=promotion.observed_revision,
-                    receiptUnitBlob=source_receipt.spec.desired.unitBlob,
+                    receiptUnitContentId=source_receipt.spec.desired.unitContentId,
                     artifactName=reference.name,
                     apiVersion=reference.apiVersion,
                     kind=reference.kind,
@@ -4772,7 +4789,7 @@ def reconciliation_statuses(unit_names: Sequence[str], desired: Path, observed: 
             statuses.append((unit_name, state.reconciliation.value, state.reason))
             continue
         receipt = load_receipt(receipt_path, unit_name)
-        if receipt.spec.desired.unitBlob == file_blob(unit_path):
+        if receipt.spec.desired.unitContentId == unit_content_id(desired, unit_path):
             validate_receipt_artifacts(observed, unit, receipt)
             state = operational.classify_observation(operational.ObservationEvidence.CURRENT)
         else:
@@ -7656,7 +7673,7 @@ def historical_receipt_matches(desired: Path, observed: Path, unit_name: str) ->
         receipt.name != PurePosixPath(unit_name).name
         or receipt.driver_name != driver
         or not re.fullmatch(r"[0-9a-f]{40}", str(desired_evidence.revision or ""))
-        or desired_evidence.unitBlob != file_blob(unit_path)
+        or desired_evidence.unitContentId != unit_content_id(desired, unit_path)
     ):
         return False
     try:
@@ -9997,7 +10014,7 @@ def publish_observation_cas(
             receipt_path = receipt_document_path(observed, unit_name)
             existing_receipt = load_receipt(receipt_path, unit_name) if receipt_path.is_file() else None
             if existing_receipt is not None:
-                if existing_receipt.spec.desired.unitBlob == receipt.spec.desired.unitBlob:
+                if existing_receipt.spec.desired.unitContentId == receipt.spec.desired.unitContentId:
                     validate_receipt_artifacts(observed, unit, existing_receipt)
             descriptors = write_artifact_documents(observed, unit_name, driver, artifact_documents)
             try:
@@ -10037,7 +10054,7 @@ def publish_observation_cas(
             )
             if (
                 existing_receipt is not None
-                and existing_receipt.spec.desired.unitBlob == candidate_receipt.spec.desired.unitBlob
+                and existing_receipt.spec.desired.unitContentId == candidate_receipt.spec.desired.unitContentId
             ):
                 if observed_revision is None:
                     raise OperationError(f"{observed_ref} receipt has no revision")
@@ -10643,7 +10660,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             write_output(False)
             return False
 
-        unit_blob = file_blob(unit_path)
+        current_unit_content_id = unit_content_id(desired, unit_path)
         receipt_path = receipt_document_path(observed, args.unit)
         previous_receipt = load_receipt(receipt_path, args.unit) if receipt_path.is_file() else None
         receipt_is_current = False
@@ -10651,7 +10668,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
             assert previous_receipt is not None
             receipt = previous_receipt
             skip_clean_unit = not args.plan or bool(UNIT_DRIVERS[driver_name].artifact_outputs)
-            receipt_is_current = receipt.spec.desired.unitBlob == unit_blob
+            receipt_is_current = receipt.spec.desired.unitContentId == current_unit_content_id
             if receipt_is_current:
                 validate_receipt_artifacts(observed, unit, receipt)
             if not getattr(args, "reapply", False) and skip_clean_unit and receipt_is_current:
@@ -10850,7 +10867,7 @@ def _command_reconcile(args: argparse.Namespace) -> bool:
                     name=unit.name,
                     qualifiedName=unit_qualified_name,
                 ),
-                desired=ReceiptDesired(revision=desired_revision, unitBlob=unit_blob),
+                desired=ReceiptDesired(revision=desired_revision, unitContentId=current_unit_content_id),
                 resolvedInputs=getattr(unit.spec, "resolvedInputs", None),
             ),
             status=ReceiptStatus(

@@ -8,6 +8,7 @@ from typing import cast
 
 import pytest
 
+import gitopsctr.controller as controller
 import gitopsctr.inventory as inventory_module
 from gitopsctr.contracts import (
     CORE_CONTRACTS,
@@ -169,7 +170,7 @@ def stack(
     }
 
 
-def receipt(name: str, unit_blob: str) -> dict[str, object]:
+def receipt(name: str, unit_content_id: str) -> dict[str, object]:
     return {
         "apiVersion": "gitopsctr.io/v1",
         "kind": "Receipt",
@@ -181,7 +182,7 @@ def receipt(name: str, unit_blob: str) -> dict[str, object]:
                 "name": name,
                 "qualifiedName": name,
             },
-            "desired": {"unitBlob": unit_blob},
+            "desired": {"unitContentId": unit_content_id},
         },
         "status": {
             "controller": {},
@@ -269,12 +270,12 @@ def build_repository(root: Path) -> Path:
     git(working, "push", "origin", f"{desired_revision}:refs/heads/desired")
     git(working, "push", "origin", f"{desired_revision}:refs/heads/gitopsctr/desired/dev")
     git(working, "push", "origin", f"{desired_revision}:refs/heads/gitopsctr/desired/staging")
-    desired_blob = git(working, "rev-parse", f"{desired_revision}:units/application.yaml")
+    desired_content_id = controller.unit_content_id(working, working / "units/application.yaml")
 
     git(working, "checkout", "-b", "observed")
     for path in (working / "units").glob("*"):
         path.unlink()
-    write_json(working / "units/application.yaml", receipt("application", desired_blob))
+    write_json(working / "units/application.yaml", receipt("application", desired_content_id))
     observed_revision = commit(working, "observed")
     git(working, "push", "origin", f"{observed_revision}:refs/heads/observed")
     git(working, "push", "origin", f"{observed_revision}:refs/heads/gitopsctr/observed/dev")
@@ -530,7 +531,7 @@ def test_inventory_discovers_desired_units_and_evaluates_current_receipts(reposi
     assert len(receipts) == 1
     application = next(item for item in units if item.name == "application")
     application_state = next(item for item in evaluation.units if item.unit.name == "application")
-    assert application.blob_id is not None
+    assert application.content_id.startswith("sha256:")
     assert application.document["kind"] == "Terraform"
     assert application_state.observation is InventoryObservationState.CURRENT
     assert application_state.reconciliation is ReconciliationState.CLEAN
@@ -611,7 +612,7 @@ def test_relationship_evaluation_distinguishes_stale_missing_and_orphan(reposito
     with InventorySession(repository, RESOURCE_REGISTRY) as inventory:
         units, receipts, artifacts = inventory.environment_inventory("dev")
         stale_document = json.loads(json.dumps(receipts[0].document))
-        stale_document["spec"]["desired"]["unitBlob"] = "stale"  # type: ignore[index]
+        stale_document["spec"]["desired"]["unitContentId"] = "sha256:" + "f" * 64  # type: ignore[index]
         stale_receipt = replace(receipts[0], document=stale_document)
         stale = evaluate_relationships(RESOURCE_REGISTRY, units, (stale_receipt,), artifacts)
         missing = evaluate_relationships(RESOURCE_REGISTRY, units, (), artifacts)
@@ -706,7 +707,7 @@ def test_inventory_validates_complete_receipt_artifact_relationship(repository: 
     )
     desired_revision = commit(repository, "desired artifact producer")
     git(repository, "push", "origin", f"{desired_revision}:refs/heads/gitopsctr/desired/artifacts")
-    unit_blob = git(repository, "rev-parse", f"{desired_revision}:units/images.yaml")
+    unit_content_id = controller.unit_content_id(repository, repository / "units/images.yaml")
 
     git(repository, "checkout", "observed")
     artifact_path = repository / "artifacts/images/containers.yaml"
@@ -741,7 +742,7 @@ def test_inventory_validates_complete_receipt_artifact_relationship(repository: 
                 "name": "images",
                 "qualifiedName": "images",
             },
-            "desired": {"unitBlob": unit_blob},
+            "desired": {"unitContentId": unit_content_id},
         },
         "status": {
             "controller": {},
@@ -870,7 +871,7 @@ def test_inventory_validates_complete_receipt_artifact_relationship(repository: 
         images.unit,
         document=advanced_document,
         parsed=RESOURCE_REGISTRY.contract(images.unit.gvk, "desired").parse(advanced_document),
-        blob_id="advanced-unit-blob",
+        content_id="sha256:" + "a" * 64,
     )
     advanced_units = tuple(advanced_unit if item.name == "images" else item for item in units)
     stale = evaluate_relationships(RESOURCE_REGISTRY, advanced_units, receipts, artifacts)

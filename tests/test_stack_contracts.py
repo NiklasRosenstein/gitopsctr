@@ -828,23 +828,27 @@ def test_environment_reference_schema_matches_runtime_contract():
         )
 
 
-def test_promoted_artifact_lineage_requires_a_git_receipt_blob():
+def test_promoted_artifact_lineage_requires_a_logical_receipt_content_id():
     contract = MashumaroContract(ResolvedArtifactImport, "urn:test:resolved-artifact-import")
+    document = {
+        "sourceStack": "application",
+        "sourceStackUid": "uid-stack",
+        "sourceUnit": "images",
+        "sourceUnitUid": "uid-images",
+        "sourceDesiredRevision": "a" * 40,
+        "sourceObservedRevision": "b" * 40,
+        "receiptUnitContentId": "sha256:" + "c" * 64,
+        "artifactName": "containers",
+        "apiVersion": "artifact.gitopsctr.io/v1",
+        "kind": "ContainerImages",
+        "artifactDigest": "sha256:" + "d" * 64,
+        "targetStackUid": "uid-target",
+        "artifactDocument": JsonObjectValue({}),
+    }
+    contract.parse(document)
     with pytest.raises(ContractError, match="does not match"):
-        contract.parse(
-            {
-                "sourceStack": "application",
-                "sourceStackUid": "uid-stack",
-                "sourceUnit": "images",
-                "sourceUnitUid": "uid-images",
-                "sourceDesiredRevision": "a" * 40,
-                "sourceObservedRevision": "b" * 40,
-                "receiptUnitBlob": "c" * 64,
-                "artifactName": "containers",
-                "apiVersion": "artifact.gitopsctr.io/v1",
-                "kind": "ContainerImages",
-                "artifactDigest": "sha256:" + "d" * 64,
-                "targetStackUid": "uid-target",
-                "artifactDocument": JsonObjectValue({}),
-            }
-        )
+        contract.parse({**document, "receiptUnitContentId": "c" * 40})
+    obsolete = {key: value for key, value in document.items() if key != "receiptUnitContentId"}
+    obsolete["receiptUnitBlob"] = "c" * 40
+    with pytest.raises(ContractError):
+        contract.parse(obsolete)

@@ -106,7 +106,7 @@ def _receipt(unit_path: Path, unit_name: str, revision: str) -> dict:
     return receipt_document(
         "terraform",
         unit_name,
-        {"revision": revision, "unitBlob": deploy_release.file_blob(unit_path)},
+        {"revision": revision, "unitContentId": deploy_release.unit_content_id(unit_path.parents[1], unit_path)},
         {"applied": {"sourceRevision": revision}, "outputs": {}},
     )
 
