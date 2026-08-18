@@ -125,21 +125,22 @@ def test_application_import_boundary_resolves_descendants_and_relative_imports()
     assert any(_is_forbidden_application_import(target) for target in _application_import_targets(path, relative))
 
 
-def test_git_resource_inspector_does_not_reach_legacy_inventory_or_plane_materialization() -> None:
+def test_git_read_adapters_do_not_reach_legacy_inventory_or_plane_materialization() -> None:
     """Phase 3b keeps the adapter facade clear of the retired path session."""
 
-    path = SOURCE / "adapters" / "git" / "inspection.py"
-    tree = ast.parse(path.read_text(), filename=str(path))
-    targets = {
-        target
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.Import, ast.ImportFrom))
-        for target in _application_import_targets(path, node)
-    }
     forbidden = ("gitopsctr.inventory", "gitopsctr.inspection", "gitopsctr.plane_repositories")
-    assert not [
-        target for target in targets if any(target == item or target.startswith(f"{item}.") for item in forbidden)
-    ]
+    for relative_name in ("adapters/git/inspection.py", "adapters/git/dependencies.py"):
+        path = SOURCE / relative_name
+        tree = ast.parse(path.read_text(), filename=str(path))
+        targets = {
+            target
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for target in _application_import_targets(path, node)
+        }
+        assert not [
+            target for target in targets if any(target == item or target.startswith(f"{item}.") for item in forbidden)
+        ]
 
 
 def test_workspace_get_helper_chain_has_no_legacy_inventory_or_plane_import() -> None:
@@ -150,6 +151,7 @@ def test_workspace_get_helper_chain_has_no_legacy_inventory_or_plane_import() ->
         "adapters/git/status.py",
         "workspace_get.py",
         "workspace_status.py",
+        "workspace_dependencies.py",
         "workspace_inventory.py",
         "workspace_collections.py",
         "workspace_inspection.py",
@@ -189,6 +191,7 @@ def test_logical_workspace_modules_cannot_import_filesystem_path_api() -> None:
     modules = (
         "workspace_get.py",
         "workspace_status.py",
+        "workspace_dependencies.py",
         "workspace_inventory.py",
         "workspace_collections.py",
         "workspace_inspection.py",

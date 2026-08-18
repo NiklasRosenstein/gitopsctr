@@ -2228,46 +2228,31 @@ def test_persisted_dependencies_accept_hierarchical_unit_addresses():
     assert deploy_release.desired_observation_reference_units(unit) == {"application/image"}
 
 
-def test_dependencies_command_prints_the_resolved_tree(monkeypatch, capsys):
-    monkeypatch.setattr(
-        deploy_release,
-        "git",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(_args, 0, "a" * 40 + "\n", ""),
+def test_dependencies_command_prints_the_resolved_tree(monkeypatch, tmp_path: Path, capsys):
+    monkeypatch.setattr(deploy_release, "REPOSITORY_ROOT", tmp_path)
+    project = deploy_release.build_parser().parse_args(["create", "project", "--name", "example"])
+    project.handler(project)
+    environment = deploy_release.build_parser().parse_args(["create", "environment", "--name", "dev"])
+    environment.handler(environment)
+    units = tmp_path / "deployment/environments/dev/units"
+    _write_json(units / "base.json", _unit("base"))
+    _write_json(
+        units / "producer.json",
+        _unit("producer", {"value": {"fromReceipt": {"unit": "base", "pointer": "/value"}}}),
     )
-
-    def materialize(_revision: str, output: Path):
-        _write_json(
-            output / "deployment/environments/dev/environment.json",
-            {"schema": 1, "name": "dev"},
-        )
-        _write_json(
-            output / "deployment/environments/dev/units/base.json",
-            _unit("base"),
-        )
-        _write_json(
-            output / "deployment/environments/dev/units/producer.json",
-            _unit(
-                "producer",
-                {
-                    "value": {
-                        "fromReceipt": {"unit": "base", "pointer": "/value"},
-                    }
-                },
-            ),
-        )
-        _write_json(
-            output / "deployment/environments/dev/units/consumer.json",
-            _unit(
-                "consumer",
-                {
-                    "value": {
-                        "fromReceipt": {"unit": "producer", "pointer": "/value"},
-                    }
-                },
-            ),
-        )
-
-    monkeypatch.setattr(deploy_release, "materialize_revision", materialize)
+    _write_json(
+        units / "consumer.json",
+        _unit("consumer", {"value": {"fromReceipt": {"unit": "producer", "pointer": "/value"}}}),
+    )
+    subprocess.run(("git", "init", "-b", "main"), cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(("git", "add", "."), cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ("git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "source"),
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    capsys.readouterr()
     args = deploy_release.build_parser().parse_args(
         [
             "dependencies",

@@ -9,18 +9,22 @@ from typing import cast
 
 import pytest
 
-from gitopsctr.adapters.git import GitSnapshotReader
+from gitopsctr.adapters.git import GitDependencyInspector, GitSnapshotReader
 from gitopsctr.adapters.git.workspace_inspection import inspect_workspace_provider
 from gitopsctr.adapters.git.workspace_planes import GitWorkspacePlaneSession
+from gitopsctr.adapters.memory import MemoryDependencyInspector, MemoryDependencySnapshot
+from gitopsctr.application.dependencies import DependencyCommand
 from gitopsctr.application.inspection import InspectionOutputFormat, ResourceInspectionCommand
 from gitopsctr.application.model import ContentId, SnapshotId
 from gitopsctr.application.status import StatusCommand
 from gitopsctr.application.workspace import InMemoryWorkspace, WorkspaceCapabilities, WorkspaceEntry
 from gitopsctr.errors import OperationError
 from gitopsctr.formats import validate_project_document
-from gitopsctr.registry import RESOURCE_REGISTRY
+from gitopsctr.registry import DRIVER_GVKS, DRIVER_NAMES_BY_GVK, RESOURCE_REGISTRY, UNIT_DRIVERS
 from gitopsctr.resource_model import ResourcePlane
+from gitopsctr.resources import ResourceCatalog
 from gitopsctr.workspace_collections import WorkspaceCollectionReadContext, discover_workspace_collection
+from gitopsctr.workspace_dependencies import dependency_workspace_provider
 from gitopsctr.workspace_inspection import WorkspaceSnapshot
 from gitopsctr.workspace_status import _status_entries, status_workspace_provider
 from tests import test_inventory as inventory_support
@@ -78,6 +82,149 @@ def test_git_and_memory_workspaces_discover_identical_collection_records(reposit
     assert all(record.path == PurePosixPath(record.path.as_posix()) for record in git_records)
 
 
+def _dependency_unit(name: str, dependencies: tuple[str, ...] = ()) -> dict[str, object]:
+    inputs = {
+        f"input-{index}": {"fromReceipt": {"unit": dependency, "pointer": "/value"}}
+        for index, dependency in enumerate(dependencies)
+    }
+    return {
+        "apiVersion": "unit.gitopsctr.io/v1",
+        "kind": "Terraform",
+        "metadata": {"name": name},
+        "spec": {"source": {"path": "."}, **({"inputs": inputs} if inputs else {})},
+    }
+
+
+def _dependency_documents(
+    *,
+    consumer_dependencies: tuple[str, ...] = ("base",),
+    environments_path: str = "deployment/environments",
+) -> dict[str, dict[str, object]]:
+    project = inventory_support.project_document()
+    if environments_path != "deployment/environments":
+        project["spec"] = {"effectLease": None, "environmentsPath": environments_path}
+    environment_root = f"{environments_path}/dev"
+    return {
+        "gitopsctr.yaml": project,
+        f"{environment_root}/environment.json": inventory_support.environment_document("dev"),
+        f"{environment_root}/units/base.json": _dependency_unit("base"),
+        f"{environment_root}/units/consumer.json": _dependency_unit("consumer", consumer_dependencies),
+        "deployment/stack-templates/web.json": {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "StackTemplate",
+            "metadata": {"name": "web"},
+            "spec": {
+                "parameters": [],
+                "unitTemplates": {
+                    "seed": {
+                        "apiVersion": "unit.gitopsctr.io/v1",
+                        "kind": "Terraform",
+                        "spec": {"source": {"path": "."}},
+                    },
+                    "application": {
+                        "apiVersion": "unit.gitopsctr.io/v1",
+                        "kind": "Terraform",
+                        "spec": {"source": {"path": "."}},
+                        "dependsOn": ["seed"],
+                    },
+                },
+            },
+        },
+        f"{environment_root}/stacks/web.json": {
+            "apiVersion": "gitopsctr.io/v1",
+            "kind": "Stack",
+            "metadata": {"name": "web"},
+            "spec": {"template": "web"},
+        },
+    }
+
+
+def _dependency_workspace(documents: dict[str, dict[str, object]]) -> InMemoryWorkspace:
+    return InMemoryWorkspace(
+        tuple(WorkspaceEntry.file(key, json.dumps(value, sort_keys=True).encode()) for key, value in documents.items()),
+        mutable=False,
+    )
+
+
+def _dependency_result_shape(result):
+    return result.environment, result.source_revision, result.targets, result.entries
+
+
+def test_dependency_adapters_agree_for_current_historical_custom_and_unknown_selectors(tmp_path: Path) -> None:
+    historical_documents = _dependency_documents()
+    current_documents = _dependency_documents(
+        consumer_dependencies=("base", "later"), environments_path="config/environments"
+    )
+    current_documents["config/environments/dev/units/later.json"] = _dependency_unit("later")
+    for key, document in historical_documents.items():
+        inventory_support.write_json(tmp_path / key, document)
+    inventory_support.git(tmp_path, "init", "-b", "main")
+    inventory_support.git(tmp_path, "add", ".")
+    historical = inventory_support.commit(tmp_path, "historical source")
+    for key, document in current_documents.items():
+        inventory_support.write_json(tmp_path / key, document)
+    inventory_support.git(tmp_path, "add", ".")
+    current = inventory_support.commit(tmp_path, "current source")
+    inventory_support.git(tmp_path, "tag", "dependency-history", historical)
+
+    memory = MemoryDependencyInspector(
+        {
+            "HEAD": MemoryDependencySnapshot(
+                current, SnapshotId("memory-current"), _dependency_workspace(current_documents)
+            ),
+            historical: MemoryDependencySnapshot(
+                historical, SnapshotId("memory-historical"), _dependency_workspace(historical_documents)
+            ),
+            "dependency-history": MemoryDependencySnapshot(
+                historical, SnapshotId("memory-custom"), _dependency_workspace(historical_documents)
+            ),
+        },
+        RESOURCE_REGISTRY,
+    )
+    reader = GitSnapshotReader.from_path(tmp_path)
+    git = GitDependencyInspector(tmp_path, reader, RESOURCE_REGISTRY)
+
+    for selector, expected_revision, expected_names in (
+        ("HEAD", current, ("base", "later", "consumer")),
+        (historical, historical, ("base", "consumer")),
+        ("dependency-history", historical, ("base", "consumer")),
+    ):
+        command = DependencyCommand("dev", source_selector=selector, units=("consumer",))
+        git_result = git.dependencies(command)
+        memory_result = memory.dependencies(command)
+        assert _dependency_result_shape(git_result) == _dependency_result_shape(memory_result)
+        assert git_result.source_revision == expected_revision
+        assert tuple(entry.name for entry in git_result.entries) == expected_names
+        assert str(git_result.source_snapshot) == f"git-commit:{expected_revision}"
+        stack_command = DependencyCommand("dev", source_selector=selector, units=("web/application",))
+        assert _dependency_result_shape(git.dependencies(stack_command)) == _dependency_result_shape(
+            memory.dependencies(stack_command)
+        )
+        assert tuple(entry.name for entry in git.dependencies(stack_command).entries) == ("web/seed", "web/application")
+
+    # A dirty source tree must not bleed into the exact selected Git commit.
+    inventory_support.write_json(tmp_path / "config/environments/dev/units/consumer.json", _dependency_unit("consumer"))
+    dirty_result = git.dependencies(DependencyCommand("dev", units=("consumer",)))
+    assert tuple(entry.name for entry in dirty_result.entries) == ("base", "later", "consumer")
+    with pytest.raises(OperationError, match="source revision 'missing' does not exist"):
+        git.dependencies(DependencyCommand("dev", source_selector="missing"))
+    with pytest.raises(OperationError, match="source revision 'missing' does not exist"):
+        memory.dependencies(DependencyCommand("dev", source_selector="missing"))
+
+    mixed_layout_documents = dict(historical_documents)
+    mixed_layout_documents["gitopsctr.yaml"] = current_documents["gitopsctr.yaml"]
+    mixed = MemoryDependencyInspector(
+        {
+            "mixed": MemoryDependencySnapshot(
+                "mixed", SnapshotId("memory-mixed"), _dependency_workspace(mixed_layout_documents)
+            )
+        },
+        RESOURCE_REGISTRY,
+    )
+    with pytest.raises(OperationError, match="config/environments/dev has no environment"):
+        mixed.dependencies(DependencyCommand("dev", source_selector="mixed"))
+
+
 class MemoryPlaneProvider:
     """Independent conformance provider; it owns neither Git state nor Git blobs."""
 
@@ -120,6 +267,104 @@ class MemoryPlaneProvider:
                 return WorkspaceSnapshot(plane, reference, None, None, empty, empty.entry_content_ids())
             raise OperationError(f"{plane} ref {reference!r} does not exist")
         return selected
+
+
+def _memory_dependency_inspector(documents: dict[str, dict[str, object]]) -> MemoryDependencyInspector:
+    workspace = _dependency_workspace(documents)
+    return MemoryDependencyInspector(
+        {"source": MemoryDependencySnapshot("memory-source", SnapshotId("memory-source"), workspace)},
+        RESOURCE_REGISTRY,
+    )
+
+
+def test_dependencies_require_one_valid_requested_environment_before_loading_units() -> None:
+    missing_environment = _dependency_documents()
+    missing_environment.pop("deployment/environments/dev/environment.json")
+    with pytest.raises(OperationError, match="directory deployment/environments/dev has no environment"):
+        _memory_dependency_inspector(missing_environment).dependencies(
+            DependencyCommand("dev", source_selector="source")
+        )
+
+    malformed_environment = _dependency_documents()
+    malformed_environment["deployment/environments/dev/environment.json"] = {
+        "apiVersion": "gitopsctr.io/v1",
+        "kind": "Environment",
+        "metadata": {"name": "dev"},
+        "spec": {"refs": "not-a-mapping"},
+    }
+    with pytest.raises(OperationError, match="invalid refs|invalid source resource"):
+        _memory_dependency_inspector(malformed_environment).dependencies(
+            DependencyCommand("dev", source_selector="source")
+        )
+
+    with pytest.raises(OperationError, match="directory deployment/environments/missing has no environment"):
+        _memory_dependency_inspector(_dependency_documents()).dependencies(
+            DependencyCommand("missing", source_selector="source")
+        )
+
+
+def test_memory_dependency_selector_derives_and_validates_its_own_project() -> None:
+    missing_project = _dependency_documents()
+    missing_project.pop("gitopsctr.yaml")
+    with pytest.raises(OperationError, match="source tree has no Project configuration"):
+        _memory_dependency_inspector(missing_project).dependencies(DependencyCommand("dev", source_selector="source"))
+
+    malformed_project = _dependency_documents()
+    malformed_project["gitopsctr.yaml"] = {"apiVersion": "gitopsctr.io/v1", "kind": "Project"}
+    with pytest.raises(OperationError, match="invalid project config gitopsctr.yaml"):
+        _memory_dependency_inspector(malformed_project).dependencies(DependencyCommand("dev", source_selector="source"))
+
+
+def test_dependencies_preserve_nested_source_unit_addresses_and_references() -> None:
+    documents = {
+        "gitopsctr.yaml": inventory_support.project_document(),
+        "deployment/environments/dev/environment.json": inventory_support.environment_document("dev"),
+        "deployment/environments/dev/units/a/base.json": _dependency_unit("base"),
+        "deployment/environments/dev/units/b/base.json": _dependency_unit("base"),
+        "deployment/environments/dev/units/c/consumer.json": _dependency_unit("consumer", ("a/base", "b/base")),
+    }
+    inspector = _memory_dependency_inspector(documents)
+
+    result = inspector.dependencies(DependencyCommand("dev", source_selector="source", units=("c/consumer",)))
+    assert result.targets == ("c/consumer",)
+    assert [(entry.name, entry.dependencies) for entry in result.entries] == [
+        ("a/base", ()),
+        ("b/base", ()),
+        ("c/consumer", ("a/base", "b/base")),
+    ]
+    selected = inspector.dependencies(DependencyCommand("dev", source_selector="source", units=("a/base",)))
+    assert [(entry.name, entry.dependencies) for entry in selected.entries] == [("a/base", ())]
+    with pytest.raises(OperationError, match=r"unknown Unit qualified name\(s\): base"):
+        inspector.dependencies(DependencyCommand("dev", source_selector="source", units=("base",)))
+
+
+def test_dependencies_close_the_provider_once_when_inventory_construction_fails() -> None:
+    class FailingPlanes:
+        close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        def project(self):
+            raise RuntimeError("project load failed")
+
+        def source(self):
+            raise AssertionError("source must not be read after project failure")
+
+        def snapshot(self, *_args, **_kwargs):
+            raise AssertionError("dependency inspection has no deployment snapshots")
+
+    planes = FailingPlanes()
+    with pytest.raises(RuntimeError, match="project load failed"):
+        dependency_workspace_provider(
+            planes,
+            RESOURCE_REGISTRY,
+            ResourceCatalog(UNIT_DRIVERS, DRIVER_NAMES_BY_GVK, DRIVER_GVKS),
+            DependencyCommand("dev"),
+            source_revision="memory-source",
+            source_snapshot=SnapshotId("memory-source"),
+        )
+    assert planes.close_calls == 1
 
 
 def _memory_workspace(documents: dict[str, dict[str, object]]) -> InMemoryWorkspace:

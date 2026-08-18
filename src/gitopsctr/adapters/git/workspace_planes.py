@@ -6,7 +6,7 @@ from pathlib import Path
 
 from gitopsctr.adapters.filesystem import FilesystemWorkspaceAdapter
 from gitopsctr.adapters.git.snapshots import GitSnapshotReader
-from gitopsctr.application.snapshots import SnapshotNotFoundError
+from gitopsctr.application.snapshots import SnapshotId, SnapshotNotFoundError
 from gitopsctr.application.workspace import InMemoryWorkspace
 from gitopsctr.errors import OperationError
 from gitopsctr.formats import Project, parse_document_bytes, validate_project_document
@@ -17,8 +17,17 @@ from gitopsctr.workspace_inspection import WorkspacePlaneProvider, WorkspaceSnap
 class GitWorkspacePlaneProvider(WorkspacePlaneProvider):
     """Resolve Git selector hints to exact snapshots without claiming CAS fences."""
 
-    def __init__(self, repository_root: Path, snapshot_reader: GitSnapshotReader) -> None:
-        self._source = FilesystemWorkspaceAdapter().read(repository_root, excluded_top_level=frozenset((".git",)))
+    def __init__(
+        self,
+        repository_root: Path,
+        snapshot_reader: GitSnapshotReader,
+        source_snapshot: SnapshotId | None = None,
+    ) -> None:
+        self._source = (
+            snapshot_reader.open_snapshot(source_snapshot).workspace
+            if source_snapshot is not None
+            else FilesystemWorkspaceAdapter().read(repository_root, excluded_top_level=frozenset((".git",)))
+        )
         self._snapshot_reader = snapshot_reader
         self._snapshots: dict[tuple[ResourcePlane, str, str | None], WorkspaceSnapshot] = {}
 

@@ -240,13 +240,13 @@ def project_config_path(root: Path) -> Path:
     return paths[0]
 
 
-def _validate_project_name(name: str, path: Path) -> None:
+def _validate_project_name(name: str, path: Path | PurePosixPath) -> None:
     labels = name.split(".")
     if any(len(label) > 63 for label in labels):
         raise DocumentFormatError(f"invalid project config {path}: metadata.name must be a DNS-1123 subdomain")
 
 
-def validate_project_document(value: object, path: Path) -> Project:
+def validate_project_document(value: object, path: Path | PurePosixPath) -> Project:
     """Validate a Project resource and return its runtime configuration."""
 
     if not isinstance(value, dict):
