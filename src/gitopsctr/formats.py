@@ -326,7 +326,7 @@ def project_environment_root(root: Path, environment_name: str) -> Path:
     return root.joinpath(*load_project_config(root).environments_path.parts, environment_name)
 
 
-def _ensure_json_value(value: object, path: Path) -> dict[str, Any]:
+def _ensure_json_value(value: object, path: Path | PurePosixPath) -> dict[str, Any]:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise DocumentFormatError(f"expected a mapping in {path}")
     try:
@@ -336,7 +336,7 @@ def _ensure_json_value(value: object, path: Path) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
-def parse_document_bytes(data: bytes, path: Path) -> dict[str, Any]:
+def parse_document_bytes(data: bytes, path: Path | PurePosixPath) -> dict[str, Any]:
     """Parse document bytes using the format implied by *path*."""
 
     try:

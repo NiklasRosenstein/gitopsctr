@@ -123,3 +123,93 @@ def test_application_import_boundary_resolves_descendants_and_relative_imports()
     assert any(_is_forbidden_application_import(target) for target in _application_import_targets(path, descendant))
     assert any(_is_forbidden_application_import(target) for target in _application_import_targets(path, parent_alias))
     assert any(_is_forbidden_application_import(target) for target in _application_import_targets(path, relative))
+
+
+def test_git_resource_inspector_does_not_reach_legacy_inventory_or_plane_materialization() -> None:
+    """Phase 3b keeps the adapter facade clear of the retired path session."""
+
+    path = SOURCE / "adapters" / "git" / "inspection.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    targets = {
+        target
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for target in _application_import_targets(path, node)
+    }
+    forbidden = ("gitopsctr.inventory", "gitopsctr.inspection", "gitopsctr.plane_repositories")
+    assert not [
+        target for target in targets if any(target == item or target.startswith(f"{item}.") for item in forbidden)
+    ]
+
+
+def test_workspace_get_helper_chain_has_no_legacy_inventory_or_plane_import() -> None:
+    """The Git facade cannot hide legacy discovery one helper deeper."""
+
+    modules = (
+        "adapters/git/workspace_inspection.py",
+        "workspace_get.py",
+        "workspace_inventory.py",
+        "workspace_collections.py",
+        "workspace_inspection.py",
+    )
+    forbidden = (
+        "gitopsctr.inventory",
+        "gitopsctr.inspection",
+        "gitopsctr.plane_repositories",
+        "gitopsctr.adapters.git.plane_materialization",
+    )
+    violations: list[str] = []
+    for relative_name in modules:
+        path = SOURCE / relative_name
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            for target in _application_import_targets(path, node):
+                if any(target == item or target.startswith(f"{item}.") for item in forbidden):
+                    violations.append(f"{relative_name} imports {target}")
+    assert not violations, "workspace get helper chain reaches a legacy backend: " + "; ".join(violations)
+
+
+def _logical_workspace_path_imports(tree: ast.AST) -> set[str]:
+    """Find filesystem-path imports while permitting logical POSIX value types."""
+
+    violations: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            violations.update(alias.name for alias in node.names if alias.name == "pathlib")
+        elif isinstance(node, ast.ImportFrom) and node.module == "pathlib":
+            violations.update(alias.name for alias in node.names if alias.name != "PurePosixPath")
+    return violations
+
+
+def test_logical_workspace_modules_cannot_import_filesystem_path_api() -> None:
+    modules = (
+        "workspace_get.py",
+        "workspace_inventory.py",
+        "workspace_collections.py",
+        "workspace_inspection.py",
+    )
+    violations: list[str] = []
+    for relative_name in modules:
+        tree = ast.parse((SOURCE / relative_name).read_text(), filename=relative_name)
+        violations.extend(f"{relative_name} imports {name}" for name in _logical_workspace_path_imports(tree))
+    assert not violations, "logical workspace modules import filesystem paths: " + "; ".join(violations)
+
+
+def test_logical_workspace_path_guard_rejects_pathlib_and_path_imports() -> None:
+    pathlib_import = ast.parse("import pathlib")
+    path_import = ast.parse("from pathlib import Path")
+    wildcard_import = ast.parse("from pathlib import *")
+    pure_path_import = ast.parse("from pathlib import PurePath")
+    posix_path_import = ast.parse("from pathlib import PosixPath")
+    windows_path_import = ast.parse("from pathlib import WindowsPath")
+    pure_posix_import = ast.parse("from pathlib import PurePosixPath")
+
+    assert _logical_workspace_path_imports(pathlib_import) == {"pathlib"}
+    assert _logical_workspace_path_imports(path_import) == {"Path"}
+    assert _logical_workspace_path_imports(wildcard_import) == {"*"}
+    assert _logical_workspace_path_imports(pure_path_import) == {"PurePath"}
+    assert _logical_workspace_path_imports(posix_path_import) == {"PosixPath"}
+    assert _logical_workspace_path_imports(windows_path_import) == {"WindowsPath"}
+    assert not _logical_workspace_path_imports(pure_posix_import)

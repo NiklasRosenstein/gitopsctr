@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import stat
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from gitopsctr.application.model import SnapshotId
 from gitopsctr.application.snapshots import SnapshotNotFoundError, SnapshotReadError, SnapshotView
@@ -96,6 +96,32 @@ class GitSnapshotReader:
         except WorkspaceError as exc:
             raise GitSnapshotEntryError(f"Git snapshot contains an invalid logical workspace entry: {exc}") from exc
         return SnapshotView(snapshot_id, workspace.content_id, workspace)
+
+    def revision_for_snapshot(self, snapshot_id: SnapshotId) -> str:
+        """Return this adapter's exact revision spelling for one issued snapshot."""
+
+        return self._revision_for(snapshot_id)
+
+    def blob_ids_for_snapshot(self, snapshot_id: SnapshotId) -> dict[PurePosixPath, str]:
+        """Return raw Git blob provenance for logical keys in one exact snapshot."""
+
+        revision = self._revision_for(snapshot_id)
+        try:
+            return self.repository.blob_ids(revision)
+        except GitRepositoryError as exc:
+            raise SnapshotReadError("local Git snapshot repository cannot be opened") from exc
+        except OperationError as exc:
+            raise SnapshotNotFoundError(f"Git snapshot does not exist: {snapshot_id}") from exc
+
+    def is_ancestor_snapshot(self, ancestor: SnapshotId, descendant: SnapshotId) -> bool:
+        """Check immutable Git lineage for read-only historical selection only."""
+
+        try:
+            return self.repository.is_ancestor(self._revision_for(ancestor), self._revision_for(descendant))
+        except GitRepositoryError as exc:
+            raise SnapshotReadError("local Git snapshot repository cannot be opened") from exc
+        except OperationError as exc:
+            raise SnapshotNotFoundError("Git snapshot cannot be checked for lineage") from exc
 
     @staticmethod
     def _revision_for(snapshot_id: SnapshotId) -> str:

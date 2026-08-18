@@ -1,0 +1,690 @@
+"""Logical-workspace get orchestration with no filesystem or Git dependency."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import cast
+
+from gitopsctr.application.inspection import InspectionTable, ResourceInspectionResult
+from gitopsctr.contracts import (
+    INSPECTION_RESOURCE_LIST_CONTRACT,
+    InspectionAddress,
+    InspectionAuthentication,
+    InspectionDetails,
+    InspectionProvenance,
+    InspectionResourceItem,
+    InspectionResourceListDocument,
+    InspectionResourceListMetadata,
+)
+from gitopsctr.document import JsonObjectValue
+from gitopsctr.errors import OperationError
+from gitopsctr.resource_api import JsonObject
+from gitopsctr.resource_model import (
+    IdentitySegmentDefinition,
+    InspectionRelationshipRole,
+    ResourceFamilyDefinition,
+    ResourceModelError,
+    ResourcePlane,
+    ResourceRegistry,
+    ResourceScope,
+    ResourceSelection,
+    WideInspectionPresenter,
+)
+from gitopsctr.workspace_inspection import WorkspacePlaneProvider
+from gitopsctr.workspace_inventory import (
+    WorkspaceInventoryRecord,
+    WorkspaceInventorySession,
+    evaluate_observation_relationship,
+    evaluate_relationships,
+)
+
+
+@dataclass(frozen=True)
+class InspectionResult:
+    """A persisted resource and any relationship state used only for its table row."""
+
+    record: WorkspaceInventoryRecord
+    relationship: object | None = None
+    qualified_name: str | None = None
+
+
+ALL_SELECTOR = "all"
+
+
+def inspectable_selectors(registry: ResourceRegistry) -> tuple[str, ...]:
+    """Return selectors from the semantic registry, not a CLI-owned kind list."""
+
+    selectors = {selector for family in registry.families if family.inspection for selector in family.selectors}
+    selectors.add(ALL_SELECTOR)
+    return tuple(sorted(selectors))
+
+
+def identity_filter_options(registry: ResourceRegistry) -> tuple[IdentitySegmentDefinition, ...]:
+    """Return the registry-declared family identity filters exposed by ``get``."""
+
+    options: dict[str, IdentitySegmentDefinition] = {}
+    for family in registry.families:
+        if family.inspection is None:
+            continue
+        for segment in family.identity.segments:
+            if segment.filter_option is None:
+                continue
+            previous = options.get(segment.filter_option)
+            if previous is not None and previous.name != segment.name:
+                raise ResourceModelError(
+                    f"identity filter {segment.filter_option!r} is registered for multiple identity segments"
+                )
+            options[segment.filter_option] = segment
+    return tuple(options[key] for key in sorted(options))
+
+
+def _aggregate_families(registry) -> tuple[ResourceFamilyDefinition, ...]:
+    """Return registry-defined inspection families inside an Environment namespace."""
+
+    return tuple(
+        family
+        for family in registry.families
+        if family.inspection is not None
+        and family.inspection.include_in_all
+        and next(item for item in family.placements if item.default_for_inspection).scope is ResourceScope.ENVIRONMENT
+    )
+
+
+def _is_authenticated_artifact_family(family: ResourceFamilyDefinition) -> bool:
+    view = family.inspection
+    return view is not None and view.relationship_role is InspectionRelationshipRole.DESCRIBED_RESOURCE
+
+
+def _inspection_planes(family: ResourceFamilyDefinition, registry) -> frozenset[ResourcePlane]:
+    """Planes used by a registry-defined view and its relationship traversal."""
+
+    view = family.inspection
+    if view is None:
+        return frozenset()
+    planes = {view.default_plane}
+    if view.observation is not None:
+        observation = registry.observation(view.observation)
+        planes.update((observation.observer_plane, observation.subject_plane))
+    if view.artifact_description is not None:
+        description = registry.artifact_description(view.artifact_description)
+        planes.update((description.describer_plane, description.artifact_plane, description.producer_plane))
+    return frozenset(planes)
+
+
+def _environments(inventory: WorkspaceInventorySession) -> tuple[str, ...]:
+    return tuple(record.name for record in inventory.resources(inventory.registry.namespace_family.name))
+
+
+def _selection(family: ResourceFamilyDefinition, args: argparse.Namespace) -> ResourceSelection | None:
+    storage_selection: ResourceSelection | None = None
+    try:
+        if args.name is not None:
+            family.addressing.validate(args.name)
+            storage_selection = family.addressing.storage_selection(args.name, family.identity)
+    except ResourceModelError as exc:
+        raise OperationError(f"invalid {family.singular} qualified name {args.name!r}: {exc}") from exc
+    try:
+        constraints = tuple(
+            constraint
+            for segment in family.identity.segments
+            if segment.option_destination is not None
+            and isinstance(value := getattr(args, segment.option_destination, None), str)
+            and (constraint := family.addressing.storage_constraint(segment.name, value, family.identity)) is not None
+        )
+    except ResourceModelError as exc:
+        raise OperationError(f"invalid {family.singular} address filter: {exc}") from exc
+    if storage_selection is not None and constraints:
+        return ResourceSelection(storage_selection.exact, (*storage_selection.constraints, *constraints))
+    return storage_selection or (ResourceSelection(constraints=constraints) if constraints else None)
+
+
+def _matches_address_filters(
+    family: ResourceFamilyDefinition,
+    qualified_name: str,
+    args: argparse.Namespace,
+) -> bool:
+    try:
+        return all(
+            family.addressing.filter_value(qualified_name, segment.name, family.identity) == value
+            for segment in family.identity.segments
+            if segment.option_destination is not None
+            and isinstance(value := getattr(args, segment.option_destination, None), str)
+        )
+    except ResourceModelError as exc:
+        raise OperationError(f"invalid {family.singular} address filter: {exc}") from exc
+
+
+def _names_selection(names: frozenset[str]) -> ResourceSelection:
+    return ResourceSelection.segment("name", names)
+
+
+def _validate_options(args: argparse.Namespace, family: ResourceFamilyDefinition, registry) -> None:
+    all_environments = cast(bool, args.all_environments)
+    environment = cast(str | None, args.environment)
+    desired_override = args.desired_ref is not None or args.desired_revision is not None
+    observed_override = args.observed_ref is not None or args.observed_revision is not None
+    default_placement = next(item for item in family.placements if item.default_for_inspection)
+    if default_placement.scope is ResourceScope.PROJECT:
+        if environment is not None or all_environments:
+            raise OperationError(f"{family.singular.title()} queries do not accept --environment or --all-environments")
+        if desired_override or observed_override:
+            raise OperationError(f"{family.singular.title()} queries do not accept deployment-ref overrides")
+    else:
+        if environment is None and not all_environments:
+            raise OperationError(f"get {family.plural} requires --environment or --all-environments")
+        if all_environments and (desired_override or observed_override):
+            raise OperationError("deployment-ref overrides cannot be combined with --all-environments")
+    planes = _inspection_planes(family, registry)
+    if desired_override and ResourcePlane.DESIRED not in planes:
+        raise OperationError(f"get {family.plural} does not accept desired-ref overrides")
+    if observed_override and ResourcePlane.OBSERVED not in planes and family.name != "stack":
+        raise OperationError(f"get {family.plural} does not accept observed-ref overrides")
+    if args.artifact is not None or args.artifacts:
+        view = family.inspection
+        definition = (
+            registry.artifact_description(view.artifact_description)
+            if view is not None and view.artifact_description is not None
+            else None
+        )
+        if definition is None or definition.describer_family != family.name:
+            raise OperationError("--artifact and --artifacts are available only for Receipt queries")
+        if args.name is None:
+            raise OperationError("Receipt artifact inspection requires a receipt name")
+    family_options = {segment.filter_option for segment in family.identity.segments}
+    for segment in identity_filter_options(registry):
+        if (
+            getattr(args, cast(str, segment.option_destination), None) is not None
+            and segment.filter_option not in family_options
+        ):
+            raise OperationError(f"{segment.filter_option} is not available for {family.plural}")
+
+
+def _validate_all_options(args: argparse.Namespace, registry) -> None:
+    """Validate aggregate inspection without imposing one family's plane."""
+
+    if args.name is not None:
+        raise OperationError("get all does not accept a resource name")
+    if args.artifact is not None or args.artifacts:
+        raise OperationError("get all does not accept --artifact or --artifacts")
+    for segment in identity_filter_options(registry):
+        if getattr(args, cast(str, segment.option_destination), None) is not None:
+            raise OperationError(f"get all does not accept {segment.filter_option}")
+    if args.environment is None and not args.all_environments:
+        raise OperationError("get all requires --environment or --all-environments")
+    desired_override = args.desired_ref is not None or args.desired_revision is not None
+    observed_override = args.observed_ref is not None or args.observed_revision is not None
+    if args.all_environments and (desired_override or observed_override):
+        raise OperationError("deployment-ref overrides cannot be combined with --all-environments")
+
+
+def _records_for_environment(
+    inventory: WorkspaceInventorySession,
+    family: ResourceFamilyDefinition,
+    environment: str,
+    args: argparse.Namespace,
+    *,
+    evaluate: bool,
+) -> tuple[InspectionResult, ...]:
+    desired_ref, observed_ref = inventory.deployment_refs(environment)
+    plane = family.inspection.default_plane if family.inspection is not None else None
+    selection = _selection(family, args)
+    if plane is ResourcePlane.DESIRED:
+        desired_ref = args.desired_ref or desired_ref
+        records = inventory.resources(
+            family.name,
+            environment=environment,
+            ref=desired_ref,
+            revision=args.desired_revision,
+            allow_missing_ref=args.desired_ref is None and args.desired_revision is None,
+            selection=selection,
+        )
+    elif plane is ResourcePlane.OBSERVED:
+        observed_ref = args.observed_ref or observed_ref
+        records = inventory.resources(
+            family.name,
+            environment=environment,
+            ref=observed_ref,
+            revision=args.observed_revision,
+            allow_missing_ref=args.observed_ref is None and args.observed_revision is None,
+            selection=selection,
+        )
+    else:
+        records = inventory.resources(
+            family.name,
+            environment=environment,
+            selection=selection,
+        )
+
+    addressed_records = tuple(
+        (record, inventory.resource_qualified_name(record))
+        for record in records
+        if (
+            (args.name is None or inventory.resource_qualified_name(record) == args.name)
+            and _matches_address_filters(family, inventory.resource_qualified_name(record), args)
+        )
+    )
+    selected_records = tuple(record for record, _qualified_name in addressed_records)
+    if evaluate and family.name in {"stack", "stacktemplate"}:
+        allow_missing_observed_ref = args.observed_ref is None and args.observed_revision is None
+        inventory.prepare_stack_inspection(
+            selected_records,
+            observed_ref=args.observed_ref or observed_ref,
+            observed_revision=args.observed_revision,
+            allow_missing_observed_ref=allow_missing_observed_ref,
+        )
+    relationship_by_path = (
+        _relationship_states(inventory, family, selected_records, environment, args) if evaluate else {}
+    )
+    return tuple(
+        InspectionResult(record, relationship_by_path.get(record.path), qualified_name)
+        for record, qualified_name in addressed_records
+    )
+
+
+def _relationship_states(
+    inventory: WorkspaceInventorySession,
+    family: ResourceFamilyDefinition,
+    records: tuple[WorkspaceInventoryRecord, ...],
+    environment: str,
+    args: argparse.Namespace,
+    *,
+    resolve_artifacts: bool = False,
+) -> dict[object, object]:
+    view = family.inspection
+    if view is None or view.observation is None:
+        return {}
+    observation = inventory.registry.observation(view.observation)
+    description = (
+        inventory.registry.artifact_description(view.artifact_description)
+        if view.artifact_description is not None
+        else None
+    )
+    desired_ref, observed_ref = inventory.deployment_refs(environment)
+    desired_ref = args.desired_ref or desired_ref
+    observed_ref = args.observed_ref or observed_ref
+
+    def related_resources(
+        related_family: str,
+        plane: ResourcePlane,
+        selection: ResourceSelection | None = None,
+    ) -> tuple[WorkspaceInventoryRecord, ...]:
+        definition = inventory.registry.family(related_family)
+        placement = next(item for item in definition.placements if item.plane is plane)
+        related_environment = environment if placement.scope is ResourceScope.ENVIRONMENT else None
+        if plane is ResourcePlane.SOURCE:
+            return inventory.resources(
+                related_family,
+                environment=related_environment,
+                plane=plane,
+                selection=selection,
+            )
+        if plane is ResourcePlane.DESIRED:
+            ref, revision = desired_ref, args.desired_revision
+            allow_missing_ref = args.desired_ref is None and args.desired_revision is None
+        else:
+            ref, revision = observed_ref, args.observed_revision
+            allow_missing_ref = args.observed_ref is None and args.observed_revision is None
+        return inventory.resources(
+            related_family,
+            environment=related_environment,
+            plane=plane,
+            ref=ref,
+            revision=revision,
+            allow_missing_ref=allow_missing_ref,
+            selection=selection,
+        )
+
+    if view.relationship_role is InspectionRelationshipRole.SUBJECT:
+        units = records
+        receipts = related_resources(
+            observation.observer_family,
+            observation.observer_plane,
+        )
+    elif view.relationship_role is InspectionRelationshipRole.OBSERVER:
+        receipts = records
+        units = related_resources(
+            observation.subject_family,
+            observation.subject_plane,
+        )
+    elif view.relationship_role is InspectionRelationshipRole.DESCRIBED_RESOURCE and description is not None:
+        receipts = related_resources(
+            description.describer_family,
+            description.describer_plane,
+        )
+        units = related_resources(
+            description.producer_family,
+            description.producer_plane,
+        )
+    else:
+        raise OperationError(
+            f"inspection relationship {observation.name!r} does not include resource family {family.name!r}"
+        )
+
+    artifacts: tuple[WorkspaceInventoryRecord, ...] = ()
+    if description is not None and (
+        resolve_artifacts or view.relationship_role is InspectionRelationshipRole.DESCRIBED_RESOURCE
+    ):
+        artifacts = related_resources(
+            description.artifact_family,
+            description.artifact_plane,
+        )
+    if description is None:
+        evaluation = evaluate_observation_relationship(observation, units, receipts)
+        if view.relationship_role is InspectionRelationshipRole.SUBJECT:
+            return {value.resource.path: value for value in evaluation.subjects}
+        if view.relationship_role is InspectionRelationshipRole.OBSERVER:
+            return {value.resource.path: value for value in evaluation.observers}
+        raise OperationError(
+            f"inspection relationship {observation.name!r} has no Artifact description for "
+            f"resource family {family.name!r}"
+        )
+
+    evaluation = evaluate_relationships(
+        inventory.registry,
+        units,
+        receipts,
+        artifacts,
+        resolve_artifacts=(
+            resolve_artifacts or view.relationship_role is InspectionRelationshipRole.DESCRIBED_RESOURCE
+        ),
+        strict_artifacts=view.relationship_role is not InspectionRelationshipRole.DESCRIBED_RESOURCE,
+        observation=observation,
+        description=description,
+        address_runtime=inventory,
+    )
+    if view.relationship_role is InspectionRelationshipRole.SUBJECT:
+        return {value.unit.path: value for value in evaluation.units}
+    if view.relationship_role is InspectionRelationshipRole.OBSERVER:
+        return {value.receipt.path: value for value in evaluation.receipts}
+    if view.relationship_role is InspectionRelationshipRole.DESCRIBED_RESOURCE:
+        selected_paths = {record.path for record in records}
+        return {value.artifact.path: value for value in evaluation.artifacts if value.artifact.path in selected_paths}
+    return {}
+
+
+def _select(
+    inventory: WorkspaceInventorySession,
+    family: ResourceFamilyDefinition,
+    args: argparse.Namespace,
+    *,
+    evaluate: bool,
+) -> tuple[InspectionResult, ...]:
+    default_placement = next(item for item in family.placements if item.default_for_inspection)
+    if default_placement.scope is ResourceScope.PROJECT:
+        results = tuple(
+            InspectionResult(record, qualified_name=inventory.resource_qualified_name(record))
+            for record in inventory.resources(
+                family.name,
+                selection=_selection(family, args),
+            )
+        )
+    else:
+        authored_environments = _environments(inventory)
+        if args.all_environments:
+            environments = authored_environments
+        else:
+            selected_environment = cast(str, args.environment)
+            if selected_environment not in authored_environments:
+                raise OperationError(f"no environment named {selected_environment!r}")
+            environments = (selected_environment,)
+        results = tuple(
+            result
+            for environment in environments
+            for result in _records_for_environment(inventory, family, environment, args, evaluate=evaluate)
+        )
+    if args.name is not None:
+        results = tuple(result for result in results if result.qualified_name == args.name)
+    if args.name is not None and not results:
+        location = (
+            " in any environment"
+            if args.all_environments
+            else ("" if default_placement.scope is ResourceScope.PROJECT else f" in environment {args.environment!r}")
+        )
+        raise OperationError(f"no {family.singular} named {args.name!r}{location}")
+    return tuple(
+        sorted(
+            results,
+            key=lambda item: (
+                item.record.environment or "",
+                item.qualified_name or item.record.qualified_name,
+                str(item.record.gvk),
+            ),
+        )
+    )
+
+
+def _table_rows(
+    family: ResourceFamilyDefinition,
+    results: Sequence[InspectionResult],
+    *,
+    include_environment: bool,
+    inventory: WorkspaceInventorySession,
+    wide: bool = False,
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for result in results:
+        assert family.inspection is not None
+        try:
+            if wide and family.inspection.wide_columns is not None:
+                presenter = family.inspection.presenter
+                if not isinstance(presenter, WideInspectionPresenter):
+                    raise ResourceModelError(f"{family.name} has no wide inspection presenter")
+                values = list(presenter.wide_row(result.record, result.relationship, inventory))
+            else:
+                values = list(family.inspection.presenter.row(result.record, result.relationship, inventory))
+        except ResourceModelError as exc:
+            raise OperationError(
+                f"could not present {family.singular} {result.record.qualified_name!r} at {result.record.path}: {exc}"
+            ) from exc
+        columns = family.inspection.columns_for(wide=wide)
+        if len(values) != len(columns):
+            raise OperationError(
+                f"resource family {family.name!r} presenter returned {len(values)} values for {len(columns)} columns"
+            )
+        if include_environment:
+            values.insert(0, result.record.environment or "-")
+        rows.append(values)
+    return rows
+
+
+def _envelope(results: Sequence[InspectionResult]) -> JsonObject:
+    items: list[InspectionResourceItem] = []
+    for result in results:
+        authentication = getattr(result.relationship, "authentication", None)
+        authentication_value = getattr(authentication, "value", None)
+        items.append(
+            InspectionResourceItem(
+                provenance=InspectionProvenance(
+                    environment=result.record.environment,
+                    plane=result.record.plane.value,
+                    ref=result.record.ref,
+                    revision=result.record.revision,
+                    path=result.record.path.as_posix(),
+                ),
+                address=InspectionAddress(
+                    family=result.record.family.name,
+                    scope=result.record.address.scope.value,
+                    namespace=result.record.address.namespace,
+                    qualifiedName=result.qualified_name or result.record.qualified_name,
+                ),
+                document=JsonObjectValue(result.record.document),
+                inspection=(
+                    InspectionDetails(authentication=cast(InspectionAuthentication, authentication_value))
+                    if isinstance(authentication_value, str)
+                    else None
+                ),
+            )
+        )
+    return INSPECTION_RESOURCE_LIST_CONTRACT.dump(
+        InspectionResourceListDocument(
+            apiVersion="inspection.gitopsctr.io/v1",
+            kind="ResourceList",
+            metadata=InspectionResourceListMetadata(),
+            items=items,
+        )
+    )
+
+
+def _artifact_results(
+    inventory: WorkspaceInventorySession,
+    receipt_results: Sequence[InspectionResult],
+    args: argparse.Namespace,
+) -> tuple[InspectionResult, ...]:
+    selected: list[InspectionResult] = []
+    for receipt_result in receipt_results:
+        environment = cast(str, receipt_result.record.environment)
+        observation = getattr(receipt_result.relationship, "observation", None)
+        if getattr(observation, "value", None) != "CURRENT":
+            state = getattr(observation, "value", "UNKNOWN")
+            raise OperationError(
+                f"Receipt {receipt_result.record.name!r} is {state}; its Artifacts cannot be authenticated without "
+                "the exact historical desired producer"
+            )
+        relationships = _relationship_states(
+            inventory,
+            receipt_result.record.family,
+            (receipt_result.record,),
+            environment,
+            args,
+            resolve_artifacts=True,
+        )
+        current = relationships.get(receipt_result.record.path)
+        _desired_ref, observed_ref = inventory.deployment_refs(environment)
+        assert receipt_result.record.family.inspection is not None
+        description = inventory.registry.artifact_description(
+            cast(str, receipt_result.record.family.inspection.artifact_description)
+        )
+        artifacts = inventory.resources(
+            description.artifact_family,
+            environment=environment,
+            plane=ResourcePlane.OBSERVED,
+            ref=args.observed_ref or observed_ref,
+            revision=args.observed_revision,
+            allow_missing_ref=args.observed_ref is None and args.observed_revision is None,
+            selection=ResourceSelection.segment(
+                description.producer_identity_segment,
+                frozenset((receipt_result.record.qualified_name,)),
+            ),
+        )
+        by_path = {artifact.path: artifact for artifact in artifacts}
+        links = getattr(current, "artifacts", ())
+        for link in links:
+            if args.artifact is None or link.name == args.artifact:
+                artifact = by_path[link.artifact.path]
+                selected.append(InspectionResult(artifact, qualified_name=inventory.resource_qualified_name(artifact)))
+    if args.artifact is not None and not selected:
+        raise OperationError(f"receipt {args.name!r} has no artifact named {args.artifact!r}")
+    return tuple(selected)
+
+
+def build_workspace_resource_inspection(
+    planes: WorkspacePlaneProvider,
+    args: argparse.Namespace,
+    *,
+    registry: ResourceRegistry,
+) -> ResourceInspectionResult:
+    """Build structured inspection output through registry-defined collections.
+
+    This compatibility implementation remains an infrastructure adapter while
+    collection discovery moves from materialized paths to logical workspaces.
+    It deliberately performs no rendering so every incoming adapter shares the
+    same typed application result.
+    """
+
+    if args.as_list and args.output in {"table", "wide"}:
+        raise OperationError("--as-list requires --output yaml or json")
+
+    if args.selector == ALL_SELECTOR:
+        _validate_all_options(args, registry)
+        inventory_context = WorkspaceInventorySession(registry, planes)
+        with inventory_context as inventory:
+            selected: list[tuple[ResourceFamilyDefinition, tuple[InspectionResult, ...]]] = []
+            table = args.output in {"table", "wide"}
+            for family in _aggregate_families(registry):
+                evaluate = (
+                    (
+                        table
+                        and (
+                            bool(family.inspection and family.inspection.observation)
+                            or family.name in {"stack", "stacktemplate"}
+                        )
+                    )
+                    or _is_authenticated_artifact_family(family)
+                    or family.addressing.requires_relationship_authentication
+                )
+                selected.append((family, _select(inventory, family, args, evaluate=evaluate)))
+            if table:
+                populated = tuple((family, results) for family, results in selected if results)
+                if not populated:
+                    return ResourceInspectionResult()
+                tables: list[InspectionTable] = []
+                for family, results in populated:
+                    assert family.inspection is not None
+                    headers = list(family.inspection.columns_for(wide=args.output == "wide"))
+                    if args.all_environments:
+                        headers.insert(0, "ENVIRONMENT")
+                    rows = _table_rows(
+                        family,
+                        results,
+                        include_environment=args.all_environments,
+                        inventory=inventory,
+                        wide=args.output == "wide",
+                    )
+                    tables.append(
+                        InspectionTable(
+                            tuple(headers),
+                            tuple(tuple(value for value in row) for row in rows),
+                            family.plural.upper(),
+                        )
+                    )
+                return ResourceInspectionResult(tables=tuple(tables))
+            else:
+                results = tuple(result for _family, family_results in selected for result in family_results)
+                return ResourceInspectionResult(document=_envelope(results))
+
+    try:
+        family = registry.family(args.selector)
+    except KeyError as exc:
+        raise OperationError(str(exc)) from exc
+    if family.inspection is None:
+        raise OperationError(f"resource family {family.name!r} has no inspection view")
+    _validate_options(args, family, registry)
+    inventory_context = WorkspaceInventorySession(registry, planes)
+    with inventory_context as inventory:
+        wants_artifacts = args.artifact is not None or args.artifacts
+        table_output = args.output in {"table", "wide"}
+        table = table_output and not wants_artifacts
+        evaluate = (
+            (
+                (table or wants_artifacts)
+                and (bool(family.inspection.observation) or family.name in {"stack", "stacktemplate"})
+            )
+            or _is_authenticated_artifact_family(family)
+            or family.addressing.requires_relationship_authentication
+        )
+        results = _select(inventory, family, args, evaluate=evaluate)
+        if wants_artifacts:
+            results = _artifact_results(inventory, results, args)
+        if table:
+            rows = _table_rows(
+                family,
+                results,
+                include_environment=args.all_environments,
+                inventory=inventory,
+                wide=args.output == "wide",
+            )
+            headers = list(family.inspection.columns_for(wide=args.output == "wide"))
+            if args.all_environments and family is not inventory.registry.namespace_family:
+                headers.insert(0, "ENVIRONMENT")
+            return ResourceInspectionResult(
+                tables=(InspectionTable(tuple(headers), tuple(tuple(value for value in row) for row in rows)),)
+            )
+        else:
+            document = (
+                _envelope(results)
+                if args.as_list or args.name is None or args.artifacts
+                else (results[0].record.document if len(results) == 1 else _envelope(results))
+            )
+            return ResourceInspectionResult(document=document)

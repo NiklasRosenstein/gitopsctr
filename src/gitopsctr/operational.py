@@ -10,9 +10,10 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
+from gitopsctr.application.workspace import ImmutableWorkspace, WorkspaceEntryKind, WorkspaceError
 from gitopsctr.driver import DriverError, MaterializationCapability, ReconciliationCapability
 from gitopsctr.errors import OperationError
-from gitopsctr.formats import load_document
+from gitopsctr.formats import load_document, parse_document_bytes
 from gitopsctr.resource_api import JsonObject
 from gitopsctr.resources import UnitResource
 from gitopsctr.templates import TemplateError, contains_reference, parse_template_value
@@ -47,6 +48,24 @@ def load_desired_transition_blocks(root: Path) -> dict[str, str]:
         return {}
     try:
         document = load_document(path)
+    except Exception as exc:
+        raise OperationError("invalid desired transition-block document") from exc
+    blocks = document.get("blocks") if isinstance(document, dict) else None
+    if not isinstance(blocks, dict) or not all(
+        isinstance(name, str) and isinstance(reason, str) for name, reason in blocks.items()
+    ):
+        raise OperationError("invalid desired transition-block document")
+    return cast(dict[str, str], blocks)
+
+
+def load_workspace_transition_blocks(workspace: ImmutableWorkspace) -> dict[str, str]:
+    """Load transition fences directly from immutable logical content."""
+
+    key = DESIRED_TRANSITION_BLOCKS_PATH.as_posix()
+    try:
+        document = parse_document_bytes(workspace.read(key), DESIRED_TRANSITION_BLOCKS_PATH)
+    except WorkspaceError:
+        return {}
     except Exception as exc:
         raise OperationError("invalid desired transition-block document") from exc
     blocks = document.get("blocks") if isinstance(document, dict) else None
@@ -127,6 +146,61 @@ def validate_unit_materialization(desired_root: Path, unit_name: str, unit: Unit
         raise OperationError(f"{unit_name} materialized payload does not match its digest")
 
 
+def workspace_materialization_tree_digest(workspace: ImmutableWorkspace, prefix: PurePosixPath) -> str:
+    """Digest a materialization subtree without materializing it to disk."""
+
+    key_prefix = prefix.as_posix()
+    entries = workspace.list_entries(key_prefix)
+    files: list[dict[str, str]] = []
+    for entry in entries:
+        relative = entry.key.removeprefix(f"{key_prefix}/")
+        if not relative:
+            continue
+        if entry.kind is WorkspaceEntryKind.SYMLINK:
+            raise OperationError(f"materialization output contains a symbolic link: {relative}")
+        if entry.kind is WorkspaceEntryKind.DIRECTORY:
+            continue
+        if entry.kind is not WorkspaceEntryKind.FILE or entry.content is None:
+            raise OperationError(f"materialization output contains a non-file: {relative}")
+        files.append(
+            {
+                "path": relative,
+                "mode": "100755" if entry.executable else "100644",
+                "contentHash": hashlib.sha256(entry.content).hexdigest(),
+            }
+        )
+    if not files:
+        raise OperationError("materialization output is empty")
+    payload = {"materializationHashVersion": 1, "files": files}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def validate_workspace_unit_materialization(
+    workspace: ImmutableWorkspace,
+    unit_name: str,
+    unit: UnitResource[Any],
+) -> None:
+    """Validate a Unit's materialization entirely through logical workspace keys."""
+
+    expects_materialization = isinstance(unit.driver, MaterializationCapability)
+    descriptor = getattr(unit.spec, "materialization", None)
+    if not expects_materialization:
+        if descriptor is not None:
+            raise OperationError(f"{unit_name} records materialization for a plugin without that capability")
+        return
+    if descriptor is None:
+        raise OperationError(f"{unit_name} has an invalid materialization descriptor")
+    expected_path = PurePosixPath("materialized", *unit_name.split("/"))
+    if not isinstance(descriptor.digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", descriptor.digest):
+        raise OperationError(f"{unit_name} has an invalid materialization digest")
+    if not descriptor.mediaType:
+        raise OperationError(f"{unit_name} has an invalid materialization media type")
+    actual = workspace_materialization_tree_digest(workspace, expected_path)
+    if actual != descriptor.digest:
+        raise OperationError(f"{unit_name} materialized payload does not match its digest")
+
+
 def deletion_reason(unit: UnitResource[Any]) -> str:
     deletion = unit.metadata.deletion
     if deletion is None:
@@ -152,6 +226,32 @@ def classify_before_observation(
     if raw_unit_contains_reference(document):
         return OperationalStatus(ReconciliationState.WAIT, "desired inputs are not materialized")
     validate_unit_materialization(desired_root, unit_name, unit)
+    if not unit_requires_reconciliation(unit):
+        return OperationalStatus(
+            ReconciliationState.MATERIALIZED,
+            "desired payload is published for external delivery",
+        )
+    return None
+
+
+def classify_workspace_before_observation(
+    workspace: ImmutableWorkspace,
+    unit_name: str,
+    document: JsonObject | None,
+    unit: UnitResource[Any] | None,
+    transition_reason: str | None = None,
+) -> OperationalStatus | None:
+    """Classify desired-only gates with no filesystem materialization."""
+
+    if unit is not None and unit.metadata.deletion is not None:
+        return OperationalStatus(ReconciliationState.WAIT, deletion_reason(unit))
+    if transition_reason is not None:
+        return OperationalStatus(ReconciliationState.WAIT, transition_reason)
+    if document is None or unit is None:
+        return OperationalStatus(ReconciliationState.WAIT, "desired inputs are not materialized")
+    if raw_unit_contains_reference(document):
+        return OperationalStatus(ReconciliationState.WAIT, "desired inputs are not materialized")
+    validate_workspace_unit_materialization(workspace, unit_name, unit)
     if not unit_requires_reconciliation(unit):
         return OperationalStatus(
             ReconciliationState.MATERIALIZED,

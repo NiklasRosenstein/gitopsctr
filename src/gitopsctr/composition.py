@@ -7,6 +7,7 @@ from pathlib import Path
 from gitopsctr.adapters.git import GitResourceInspector, GitSnapshotReader
 from gitopsctr.adapters.source_authored import SourceAuthoredSpecificationValidator
 from gitopsctr.application.services import ApplicationServices
+from gitopsctr.registry import RESOURCE_REGISTRY
 
 
 def create_default_application(repository: Path) -> ApplicationServices:
@@ -15,8 +16,9 @@ def create_default_application(repository: Path) -> ApplicationServices:
     # Preserve a root symlink for the authored-path policy to reject.  Resolving
     # here would erase the security-relevant fact before validation observes it.
     repository_root = repository.absolute()
+    snapshot_reader = GitSnapshotReader.from_path(repository_root)
     return ApplicationServices(
-        GitSnapshotReader.from_path(repository_root),
+        snapshot_reader,
         SourceAuthoredSpecificationValidator(repository_root),
-        GitResourceInspector(repository_root),
+        GitResourceInspector(repository_root, snapshot_reader, RESOURCE_REGISTRY),
     )
