@@ -78,6 +78,33 @@ class GitSourceRetentionStore:
             self._write(store)
             return retained
 
+    def retain_for_request(self, source: SourceSnapshot, request_token: str) -> RetainedSource:
+        """Idempotently retain one host-authenticated remote request."""
+
+        if not isinstance(source, SourceSnapshot):
+            raise TypeError("source must be a SourceSnapshot")
+        if (
+            not isinstance(request_token, str)
+            or len(request_token) != 64
+            or any(character not in "0123456789abcdef" for character in request_token)
+        ):
+            raise ValueError("source retention request token must be one private canonical digest")
+        with self._locked():
+            store = self._load()
+            store_id = RetentionStoreId(store["store_id"])
+            records = store["records"]
+            handle = RetainedSourceHandle(f"git-retained:request-{request_token}")
+            record = records.get(handle.value)
+            expected = _source_record(source)
+            if record is not None:
+                if record != expected:
+                    raise SourceRetentionError("source retention request token was already bound to other content")
+                return _issue_retained_source(handle, store_id, source.source_snapshot_id, source.content_id)
+            retained = _issue_retained_source(handle, store_id, source.source_snapshot_id, source.content_id)
+            records[handle.value] = expected
+            self._write(store)
+            return retained
+
     def recover(self, retained: RetainedSource, source_id: SourceId) -> SourceSnapshot:
         """Recover a retained payload without opening the source repository."""
 

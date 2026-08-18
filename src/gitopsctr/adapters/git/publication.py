@@ -315,6 +315,73 @@ class GitPublicationStore:
             self._write_state(state)
             return candidate
 
+    def seal_candidate_for_request(
+        self,
+        workspace: ImmutableWorkspace,
+        parent_snapshot_id: SnapshotId | None,
+        request_token: str,
+    ) -> SealedCandidate:
+        """Idempotently seal one host-authenticated remote request.
+
+        The request token is a private authority HMAC, not caller-selected
+        identity.  It fixes both the handle and commit timestamp so a crash at
+        any point before the host replay result is journaled cannot mint a
+        second candidate or even a distinct unreachable commit object.
+        """
+
+        if not isinstance(workspace, ImmutableWorkspace) or workspace.is_mutable:
+            raise TypeError("idempotent candidate workspace must be immutable")
+        if (
+            not isinstance(request_token, str)
+            or len(request_token) != 64
+            or any(character not in "0123456789abcdef" for character in request_token)
+        ):
+            raise ValueError("candidate request token must be one private canonical digest")
+        if parent_snapshot_id is not None:
+            _revision(parent_snapshot_id)
+            self._validate_commit_tree(_revision(parent_snapshot_id))
+        handle = SealedCandidateHandle(f"git-candidate:request-{request_token}")
+        with self._locked() as state:
+            record = state["candidates"].get(handle.value)
+            if record is not None:
+                candidate = _issue_sealed_candidate(
+                    handle,
+                    CandidateStoreId(state["candidate_store_id"]),
+                    SnapshotId(record["snapshot"]),
+                    ContentId(record["content"]),
+                )
+                if candidate.content_id != workspace.content_id:
+                    raise GitPublicationError("candidate request token was already bound to other content")
+                self._validate_candidate_content(candidate)
+                self._validate_candidate_parent(candidate.snapshot_id, parent_snapshot_id)
+                return candidate
+            existing_revision = self._ref_revision(_candidate_ref(handle))
+            if existing_revision is None:
+                existing_revision = self._write_candidate_commit(
+                    workspace,
+                    handle,
+                    parent_snapshot_id,
+                    timestamp=int(request_token[:8], 16),
+                )
+                if not self._set_ref_if_equals(_candidate_ref(handle), None, existing_revision):
+                    existing_revision = self._ref_revision(_candidate_ref(handle))
+                    if existing_revision is None:
+                        raise GitPublicationError("idempotent candidate reference cannot be recovered")
+            candidate = _issue_sealed_candidate(
+                handle,
+                CandidateStoreId(state["candidate_store_id"]),
+                SnapshotId(f"{_SNAPSHOT_PREFIX}{existing_revision}"),
+                workspace.content_id,
+            )
+            self._validate_candidate_content(candidate)
+            self._validate_candidate_parent(candidate.snapshot_id, parent_snapshot_id)
+            state["candidates"][handle.value] = {
+                "content": candidate.content_id.value,
+                "snapshot": candidate.snapshot_id.value,
+            }
+            self._write_state(state)
+            return candidate
+
     def candidate_locator(self, candidate: SealedCandidate) -> CandidateLocator:
         candidate._validate()
         return CandidateLocator(
@@ -1443,7 +1510,12 @@ class GitPublicationStore:
             raise GitPublicationError("managed publication snapshot tree is missing or invalid") from exc
 
     def _write_candidate_commit(
-        self, workspace: ImmutableWorkspace, handle: SealedCandidateHandle, parent_snapshot_id: SnapshotId | None
+        self,
+        workspace: ImmutableWorkspace,
+        handle: SealedCandidateHandle,
+        parent_snapshot_id: SnapshotId | None,
+        *,
+        timestamp: int | None = None,
     ) -> str:
         repository = Repo(self.repository)
         try:
@@ -1474,13 +1546,27 @@ class GitPublicationStore:
             commit.author = identity
             commit.committer = identity
             commit.message = f"Seal publication candidate {handle.value}".encode()
-            moment = int(time.time())
+            moment = int(time.time()) if timestamp is None else timestamp
             commit.author_time = moment
             commit.commit_time = moment
             commit.author_timezone = 0
             commit.commit_timezone = 0
             repository.object_store.add_object(commit)
             return commit.id.decode()
+        finally:
+            repository.close()
+
+    def _validate_candidate_parent(self, snapshot_id: SnapshotId, parent_snapshot_id: SnapshotId | None) -> None:
+        repository = Repo(self.repository)
+        try:
+            commit = repository[cast(ObjectID, _revision(snapshot_id).encode())]
+            if not isinstance(commit, Commit):
+                raise GitPublicationError("idempotent candidate snapshot is not a commit")
+            expected = [] if parent_snapshot_id is None else [cast(ObjectID, _revision(parent_snapshot_id).encode())]
+            if commit.parents != expected:
+                raise GitPublicationError("candidate request token was already bound to another parent")
+        except KeyError as exc:
+            raise GitPublicationError("idempotent candidate snapshot is missing") from exc
         finally:
             repository.close()
 
