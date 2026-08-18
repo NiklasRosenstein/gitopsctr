@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from gitopsctr.application.dependencies import DependencyCommand, DependencyResult
 from gitopsctr.application.inspection import ResourceInspectionCommand, ResourceInspectionResult
 from gitopsctr.application.model import (
     AcceptedDesiredSnapshot,
@@ -114,6 +115,16 @@ class StatusInspector(Protocol):
         """Release owned resources; repeated calls must be safe."""
 
 
+class DependencyInspector(Protocol):
+    """Read a dependency graph through one exact source workspace."""
+
+    def dependencies(self, command: DependencyCommand) -> DependencyResult:
+        """Return the closed graph selected by the command."""
+
+    def close(self) -> None:
+        """Release owned resources; repeated calls must be safe."""
+
+
 class Orchestrator(Protocol):
     """The incoming application port for the first typed use cases."""
 
@@ -128,3 +139,6 @@ class Orchestrator(Protocol):
 
     def status(self, command: StatusCommand) -> StatusResult:
         """Read one coherent environment reconciliation status."""
+
+    def dependencies(self, command: DependencyCommand) -> DependencyResult:
+        """Read one exact source dependency graph."""

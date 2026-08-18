@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from gitopsctr.application.dependencies import DependencyCommand, DependencyResult
 from gitopsctr.application.inspection import ResourceInspectionCommand, ResourceInspectionResult
 from gitopsctr.application.model import (
     SnapshotInspectionCommand,
@@ -11,7 +12,13 @@ from gitopsctr.application.model import (
     ValidateCommand,
     ValidationResult,
 )
-from gitopsctr.application.ports import ResourceInspector, SnapshotReader, SpecificationValidator, StatusInspector
+from gitopsctr.application.ports import (
+    DependencyInspector,
+    ResourceInspector,
+    SnapshotReader,
+    SpecificationValidator,
+    StatusInspector,
+)
 from gitopsctr.application.status import StatusCommand, StatusResult
 
 
@@ -23,6 +30,7 @@ class ApplicationServices:
     specification_validator: SpecificationValidator
     resource_inspector: ResourceInspector
     status_inspector: StatusInspector
+    dependency_inspector: DependencyInspector
     _closed: bool = field(default=False, init=False, repr=False)
 
     def validate(self, command: ValidateCommand) -> ValidationResult:
@@ -46,6 +54,11 @@ class ApplicationServices:
 
         return self.status_inspector.status(command)
 
+    def dependencies(self, command: DependencyCommand) -> DependencyResult:
+        """Read an exact source dependency graph through the configured adapter."""
+
+        return self.dependency_inspector.dependencies(command)
+
     def close(self) -> None:
         """Close both explicit dependencies exactly once."""
 
@@ -53,15 +66,18 @@ class ApplicationServices:
             return
         self._closed = True
         try:
-            self.status_inspector.close()
+            self.dependency_inspector.close()
         finally:
             try:
-                self.resource_inspector.close()
+                self.status_inspector.close()
             finally:
                 try:
-                    self.specification_validator.close()
+                    self.resource_inspector.close()
                 finally:
-                    self.snapshot_reader.close()
+                    try:
+                        self.specification_validator.close()
+                    finally:
+                        self.snapshot_reader.close()
 
     def __enter__(self) -> ApplicationServices:
         return self

@@ -1,5 +1,6 @@
 """Backend-neutral application commands, values, and ports."""
 
+from gitopsctr.application.dependencies import DependencyCommand, DependencyEntry, DependencyResult
 from gitopsctr.application.inspection import (
     InspectionFilter,
     InspectionOutputFormat,
@@ -43,6 +44,7 @@ from gitopsctr.application.model import (
 )
 from gitopsctr.application.ports import (
     ChannelReader,
+    DependencyInspector,
     DeploymentAuthority,
     EffectFencing,
     Orchestrator,
@@ -64,6 +66,10 @@ __all__ = [
     "ChannelId",
     "ContentId",
     "DeploymentAuthority",
+    "DependencyCommand",
+    "DependencyEntry",
+    "DependencyInspector",
+    "DependencyResult",
     "EffectAuthorization",
     "EffectFencing",
     "EffectIntent",

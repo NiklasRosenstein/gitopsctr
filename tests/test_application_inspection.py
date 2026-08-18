@@ -10,6 +10,9 @@ import pytest
 from gitopsctr import composition, controller
 from gitopsctr.adapters.git.status import GitStatusInspector
 from gitopsctr.application import (
+    DependencyCommand,
+    DependencyEntry,
+    DependencyResult,
     InspectionOutputFormat,
     InspectionTable,
     ResourceInspectionCommand,
@@ -76,6 +79,31 @@ class RecordingStatusInspector:
 
 
 @dataclass
+class RecordingDependencyInspector:
+    close_count: int = 0
+
+    def dependencies(self, _command: object) -> object:
+        raise AssertionError("dependency inspection is not expected")
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+@dataclass
+class DispatchingDependencyInspector:
+    result: DependencyResult
+    calls: list[DependencyCommand]
+    close_count: int = 0
+
+    def dependencies(self, command: DependencyCommand) -> DependencyResult:
+        self.calls.append(command)
+        return self.result
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+@dataclass
 class RecordingApplication:
     result: ResourceInspectionResult
     calls: list[ResourceInspectionCommand]
@@ -86,6 +114,23 @@ class RecordingApplication:
         return self.result
 
     def __enter__(self) -> RecordingApplication:
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.close_count += 1
+
+
+@dataclass
+class RecordingDependencyApplication:
+    result: DependencyResult
+    calls: list[DependencyCommand]
+    close_count: int = 0
+
+    def dependencies(self, command: DependencyCommand) -> DependencyResult:
+        self.calls.append(command)
+        return self.result
+
+    def __enter__(self) -> RecordingDependencyApplication:
         return self
 
     def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
@@ -104,6 +149,7 @@ def test_application_services_uses_injected_resource_inspector_and_closes_it() -
         validator,
         inspector,
         RecordingStatusInspector(StatusResult("dev", "desired/dev", None, "observed/dev", None, ()), []),
+        RecordingDependencyInspector(),
     )
 
     assert services.inspect_resources(command) is expected
@@ -123,13 +169,82 @@ def test_application_services_uses_closed_status_port_and_closes_it() -> None:
         ),
         [],
     )
-    services = ApplicationServices(RecordingSnapshotReader(), RecordingValidator(), inspector, status)
+    services = ApplicationServices(
+        RecordingSnapshotReader(), RecordingValidator(), inspector, status, RecordingDependencyInspector()
+    )
     command = StatusCommand("dev")
 
     assert services.status(command) is status.result
     assert status.calls == [command]
     services.close()
     assert status.close_count == 1
+
+
+def test_application_services_dispatches_exact_dependency_command_and_result() -> None:
+    expected = DependencyResult(
+        "dev",
+        "a" * 40,
+        SnapshotId("dependency-source"),
+        ("consumer",),
+        (DependencyEntry("consumer", ()),),
+    )
+    dependencies = DispatchingDependencyInspector(expected, [])
+    services = ApplicationServices(
+        RecordingSnapshotReader(),
+        RecordingValidator(),
+        RecordingInspector(ResourceInspectionResult(), []),
+        RecordingStatusInspector(StatusResult("dev", "desired/dev", None, "observed/dev", None, ()), []),
+        dependencies,
+    )
+    command = DependencyCommand("dev", source_selector="source", units=("consumer",))
+
+    assert services.dependencies(command) is expected
+    assert dependencies.calls == [command]
+
+
+def test_application_services_closes_all_five_dependencies_once_after_a_close_failure() -> None:
+    class CloseProbe:
+        def __init__(self, fail: bool = False) -> None:
+            self.fail = fail
+            self.calls = 0
+
+        def close(self) -> None:
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("dependency close failed")
+
+    reader, validator, inspector, status = (CloseProbe() for _ in range(4))
+    dependencies = CloseProbe(fail=True)
+    services = ApplicationServices(reader, validator, inspector, status, dependencies)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="dependency close failed"):
+        services.close()
+    services.close()
+    assert [item.calls for item in (reader, validator, inspector, status, dependencies)] == [1, 1, 1, 1, 1]
+
+
+def test_command_dependencies_dispatches_the_exact_typed_command_and_renders_result(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    result = DependencyResult(
+        "dev",
+        "a" * 40,
+        SnapshotId("dependency-source"),
+        ("consumer",),
+        (DependencyEntry("base", ()), DependencyEntry("consumer", ("base",))),
+    )
+    application = RecordingDependencyApplication(result, [])
+    monkeypatch.setattr(composition, "create_default_application", lambda _repository: application)
+    controller.REPOSITORY_ROOT = tmp_path
+    args = controller.build_parser().parse_args(
+        ["dependencies", "--environment", "dev", "--source-revision", "custom", "--unit", "consumer", "--depth", "1"]
+    )
+
+    controller.command_dependencies(args)
+
+    assert application.calls == [DependencyCommand("dev", "custom", ("consumer",), 1)]
+    assert application.close_count == 1
+    assert capsys.readouterr().out == "consumer\n└── base\n"
 
 
 def test_status_entry_rejects_unclosed_string_states() -> None:

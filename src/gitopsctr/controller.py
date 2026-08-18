@@ -36,6 +36,7 @@ import yaml
 
 from gitopsctr import operational
 from gitopsctr.application import (
+    DependencyCommand,
     EnvironmentId,
     InspectionFilter,
     InspectionOutputFormat,
@@ -94,7 +95,6 @@ from gitopsctr.contracts import StackProjection as StructuralStackProjection
 from gitopsctr.dependencies import (
     convergence_order,
     convergence_scope,
-    dependency_graph,
     desired_observation_reference_units,
     observation_reference_units,
 )
@@ -11029,37 +11029,25 @@ def log_compact_convergence_summary(
 
 
 def command_dependencies(args: argparse.Namespace) -> None:
-    source_revision = git("rev-parse", f"{args.source_revision}^{{commit}}").stdout.strip()
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        source_root = Path(temporary_directory) / "source"
-        materialize_revision(source_revision, source_root)
-        current_desired = Path(temporary_directory) / "current-desired"
-        current_desired.mkdir()
-        loaded = load_convergence_specifications(
-            source_root,
-            args.environment,
-            current_desired,
-            source_revision,
-            Path(temporary_directory) / "stack-projection",
-        )
-        specifications, stack_dependencies = loaded.units, loaded.dependencies
-        addresses = {qualified: concrete for concrete, qualified in loaded.qualified_names.items()}
-        requested = resolve_qualified_unit_values(args.unit or (), addresses)
-        selection = convergence_scope(specifications, requested, args.depth, stack_dependencies)
-        targets, scope = selection.targets, selection.scope
-        graph = dependency_graph(specifications, scope, stack_dependencies)
-        order = convergence_order(specifications, scope, stack_dependencies)
+    from gitopsctr.composition import create_default_application
+
+    command = DependencyCommand(
+        environment=args.environment,
+        source_selector=args.source_revision,
+        units=tuple(args.unit or ()),
+        depth=args.depth,
+    )
+    with create_default_application(REPOSITORY_ROOT) as application:
+        result = application.dependencies(command)
     if args.json:
         print(
             json.dumps(
                 {
                     "schema": 1,
-                    "environment": args.environment,
-                    "sourceRevision": source_revision,
-                    "targets": targets,
-                    "units": [
-                        {"name": unit_name, "dependencies": graph.dependencies[unit_name]} for unit_name in order
-                    ],
+                    "environment": result.environment,
+                    "sourceRevision": result.source_revision,
+                    "targets": result.targets,
+                    "units": [{"name": entry.name, "dependencies": entry.dependencies} for entry in result.entries],
                 },
                 indent=2,
                 sort_keys=True,
@@ -11067,19 +11055,32 @@ def command_dependencies(args: argparse.Namespace) -> None:
         )
         return
     if args.list:
-        print("\n".join(loaded.qualified_names.get(name, name) for name in order))
+        print("\n".join(entry.name for entry in result.entries))
         return
-    for index, target in enumerate(targets):
+    dependencies = {entry.name: entry.dependencies for entry in result.entries}
+    for index, target in enumerate(result.targets):
         if index:
             print()
-        print(
-            "\n".join(
-                graph.render_tree(
-                    target,
-                    lambda unit_name: style_unit(loaded.qualified_names.get(unit_name, unit_name), sys.stdout),
-                )
+        print("\n".join(_render_dependency_tree(target, dependencies)))
+
+
+def _render_dependency_tree(target: str, dependencies: Mapping[str, tuple[str, ...]]) -> tuple[str, ...]:
+    """Render an application-owned closed graph through the CLI presentation adapter."""
+
+    lines = [style_unit(target, sys.stdout)]
+
+    def render(name: str, prefix: str, ancestors: set[str]) -> None:
+        for index, dependency in enumerate(dependencies[name]):
+            last = index == len(dependencies[name]) - 1
+            cycle = dependency in ancestors
+            lines.append(
+                f"{prefix}{'└── ' if last else '├── '}{style_unit(dependency, sys.stdout)}{' [cycle]' if cycle else ''}"
             )
-        )
+            if not cycle:
+                render(dependency, prefix + ("    " if last else "│   "), ancestors | {dependency})
+
+    render(target, "", {target})
+    return tuple(lines)
 
 
 def _partition_unit_names(desired: Path, partition: str) -> list[str]:

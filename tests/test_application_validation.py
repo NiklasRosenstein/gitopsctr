@@ -90,6 +90,17 @@ class RecordingStatusInspector:
 
 
 @dataclass
+class RecordingDependencyInspector:
+    close_count: int = 0
+
+    def dependencies(self, _command: object) -> object:
+        raise AssertionError("dependency inspection is not expected")
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+@dataclass
 class RecordingApplication:
     result: ValidationResult
     calls: list[ValidateCommand]
@@ -116,7 +127,8 @@ def test_application_services_uses_its_injected_specification_validator() -> Non
     reader = RecordingSnapshotReader()
     inspector = RecordingResourceInspector()
     status = RecordingStatusInspector()
-    services = ApplicationServices(reader, validator, inspector, status)
+    dependencies = RecordingDependencyInspector()
+    services = ApplicationServices(reader, validator, inspector, status, dependencies)
     orchestrator: Orchestrator = services
 
     assert orchestrator.validate(command) is expected
@@ -127,6 +139,7 @@ def test_application_services_uses_its_injected_specification_validator() -> Non
     assert reader.close_count == 1
     assert inspector.close_count == 1
     assert status.close_count == 1
+    assert dependencies.close_count == 1
 
 
 def test_application_services_context_closes_both_dependencies_after_an_exception() -> None:
@@ -134,15 +147,17 @@ def test_application_services_context_closes_both_dependencies_after_an_exceptio
     validator = RecordingValidator(ValidationResult(), [], [])
     inspector = RecordingResourceInspector()
     status = RecordingStatusInspector()
+    dependencies = RecordingDependencyInspector()
 
     with pytest.raises(RuntimeError, match="operation failed"):
-        with ApplicationServices(reader, validator, inspector, status):
+        with ApplicationServices(reader, validator, inspector, status, dependencies):
             raise RuntimeError("operation failed")
 
     assert reader.close_count == 1
     assert len(validator.closes) == 1
     assert inspector.close_count == 1
     assert status.close_count == 1
+    assert dependencies.close_count == 1
 
 
 def test_source_authored_validator_returns_logical_counts_and_preserves_invalid_fail_fast_parity(
