@@ -42,8 +42,11 @@ from gitopsctr.application import (
     EnvironmentId,
     InspectionFilter,
     InspectionOutputFormat,
+    PublicationMode,
     PublicationOutcomeState,
+    PublicationRecoveryLocator,
     ResourceInspectionCommand,
+    ReviewAdoptionCommand,
     StatusCommand,
     ValidateCommand,
     ValidationFailFastError,
@@ -12479,6 +12482,58 @@ def command_apply(args: argparse.Namespace) -> str | None:
     revision = result.snapshot_id.value.removeprefix("git-commit:")
     if result.publication_outcome is not None:
         print(revision)
+    if result.publication_mode is PublicationMode.REVIEW_REQUIRED and result.recovery_locator is not None:
+        locator = result.recovery_locator.to_wire()
+        log_status("REVIEW", f"review publication locator: {locator}")
+        if output := os.environ.get("GITHUB_OUTPUT"):
+            with Path(output).open("a") as stream:
+                stream.write(f"review_publication={locator}\n")
+    return revision
+
+
+def command_adopt_review(args: argparse.Namespace) -> str | None:
+    """Translate reviewed acceptance into the application-owned adoption service."""
+
+    from gitopsctr.composition import create_default_application
+
+    try:
+        locator = PublicationRecoveryLocator.from_wire(args.publication)
+        with create_default_application(REPOSITORY_ROOT) as application:
+            result = application.adopt_review(ReviewAdoptionCommand(EnvironmentId(args.environment), locator))
+    except (TypeError, ValueError) as exc:
+        raise OperationError(str(exc)) from exc
+    if result.outcome.state is PublicationOutcomeState.UNKNOWN:
+        raise OperationError("review adoption outcome is unknown; recover attempt " + result.recovery_locator.to_wire())
+    if result.outcome.state is PublicationOutcomeState.NOT_COMMITTED:
+        raise OperationError("review adoption was not committed")
+    assert result.snapshot_id is not None
+    revision = result.snapshot_id.value.removeprefix("git-commit:")
+    print(revision)
+    if output := os.environ.get("GITHUB_OUTPUT"):
+        with Path(output).open("a") as stream:
+            stream.write(f"adoption_revision={revision}\n")
+            stream.write(f"adoption_publication={result.recovery_locator.to_wire()}\n")
+    return revision
+
+
+def command_recover_review_adoption(args: argparse.Namespace) -> str | None:
+    """Recover one durable adoption attempt without re-executing it."""
+
+    from gitopsctr.composition import create_default_application
+
+    try:
+        locator = PublicationRecoveryLocator.from_wire(args.publication)
+        with create_default_application(REPOSITORY_ROOT) as application:
+            result = application.recover_review_adoption(locator)
+    except (TypeError, ValueError) as exc:
+        raise OperationError(str(exc)) from exc
+    if result.outcome.state is PublicationOutcomeState.UNKNOWN:
+        raise OperationError("review adoption outcome remains unknown")
+    if result.outcome.state is PublicationOutcomeState.NOT_COMMITTED:
+        raise OperationError("review adoption was not committed")
+    assert result.snapshot_id is not None
+    revision = result.snapshot_id.value.removeprefix("git-commit:")
+    print(revision)
     return revision
 
 
@@ -13296,6 +13351,17 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--dry", action="store_true")
     apply.add_argument("--verbose", action="store_true")
     apply.set_defaults(handler=command_apply)
+
+    adopt_review = commands.add_parser("adopt-review", help="adopt one authenticated reviewed candidate")
+    adopt_review.add_argument("--environment", required=True)
+    adopt_review.add_argument("--publication", required=True, help="review publication recovery locator")
+    adopt_review.set_defaults(handler=command_adopt_review)
+
+    recover_review = commands.add_parser(
+        "recover-review-adoption", help="recover one durable reviewed-adoption attempt"
+    )
+    recover_review.add_argument("--publication", required=True, help="adoption recovery locator")
+    recover_review.set_defaults(handler=command_recover_review_adoption)
 
     delete = commands.add_parser("delete", help="mark a desired resource for deletion")
     delete_commands = delete.add_subparsers(dest="delete_kind", required=True)

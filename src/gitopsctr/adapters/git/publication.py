@@ -38,6 +38,7 @@ from gitopsctr.application.model import (
     CoordinationChange,
     CoordinationObservation,
     CoordinationResult,
+    EnvironmentId,
     HeadObservation,
     OwnershipId,
     OwnershipObservation,
@@ -54,6 +55,7 @@ from gitopsctr.application.model import (
     PublicationTarget,
     RetainedSourceHandle,
     RetentionStoreId,
+    ReviewAcceptanceObservation,
     SealedCandidate,
     SealedCandidateHandle,
     SnapshotId,
@@ -63,10 +65,11 @@ from gitopsctr.application.model import (
     SourceSnapshotId,
     _issue_historical_retained_source_evidence,
     _issue_publication_proof,
+    _issue_review_acceptance_observation,
     _issue_sealed_candidate,
     _open_publication_proof_issuer,
 )
-from gitopsctr.application.ports import PublicationExecutionUnknownError
+from gitopsctr.application.ports import PublicationExecutionUnknownError, PublicationRecoveryNotFoundError
 from gitopsctr.application.sources import RetainedSourceLocator, SourceRepository
 from gitopsctr.application.workspace import (
     ImmutableWorkspace,
@@ -349,6 +352,45 @@ class GitPublicationStore:
         intent = self.reissue_intent(adapter_locator)
         return PublicationRecovery(intent, self.verify(intent))
 
+    def observe_review_acceptance(self, locator: PublicationRecoveryLocator) -> ReviewAcceptanceObservation:
+        """Issue evidence only while external desired equals a proven review candidate."""
+
+        if not isinstance(locator, PublicationRecoveryLocator) or locator.publication_store_id != self._store_id:
+            raise ValueError("review publication locator belongs to another transaction store")
+        with self._locked() as state:
+            record = state["attempts"].get(locator.attempt_id.value)
+            if not isinstance(record, dict) or record.get("status") != "committed":
+                raise ValueError("review publication has no committed proof")
+            intent = self._intent_from_wire(json.loads(record["intent"]), state=state)
+            proof = self._proof_from_record(intent, record["proof"])
+            if (
+                intent.mode is not PublicationMode.REVIEW_REQUIRED
+                or intent.target is not PublicationTarget.REVIEW_CANDIDATE
+                or intent.review_base_head is None
+            ):
+                raise ValueError("publication proof does not identify a review candidate")
+            assert intent.environment_id is not None
+            if self._current_head(state, intent.channel_id) != proof.resulting_head:
+                raise GitPublicationError("review candidate head drifted from its committed proof")
+            self._validate_review_adoption_refs(
+                state,
+                intent.review_base_head,
+                intent.candidate.snapshot_id,
+                pending_attempt=None,
+            )
+            return _issue_review_acceptance_observation(
+                self._store_id,
+                locator,
+                proof.proof_id,
+                intent.review_base_head.channel_id,
+                intent.review_base_head,
+                intent.candidate.snapshot_id,
+                intent.candidate.content_id,
+                intent.environment_id,
+                f"git-review:{intent.review_base_head.incarnation}:{_revision(intent.candidate.snapshot_id)}",
+                self._issuer,
+            )
+
     def reissue_intent(self, locator: PublicationAttemptLocator) -> PublicationIntent:
         """Reconstruct an exact intent only from authenticated durable evidence."""
 
@@ -359,7 +401,7 @@ class GitPublicationStore:
         with self._locked() as state:
             record = state["attempts"].get(locator.attempt_id.value)
             if not isinstance(record, dict) or not isinstance(record.get("intent"), str):
-                raise ValueError("publication attempt locator is unknown")
+                raise PublicationRecoveryNotFoundError("publication attempt locator is unknown")
             try:
                 wire = json.loads(record["intent"])
             except (TypeError, json.JSONDecodeError) as exc:
@@ -519,9 +561,14 @@ class GitPublicationStore:
                 self._unknown_next = False
                 return PublicationOutcome(PublicationOutcomeState.UNKNOWN)
             marker = state["attempts"][intent.attempt_id.value]["marker"]
-            if not self._atomic_publish_refs(
-                intent.channel_id, intent.expected_head.snapshot_id, intent.candidate.snapshot_id, marker
-            ):
+            published = (
+                self._atomic_adopt_review_refs(intent, marker)
+                if intent.mode is PublicationMode.REVIEW_ADOPTION
+                else self._atomic_publish_refs(
+                    intent.channel_id, intent.expected_head.snapshot_id, intent.candidate.snapshot_id, marker
+                )
+            )
+            if not published:
                 state["attempts"][intent.attempt_id.value]["status"] = "not-committed"
                 self._write_state(state)
                 return PublicationOutcome(PublicationOutcomeState.NOT_COMMITTED)
@@ -577,7 +624,9 @@ class GitPublicationStore:
         if self._ref_revision(_candidate_ref(intent.candidate.handle)) != _revision(intent.candidate.snapshot_id):
             raise ValueError("publication candidate is unavailable")
         self._validate_candidate_content(intent.candidate)
-        if self._current_head(state, intent.channel_id, pending_attempt=pending_attempt) != intent.expected_head:
+        if intent.mode is PublicationMode.REVIEW_ADOPTION:
+            self._validate_review_adoption(state, intent, pending_attempt=pending_attempt)
+        elif self._current_head(state, intent.channel_id, pending_attempt=pending_attempt) != intent.expected_head:
             raise ValueError("publication expected head is stale")
         if (
             intent.review_base_head is not None
@@ -597,6 +646,97 @@ class GitPublicationStore:
             if _coordination_observation(state["coordination"].get(change.key)) != change.expected:
                 raise ValueError("publication coordination fence is stale")
 
+    def _validate_review_adoption(
+        self, state: dict[str, Any], intent: PublicationIntent, *, pending_attempt: str | None
+    ) -> None:
+        acceptance = intent.review_acceptance
+        if acceptance is None:
+            raise ValueError("review adoption lacks external acceptance evidence")
+        acceptance._validate()
+        if acceptance.publication_store_id != self._store_id:
+            raise ValueError("review acceptance was issued by another publication store")
+        review_record = state["attempts"].get(acceptance.review_publication.attempt_id.value)
+        if not isinstance(review_record, dict) or review_record.get("status") != "committed":
+            raise ValueError("review acceptance does not identify a committed publication")
+        review_intent = self._intent_from_wire(json.loads(review_record["intent"]), historical=True, state=state)
+        review_proof = self._proof_from_record(review_intent, review_record["proof"])
+        if (
+            review_proof.proof_id != acceptance.review_proof_id
+            or review_intent.mode is not PublicationMode.REVIEW_REQUIRED
+            or review_intent.target is not PublicationTarget.REVIEW_CANDIDATE
+            or review_intent.review_base_head != intent.expected_head
+            or review_intent.candidate.snapshot_id != intent.candidate.snapshot_id
+            or review_intent.candidate.content_id != intent.candidate.content_id
+            or review_intent.environment_id != intent.environment_id
+            or acceptance.environment_id != intent.environment_id
+            or review_proof.resulting_head.snapshot_id != intent.candidate.snapshot_id
+        ):
+            raise ValueError("review acceptance does not match its authenticated review proof")
+        if self._current_head(state, review_intent.channel_id) != review_proof.resulting_head:
+            raise ValueError("review candidate head is stale")
+        self._validate_review_adoption_refs(
+            state,
+            intent.expected_head,
+            intent.candidate.snapshot_id,
+            pending_attempt=pending_attempt,
+        )
+
+    def _validate_review_adoption_refs(
+        self,
+        state: dict[str, Any],
+        accepted_base: HeadObservation,
+        candidate: SnapshotId,
+        *,
+        pending_attempt: str | None,
+    ) -> None:
+        """Validate accepted authority plus the external review decision.
+
+        The public ref is deliberately allowed to be ahead of authenticated
+        authority only in this specialized path.  ``_atomic_adopt_review_refs``
+        repeats the public comparison in the same Git ref transaction that
+        advances the private mirror/attempt marker, closing the read/CAS gap.
+        """
+
+        record = state["heads"].get(accepted_base.channel_id.value)
+        authority_marker = self._ref_revision(_authority_ref(accepted_base.channel_id))
+        pending_marker = (
+            state["attempts"].get(pending_attempt, {}).get("marker") if pending_attempt is not None else None
+        )
+        if record is None:
+            if accepted_base.snapshot_id is not None or accepted_base.incarnation != "git:0":
+                raise ValueError("review adoption accepted base is stale")
+            if authority_marker is None:
+                pass
+            elif authority_marker == pending_marker and isinstance(pending_marker, str):
+                self._validate_marker_object(pending_marker, candidate, pending_attempt)
+            else:
+                raise GitPublicationError("managed accepted authority exists without journal state")
+        else:
+            stored = HeadObservation(
+                accepted_base.channel_id,
+                SnapshotId(record["snapshot"]) if record["snapshot"] is not None else None,
+                f"git:{record['version']}",
+            )
+            if stored != accepted_base:
+                raise ValueError("review adoption accepted base is stale")
+            marker = record.get("marker")
+            if (
+                not isinstance(marker, str)
+                or authority_marker not in {marker, pending_marker}
+                or (authority_marker == pending_marker and not isinstance(pending_marker, str))
+            ):
+                raise GitPublicationError("managed accepted authority marker is missing or drifted")
+            if authority_marker == marker:
+                self._validate_marker_object(marker, accepted_base.snapshot_id, record.get("attempt"))
+            else:
+                self._validate_marker_object(cast(str, pending_marker), candidate, pending_attempt)
+        expected_private = candidate if pending_attempt is not None else accepted_base.snapshot_id
+        if self._ref_revision(_channel_ref(accepted_base.channel_id)) != _revision_or_none(expected_private):
+            raise GitPublicationError("private accepted channel does not match review adoption state")
+        if self._ref_revision(_public_channel_ref(accepted_base.channel_id)) != _revision(candidate):
+            raise ValueError("external accepted channel does not equal the reviewed candidate")
+        self._validate_commit_tree(_revision(candidate))
+
     def _validate_candidate_content(self, candidate: SealedCandidate) -> None:
         if self._ref_revision(_candidate_ref(candidate.handle)) != _revision(candidate.snapshot_id):
             raise ValueError("publication candidate is unavailable")
@@ -611,24 +751,46 @@ class GitPublicationStore:
         if candidate_view.content_id != candidate.content_id:
             raise GitPublicationError("publication candidate content does not match its sealed content identity")
 
-    def _intent_from_wire(self, wire: object, *, historical: bool = False) -> PublicationIntent:
+    def _intent_from_wire(
+        self, wire: object, *, historical: bool = False, state: dict[str, Any] | None = None
+    ) -> PublicationIntent:
         if not isinstance(wire, dict) or wire.get("effect_authorization") is not None:
             raise GitPublicationError("publication intent evidence cannot be reissued safely")
         try:
             candidate_wire = wire["candidate"]
             if not isinstance(candidate_wire, dict):
                 raise ValueError
-            candidate = self.reissue_candidate(
-                CandidateLocator(
-                    SealedCandidateHandle(candidate_wire["handle"]),
-                    CandidateStoreId(candidate_wire["store"]),
-                    SnapshotId(candidate_wire["snapshot"]),
-                    ContentId(candidate_wire["content"]),
-                )
+            candidate_locator = CandidateLocator(
+                SealedCandidateHandle(candidate_wire["handle"]),
+                CandidateStoreId(candidate_wire["store"]),
+                SnapshotId(candidate_wire["snapshot"]),
+                ContentId(candidate_wire["content"]),
             )
+            if state is None:
+                candidate = self.reissue_candidate(candidate_locator)
+            else:
+                if candidate_locator.candidate_store_id.value != state["candidate_store_id"] or state["candidates"].get(
+                    candidate_locator.handle.value
+                ) != {
+                    "content": candidate_locator.content_id.value,
+                    "snapshot": candidate_locator.snapshot_id.value,
+                }:
+                    raise ValueError
+                candidate = _issue_sealed_candidate(
+                    candidate_locator.handle,
+                    candidate_locator.candidate_store_id,
+                    candidate_locator.snapshot_id,
+                    candidate_locator.content_id,
+                )
+                self._validate_candidate_content(candidate)
             expected = wire["expected_head"]
             if not isinstance(expected, dict):
                 raise ValueError
+            expected_head = HeadObservation(
+                ChannelId(expected["channel"]),
+                SnapshotId(expected["snapshot"]) if expected["snapshot"] is not None else None,
+                expected["incarnation"],
+            )
             changes: list[SourceOwnershipChange] = []
             ownership = wire["ownership"]
             if not isinstance(ownership, list):
@@ -676,14 +838,38 @@ class GitPublicationStore:
                         change["next"],
                     )
                 )
+            review_acceptance_wire = wire.get("review_acceptance")
+            review_acceptance = None
+            if isinstance(review_acceptance_wire, dict):
+                accepted_base_wire = review_acceptance_wire["accepted_base"]
+                if not isinstance(accepted_base_wire, dict):
+                    raise ValueError
+                accepted_base = HeadObservation(
+                    ChannelId(accepted_base_wire["channel"]),
+                    SnapshotId(accepted_base_wire["snapshot"]) if accepted_base_wire["snapshot"] is not None else None,
+                    accepted_base_wire["incarnation"],
+                )
+                store_id = PublicationStoreId(review_acceptance_wire["store"])
+                review_acceptance = _issue_review_acceptance_observation(
+                    store_id,
+                    PublicationRecoveryLocator(
+                        store_id, PublicationAttemptId(review_acceptance_wire["review_attempt"])
+                    ),
+                    PublicationProofId(review_acceptance_wire["proof"]),
+                    ChannelId(review_acceptance_wire["desired_channel"]),
+                    accepted_base,
+                    SnapshotId(review_acceptance_wire["candidate_snapshot"]),
+                    ContentId(review_acceptance_wire["candidate_content"]),
+                    EnvironmentId(review_acceptance_wire["environment"]),
+                    review_acceptance_wire["incarnation"],
+                    self._issuer,
+                )
+            elif review_acceptance_wire is not None:
+                raise ValueError
             return PublicationIntent(
                 PublicationAttemptId(wire["attempt"]),
                 ChannelId(wire["channel"]),
-                HeadObservation(
-                    ChannelId(expected["channel"]),
-                    SnapshotId(expected["snapshot"]) if expected["snapshot"] is not None else None,
-                    expected["incarnation"],
-                ),
+                expected_head,
                 candidate,
                 tuple(changes),
                 OwnershipId(wire["owner"]),
@@ -701,6 +887,8 @@ class GitPublicationStore:
                     if isinstance(wire.get("review_base_head"), dict)
                     else None
                 ),
+                review_acceptance=review_acceptance,
+                environment_id=(EnvironmentId(wire["environment"]) if wire.get("environment") is not None else None),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise GitPublicationError("authenticated publication intent record is malformed") from exc
@@ -1060,6 +1248,33 @@ class GitPublicationStore:
         if "cannot lock ref" in completed.stderr or "reference already exists" in completed.stderr:
             return False
         raise GitPublicationError("atomic publication ref transaction failed")
+
+    def _atomic_adopt_review_refs(self, intent: PublicationIntent, marker: str) -> bool:
+        """Adopt an externally accepted review without rewriting its public ref."""
+
+        candidate = _revision(intent.candidate.snapshot_id)
+        expected = _revision_or_none(intent.expected_head.snapshot_id) or "0" * 40
+        lines = [
+            "start",
+            f"verify {_public_channel_ref(intent.channel_id)} {candidate}",
+            f"update {_channel_ref(intent.channel_id)} {candidate} {expected}",
+            f"create {_attempt_marker_ref(marker)} {marker}",
+            "prepare",
+            "commit",
+            "",
+        ]
+        completed = subprocess.run(
+            ["git", "-C", str(self.repository), "update-ref", "--stdin"],
+            input="\n".join(lines),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode == 0:
+            return True
+        if "cannot lock ref" in completed.stderr or "reference already exists" in completed.stderr:
+            return False
+        raise GitPublicationError("atomic review adoption ref transaction failed")
 
     def _atomic_bootstrap_refs(self, channel: ChannelId, public_revision: str, marker: str) -> bool:
         lines = [

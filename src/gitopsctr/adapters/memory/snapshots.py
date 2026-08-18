@@ -17,15 +17,18 @@ from gitopsctr.application.model import (
     OwnershipId,
     OwnershipObservation,
     PublicationIntent,
+    PublicationMode,
     PublicationOutcome,
     PublicationOutcomeState,
     PublicationProof,
     PublicationRecovery,
     PublicationRecoveryLocator,
     PublicationStoreId,
+    PublicationTarget,
     RetainedSource,
     RetainedSourceHandle,
     RetentionStoreId,
+    ReviewAcceptanceObservation,
     SealedCandidate,
     SealedCandidateHandle,
     SnapshotId,
@@ -33,9 +36,11 @@ from gitopsctr.application.model import (
     SourceSnapshotId,
     _issue_publication_proof,
     _issue_retained_source,
+    _issue_review_acceptance_observation,
     _issue_sealed_candidate,
     _new_publication_proof_issuer,
 )
+from gitopsctr.application.ports import PublicationRecoveryNotFoundError
 from gitopsctr.application.snapshots import SnapshotNotFoundError, SnapshotView
 from gitopsctr.application.workspace import ImmutableWorkspace, InMemoryWorkspace, MutableWorkspace, WorkspaceEntry
 
@@ -106,6 +111,7 @@ class InMemorySnapshotStore:
     )
     _publication_issuer: object = field(init=False, repr=False)
     _heads: dict[ChannelId, SnapshotId | None] = field(default_factory=dict, init=False, repr=False)
+    _external_review_heads: dict[ChannelId, SnapshotId | None] = field(default_factory=dict, init=False, repr=False)
     _head_versions: dict[ChannelId, int] = field(default_factory=dict, init=False, repr=False)
     _candidates: dict[SealedCandidateHandle, tuple[object, SealedCandidate]] = field(
         default_factory=dict, init=False, repr=False
@@ -181,6 +187,47 @@ class InMemorySnapshotStore:
     def prepare_head(self, channel_id: ChannelId) -> HeadObservation:
         return self.resolve_head(channel_id)
 
+    def set_external_review_head(self, channel_id: ChannelId, snapshot_id: SnapshotId | None) -> None:
+        """Conformance hook representing a review system's public branch."""
+
+        if snapshot_id is not None:
+            self.open_snapshot(snapshot_id)
+        self._external_review_heads[channel_id] = snapshot_id
+
+    def observe_review_acceptance(self, locator: PublicationRecoveryLocator) -> ReviewAcceptanceObservation:
+        if locator.publication_store_id != self._publication_store_id:
+            raise ValueError("review publication locator belongs to another transaction store")
+        recovered = self.recover_publication(locator)
+        if recovered.outcome.state is not PublicationOutcomeState.COMMITTED or recovered.outcome.proof is None:
+            raise ValueError("review publication has no committed proof")
+        intent = recovered.intent
+        proof = recovered.outcome.proof
+        if (
+            intent.mode is not PublicationMode.REVIEW_REQUIRED
+            or intent.target is not PublicationTarget.REVIEW_CANDIDATE
+            or intent.review_base_head is None
+        ):
+            raise ValueError("publication proof does not identify a review candidate")
+        assert intent.environment_id is not None
+        if self.resolve_head(intent.channel_id) != proof.resulting_head:
+            raise ValueError("review candidate head drifted from its committed proof")
+        if self.resolve_head(intent.review_base_head.channel_id) != intent.review_base_head:
+            raise ValueError("review adoption accepted base authority is stale")
+        if self._external_review_heads.get(intent.review_base_head.channel_id) != intent.candidate.snapshot_id:
+            raise ValueError("external accepted channel does not equal the reviewed candidate")
+        return _issue_review_acceptance_observation(
+            self._publication_store_id,
+            locator,
+            proof.proof_id,
+            intent.review_base_head.channel_id,
+            intent.review_base_head,
+            intent.candidate.snapshot_id,
+            intent.candidate.content_id,
+            intent.environment_id,
+            f"memory-review-current:{intent.candidate.snapshot_id.value}",
+            self._publication_issuer,
+        )
+
     def recovery_locator(self, intent: PublicationIntent) -> PublicationRecoveryLocator:
         intent._validate()
         return PublicationRecoveryLocator(self._publication_store_id, intent.attempt_id)
@@ -191,7 +238,7 @@ class InMemorySnapshotStore:
         try:
             intent = self._intent_by_attempt[locator.attempt_id]
         except KeyError as exc:
-            raise ValueError("publication recovery locator is unknown") from exc
+            raise PublicationRecoveryNotFoundError("publication recovery locator is unknown") from exc
         return PublicationRecovery(intent, self.verify(intent))
 
     def begin_candidate(
@@ -340,7 +387,9 @@ class InMemorySnapshotStore:
             raise ValueError("publication candidate was issued by another candidate store")
         if candidate is None or candidate[1] != intent.candidate:
             raise ValueError("publication candidate was not sealed by this store")
-        if self.resolve_head(intent.channel_id) != intent.expected_head:
+        if intent.mode is PublicationMode.REVIEW_ADOPTION:
+            self._validate_review_adoption(intent)
+        elif self.resolve_head(intent.channel_id) != intent.expected_head:
             raise ValueError("publication expected head is stale")
         if (
             intent.review_base_head is not None
@@ -363,6 +412,37 @@ class InMemorySnapshotStore:
         for change in intent.coordination_changes:
             if self.coordination(change.key) != change.expected:
                 raise ValueError("publication coordination fence is stale")
+
+    def _validate_review_adoption(self, intent: PublicationIntent) -> None:
+        acceptance = intent.review_acceptance
+        if acceptance is None:
+            raise ValueError("review adoption lacks external acceptance evidence")
+        acceptance._validate()
+        if acceptance.publication_store_id != self._publication_store_id:
+            raise ValueError("review acceptance was issued by another publication store")
+        recovered = self.recover_publication(acceptance.review_publication)
+        if recovered.outcome.state is not PublicationOutcomeState.COMMITTED or recovered.outcome.proof is None:
+            raise ValueError("review acceptance does not identify a committed publication")
+        review_intent = recovered.intent
+        review_proof = recovered.outcome.proof
+        if (
+            review_proof.proof_id != acceptance.review_proof_id
+            or review_intent.mode is not PublicationMode.REVIEW_REQUIRED
+            or review_intent.target is not PublicationTarget.REVIEW_CANDIDATE
+            or review_intent.review_base_head != intent.expected_head
+            or review_intent.candidate.snapshot_id != intent.candidate.snapshot_id
+            or review_intent.candidate.content_id != intent.candidate.content_id
+            or review_intent.environment_id != intent.environment_id
+            or acceptance.environment_id != intent.environment_id
+            or review_proof.resulting_head.snapshot_id != intent.candidate.snapshot_id
+        ):
+            raise ValueError("review acceptance does not match its authenticated review proof")
+        if self.resolve_head(review_intent.channel_id) != review_proof.resulting_head:
+            raise ValueError("review candidate head is stale")
+        if self.resolve_head(intent.channel_id) != intent.expected_head:
+            raise ValueError("review adoption accepted base is stale")
+        if self._external_review_heads.get(intent.channel_id) != intent.candidate.snapshot_id:
+            raise ValueError("external accepted channel does not equal the reviewed candidate")
 
     def _apply_coordination(self, change: CoordinationChange) -> CoordinationObservation:
         version = self._coordination_versions.get(change.key, 0) + 1

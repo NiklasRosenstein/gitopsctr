@@ -16,6 +16,7 @@ from gitopsctr.application import (
     ChannelId,
     CoordinationChange,
     CoordinationObservation,
+    EnvironmentId,
     HeadObservation,
     OwnershipId,
     OwnershipObservation,
@@ -72,6 +73,7 @@ def _intent(
         target,
         mode,
         review_base_head=review_base,
+        environment_id=EnvironmentId("dev") if mode is PublicationMode.REVIEW_REQUIRED else None,
     )
 
 

@@ -34,6 +34,7 @@ from gitopsctr.application.model import (
     ChannelId,
     CoordinationChange,
     CoordinationObservation,
+    EnvironmentId,
     HeadObservation,
     OwnershipId,
     OwnershipObservation,
@@ -45,6 +46,7 @@ from gitopsctr.application.model import (
     PublicationRecoveryLocator,
     PublicationTarget,
     RetainedSource,
+    ReviewAcceptanceObservation,
     SealedCandidate,
     SourceOwnershipChange,
     SourceSnapshotId,
@@ -141,6 +143,8 @@ class ApplyPublicationAuthority(CandidateStore, PublicationTransaction, Protocol
 
     def recover_publication(self, locator: PublicationRecoveryLocator) -> PublicationRecovery: ...
 
+    def observe_review_acceptance(self, locator: PublicationRecoveryLocator) -> ReviewAcceptanceObservation: ...
+
     def close(self) -> None: ...
 
 
@@ -217,6 +221,7 @@ class CandidatePublicationCoordinator:
         if not isinstance(request, CandidatePublicationRequest):
             raise TypeError("request must be a CandidatePublicationRequest")
         request.__post_init__()
+        environment_id = EnvironmentId(request.environment_id)
         workspace = self.authority.begin_candidate(request.candidate, request.expected_desired_head.snapshot_id)
         sealed = self.authority.seal_candidate(workspace)
         if sealed.content_id != request.candidate.content_id:
@@ -234,7 +239,7 @@ class CandidatePublicationCoordinator:
             target = PublicationTarget.ACCEPTED_DESIRED
             mode = PublicationMode.DIRECT_ACCEPTED
             review_base = None
-        owner = self.identity_issuer.issue_owner(request.environment_id, sealed)
+        owner = self.identity_issuer.issue_owner(environment_id.value, sealed)
         coordination = tuple(
             CoordinationChange(item.key, self.authority.coordination(item.key), item.next_value)
             for item in request.coordination_requests
@@ -248,7 +253,7 @@ class CandidatePublicationCoordinator:
             for retained in request.retained_sources
         )
         intent = PublicationIntent(
-            self.identity_issuer.issue_attempt(request.environment_id, target_channel, expected_head, sealed),
+            self.identity_issuer.issue_attempt(environment_id.value, target_channel, expected_head, sealed),
             target_channel,
             expected_head,
             sealed,
@@ -258,6 +263,7 @@ class CandidatePublicationCoordinator:
             target,
             mode,
             review_base_head=review_base,
+            environment_id=environment_id if request.review_required else None,
         )
         locator = self.authority.recovery_locator(intent)
         verified = False
@@ -433,7 +439,7 @@ class ApplyCoordinator:
                 mode = PublicationMode.DIRECT_ACCEPTED
                 target = PublicationTarget.ACCEPTED_DESIRED
                 review_base = None
-            owner = self.publication_identity_issuer.issue_owner(str(command.environment_id), sealed)
+            owner = self.publication_identity_issuer.issue_owner(command.environment_id.value, sealed)
             source_changes = tuple(
                 SourceOwnershipChange(
                     plane.retained,
@@ -452,7 +458,7 @@ class ApplyCoordinator:
             )
             intent = PublicationIntent(
                 self.publication_identity_issuer.issue_attempt(
-                    str(command.environment_id), target_channel, target_head, sealed
+                    command.environment_id.value, target_channel, target_head, sealed
                 ),
                 target_channel,
                 target_head,
@@ -463,6 +469,7 @@ class ApplyCoordinator:
                 target,
                 mode,
                 review_base_head=review_base,
+                environment_id=command.environment_id if review else None,
             )
             locator = self.authority.recovery_locator(intent)
             verified = False

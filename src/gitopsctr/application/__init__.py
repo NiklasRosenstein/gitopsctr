@@ -60,6 +60,7 @@ from gitopsctr.application.model import (
     RetainedSource,
     RetainedSourceHandle,
     RetentionStoreId,
+    ReviewAcceptanceObservation,
     SealedCandidate,
     SealedCandidateHandle,
     SnapshotId,
@@ -89,6 +90,15 @@ from gitopsctr.application.ports import (
     SnapshotReader,
     SpecificationValidator,
     StatusInspector,
+)
+from gitopsctr.application.review_adoption import (
+    ReviewAdoptionCommand,
+    ReviewAdoptionConfiguration,
+    ReviewAdoptionCoordinator,
+    ReviewAdoptionEnvironmentResolver,
+    ReviewAdoptionError,
+    ReviewAdoptionResult,
+    ReviewAdoptionService,
 )
 from gitopsctr.application.snapshots import SnapshotNotFoundError, SnapshotView
 from gitopsctr.application.status import StatusCommand, StatusEntry, StatusExplanation, StatusResult, StatusState
@@ -150,6 +160,14 @@ __all__ = [
     "PublicationTarget",
     "PublicationExecutionUnknownError",
     "PublicationTransaction",
+    "ReviewAcceptanceObservation",
+    "ReviewAdoptionCommand",
+    "ReviewAdoptionConfiguration",
+    "ReviewAdoptionCoordinator",
+    "ReviewAdoptionEnvironmentResolver",
+    "ReviewAdoptionError",
+    "ReviewAdoptionResult",
+    "ReviewAdoptionService",
     "RetainedSource",
     "RetainedSourceHandle",
     "RetentionStoreId",

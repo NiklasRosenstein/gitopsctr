@@ -9,6 +9,8 @@ from gitopsctr.adapters.git import (
     GitAuthoredChangeDecoder,
     GitDependencyInspector,
     GitResourceInspector,
+    GitReviewAdoptionEnvironmentResolver,
+    GitReviewAdoptionService,
     GitSnapshotReader,
     GitStatusInspector,
 )
@@ -40,4 +42,8 @@ def create_default_application(repository: Path) -> ApplicationServices:
         GitDependencyInspector(repository_root, snapshot_reader, RESOURCE_REGISTRY),
         GitApplyService(repository_root),
         GitAuthoredChangeDecoder(repository_root),
+        GitReviewAdoptionService(
+            repository_root,
+            GitReviewAdoptionEnvironmentResolver(repository_root),
+        ),
     )
