@@ -36,6 +36,8 @@ import yaml
 
 from gitopsctr import operational
 from gitopsctr.application import (
+    ApplyCommand,
+    ChannelId,
     DependencyCommand,
     EnvironmentId,
     InspectionFilter,
@@ -48,6 +50,7 @@ from gitopsctr.application import (
     ValidationResult,
     ValidationSubject,
 )
+from gitopsctr.application.apply import AuthoredChangeSet
 from gitopsctr.application.workspace import WorkspaceEntry, entry_content_id
 from gitopsctr.artifacts import require_artifact_api
 from gitopsctr.contracts import (
@@ -12173,8 +12176,12 @@ def _reject_applied_stacks_against_deleting_templates(
 
 
 @_cached_desired_graph_operation
-def command_apply(args: argparse.Namespace) -> str | None:
-    """Resolve explicit resources and atomically publish one desired snapshot."""
+def _execute_git_apply(
+    args: argparse.Namespace,
+    *,
+    documents: Sequence[ApplyInputDocument] | None = None,
+) -> str | None:
+    """Default-Git implementation behind the typed application boundary."""
 
     _resource_name(args.environment, "environment name")
     partition = _resource_name(args.partition, "partition name") if args.partition is not None else None
@@ -12194,7 +12201,7 @@ def command_apply(args: argparse.Namespace) -> str | None:
         observed = temporary / "observed"
         candidate = temporary / "candidate"
         if source_revision is None:
-            documents = _load_apply_documents(args.files)
+            documents = list(documents) if documents is not None else _load_apply_documents(args.files)
             if not documents and partition is None:
                 raise OperationError(
                     "apply produced zero documents; specify --partition for authoritative empty membership"
@@ -12362,6 +12369,39 @@ def command_apply(args: argparse.Namespace) -> str | None:
             print(revision)
             write_change_outputs(revision, desired_ref, candidate_ref if outcome else "", outcome)
         return revision
+
+
+def _apply_documents_from_change_set(changes: AuthoredChangeSet) -> list[ApplyInputDocument]:
+    """Reify normalized authored data at the default-Git adapter boundary."""
+
+    return [
+        ApplyInputDocument(document.origin, document.document, document.content_id.value)
+        for document in changes.documents
+    ]
+
+
+def command_apply(args: argparse.Namespace) -> str | None:
+    """Translate CLI arguments and delegate apply to the composed application."""
+
+    from gitopsctr.adapters.git import source_request_for_git
+    from gitopsctr.composition import create_default_application
+
+    command = ApplyCommand(
+        EnvironmentId(args.environment),
+        tuple(args.files),
+        ChannelId(args.desired_ref) if args.desired_ref is not None else None,
+        ChannelId(args.observed_ref) if args.observed_ref is not None else None,
+        ChannelId(args.candidate_ref) if args.candidate_ref is not None else None,
+        source_request_for_git(args.source_revision),
+        args.partition,
+        args.dry,
+        getattr(args, "verbose", False),
+    )
+    with create_default_application(REPOSITORY_ROOT) as application:
+        result = application.apply(command)
+    if result.snapshot_id is None:
+        return None
+    return result.snapshot_id.value.removeprefix("git-commit:")
 
 
 def command_create_stacktemplate(args: argparse.Namespace) -> None:

@@ -7,17 +7,33 @@ SOURCE = Path(__file__).parents[1] / "src" / "gitopsctr"
 ISSUANCE_NAMES = {
     "_issue_accepted_desired_snapshot",
     "_issue_effect_authorization",
+    "_issue_sealed_candidate",
+    "_issue_publication_proof",
+    "_issue_retained_source",
+    "_issue_authored_document",
+    "_new_publication_proof_issuer",
 }
-MARKER_NAMES = {"_ACCEPTED_DESIRED_ISSUANCE", "_EFFECT_AUTHORIZATION_ISSUANCE"}
+MARKER_NAMES = {
+    "_ACCEPTED_DESIRED_ISSUANCE",
+    "_EFFECT_AUTHORIZATION_ISSUANCE",
+    "_RETAINED_SOURCE_ISSUANCE",
+    "_SEALED_CANDIDATE_ISSUANCE",
+    "_PUBLICATION_PROOF_ISSUANCE",
+    "_PUBLICATION_PROOF_ISSUERS",
+}
 TRUSTED_ISSUERS = {
     Path("adapters/authority.py"),
     Path("adapters/effect_fencing.py"),
+    Path("adapters/git/apply.py"),
     Path("adapters/memory/authority.py"),
     Path("adapters/memory/effect_fencing.py"),
+    Path("adapters/git/sources.py"),
+    Path("adapters/memory/snapshots.py"),
+    Path("adapters/memory/sources.py"),
 }
 
 
-def test_authority_issuance_factories_stay_inside_trusted_adapters() -> None:
+def test_application_issuance_factories_stay_inside_trusted_adapters() -> None:
     violations: list[str] = []
     for path in sorted(SOURCE.rglob("*.py")):
         relative = path.relative_to(SOURCE)
@@ -33,10 +49,10 @@ def test_authority_issuance_factories_stay_inside_trusted_adapters() -> None:
                 continue
             if accessed:
                 violations.append(f"{relative}: {', '.join(sorted(accessed))}")
-    assert not violations, "authority issuance factories accessed outside trusted adapters: " + "; ".join(violations)
+    assert not violations, "application issuance factories accessed outside trusted adapters: " + "; ".join(violations)
 
 
-def test_authority_issuance_markers_are_never_imported() -> None:
+def test_application_issuance_markers_are_never_imported() -> None:
     for path in sorted(SOURCE.rglob("*.py")):
         if path == SOURCE / "application" / "model.py":
             continue
@@ -47,7 +63,7 @@ def test_authority_issuance_markers_are_never_imported() -> None:
                 accessed.update(MARKER_NAMES & {alias.name for alias in node.names})
             elif isinstance(node, ast.Attribute):
                 accessed.update(MARKER_NAMES & {node.attr})
-        assert not accessed, f"{path.relative_to(SOURCE)} accesses an authority issuance marker"
+        assert not accessed, f"{path.relative_to(SOURCE)} accesses an application issuance marker"
 
 
 _APPLICATION_FORBIDDEN_IMPORTS = (

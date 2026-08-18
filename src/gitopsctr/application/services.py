@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from gitopsctr.application.apply import ApplyCommand, ApplyResult, AuthoredChangeSet
 from gitopsctr.application.dependencies import DependencyCommand, DependencyResult
 from gitopsctr.application.inspection import ResourceInspectionCommand, ResourceInspectionResult
 from gitopsctr.application.model import (
@@ -13,6 +14,8 @@ from gitopsctr.application.model import (
     ValidationResult,
 )
 from gitopsctr.application.ports import (
+    ApplyService,
+    AuthoredChangeDecoder,
     DependencyInspector,
     ResourceInspector,
     SnapshotReader,
@@ -31,6 +34,8 @@ class ApplicationServices:
     resource_inspector: ResourceInspector
     status_inspector: StatusInspector
     dependency_inspector: DependencyInspector
+    apply_service: ApplyService | None = None
+    authored_change_decoder: AuthoredChangeDecoder | None = None
     _closed: bool = field(default=False, init=False, repr=False)
 
     def validate(self, command: ValidateCommand) -> ValidationResult:
@@ -59,6 +64,17 @@ class ApplicationServices:
 
         return self.dependency_inspector.dependencies(command)
 
+    def apply(self, command: ApplyCommand, changes: AuthoredChangeSet | None = None) -> ApplyResult:
+        """Coordinate apply through the explicitly composed service."""
+
+        if self.apply_service is None:
+            raise RuntimeError("the configured application does not provide apply")
+        if changes is None:
+            if self.authored_change_decoder is None:
+                raise RuntimeError("the configured application does not provide authored input decoding")
+            changes = self.authored_change_decoder.decode(command)
+        return self.apply_service.apply(command, changes)
+
     def close(self) -> None:
         """Close both explicit dependencies exactly once."""
 
@@ -66,18 +82,26 @@ class ApplicationServices:
             return
         self._closed = True
         try:
-            self.dependency_inspector.close()
+            if self.authored_change_decoder is not None:
+                self.authored_change_decoder.close()
         finally:
             try:
-                self.status_inspector.close()
+                if self.apply_service is not None:
+                    self.apply_service.close()
             finally:
                 try:
-                    self.resource_inspector.close()
+                    self.dependency_inspector.close()
                 finally:
                     try:
-                        self.specification_validator.close()
+                        self.status_inspector.close()
                     finally:
-                        self.snapshot_reader.close()
+                        try:
+                            self.resource_inspector.close()
+                        finally:
+                            try:
+                                self.specification_validator.close()
+                            finally:
+                                self.snapshot_reader.close()
 
     def __enter__(self) -> ApplicationServices:
         return self

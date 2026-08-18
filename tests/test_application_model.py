@@ -10,8 +10,11 @@ from gitopsctr.application import (
     AcceptedDesiredSnapshot,
     AuthorityIssuer,
     AuthorityObservation,
+    CandidateStoreId,
     ChannelId,
     ContentId,
+    CoordinationChange,
+    CoordinationObservation,
     EffectAuthorization,
     EffectIntent,
     EffectKind,
@@ -23,17 +26,22 @@ from gitopsctr.application import (
     PublicationAttemptId,
     PublicationIntent,
     PublicationMode,
-    RetainedSource,
+    PublicationTarget,
     RetainedSourceHandle,
-    SealedCandidate,
+    RetentionStoreId,
     SealedCandidateHandle,
     SnapshotId,
     SourceId,
-    SourceOwnershipRequirement,
+    SourceOwnershipChange,
     SourceSnapshotId,
     ValidateCommand,
 )
-from gitopsctr.application.model import _issue_accepted_desired_snapshot, _issue_effect_authorization
+from gitopsctr.application.model import (
+    _issue_accepted_desired_snapshot,
+    _issue_effect_authorization,
+    _issue_retained_source,
+    _issue_sealed_candidate,
+)
 
 
 def accepted_snapshot() -> AcceptedDesiredSnapshot:
@@ -163,25 +171,29 @@ def test_effect_and_publication_intents_preserve_authorization_and_exact_head():
         EffectLeaseToken("lease-token-1"),
         2,
     )
-    source = RetainedSource(
+    source = _issue_retained_source(
         RetainedSourceHandle("retained-source-1"),
+        RetentionStoreId("retention-store-1"),
         SourceSnapshotId(SourceId("source-repository"), SnapshotId("source-snapshot")),
+        ContentId("source-content"),
     )
-    requirement = SourceOwnershipRequirement(
-        source, OwnershipObservation.present(OwnershipId("accepted-owner"), "owner-v1")
+    change = SourceOwnershipChange(
+        source, OwnershipObservation.present(OwnershipId("accepted-owner"), "owner-v1"), OwnershipId("accepted-owner")
     )
     intent = PublicationIntent(
         PublicationAttemptId("publication-attempt-1"),
         accepted.channel_id,
         accepted.head_observation,
-        SealedCandidate(
+        _issue_sealed_candidate(
             SealedCandidateHandle("candidate-handle-1"),
+            CandidateStoreId("candidate-store-1"),
             SnapshotId("candidate-snapshot"),
             ContentId("candidate-content"),
         ),
-        (source,),
+        (change,),
         OwnershipId("accepted-owner"),
-        (requirement,),
+        (CoordinationChange("review-request", CoordinationObservation.absent("coordination-v1"), "candidate-1"),),
+        PublicationTarget.ACCEPTED_DESIRED,
         PublicationMode.FENCED_CONTINUATION,
         authorization,
     )
@@ -196,6 +208,7 @@ def test_effect_and_publication_intents_preserve_authorization_and_exact_head():
             (),
             OwnershipId("accepted-owner"),
             (),
+            PublicationTarget.ACCEPTED_DESIRED,
             PublicationMode.DIRECT_ACCEPTED,
         )
     with pytest.raises(TypeError, match="must be issued"):
@@ -217,9 +230,10 @@ def test_effect_and_publication_intents_preserve_authorization_and_exact_head():
             accepted.channel_id,
             accepted.head_observation,
             intent.candidate,
-            (source,),
+            (change,),
             OwnershipId("accepted-owner"),
-            (requirement,),
+            (),
+            PublicationTarget.ACCEPTED_DESIRED,
             PublicationMode.FENCED_CONTINUATION,
         )
 
@@ -237,21 +251,39 @@ def test_effect_authorization_and_publication_ownership_reject_inconsistent_inpu
         )
 
     source_id = SourceSnapshotId(SourceId("source-repository"), SnapshotId("source-snapshot"))
-    retained = RetainedSource(RetainedSourceHandle("retained-source-1"), source_id)
-    mismatched = RetainedSource(RetainedSourceHandle("retained-source-2"), source_id)
-    with pytest.raises(ValueError, match="retained source handle"):
+    retained = _issue_retained_source(
+        RetainedSourceHandle("retained-source-1"),
+        RetentionStoreId("retention-store-1"),
+        source_id,
+        ContentId("content-1"),
+    )
+    mismatched = _issue_retained_source(
+        RetainedSourceHandle("retained-source-2"),
+        RetentionStoreId("retention-store-1"),
+        source_id,
+        ContentId("content-1"),
+    )
+    candidate = _issue_sealed_candidate(
+        SealedCandidateHandle("candidate-handle-1"),
+        CandidateStoreId("candidate-store-1"),
+        SnapshotId("candidate-snapshot"),
+        ContentId("candidate-content"),
+    )
+    with pytest.raises(ValueError, match="source-keyed"):
         PublicationIntent(
             PublicationAttemptId("publication-attempt-4"),
             accepted.channel_id,
             accepted.head_observation,
-            SealedCandidate(
-                SealedCandidateHandle("candidate-handle-1"),
-                SnapshotId("candidate-snapshot"),
-                ContentId("candidate-content"),
+            candidate,
+            (
+                SourceOwnershipChange(retained, OwnershipObservation.absent("owner-v1"), OwnershipId("accepted-owner")),
+                SourceOwnershipChange(
+                    mismatched, OwnershipObservation.absent("owner-v1"), OwnershipId("accepted-owner")
+                ),
             ),
-            (retained,),
             OwnershipId("accepted-owner"),
-            (SourceOwnershipRequirement(mismatched, OwnershipObservation.absent("owner-v1")),),
+            (),
+            PublicationTarget.ACCEPTED_DESIRED,
             PublicationMode.DIRECT_ACCEPTED,
         )
 
@@ -266,39 +298,43 @@ def test_ownership_observations_fence_absence_aba_and_allow_idempotent_owner():
     assert first.to_wire() != second.to_wire()
 
     accepted = accepted_snapshot()
-    retained = RetainedSource(
+    retained = _issue_retained_source(
         RetainedSourceHandle("retained-source-1"),
+        RetentionStoreId("retention-store-1"),
         SourceSnapshotId(SourceId("source-repository"), SnapshotId("source-snapshot")),
+        ContentId("source-content"),
     )
     publication = PublicationIntent(
         PublicationAttemptId("publication-attempt-5"),
         accepted.channel_id,
         accepted.head_observation,
-        SealedCandidate(
+        _issue_sealed_candidate(
             SealedCandidateHandle("candidate-handle-1"),
+            CandidateStoreId("candidate-store-1"),
             SnapshotId("candidate-snapshot"),
             ContentId("candidate-content"),
         ),
-        (retained,),
+        (SourceOwnershipChange(retained, first, owner),),
         owner,
-        (SourceOwnershipRequirement(retained, first),),
+        (),
+        PublicationTarget.ACCEPTED_DESIRED,
         PublicationMode.DIRECT_ACCEPTED,
     )
     assert publication.publication_owner == first.owner
 
-    other = RetainedSource(
-        RetainedSourceHandle("retained-source-2"),
-        SourceSnapshotId(SourceId("other-source"), SnapshotId("other-source-snapshot")),
-    )
-    with pytest.raises(ValueError, match="cover exactly"):
+    with pytest.raises(ValueError, match="source-keyed"):
         PublicationIntent(
             PublicationAttemptId("publication-attempt-coverage"),
             accepted.channel_id,
             accepted.head_observation,
             publication.candidate,
-            (retained, other),
+            (
+                SourceOwnershipChange(retained, first, owner),
+                SourceOwnershipChange(retained, first, owner),
+            ),
             owner,
-            (SourceOwnershipRequirement(retained, first),),
+            (),
+            PublicationTarget.ACCEPTED_DESIRED,
             PublicationMode.DIRECT_ACCEPTED,
         )
 
@@ -314,23 +350,27 @@ def test_publication_rejects_forged_nested_acceptance_proof():
         2,
     )
     object.__setattr__(authorization, "accepted_desired_snapshot", forged_accepted_snapshot(accepted))
-    retained = RetainedSource(
+    retained = _issue_retained_source(
         RetainedSourceHandle("retained-source-1"),
+        RetentionStoreId("retention-store-1"),
         SourceSnapshotId(SourceId("source-repository"), SnapshotId("source-snapshot")),
+        ContentId("source-content"),
     )
     with pytest.raises(TypeError, match="issuance proof"):
         PublicationIntent(
             PublicationAttemptId("publication-attempt-6"),
             accepted.channel_id,
             accepted.head_observation,
-            SealedCandidate(
+            _issue_sealed_candidate(
                 SealedCandidateHandle("candidate-handle-1"),
+                CandidateStoreId("candidate-store-1"),
                 SnapshotId("candidate-snapshot"),
                 ContentId("candidate-content"),
             ),
-            (retained,),
+            (SourceOwnershipChange(retained, OwnershipObservation.absent("owner-v1"), OwnershipId("accepted-owner")),),
             OwnershipId("accepted-owner"),
-            (SourceOwnershipRequirement(retained, OwnershipObservation.absent("owner-v1")),),
+            (),
+            PublicationTarget.ACCEPTED_DESIRED,
             PublicationMode.FENCED_CONTINUATION,
             authorization,
         )
